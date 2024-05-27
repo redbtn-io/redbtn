@@ -1,0 +1,16 @@
+# Logs
+logs
+*.log
+
+# Dependency directories
+node_modules
+
+# Build folder
+dist
+
+# Example files
+examples
+
+# Packed files
+red*.tgz
+
