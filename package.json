@@ -4,7 +4,7 @@
   "description": "",
   "author": "George Abreu Jr. <george8794@gmail.com> (https://georgeanthony.net/)",
   "license": "GPL-3.0-only",
-  "homepage": "https://github.com/xiroex/red-btn#readme",
+  "homepage": "https://github.com/redbtn-io/redbtn#readme",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -18,10 +18,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/xiroex/red-btn.git"
+    "url": "https://github.com/redbtn-io/redbtn.git"
   },
   "bugs": {
-    "url": "https://github.com/xiroex/red-btn/issues"
+    "url": "https://github.com/redbtn-io/redbtn/issues"
   },
   "dependencies": {
     "typescript": "^5.4.5"

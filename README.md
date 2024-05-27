@@ -24,12 +24,10 @@ It requires no dependencies, and dynamically imports "connectors" to load data f
 
 ## Installation
 
-To install the REDBTN system, clone the repository and install the necessary dependencies:
+To install the REDBTN system, use npm:
 
 ```sh
-git clone https://github.com/yourusername/redbtn.git
-cd redbtn
-npm install
+npm install redbtn
 ```
 
 ## Usage
@@ -39,7 +37,7 @@ npm install
 To start the REDBTN system with specific options:
 
 ```typescript
-import { start } from './path-to-redbtn';
+import { start } from 'redbtn';
 
 await start({ freq: 1000 });
 ```
@@ -49,7 +47,7 @@ await start({ freq: 1000 });
 To stop the REDBTN system:
 
 ```typescript
-import { stop } from './path-to-redbtn';
+import { stop } from 'redbtn';
 
 await stop();
 ```
@@ -59,7 +57,7 @@ await stop();
 To add a new automation:
 
 ```typescript
-import { add } from './path-to-redbtn';
+import { add } from 'redbtn';
 
 await add({
   name: "Sample Automation",
@@ -77,7 +75,7 @@ await add({
 To remove an existing automation:
 
 ```typescript
-import { remove } from './path-to-redbtn';
+import { remove } from 'redbtn';
 
 await remove('automation-id');
 ```
@@ -87,7 +85,7 @@ await remove('automation-id');
 To edit an existing automation:
 
 ```typescript
-import { edit } from './path-to-redbtn';
+import { edit } from 'redbtn';
 
 await edit('automation-id', {
   name: "Updated Automation",
@@ -102,7 +100,7 @@ await edit('automation-id', {
 To set options for the REDBTN system:
 
 ```typescript
-import { setOptions } from './path-to-redbtn';
+import { setOptions } from 'redbtn';
 
 await setOptions({ freq: 2000 });
 ```
@@ -112,7 +110,7 @@ await setOptions({ freq: 2000 });
 To set data for the REDBTN system:
 
 ```typescript
-import { set } from './path-to-redbtn';
+import { set } from 'redbtn';
 
 await set({ key: "value" });
 ```
@@ -122,7 +120,7 @@ await set({ key: "value" });
 To set a listener function:
 
 ```typescript
-import { listen } from './path-to-redbtn';
+import { listen } from 'redbtn';
 
 await listen((id, results) => {
   console.log(`Automation ${id} executed with results:`, results);
@@ -132,7 +130,7 @@ await listen((id, results) => {
 To set a finisher function:
 
 ```typescript
-import { finish } from './path-to-redbtn';
+import { finish } from 'redbtn';
 
 await finish(() => {
   console.log('REDBTN system finished execution.');
@@ -144,7 +142,7 @@ await finish(() => {
 To get the current status of the REDBTN system:
 
 ```typescript
-import { status } from './path-to-redbtn';
+import { status } from 'redbtn';
 
 console.log(status());
 ```
@@ -152,7 +150,7 @@ console.log(status());
 To get all automations in the REDBTN system:
 
 ```typescript
-import { automations } from './path-to-redbtn';
+import { automations } from 'redbtn';
 
 console.log(automations());
 ```
@@ -160,7 +158,7 @@ console.log(automations());
 To get a specific automation by ID:
 
 ```typescript
-import { automation } from './path-to-redbtn';
+import { automation } from 'redbtn';
 
 console.log(automation('automation-id'));
 ```
