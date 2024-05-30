@@ -30,28 +30,32 @@ export async function setOptions(options: any) {
  * It then checks the conditions of the actions and runs them if the conditions are met.
  */
 async function main() {
-    for await (const id of Object.keys(REDBTN.automations)) {
-        const automation = REDBTN.automations[id]
-        const loaders = automation?.loaders
-        if (loaders) for await (const loader of loaders) {
-            await loader.connector[loader.action](loader.params, REDBTN)
+    try {
+        for await (const id of Object.keys(REDBTN.automations)) {
+            const automation = REDBTN.automations[id]
+            const loaders = automation?.loaders
+            if (loaders) for await (const loader of loaders) {
+                await loader.connector[loader.action](loader.params, REDBTN)
+            }
+            const triggers = automation?.triggers
+            if (!triggers) continue
+            const runResults = await Promise.all( triggers.map(async (trigger:Trigger) => { 
+                return await trigger.connector[trigger.action](trigger.params, REDBTN)
+            }))
+            const runString = runResults.map((result:any) => (!result ? 'f' : 't'))
+                .join('')
+            const results: any[] = []
+            if (!automation.actions) continue
+            for await (const action of automation.actions) {
+                if (action.condition == runString) results.push(await action.connector[action.action](action.params, REDBTN))
+            }
+            if (results.length > 0 && REDBTN.listener) REDBTN.listener([id, results])
         }
-        const triggers = automation?.triggers
-        if (!triggers) continue
-        const runResults = await Promise.all( triggers.map(async (trigger:Trigger) => { 
-            return await trigger.connector[trigger.action](trigger.params, REDBTN)
-        }))
-        const runString = runResults.map((result:any) => (!result ? 'f' : 't'))
-            .join('')
-        const results: any[] = []
-        if (!automation.actions) continue
-        for await (const action of automation.actions) {
-            if (action.condition == runString) results.push(await action.connector[action.action](action.params, REDBTN))
-        }
-        if (results.length > 0 && REDBTN.listener) REDBTN.listener([id, results])
+        if (REDBTN.finisher) REDBTN.finisher(REDBTN)
+        if (REDBTN.active) REDBTN.interval = setTimeout(main, REDBTN.options.freq)
+    } catch (error) {
+        console.log(error)
     }
-    if (REDBTN.finisher) REDBTN.finisher(REDBTN)
-    if (REDBTN.active) REDBTN.interval = setTimeout(main, REDBTN.options.freq)
 }
 
 /**
@@ -88,7 +92,6 @@ async function stop() {
  * @throws Error if the automation is missing required properties or if the module is not found.
  */
 export async function add(params: AutomationCreationParams) {
-    console.log('adding')
     try {
         const automation: Automation = params as Automation
         if (automation.persistent) {
@@ -124,7 +127,6 @@ export async function add(params: AutomationCreationParams) {
             throw new Error('Automation must contain at least one action, trigger or persistent process')
         if (!automation.id) automation.id = randomUUID()
         REDBTN.automations[automation.id] = automation
-        console.log(!REDBTN.interval && automation.triggers)
         if (!REDBTN.interval && automation.triggers) start()
         return automation
     } catch (error) {
@@ -202,7 +204,6 @@ export function status() {
     delete status.listener
     delete status.interval
     status.automations = Object.keys(status.automations)
-    console.log(status)
     return JSON.parse(JSON.stringify(status))
 }
 
