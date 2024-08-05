@@ -1,0 +1,32 @@
+{
+  "name": "@xiroex/ai",
+  "version": "0.0.1",
+  "description": "",
+  "author": "George Abreu Jr. <george8794@gmail.com> (https://georgeanthony.net/)",
+  "license": "GPL-3.0-only",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "prepare": "tsc -d"
+  },
+  "files": [
+    "dist/",
+    "LICENSE",
+    "README.md",
+    "package.json"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xiroex/ai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xiroex/ai/issues"
+  },
+  "dependencies": {
+    "openai": "^4.47.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "typescript": "^5.4.5"
+  }
+}
