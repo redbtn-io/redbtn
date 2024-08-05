@@ -1,8 +1,8 @@
 {
-  "name": "@xiroex/ai",
+  "name": "@redbtn/ai",
   "version": "0.0.1",
   "description": "",
-  "author": "George Abreu Jr. <george8794@gmail.com> (https://georgeanthony.net/)",
+  "author": "George Abreu Jr. <george@redbtn.io> (https://georgeanthony.net/)",
   "license": "GPL-3.0-only",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -17,10 +17,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/xiroex/ai.git"
+    "url": "https://github.com/redbtn-io/ai.git"
   },
   "bugs": {
-    "url": "https://github.com/xiroex/ai/issues"
+    "url": "https://github.com/redbtn-io/ai/issues"
   },
   "dependencies": {
     "openai": "^4.47.1"
