@@ -26,14 +26,19 @@ export async function deleteAssistant(id: string) {
 
 // Threads
 export async function createThread(params?: ThreadCreation) {
-    let {metadata, messages, assistant_id } = params as ThreadCreation
+    let {metadata, messages, assistant_id, tool_resources } = params as ThreadCreation
     if (!metadata) metadata = {}
+    if (!tool_resources) tool_resources = {}
     if (messages && assistant_id) return openai.beta.threads.createAndRunStream({
         assistant_id,
         metadata, 
-        thread: { messages }
+        thread: { messages, tool_resources }
     })
-    const createParams = messages ? { messages, metadata } : { metadata }
+    const createParams = { 
+        metadata, 
+        ...(messages && { messages }), 
+        ...(tool_resources && { tool_resources }) 
+    };
     return await openai.beta.threads.create(createParams)
 }
 
