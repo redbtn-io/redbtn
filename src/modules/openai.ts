@@ -26,7 +26,7 @@ export async function deleteAssistant(id: string) {
 
 // Threads
 export async function createThread(params?: ThreadCreation) {
-    let {metadata, messages, assistant_id, tool_resources } = params as ThreadCreation
+    let {metadata, messages, assistant_id, tool_resources} = params as ThreadCreation
     if (!metadata) metadata = {}
     if (!tool_resources) tool_resources = {}
     if (messages && assistant_id) return openai.beta.threads.createAndRunStream({
@@ -91,7 +91,8 @@ export async function runThread(assistant_id: string, thread: string, params?: a
 
 export async function submitTools(threadId: string, runId:string, outputs: any[]) {
     return await openai.beta.threads.runs.submitToolOutputs(threadId, runId, {
-        tool_outputs: outputs
+        tool_outputs: outputs,
+        stream: true
     })
 }
 
@@ -190,5 +191,5 @@ export async function deleteBatch(id: string, batchId: string) {
 
 
 interface ThreadCreation extends ThreadCreateParams {
-    assistant_id?: string
+    assistant_id?: string,
 }
