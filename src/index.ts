@@ -1,3 +1,3 @@
-import * as AI from './modules/openai'
+import { Assistant } from './modules/openai'
 
-export { AI }
+export { Assistant }
