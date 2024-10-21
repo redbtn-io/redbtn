@@ -15,14 +15,10 @@
 
 ## Installation
 
-To use redbtn AI, ensure you have Node.js and npm (or yarn) installed. Clone the repository and install dependencies:
+To use redbtn AI, ensure you have Node.js and npm installed. Install the package using npm:
 
 ```bash
-git clone https://github.com/your-username/redbtn-ai.git
-cd redbtn-ai
-npm install
-# or
-yarn install
+npm install @redbtn/ai
 ```
 
 ## Configuration
@@ -35,7 +31,7 @@ export OPENAI_API_KEY=your_openai_api_key
 
 ## Usage
 
-Import the AI module in your application:
+Import the AI module in your application and interact with an Assistant:
 
 ```typescript
 import { AI } from './index';
@@ -43,15 +39,117 @@ import { AI } from './index';
 // Example: Creating an assistant
 const createAssistant = async () => {
   try {
-    const response = await AI.createAssistant({ model: 'gpt-3.5-turbo-1106' });
+    const response = await AI.createAssistant({ model: 'gpt-3.5-4o-mini' });
     console.log(response);
   } catch (error) {
     console.error('Error creating assistant:', error);
   }
 };
 
+// Example: Editing an assistant
+const editAssistant = async (id: string) => {
+  try {
+    const response = await Assistant.editAssistant(id, { model: 'gpt-3.5-turbo-1106', name: 'Updated Assistant' });
+    console.log('Assistant updated:', response);
+  } catch (error) {
+    console.error('Error editing assistant:', error);
+  }
+};
+
+// Example: Retrieving an assistant
+const getAssistant = async (id: string) => {
+  try {
+    const response = await Assistant.getAssistant(id);
+    console.log('Assistant details:', response);
+  } catch (error) {
+    console.error('Error retrieving assistant:', error);
+  }
+};
+
+// Example: Deleting an assistant
+const deleteAssistant = async (id: string) => {
+  try {
+    const response = await Assistant.deleteAssistant(id);
+    console.log('Assistant deleted:', response);
+  } catch (error) {
+    console.error('Error deleting assistant:', error);
+  }
+};
+
+// Usage
+createAssistant();
+editAssistant('assistant-id');
+getAssistant('assistant-id');
+deleteAssistant('assistant-id');
+
 createAssistant();
 ```
+#### Realtime Example
+
+```typescript
+import { RealtimeAI } from '@redbtn/ai';
+
+// Initialize RealtimeAI with onMessage and onOpen handlers
+const ai = new RealtimeAI({
+  onMessage: (message: string) => {
+    console.log("Received message:", message);
+  },
+  onOpen: () => {
+    console.log("WebSocket connection opened.");
+  }
+});
+
+// Send a message to the AI
+ai.send("Hello, AI!");
+
+// Request the AI to create a response
+ai.createResponse();
+
+// Update the session with new parameters
+ai.updateSession({
+  instructions: "Your name is Red. You are speaking with George. Respond naturally as you would in a podcast conversation, but don't be too overly-excited.",
+  modalities: ["text"],
+  voice: "shimmer"
+});
+
+// Event listener for events
+ai.on("response", (message: string) => {
+  console.log(`Red - ${message}`);
+});
+
+ai.on("delta", (letter: string) => {
+  stdout.write(data);
+});
+
+ai.on("open", () => {
+  console.log('open');
+});
+
+ai.on("error", () => {
+  console.log('error');
+});
+
+ai.on("close", () => {
+  console.log('close');
+});
+
+```
+## Reference
+
+### Realtime AI
+
+- `RealtimeAI`: Class to interact with AI in real-time using WebSockets.
+  - `constructor({ onMessage, onOpen })`: Initializes the WebSocket connection with optional `onMessage` and `onOpen` handlers.
+  - `send(message: string)`: Sends a message to the AI.
+  - `createResponse()`: Requests the AI to create a response.
+  - `updateSession(session: any)`: Updates the session with new parameters.
+  - `set onMessage(fn: Function)`: Sets the handler for incoming messages.
+  - `set onOpen(fn: Function)`: Sets the handler for the WebSocket open event.
+  - `on(eventName: string, listener: Function)`: Adds an event listener.
+  - `emit(eventName: string, ...args: any[])`: Emits an event to all registered listeners.
+
+
+
 
 ### Assistants
 
@@ -129,3 +227,4 @@ For questions or feedback, please contact us at [support@redbtn.io](mailto:suppo
 ---
 
 Enjoy using redbtn AI for your automation needs!
+
