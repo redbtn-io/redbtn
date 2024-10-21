@@ -1,4 +1,3 @@
-import EventEmitter from "events";
 import WebSocket from "ws";
 
 const url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01";
@@ -48,42 +47,52 @@ export default class RealtimeAI {
         });
 
         ws.on("message", function incoming(response: any) {
-            
-            const message = JSON.parse(response.toString())
-            switch (message.type) {
-                case "session.created": {
-                    updateSession({
-                        instructions: "Your name is Red. You are speaking with George. Respond naturally as you would in a podcast conversation, but don't be too overly-excited.",
-                        modalities: ["text"],
-                        voice: "shimmer"
-                    }, ws)
-                    break;
+            try {
+                const message = JSON.parse(response.toString())
+                switch (message.type) {
+                    case "session.created": {
+                        updateSession({
+                            instructions: "Your name is Red. You are speaking with George. Respond naturally as you would in a podcast conversation, but don't be too overly-excited.",
+                            modalities: ["audio"],
+                            voice: "shimmer"
+                        }, ws)
+                        emit(listeners,"ready", message.session)
+                        break;
+                    }
+                    case "session.updated": {
+                        
+                        break;
+                    }
+                    case "response.done": {
+                        if (onMessage)
+                            onMessage(message.response.output[0].content[0].text)
+                        emit(listeners,"response", message.response.output[0].content[0].text)
+                        break;
+                    }
+                    case "conversation.item.created": {
+                        if (message.item.role === "user") 
+                            ws.send(JSON.stringify({
+                                type: "response.create"
+                            }))
+                        break;
+                    }
+                    case "response.text.delta": {
+        
+                        break;
+                    }
+
+                    case "response.audio.done": 
+                    case "response.audio.delta": {
+                        emit(listeners,"audio", message)
+                        break;
+                    }
+
+                    default: {
+                        break;
+                    }
                 }
-                case "session.updated": {
-                    
-                    break;
-                }
-                case "response.done": {
-                    if (onMessage)
-                        onMessage(message.response.output[0].content[0].text)
-                    emit(listeners,"response", message.response.output[0].content[0].text)
-                    break;
-                }
-                case "conversation.item.created": {
-                    if (message.item.role === "user") 
-                        ws.send(JSON.stringify({
-                            type: "response.create"
-                        }))
-                    break;
-                }
-                case "response.text.delta": {
-    
-                    break;
-                }
-                default: {
-                    
-                    break;
-                }
+            } catch (error) {
+                console.log(error)
             }
         });
 

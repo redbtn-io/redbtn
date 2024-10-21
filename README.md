@@ -36,7 +36,7 @@ Import the AI module in your application and interact with an Assistant:
 ```typescript
 import { AI } from './index';
 
-// Example: Creating an assistant
+// Creating an assistant
 const createAssistant = async () => {
   try {
     const response = await AI.createAssistant({ model: 'gpt-3.5-4o-mini' });
@@ -46,7 +46,7 @@ const createAssistant = async () => {
   }
 };
 
-// Example: Editing an assistant
+// Editing an assistant
 const editAssistant = async (id: string) => {
   try {
     const response = await Assistant.editAssistant(id, { model: 'gpt-3.5-turbo-1106', name: 'Updated Assistant' });
@@ -56,7 +56,7 @@ const editAssistant = async (id: string) => {
   }
 };
 
-// Example: Retrieving an assistant
+// Retrieving an assistant
 const getAssistant = async (id: string) => {
   try {
     const response = await Assistant.getAssistant(id);
@@ -66,7 +66,7 @@ const getAssistant = async (id: string) => {
   }
 };
 
-// Example: Deleting an assistant
+// Deleting an assistant
 const deleteAssistant = async (id: string) => {
   try {
     const response = await Assistant.deleteAssistant(id);
@@ -147,9 +147,6 @@ ai.on("close", () => {
   - `set onOpen(fn: Function)`: Sets the handler for the WebSocket open event.
   - `on(eventName: string, listener: Function)`: Adds an event listener.
   - `emit(eventName: string, ...args: any[])`: Emits an event to all registered listeners.
-
-
-
 
 ### Assistants
 

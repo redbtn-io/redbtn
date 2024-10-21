@@ -1,3 +1,3 @@
-import { Assistant } from './modules/openai'
+import { Assistant } from './lib/openai'
 
 export { Assistant }
