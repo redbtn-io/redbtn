@@ -39,6 +39,14 @@ export default class RealtimeAI {
             onOpen()
         });
 
+        ws.on("error", function error(err) {
+            emit(listeners,"error", err)
+        });
+
+        ws.on("close", function close() {
+            emit(listeners,"close")
+        });
+
         ws.on("message", function incoming(response: any) {
             
             const message = JSON.parse(response.toString())
@@ -112,7 +120,7 @@ export default class RealtimeAI {
         }))
     }
 
-    set onMessage(fn: any) {
+    set onMessage(fn: Function) {
         this._onMessage = fn
         const ws = this.ws
         const updateSession = this.updateSession
@@ -150,7 +158,7 @@ export default class RealtimeAI {
                     break;
                 }
                 case "response.text.delta": {
-    
+                    emit(listeners,"delta", message.delta.text)
                     break;
                 }
                 default: {
@@ -161,7 +169,7 @@ export default class RealtimeAI {
         });
     }
 
-    set onOpen(fn: any) {
+    set onOpen(fn: Function) {
         this._onOpen = fn
         const ws = this.ws
         const onOpen = this._onOpen
@@ -179,7 +187,7 @@ export default class RealtimeAI {
         this.listeners[eventName].push(listener);
     }
 
-    emit( listeners: { [eventName: string]: Function[] }, eventName: string, ...args: any[]) {
+    private emit( listeners: { [eventName: string]: Function[] }, eventName: string, ...args: any[]) {
         if (listeners[eventName]) {
             listeners[eventName].forEach((listener) => listener(...args));
         }
