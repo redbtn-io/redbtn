@@ -5,18 +5,63 @@
 
 import express, { Request, Response } from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import { Red, RedConfig } from '../src/index';
+
+// Generate a fresh bearer token on each server startup (or use provided one from env)
+// IMPORTANT: This MUST be declared before any other code to ensure it's only generated once
+const BEARER_TOKEN = process.env.BEARER_TOKEN || (() => {
+  const token = `red_ai_sk_${crypto.randomBytes(32).toString('hex')}`;
+  console.log(`🔐 Generated bearer token: ${token}`);
+  return token;
+})();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Authentication middleware
+function authenticateToken(req: Request, res: Response, next: any) {
+  // Skip auth for health check
+  if (req.path === '/health') {
+    return next();
+  }
+
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+  if (!token) {
+    return res.status(401).json({
+      error: {
+        message: 'Missing authorization header',
+        type: 'invalid_request_error',
+        code: 'missing_api_key'
+      }
+    });
+  }
+
+  if (token !== BEARER_TOKEN) {
+    return res.status(403).json({
+      error: {
+        message: 'Invalid API key',
+        type: 'invalid_request_error',
+        code: 'invalid_api_key'
+      }
+    });
+  }
+
+  next();
+}
+
+// Apply authentication to all routes
+app.use(authenticateToken);
 
 // Initialize Red instance
 const config: RedConfig = {
   redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
   vectorDbUrl: process.env.VECTOR_DB_URL || "http://localhost:8200",
   databaseUrl: process.env.DATABASE_URL || "http://localhost:5432",
-  defaultLlmUrl: process.env.LLM_URL || "https://llm.redbtn.io",
+  defaultLlmUrl: process.env.LLM_URL || "http://localhost:11434",
 };
 
 let red: Red;
@@ -243,6 +288,14 @@ initRed().then(() => {
     console.log(`📡 OpenAI-compatible endpoint: http://localhost:${PORT}/v1/chat/completions`);
     console.log(`📋 Models endpoint: http://localhost:${PORT}/v1/models`);
     console.log(`💚 Health check: http://localhost:${PORT}/health`);
+    console.log('');
+    console.log('🔑 Bearer Token for OpenWebUI:');
+    console.log(`   ${BEARER_TOKEN}`);
+    console.log('');
+    console.log('💡 Add this to OpenWebUI:');
+    console.log('   Settings → Connections → Add OpenAI API');
+    console.log(`   API Base URL: http://localhost:${PORT}/v1`);
+    console.log(`   API Key: ${BEARER_TOKEN}`);
   });
 }).catch(error => {
   console.error('Failed to initialize Red AI:', error);

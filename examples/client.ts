@@ -4,6 +4,7 @@
  */
 
 const BASE_URL = process.env.RED_API_URL || 'http://localhost:3000';
+const BEARER_TOKEN = process.env.RED_API_KEY || 'red_ai_sk_a7f8e9d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8';
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -49,6 +50,7 @@ async function chatCompletion(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      'Authorization': `Bearer ${BEARER_TOKEN}`,
     },
     body: JSON.stringify({
       model: options.model || 'Red',
@@ -76,6 +78,7 @@ async function* chatCompletionStream(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      'Authorization': `Bearer ${BEARER_TOKEN}`,
     },
     body: JSON.stringify({
       model: options.model || 'Red',
@@ -130,7 +133,11 @@ async function* chatCompletionStream(
  * List available models
  */
 async function listModels() {
-  const response = await fetch(`${BASE_URL}/v1/models`);
+  const response = await fetch(`${BASE_URL}/v1/models`, {
+    headers: {
+      'Authorization': `Bearer ${BEARER_TOKEN}`,
+    },
+  });
   return response.json();
 }
 

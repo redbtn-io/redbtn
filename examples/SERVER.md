@@ -12,6 +12,8 @@ npm run server
 
 The server will start on `http://localhost:3000` (configurable via `PORT` environment variable).
 
+**Important:** The server will display your Bearer token on startup. Copy this token - you'll need it for authentication!
+
 ### 2. Configure your LLM endpoint
 
 Set the `LLM_URL` environment variable to point to your Ollama instance:
@@ -23,13 +25,25 @@ npm run server
 
 Or use the `.env` file approach for all configuration options.
 
-### 3. Test with curl
+### 3. Get your Bearer token
+
+When the server starts, it will display your Bearer token:
+
+```
+🔑 Bearer Token for OpenWebUI:
+   red_ai_sk_a7f8e9d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8
+```
+
+Copy this token to use in your API requests.
+
+### 4. Test with curl
 
 **Non-streaming request:**
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer red_ai_sk_a7f8e9d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8" \
   -d '{
     "model": "Red",
     "messages": [
@@ -44,6 +58,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer red_ai_sk_a7f8e9d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8" \
   -d '{
     "model": "Red",
     "messages": [
@@ -64,10 +79,16 @@ curl http://localhost:3000/v1/models
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PORT` | Server port | `3000` |
+| `BEARER_TOKEN` | Authentication token | Auto-generated secure token |
 | `LLM_URL` | Ollama endpoint URL | `https://llm.redbtn.io` |
 | `REDIS_URL` | Redis connection URL | `redis://localhost:6379` |
 | `VECTOR_DB_URL` | Vector database URL | `http://localhost:8200` |
 | `DATABASE_URL` | Traditional database URL | `http://localhost:5432` |
+
+**Generate your own token:**
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
 
 ## Using with OpenWebUI
 
@@ -80,7 +101,9 @@ curl http://localhost:3000/v1/models
 
 3. Add a new OpenAI API connection:
    - **API Base URL**: `http://localhost:3000/v1`
-   - **API Key**: (leave empty or use any value - not enforced yet)
+   - **API Key**: `red_ai_sk_a7f8e9d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8`
+   
+   (Copy the token from your server startup output)
    
 4. The "Red" model should now appear in your model selector!
 
