@@ -4,16 +4,22 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "server": "npx tsx examples/server.ts",
+    "dev": "npx tsx watch examples/server.ts"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@langchain/langgraph": "^0.4.9",
     "@langchain/ollama": "^0.2.4",
-    "@langchain/openai": "^0.6.13"
+    "@langchain/openai": "^0.6.13",
+    "cors": "^2.8.5",
+    "express": "^5.1.0"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
     "@types/node": "^24.5.2",
     "typescript": "^5.9.2"
   }

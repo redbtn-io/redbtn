@@ -161,9 +161,10 @@ export class Red {
    * Handles a direct, on-demand request from a user-facing application.
    * @param query The user's input or request data.
    * @param options Metadata about the source of the request for routing purposes.
-   * @returns A promise that resolves with the response string.
+   * @returns For non-streaming: the full AIMessage object with content, tokens, and metadata.
+   *          For streaming: an async generator that yields string chunks, then finally yields the full AIMessage.
    */
-  public async respond(query: object, options: InvokeOptions): Promise<{ response: string }> {
+  public async respond(query: object, options: InvokeOptions): Promise<any | AsyncGenerator<string | any, void, unknown>> {
     console.log("--- Responding to a direct request ---");
     
     const initialState = {
@@ -172,35 +173,48 @@ export class Red {
       redInstance: this, // Pass the entire instance into the graph
     };
 
-    // Invoke the graph and extract only the response field
-    const result = await redGraph.invoke(initialState);
-    
-    // Return only the response, not the entire internal state
-    return { response: result.response };
+    // Check if streaming is requested
+    if (options.stream) {
+      // Use LangGraph's streaming capabilities to stream through the graph
+      return this._streamThroughGraph(initialState);
+    } else {
+      // Invoke the graph and return the full AIMessage
+      const result = await redGraph.invoke(initialState);
+      
+      // Return the full AIMessage object directly
+      return result.response;
+    }
   }
 
   /**
-   * Handles a direct, on-demand request with streaming responses.
-   * Streams tokens directly from the LLM as they are generated.
-   * @param query The user's input or request data.
-   * @param options Metadata about the source of the request for routing purposes.
-   * @returns An async generator that yields response chunks as they arrive.
+   * Internal method to handle streaming responses through the graph.
+   * Yields string chunks as they arrive, then yields the final AIMessage object with complete metadata.
+   * @private
    */
-  public async *respondStream(query: object, options: InvokeOptions): AsyncGenerator<string, void, unknown> {
-    console.log("--- Responding to a direct request (streaming) ---");
+  private async *_streamThroughGraph(initialState: any): AsyncGenerator<string | any, void, unknown> {
+    // Use LangGraph's streamEvents to get token-level streaming
+    const stream = redGraph.streamEvents(initialState, { version: "v1" });
+    let finalMessage: any = null;
     
-    // For streaming, bypass the graph and stream directly from the model
-    // This gives us token-by-token streaming instead of node-by-node
-    const userText = (query && (query as any).message) ? (query as any).message : JSON.stringify(query || {});
-    
-    const stream = await this.localModel.stream([
-      { role: "user", content: userText }
-    ]);
-    
-    for await (const chunk of stream) {
-      if (chunk.content && typeof chunk.content === 'string') {
-        yield chunk.content;
+    for await (const event of stream) {
+      // Yield streaming content chunks
+      if (event.event === "on_llm_stream" && event.data?.chunk?.content) {
+        yield event.data.chunk.content;
+      }
+      // Capture the final message when LLM completes - use on_llm_end
+      if (event.event === "on_llm_end") {
+        // The AIMessage is nested in the generations array
+        const generations = event.data?.output?.generations;
+        if (generations && generations[0] && generations[0][0]?.message) {
+          finalMessage = generations[0][0].message;
+        }
       }
     }
+    
+    // After all chunks are sent, yield the final AIMessage with complete token data
+    if (finalMessage) {
+      yield finalMessage;
+    }
   }
+
 }

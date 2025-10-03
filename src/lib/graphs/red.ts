@@ -21,8 +21,9 @@ const RedGraphState = Annotation.Root({
     reducer: (x: object, y: object) => y,
     default: () => ({} as object)
   }),
-  response: Annotation<string>({
-    reducer: (x: string, y: string) => y
+  // Response contains the full AIMessage object with content, tokens, and metadata
+  response: Annotation<any>({
+    reducer: (x: any, y: any) => y
   }),
   nextGraph: Annotation<'homeGraph' | 'assistantGraph' | 'chat'>({
     reducer: (x: 'homeGraph' | 'assistantGraph' | 'chat', y: 'homeGraph' | 'assistantGraph' | 'chat') => y

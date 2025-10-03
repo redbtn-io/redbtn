@@ -7,7 +7,7 @@ import { InvokeOptions, Red } from '../../index';
 interface RedGraphState {
   query: object;
   options: InvokeOptions;
-  response?: string;
+  response?: any; // The full AIMessage object from the LLM
   nextGraph?: 'homeGraph' | 'assistantGraph' | 'chat';
   // optional reference to the Red instance provided by the caller
   redInstance?: Red;
@@ -33,8 +33,8 @@ export async function chatNode(state: RedGraphState): Promise<Partial<RedGraphSt
         const shouldStream = (state.options as any)?.stream;
         
         if (shouldStream) {
-          // For streaming, we'll collect chunks and return the full response
-          // The actual streaming happens at the graph level
+          // For streaming, use the model's stream method 
+          // LangGraph's streamEvents will capture the streaming tokens automatically
           let fullResponse = '';
           const stream = await redInstance.localModel.stream([
             { role: "user", content: userText }
@@ -45,14 +45,16 @@ export async function chatNode(state: RedGraphState): Promise<Partial<RedGraphSt
           }
           
           console.log('[Chat Node] Streaming complete');
-          return { response: fullResponse };
+          // For streaming, we still return the response for state tracking
+          // The actual streaming and final metadata happens at the graph level
+          return { response: { content: fullResponse } };
         } else {
-          // Non-streaming mode
-          const response = await redInstance.localModel.invoke([
+          // Non-streaming mode - return the full AIMessage
+          const aiMessage = await redInstance.localModel.invoke([
             { role: "user", content: userText }
           ]);
-          console.log('[Chat Node] Model response received:', response);
-          return { response: response.text };
+          console.log('[Chat Node] Model response received:', aiMessage);
+          return { response: aiMessage };
         }
       } catch (err) {
         console.error('[Chat Node] Error invoking local model:', err);
@@ -63,5 +65,5 @@ export async function chatNode(state: RedGraphState): Promise<Partial<RedGraphSt
   }
 
   // Final fallback placeholder
-  return { response: 'This is a placeholder response from the chat node.' };
+  return { response: { content: 'This is a placeholder response from the chat node.' } };
 }
