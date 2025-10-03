@@ -25,13 +25,13 @@ export class MemoryManager {
   private redis: Redis;
   private readonly MAX_RECENT_MESSAGES = parseInt(process.env.MAX_RECENT_MESSAGES || '10');
   private readonly SUMMARY_THRESHOLD_MESSAGES = parseInt(process.env.SUMMARY_THRESHOLD_MESSAGES || '15');
-  private readonly SUMMARY_THRESHOLD_TOKENS = parseInt(process.env.SUMMARY_THRESHOLD_TOKENS || '3000');
+  private readonly SUMMARY_THRESHOLD_TOKENS = parseInt(process.env.SUMMARY_THRESHOLD_TOKENS || '32000');
   private tokenEncoder: any;
 
   constructor(redisUrl: string) {
     this.redis = new Redis(redisUrl);
     // Initialize tiktoken encoder for GPT-4/GPT-3.5 compatible counting
-    this.tokenEncoder = encoding_for_model('gpt-3.5-turbo');
+    this.tokenEncoder = encoding_for_model('gpt-4');
   }
 
   /**
