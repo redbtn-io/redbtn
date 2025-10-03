@@ -4,10 +4,10 @@
  */
 
 import { ChatOllama } from "@langchain/ollama";
-import { createLocalModel, createOpenAIModel } from "./lib/models";
+import { createLocalModel, createOpenAIModel } from "./src/lib/models";
 import { ChatOpenAI } from "@langchain/openai";
-import { redGraph } from "./lib/graphs/red";
-import { MemoryManager } from "./lib/memory";
+import { redGraph } from "./src/lib/graphs/red";
+import { MemoryManager } from "./src/lib/memory";
 
 // --- Type Definitions ---
 

@@ -16,6 +16,10 @@ const BEARER_TOKEN = process.env.BEARER_TOKEN || (() => {
   return token;
 })();
 
+if (process.env.BEARER_TOKEN) {
+  console.log(`🔑 Using provided bearer token: ${BEARER_TOKEN}`);
+}
+
 const app = express();
 
 // Configure CORS to allow OpenWebUI requests
@@ -66,15 +70,9 @@ function authenticateToken(req: Request, res: Response, next: any) {
 // Apply authentication to all routes
 app.use(authenticateToken);
 
-// Request logging middleware (after auth, so we see what gets through)
-app.use((req: Request, res: Response, next: any) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-  next();
-});
-
 // Initialize Red instance
 const config: RedConfig = {
-  redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
+  redisUrl: process.env.REDIS_URL || "http://localhost:6379",
   vectorDbUrl: process.env.VECTOR_DB_URL || "http://localhost:8200",
   databaseUrl: process.env.DATABASE_URL || "http://localhost:5432",
   defaultLlmUrl: process.env.LLM_URL || "http://localhost:11434",
@@ -145,6 +143,77 @@ function generateId(): string {
   return `chatcmpl-${Date.now()}-${Math.random().toString(36).substring(7)}`;
 }
 
+// Generate or extract conversation ID
+// OpenWebUI doesn't send a conversation ID, so we use the completion ID from their first message
+// or check for a custom header
+function getConversationId(req: Request, completionId: string): string {
+  // Check for custom header first (if OpenWebUI or other clients send it)
+  const headerConvId = req.headers['x-conversation-id'] as string;
+  if (headerConvId) {
+    return headerConvId;
+  }
+  
+  // For OpenWebUI: they send full message history, so hash the first few messages
+  // to create a stable conversation ID
+  const body: ChatCompletionRequest = req.body;
+  if (body.messages && body.messages.length > 0) {
+    // Create a stable ID based on the first message(s)
+    const firstMessages = body.messages.slice(0, 2).map(m => m.content).join('|');
+    const hash = crypto.createHash('sha256').update(firstMessages).digest('hex').substring(0, 16);
+    return `conv_${hash}`;
+  }
+  
+  // Fallback: use completion ID (new conversation each time)
+  return completionId;
+}
+
+// Background summarization function
+async function summarizeConversationInBackground(conversationId: string) {
+  try {
+    const needsSummary = await red.memory.needsSummarization(conversationId);
+    
+    if (!needsSummary) {
+      return;
+    }
+    
+    const messages = await red.memory.getMessages(conversationId);
+    const metadata = await red.memory.getMetadata(conversationId);
+    const tokenCount = await red.memory.getTokenCount(conversationId);
+    
+    console.log(`[Summarization] Triggered for ${conversationId}: ${messages.length} messages, ${tokenCount} tokens`);
+    
+    // Determine which messages to summarize
+    const lastSummarizedIndex = metadata?.summaryUpToMessage || 0;
+    const messagesToSummarize = messages.slice(lastSummarizedIndex, -10); // All but last 10
+    
+    if (messagesToSummarize.length < 5) {
+      return; // Not enough to summarize
+    }
+    
+    // Create summary prompt
+    const conversationText = messagesToSummarize
+      .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+      .join('\\n');
+    
+    const summaryPrompt = `Summarize the following conversation in 3-4 concise sentences. Focus on key topics, decisions, and important context:\\n\\n${conversationText}`;
+    
+    // Generate summary using the LLM
+    const summaryResponse = await red.localModel.invoke([
+      { role: 'user', content: summaryPrompt }
+    ]);
+    
+    const summary = summaryResponse.content as string;
+    
+    // Store the summary
+    await red.memory.setSummary(conversationId, summary, lastSummarizedIndex + messagesToSummarize.length);
+    
+    console.log(`[Summarization] Complete for ${conversationId}: ${messagesToSummarize.length} messages summarized`);
+    
+  } catch (error) {
+    console.error('Background summarization error:', error);
+  }
+}
+
 // Extract the last user message from the conversation
 function extractUserMessage(messages: ChatCompletionRequest['messages']): string {
   // Get the last user message
@@ -171,16 +240,28 @@ async function handleChatCompletion(req: Request, res: Response) {
     const created = Math.floor(Date.now() / 1000);
     const modelName = body.model || 'Red';
     const userMessage = extractUserMessage(body.messages);
+    
+    // Get or create conversation ID
+    const conversationId = getConversationId(req, completionId);
+    
+    // Store user message in memory
+    await red.memory.addMessage(conversationId, {
+      role: 'user',
+      content: userMessage,
+      timestamp: Date.now()
+    });
 
     // Streaming mode
     if (body.stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+      res.flushHeaders(); // Flush headers immediately
 
       const stream = await red.respond(
         { message: userMessage },
-        { source: { application: 'redChat' }, stream: true }
+        { source: { application: 'redChat' }, stream: true, conversationId }
       );
 
       // Send initial chunk with role
@@ -196,22 +277,40 @@ async function handleChatCompletion(req: Request, res: Response) {
         }]
       };
       res.write(`data: ${JSON.stringify(initialChunk)}\n\n`);
+      
+      // Flush immediately after writing
+      if (typeof (res as any).flush === 'function') {
+        (res as any).flush();
+      }
 
-      // Stream content chunks
+      // Stream content chunks - character by character
+      let fullResponse = '';
       for await (const chunk of stream) {
         if (typeof chunk === 'string') {
-          const contentChunk: ChatCompletionChunk = {
-            id: completionId,
-            object: 'chat.completion.chunk',
-            created,
-            model: modelName,
-            choices: [{
-              index: 0,
-              delta: { content: chunk },
-              finish_reason: null
-            }]
-          };
-          res.write(`data: ${JSON.stringify(contentChunk)}\n\n`);
+          fullResponse += chunk; // Accumulate for storage
+          
+          // Split chunk into individual characters and stream them
+          const characters = chunk.split('');
+          
+          for (const char of characters) {
+            const contentChunk: ChatCompletionChunk = {
+              id: completionId,
+              object: 'chat.completion.chunk',
+              created,
+              model: modelName,
+              choices: [{
+                index: 0,
+                delta: { content: char },
+                finish_reason: null
+              }]
+            };
+            res.write(`data: ${JSON.stringify(contentChunk)}\n\n`);
+            
+            // Flush after each character to ensure immediate delivery
+            if (typeof (res as any).flush === 'function') {
+              (res as any).flush();
+            }
+          }
         } else {
           // Final chunk with metadata (AIMessage)
           const finalChunk: ChatCompletionChunk = {
@@ -231,11 +330,23 @@ async function handleChatCompletion(req: Request, res: Response) {
 
       res.write('data: [DONE]\n\n');
       res.end();
+      
+      // Store assistant response in memory (after streaming completes)
+      await red.memory.addMessage(conversationId, {
+        role: 'assistant',
+        content: fullResponse,
+        timestamp: Date.now()
+      });
+      
+      // Trigger background summarization (non-blocking)
+      summarizeConversationInBackground(conversationId).catch(err => 
+        console.error('Summarization failed:', err)
+      );
     } else {
       // Non-streaming mode
       const response = await red.respond(
         { message: userMessage },
-        { source: { application: 'redChat' } }
+        { source: { application: 'redChat' }, conversationId }
       );
 
       const completion: ChatCompletionResponse = {
@@ -259,6 +370,18 @@ async function handleChatCompletion(req: Request, res: Response) {
       };
 
       res.json(completion);
+      
+      // Store assistant response in memory
+      await red.memory.addMessage(conversationId, {
+        role: 'assistant',
+        content: typeof response.content === 'string' ? response.content : JSON.stringify(response.content),
+        timestamp: Date.now()
+      });
+      
+      // Trigger background summarization (non-blocking)
+      summarizeConversationInBackground(conversationId).catch(err => 
+        console.error('Summarization failed:', err)
+      );
     }
   } catch (error) {
     console.error('Error in chat completion:', error);

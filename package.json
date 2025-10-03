@@ -14,8 +14,11 @@
     "@langchain/langgraph": "^0.4.9",
     "@langchain/ollama": "^0.2.4",
     "@langchain/openai": "^0.6.13",
+    "@types/ioredis": "^4.28.10",
     "cors": "^2.8.5",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "ioredis": "^5.8.0",
+    "tiktoken": "^1.0.22"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",

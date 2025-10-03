@@ -1,5 +1,5 @@
 
-import { InvokeOptions } from '../../';
+import { InvokeOptions } from '../..';
 
 /**
  * Defines the state that flows through the redGraph.
@@ -21,10 +21,7 @@ interface RedGraphState {
  * @returns A partial state object indicating the next step.
  */
 export async function routerNode(state: RedGraphState): Promise<Partial<RedGraphState>> {
-  // Get the application name from the source options.
   const application = state.options?.source?.application;
-
-  console.log(`[Router Node] Routing based on application: ${application || 'default'}`);
 
   switch (application) {
     case 'redHome':
