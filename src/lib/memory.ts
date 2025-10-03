@@ -23,9 +23,9 @@ export interface ConversationMetadata {
 
 export class MemoryManager {
   private redis: Redis;
-  private readonly MAX_RECENT_MESSAGES = 10;
-  private readonly SUMMARY_THRESHOLD_MESSAGES = 15; // Start summarizing after 15 messages
-  private readonly SUMMARY_THRESHOLD_TOKENS = 3000; // Or after 3000 tokens (~2000 words)
+  private readonly MAX_RECENT_MESSAGES = parseInt(process.env.MAX_RECENT_MESSAGES || '10');
+  private readonly SUMMARY_THRESHOLD_MESSAGES = parseInt(process.env.SUMMARY_THRESHOLD_MESSAGES || '15');
+  private readonly SUMMARY_THRESHOLD_TOKENS = parseInt(process.env.SUMMARY_THRESHOLD_TOKENS || '3000');
   private tokenEncoder: any;
 
   constructor(redisUrl: string) {
