@@ -1,4 +1,4 @@
-import { InvokeOptions } from '../../index';
+import { InvokeOptions, Red } from '../../index';
 
 /**
  * Defines the state that flows through the redGraph.
@@ -9,6 +9,8 @@ interface RedGraphState {
   options: InvokeOptions;
   response?: string;
   nextGraph?: 'homeGraph' | 'assistantGraph' | 'chat';
+  // optional reference to the Red instance provided by the caller
+  redInstance?: Red;
 }
 
 /**
@@ -18,10 +20,48 @@ interface RedGraphState {
  */
 export async function chatNode(state: RedGraphState): Promise<Partial<RedGraphState>> {
   console.log(`[Chat Node] Processing query:`, state.query);
-  
-  // TODO: Implement actual chat logic here
-  // This is a placeholder implementation
-  const response = "This is a placeholder response from the chat node.";
-  
-  return { response };
+  // Try to use the Red instance's local model (ChatOllama) if available
+  try {
+    const redInstance = state.redInstance;
+    const userText = (state.query && (state.query as any).message) ? (state.query as any).message : JSON.stringify(state.query || {});
+
+    if (!redInstance) {
+      console.warn('[Chat Node] No Red instance present in state; skipping model invocation and using placeholder.');
+    } else {
+      try {
+        // Check if streaming is requested (we'll add this to options later)
+        const shouldStream = (state.options as any)?.stream;
+        
+        if (shouldStream) {
+          // For streaming, we'll collect chunks and return the full response
+          // The actual streaming happens at the graph level
+          let fullResponse = '';
+          const stream = await redInstance.localModel.stream([
+            { role: "user", content: userText }
+          ]);
+          
+          for await (const chunk of stream) {
+            fullResponse += chunk.content;
+          }
+          
+          console.log('[Chat Node] Streaming complete');
+          return { response: fullResponse };
+        } else {
+          // Non-streaming mode
+          const response = await redInstance.localModel.invoke([
+            { role: "user", content: userText }
+          ]);
+          console.log('[Chat Node] Model response received:', response);
+          return { response: response.text };
+        }
+      } catch (err) {
+        console.error('[Chat Node] Error invoking local model:', err);
+      }
+    }
+  } catch (err) {
+    console.error('[Chat Node] Unexpected error in chat node:', err);
+  }
+
+  // Final fallback placeholder
+  return { response: 'This is a placeholder response from the chat node.' };
 }

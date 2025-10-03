@@ -16,6 +16,11 @@ const RedGraphState = Annotation.Root({
     reducer: (x: InvokeOptions, y: InvokeOptions) => y,
     default: () => ({})
   }),
+  // Carry the Red instance through the graph so nodes can access configured models
+  redInstance: Annotation<object>({
+    reducer: (x: object, y: object) => y,
+    default: () => ({} as object)
+  }),
   response: Annotation<string>({
     reducer: (x: string, y: string) => y
   }),

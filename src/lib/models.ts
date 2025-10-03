@@ -9,24 +9,13 @@ import { RedConfig } from "../index"; // Import the config type
  * @param config The Red configuration object.
  * @returns A configured instance of ChatOllama.
  */
-export function createFastChatModel(config: RedConfig): ChatOllama {
+export function createLocalModel(config: RedConfig): ChatOllama {
   return new ChatOllama({
     baseUrl: config.defaultLlmUrl || 
       process.env.OLLAMA_BASE_URL || 
       "http://localhost:11434", // Use the URL from the config
-    model: "gemma:2b-instruct",
+    model: "Red",
     temperature: 0.0,
-  });
-}
-
-export function createSmartResearchModel(config: RedConfig): ChatOllama {
-  // Use the specific endpoint if available, otherwise fall back to the default
-  const baseUrl = config.llmEndpoints?.['researcher'] || config.defaultLlmUrl;
-
-  return new ChatOllama({
-    baseUrl: baseUrl,
-    model: "mixtral",
-    temperature: 0.2,
   });
 }
 

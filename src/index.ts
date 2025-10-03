@@ -4,8 +4,9 @@
  */
 
 import { ChatOllama } from "@langchain/ollama";
-import { createFastChatModel, createOpenAIModel, createSmartResearchModel } from "./lib/models";
+import { createLocalModel, createOpenAIModel } from "./lib/models";
 import { ChatOpenAI } from "@langchain/openai";
+import { redGraph } from "./lib/graphs/red";
 
 // --- Type Definitions ---
 
@@ -29,6 +30,7 @@ export interface InvokeOptions {
     device?: 'phone' | 'speaker' | 'web';
     application?: 'redHome' | 'redChat' | 'redAssistant';
   };
+  stream?: boolean; // Flag to enable streaming responses
 }
 
 // --- The Red Library Class ---
@@ -45,8 +47,7 @@ export class Red {
   private nodeId?: string;
 
   // Properties to hold the configured model instances
-  public fastChatModel!: ChatOllama;
-  public smartResearchModel!: ChatOllama;
+  public localModel!: ChatOllama;
   public openAIModel?: ChatOpenAI;
 
   /**
@@ -57,8 +58,7 @@ export class Red {
     this.config = config;
 
     // Initialize the model instances
-    this.fastChatModel = createFastChatModel(config);
-    this.smartResearchModel = createSmartResearchModel(config);
+    this.localModel = createLocalModel(config);
     this.openAIModel = createOpenAIModel();
   }
 
@@ -161,9 +161,9 @@ export class Red {
    * Handles a direct, on-demand request from a user-facing application.
    * @param query The user's input or request data.
    * @param options Metadata about the source of the request for routing purposes.
-   * @returns A promise that resolves with the result of the graph execution.
+   * @returns A promise that resolves with the response string.
    */
-  public async respond(query: object, options: InvokeOptions): Promise<any> {
+  public async respond(query: object, options: InvokeOptions): Promise<{ response: string }> {
     console.log("--- Responding to a direct request ---");
     
     const initialState = {
@@ -172,7 +172,35 @@ export class Red {
       redInstance: this, // Pass the entire instance into the graph
     };
 
-    // Assume `redGraph.invoke()` is how you run your graph
-    return await redGraph.invoke(initialState);
+    // Invoke the graph and extract only the response field
+    const result = await redGraph.invoke(initialState);
+    
+    // Return only the response, not the entire internal state
+    return { response: result.response };
+  }
+
+  /**
+   * Handles a direct, on-demand request with streaming responses.
+   * Streams tokens directly from the LLM as they are generated.
+   * @param query The user's input or request data.
+   * @param options Metadata about the source of the request for routing purposes.
+   * @returns An async generator that yields response chunks as they arrive.
+   */
+  public async *respondStream(query: object, options: InvokeOptions): AsyncGenerator<string, void, unknown> {
+    console.log("--- Responding to a direct request (streaming) ---");
+    
+    // For streaming, bypass the graph and stream directly from the model
+    // This gives us token-by-token streaming instead of node-by-node
+    const userText = (query && (query as any).message) ? (query as any).message : JSON.stringify(query || {});
+    
+    const stream = await this.localModel.stream([
+      { role: "user", content: userText }
+    ]);
+    
+    for await (const chunk of stream) {
+      if (chunk.content && typeof chunk.content === 'string') {
+        yield chunk.content;
+      }
+    }
   }
 }
