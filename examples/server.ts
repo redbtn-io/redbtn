@@ -17,13 +17,23 @@ const BEARER_TOKEN = process.env.BEARER_TOKEN || (() => {
 })();
 
 const app = express();
-app.use(cors());
+
+// Configure CORS to allow OpenWebUI requests
+app.use(cors({
+  origin: '*', // Allow all origins (restrict in production)
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['Content-Type'],
+  credentials: true,
+  maxAge: 86400 // 24 hours
+}));
+
 app.use(express.json());
 
 // Authentication middleware
 function authenticateToken(req: Request, res: Response, next: any) {
-  // Skip auth for health check
-  if (req.path === '/health') {
+  // Skip auth for health check and OPTIONS requests (CORS preflight)
+  if (req.path === '/health' || req.method === 'OPTIONS') {
     return next();
   }
 
@@ -55,6 +65,12 @@ function authenticateToken(req: Request, res: Response, next: any) {
 
 // Apply authentication to all routes
 app.use(authenticateToken);
+
+// Request logging middleware (after auth, so we see what gets through)
+app.use((req: Request, res: Response, next: any) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
 
 // Initialize Red instance
 const config: RedConfig = {
@@ -136,8 +152,8 @@ function extractUserMessage(messages: ChatCompletionRequest['messages']): string
   return lastUserMessage?.content || '';
 }
 
-// POST /v1/chat/completions
-app.post('/v1/chat/completions', async (req: Request, res: Response) => {
+// Chat completions handler (used by both /chat/completions and /v1/chat/completions)
+async function handleChatCompletion(req: Request, res: Response) {
   try {
     const body: ChatCompletionRequest = req.body;
     
@@ -254,29 +270,118 @@ app.post('/v1/chat/completions', async (req: Request, res: Response) => {
       }
     });
   }
+}
+
+// POST /chat/completions (OpenWebUI calls this without /v1)
+app.post('/chat/completions', handleChatCompletion);
+
+// POST /v1/chat/completions
+app.post('/v1/chat/completions', handleChatCompletion);
+
+// Helper function to return models list
+const getModelsList = () => ({
+  object: 'list',
+  data: [
+    {
+      id: 'Red',
+      object: 'model',
+      created: Math.floor(Date.now() / 1000),
+      owned_by: 'redbtn',
+      permission: [],
+      root: 'Red',
+      parent: null
+    }
+  ]
+});
+
+// Helper function to return single model
+const getModelDetails = (modelId: string) => {
+  if (modelId === 'Red' || modelId === 'red') {
+    return {
+      id: 'Red',
+      object: 'model',
+      created: Math.floor(Date.now() / 1000),
+      owned_by: 'redbtn',
+      permission: [],
+      root: 'Red',
+      parent: null
+    };
+  }
+  return null;
+};
+
+// GET /models - List available models (OpenWebUI calls this without /v1)
+app.get('/models', (req: Request, res: Response) => {
+  res.json(getModelsList());
+});
+
+// GET /models/{model_id} - Get specific model details (OpenWebUI calls this without /v1)
+app.get('/models/:model_id', (req: Request, res: Response) => {
+  const modelId = req.params.model_id;
+  const model = getModelDetails(modelId);
+  
+  if (model) {
+    res.json(model);
+  } else {
+    res.status(404).json({
+      error: {
+        message: `Model '${modelId}' not found`,
+        type: 'invalid_request_error',
+        code: 'model_not_found'
+      }
+    });
+  }
 });
 
 // GET /v1/models - List available models
 app.get('/v1/models', (req: Request, res: Response) => {
-  res.json({
-    object: 'list',
-    data: [
-      {
-        id: 'Red',
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'redbtn',
-        permission: [],
-        root: 'Red',
-        parent: null
+  res.json(getModelsList());
+});
+
+// GET /v1/models/{model_id} - Get specific model details (required by OpenWebUI)
+app.get('/v1/models/:model_id', (req: Request, res: Response) => {
+  const modelId = req.params.model_id;
+  const model = getModelDetails(modelId);
+  
+  if (model) {
+    res.json(model);
+  } else {
+    res.status(404).json({
+      error: {
+        message: `Model '${modelId}' not found`,
+        type: 'invalid_request_error',
+        code: 'model_not_found'
       }
-    ]
-  });
+    });
+  }
 });
 
 // GET /health - Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', service: 'Red AI API' });
+});
+
+// GET / - Root endpoint
+app.get('/', (req: Request, res: Response) => {
+  res.json({ 
+    status: 'ok', 
+    service: 'Red AI API',
+    version: '1.0.0',
+    endpoints: {
+      chat: '/v1/chat/completions',
+      models: '/v1/models',
+      health: '/health'
+    }
+  });
+});
+
+// GET /v1 - API root
+app.get('/v1', (req: Request, res: Response) => {
+  res.json({ 
+    status: 'ok', 
+    service: 'Red AI API',
+    version: '1.0.0'
+  });
 });
 
 // Start server
