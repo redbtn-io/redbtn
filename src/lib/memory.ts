@@ -17,21 +17,35 @@ export interface ConversationMetadata {
   messageCount: number;
   lastUpdated: number;
   summaryGenerated: boolean;
-  summaryUpToMessage?: number; // Index of last message included in summary
   totalTokens?: number; // Total tokens in conversation
 }
 
 export class MemoryManager {
   private redis: Redis;
-  private readonly MAX_RECENT_MESSAGES = parseInt(process.env.MAX_RECENT_MESSAGES || '10');
-  private readonly SUMMARY_THRESHOLD_MESSAGES = parseInt(process.env.SUMMARY_THRESHOLD_MESSAGES || '15');
-  private readonly SUMMARY_THRESHOLD_TOKENS = parseInt(process.env.SUMMARY_THRESHOLD_TOKENS || '32000');
+  private readonly MAX_CONTEXT_TOKENS = parseInt(process.env.MAX_CONTEXT_TOKENS || '30000');
+  private readonly SUMMARY_CUSHION_TOKENS = parseInt(process.env.SUMMARY_CUSHION_TOKENS || '2000');
   private tokenEncoder: any;
 
   constructor(redisUrl: string) {
     this.redis = new Redis(redisUrl);
     // Initialize tiktoken encoder for GPT-4/GPT-3.5 compatible counting
     this.tokenEncoder = encoding_for_model('gpt-4');
+  }
+
+  /**
+   * Generate a conversation ID based on initial message content (stable hashing)
+   * or create a random ID if no seed is provided
+   */
+  generateConversationId(seedMessage?: string): string {
+    if (seedMessage) {
+      // Create stable ID based on message content
+      const crypto = require('crypto');
+      const hash = crypto.createHash('sha256').update(seedMessage).digest('hex').substring(0, 16);
+      return `conv_${hash}`;
+    }
+    // Generate random ID for one-off conversations
+    const crypto = require('crypto');
+    return `conv_${crypto.randomBytes(8).toString('hex')}`;
   }
 
   /**
@@ -57,36 +71,37 @@ export class MemoryManager {
   }
 
   /**
-   * Get conversation context: summary (if exists) + last K messages
+   * Get conversation context: returns messages that fit within token limit.
+   * Use getContextSummary() separately to retrieve summary for merging with system prompts.
    */
   async getContextForConversation(conversationId: string): Promise<ConversationMessage[]> {
     const messages = await this.getMessages(conversationId);
     
-    if (messages.length <= this.MAX_RECENT_MESSAGES) {
-      // Return all messages if we have 10 or fewer
-      return messages;
-    }
-
-    // Get recent messages
-    const recentMessages = messages.slice(-this.MAX_RECENT_MESSAGES);
+    // Calculate tokens and return messages that fit within limit
+    let totalTokens = 0;
+    const recentMessages: ConversationMessage[] = [];
     
-    // Get summary if it exists
-    const summary = await this.getSummary(conversationId);
-    
-    if (summary) {
-      // Return summary as system message + recent messages
-      return [
-        {
-          role: 'system',
-          content: `Previous conversation context: ${summary}`,
-          timestamp: Date.now()
-        },
-        ...recentMessages
-      ];
+    // Work backwards from most recent message
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msgTokens = this.countMessageTokens(messages[i]);
+      
+      if (totalTokens + msgTokens <= this.MAX_CONTEXT_TOKENS) {
+        recentMessages.unshift(messages[i]);
+        totalTokens += msgTokens;
+      } else {
+        break;
+      }
     }
     
-    // No summary yet, just return recent messages
     return recentMessages;
+  }
+
+  /**
+   * Get conversation summary (if exists) for manual inclusion in system prompts.
+   * Returns null if no summary has been generated yet.
+   */
+  async getContextSummary(conversationId: string): Promise<string | null> {
+    return await this.getSummary(conversationId);
   }
 
   /**
@@ -123,13 +138,14 @@ export class MemoryManager {
   /**
    * Store conversation summary
    */
-  async setSummary(conversationId: string, summary: string, upToMessageIndex: number): Promise<void> {
+  async setSummary(conversationId: string, summary: string): Promise<void> {
     const summaryKey = `conversation:${conversationId}:summary`;
     const metaKey = `conversation:${conversationId}:metadata`;
     
     await this.redis.set(summaryKey, summary);
     await this.redis.hset(metaKey, 'summaryGenerated', 'true');
-    await this.redis.hset(metaKey, 'summaryUpToMessage', upToMessageIndex.toString());
+    await this.redis.hdel(metaKey, 'needsSummaryGeneration');
+    await this.redis.hdel(metaKey, 'contentToSummarize');
   }
 
   /**
@@ -148,7 +164,6 @@ export class MemoryManager {
       messageCount: parseInt(data.messageCount || '0'),
       lastUpdated: parseInt(data.lastUpdated || '0'),
       summaryGenerated: data.summaryGenerated === 'true',
-      summaryUpToMessage: data.summaryUpToMessage ? parseInt(data.summaryUpToMessage) : undefined,
       totalTokens: data.totalTokens ? parseInt(data.totalTokens) : undefined
     };
   }
@@ -172,46 +187,165 @@ export class MemoryManager {
   }
 
   /**
-   * Check if conversation needs summarization
-   * Triggers on EITHER message count OR token count threshold
+   * Check if conversation needs summarization and trimming.
+   * Returns true when total tokens exceed MAX_CONTEXT_TOKENS + SUMMARY_CUSHION_TOKENS.
    */
   async needsSummarization(conversationId: string): Promise<boolean> {
-    const metadata = await this.getMetadata(conversationId);
+    const messages = await this.getMessages(conversationId);
+    const totalTokens = this.countMessagesTokens(messages);
     
-    if (!metadata) return false;
+    // Trigger summarization when we exceed the context limit + cushion
+    return totalTokens > (this.MAX_CONTEXT_TOKENS + this.SUMMARY_CUSHION_TOKENS);
+  }
+  
+  /**
+   * Trim messages and generate summary to bring conversation under token limit.
+   * This includes any existing summary in the summarization.
+   */
+  async trimAndSummarize(conversationId: string): Promise<void> {
+    const messages = await this.getMessages(conversationId);
+    const existingSummary = await this.getSummary(conversationId);
     
-    // Check if we need initial summary (message count OR token count threshold)
-    if (!metadata.summaryGenerated) {
-      const messageThresholdMet = metadata.messageCount > this.SUMMARY_THRESHOLD_MESSAGES;
-      const tokenThresholdMet = metadata.totalTokens ? metadata.totalTokens > this.SUMMARY_THRESHOLD_TOKENS : false;
+    // Calculate how many tokens we need to keep for recent context
+    let recentTokens = 0;
+    let keepFromIndex = messages.length;
+    
+    // Work backwards to find where to cut
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msgTokens = this.countMessageTokens(messages[i]);
       
-      if (messageThresholdMet || tokenThresholdMet) {
-        return true;
+      if (recentTokens + msgTokens <= this.MAX_CONTEXT_TOKENS) {
+        recentTokens += msgTokens;
+        keepFromIndex = i;
+      } else {
+        break;
       }
     }
     
-    // Check if we need to update existing summary (10+ new messages OR significant tokens)
-    if (metadata.summaryGenerated && metadata.summaryUpToMessage) {
-      const newMessagesSinceLastSummary = metadata.messageCount - metadata.summaryUpToMessage;
-      
-      // Re-summarize if 10+ new messages
-      if (newMessagesSinceLastSummary > 10) {
-        return true;
-      }
-      
-      // Or if new messages add significant tokens (1000+ tokens)
-      if (metadata.totalTokens && newMessagesSinceLastSummary > 0) {
-        const messages = await this.getMessages(conversationId);
-        const newMessages = messages.slice(metadata.summaryUpToMessage);
-        const newTokens = this.countMessagesTokens(newMessages);
-        
-        if (newTokens > 1000) {
-          return true;
-        }
-      }
+    // If all messages fit, no need to summarize
+    if (keepFromIndex === 0) {
+      return;
     }
     
-    return false;
+    // Messages to summarize (everything before keepFromIndex)
+    const messagesToSummarize = messages.slice(0, keepFromIndex);
+    
+    if (messagesToSummarize.length === 0) {
+      return;
+    }
+    
+    // Keep only recent messages in Redis
+    const messagesToKeep = messages.slice(keepFromIndex);
+    
+    // Clear old messages and store only recent ones
+    const messagesKey = `conversation:${conversationId}:messages`;
+    await this.redis.del(messagesKey);
+    
+    for (const msg of messagesToKeep) {
+      await this.redis.rpush(messagesKey, JSON.stringify(msg));
+    }
+    
+    // Build summary content (include existing summary if present)
+    let contentToSummarize = '';
+    
+    if (existingSummary) {
+      contentToSummarize += `Previous summary: ${existingSummary}\n\n`;
+    }
+    
+    contentToSummarize += messagesToSummarize
+      .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+      .join('\n');
+    
+    // Return the content to summarize (caller will invoke LLM)
+    // Store a marker that we need to generate summary
+    const metaKey = `conversation:${conversationId}:metadata`;
+    await this.redis.hset(metaKey, 'needsSummaryGeneration', 'true');
+    await this.redis.hset(metaKey, 'contentToSummarize', contentToSummarize);
+    
+    // Update metadata
+    await this.updateMetadata(conversationId);
+  }
+  
+  /**
+   * Get content that needs to be summarized (after trimAndSummarize was called)
+   */
+  async getContentToSummarize(conversationId: string): Promise<string | null> {
+    const metaKey = `conversation:${conversationId}:metadata`;
+    return await this.redis.hget(metaKey, 'contentToSummarize');
+  }
+  
+  /**
+   * Check if summary generation is pending
+   */
+  async needsSummaryGeneration(conversationId: string): Promise<boolean> {
+    const metaKey = `conversation:${conversationId}:metadata`;
+    const value = await this.redis.hget(metaKey, 'needsSummaryGeneration');
+    return value === 'true';
+  }
+
+  /**
+   * Perform summarization if needed - complete workflow in one call.
+   * @param conversationId The conversation to check and summarize
+   * @param llmInvoker A function that takes a prompt and returns the LLM's response
+   * @returns true if summarization was performed, false if not needed
+   */
+  async summarizeIfNeeded(
+    conversationId: string,
+    llmInvoker: (prompt: string) => Promise<string>
+  ): Promise<boolean> {
+    try {
+      const needsSummary = await this.needsSummarization(conversationId);
+      
+      if (!needsSummary) {
+        return false;
+      }
+      
+      const tokenCount = await this.getTokenCount(conversationId);
+      console.log(`[Memory] Token limit exceeded for ${conversationId}: ${tokenCount} tokens - trimming and summarizing...`);
+      
+      // Trim messages to fit within token limit
+      await this.trimAndSummarize(conversationId);
+      
+      // Check if summary generation is needed
+      const needsGeneration = await this.needsSummaryGeneration(conversationId);
+      if (!needsGeneration) {
+        console.log(`[Memory] No summary generation needed for ${conversationId}`);
+        return false;
+      }
+      
+      // Get content to summarize (includes previous summary if exists)
+      const contentToSummarize = await this.getContentToSummarize(conversationId);
+      
+      if (!contentToSummarize) {
+        return false;
+      }
+      
+      // Create summary prompt
+      const summaryPrompt = this.buildSummaryPrompt(contentToSummarize);
+      
+      // Generate summary using the provided LLM invoker
+      const summary = await llmInvoker(summaryPrompt);
+      
+      // Store the summary
+      await this.setSummary(conversationId, summary);
+      
+      const newTokenCount = await this.getTokenCount(conversationId);
+      console.log(`[Memory] Summarization complete for ${conversationId}: trimmed to ${newTokenCount} tokens`);
+      
+      return true;
+    } catch (error) {
+      console.error('[Memory] Summarization error:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Build the prompt for summarization (can be overridden or customized)
+   */
+  private buildSummaryPrompt(contentToSummarize: string): string {
+    return `Summarize the following conversation history concisely. Focus on information about the user, key topics, decisions, and important context. Retain key information from previous summaries if they exist. Only respond with the summary itself. Keep it over 500 but under 1000 words:
+
+${contentToSummarize}`;
   }
 
   /**
@@ -223,12 +357,11 @@ export class MemoryManager {
   }
 
   /**
-   * Get token count for recent messages only
+   * Get token count for messages that would be returned by getContextForConversation
    */
-  async getRecentTokenCount(conversationId: string): Promise<number> {
-    const messages = await this.getMessages(conversationId);
-    const recentMessages = messages.slice(-this.MAX_RECENT_MESSAGES);
-    return this.countMessagesTokens(recentMessages);
+  async getContextTokenCount(conversationId: string): Promise<number> {
+    const contextMessages = await this.getContextForConversation(conversationId);
+    return this.countMessagesTokens(contextMessages);
   }
 
   /**

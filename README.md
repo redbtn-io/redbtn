@@ -199,6 +199,19 @@ if (Symbol.asyncIterator in response) {
 
 ### Performance Metrics
 
+## Environment variables (.env)
+
+This project supports loading environment variables from a `.env` file using `dotenv`. Create a `.env` file at the project root with values such as:
+
+```
+REDIS_URL=redis://192.168.1.10:6379
+LLM_URL=https://llm.redbtn.io
+BEARER_TOKEN=red_ai_sk_...
+PORT=3000
+```
+
+The server and library load `.env` automatically at startup. Restart the server after changing `.env`.
+
 Calculate generation speed and analyze performance:
 
 ```typescript

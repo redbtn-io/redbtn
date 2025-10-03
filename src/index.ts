@@ -3,6 +3,9 @@
  * @description The core library for the Red AI agent.
  */
 
+// Load environment variables from .env early for library modules
+import 'dotenv/config';
+
 import { ChatOllama } from "@langchain/ollama";
 import { createLocalModel, createOpenAIModel } from "./lib/models";
 import { ChatOpenAI } from "@langchain/openai";
@@ -32,7 +35,7 @@ export interface InvokeOptions {
     application?: 'redHome' | 'redChat' | 'redAssistant';
   };
   stream?: boolean; // Flag to enable streaming responses
-  conversationId?: string; // Conversation ID for memory/context
+  conversationId?: string; // Optional conversation ID - will be auto-generated if not provided
 }
 
 // --- The Red Library Class ---
@@ -156,45 +159,70 @@ export class Red {
 
   /**
    * Handles a direct, on-demand request from a user-facing application.
-   * @param query The user's input or request data.
-   * @param options Metadata about the source of the request for routing purposes.
+   * Automatically manages conversation history, memory, and summarization.
+   * @param query The user's input or request data (must have a 'message' property)
+   * @param options Metadata about the source of the request and conversation settings
    * @returns For non-streaming: the full AIMessage object with content, tokens, and metadata.
    *          For streaming: an async generator that yields string chunks, then finally yields the full AIMessage.
    */
-  public async respond(query: object, options: InvokeOptions): Promise<any | AsyncGenerator<string | any, void, unknown>> {
+  public async respond(query: { message: string }, options: InvokeOptions = {}): Promise<any | AsyncGenerator<string | any, void, unknown>> {
+    // Generate conversation ID if not provided
+    const conversationId = options.conversationId || this.memory.generateConversationId(query.message);
+    
+    // Store user message in memory
+    await this.memory.addMessage(conversationId, {
+      role: 'user',
+      content: query.message,
+      timestamp: Date.now()
+    });
+    
     const initialState = {
       query,
-      options,
+      options: { ...options, conversationId }, // Ensure conversationId is in options
       redInstance: this, // Pass the entire instance into the graph
     };
 
     // Check if streaming is requested
     if (options.stream) {
       // Use LangGraph's streaming capabilities to stream through the graph
-      return this._streamThroughGraph(initialState);
+      return this._streamThroughGraphWithMemory(initialState, conversationId);
     } else {
       // Invoke the graph and return the full AIMessage
       const result = await redGraph.invoke(initialState);
+      const response = result.response;
+      
+      // Store assistant response in memory
+      await this.memory.addMessage(conversationId, {
+        role: 'assistant',
+        content: typeof response.content === 'string' ? response.content : JSON.stringify(response.content),
+        timestamp: Date.now()
+      });
+      
+      // Trigger background summarization (non-blocking)
+      this._summarizeInBackground(conversationId);
       
       // Return the full AIMessage object directly
-      return result.response;
+      return response;
     }
   }
 
   /**
-   * Internal method to handle streaming responses through the graph.
+   * Internal method to handle streaming responses through the graph with memory management.
    * Yields string chunks as they arrive, then yields the final AIMessage object with complete metadata.
    * @private
    */
-  private async *_streamThroughGraph(initialState: any): AsyncGenerator<string | any, void, unknown> {
+  private async *_streamThroughGraphWithMemory(initialState: any, conversationId: string): AsyncGenerator<string | any, void, unknown> {
     // Use LangGraph's streamEvents to get token-level streaming
     const stream = redGraph.streamEvents(initialState, { version: "v1" });
     let finalMessage: any = null;
+    let fullContent = '';
     
     for await (const event of stream) {
       // Yield streaming content chunks
       if (event.event === "on_llm_stream" && event.data?.chunk?.content) {
-        yield event.data.chunk.content;
+        const content = event.data.chunk.content;
+        fullContent += content;
+        yield content;
       }
       // Capture the final message when LLM completes - use on_llm_end
       if (event.event === "on_llm_end") {
@@ -206,10 +234,33 @@ export class Red {
       }
     }
     
+    // Store assistant response in memory (after streaming completes)
+    if (fullContent) {
+      await this.memory.addMessage(conversationId, {
+        role: 'assistant',
+        content: fullContent,
+        timestamp: Date.now()
+      });
+      
+      // Trigger background summarization (non-blocking)
+      this._summarizeInBackground(conversationId);
+    }
+    
     // After all chunks are sent, yield the final AIMessage with complete token data
     if (finalMessage) {
       yield finalMessage;
     }
+  }
+  
+  /**
+   * Trigger summarization in background (non-blocking)
+   * @private
+   */
+  private _summarizeInBackground(conversationId: string): void {
+    this.memory.summarizeIfNeeded(conversationId, async (prompt) => {
+      const response = await this.localModel.invoke([{ role: 'user', content: prompt }]);
+      return response.content as string;
+    }).catch(err => console.error('[Red] Summarization failed:', err));
   }
 
 }

@@ -18,37 +18,51 @@ interface RedGraphState {
  * @param state The current state of the graph.
  * @returns A partial state object with the response.
  */
-export async function chatNode(state: RedGraphState): Promise<Partial<RedGraphState>> {
+export const chatNode = async (state: any): Promise<any> => {
   try {
-    const redInstance = state.redInstance;
-    const userText = (state.query && (state.query as any).message) ? (state.query as any).message : JSON.stringify(state.query || {});
-    const conversationId = (state.options as any)?.conversationId;
+    const redInstance: Red = state.redInstance;
+    const query = state.query;
+    const options: InvokeOptions = state.options || {};
+    const conversationId = options.conversationId;
 
-    if (!redInstance) {
-      return { response: { content: 'This is a placeholder response from the chat node.' } };
-    }
-
-    try {
-      let messages: any[] = [];
+    // Build messages array with memory context if available
+    let messages: any[] = [];
+    
+    if (conversationId) {
+      // Get summary (if exists) and recent messages separately
+      const summary = await redInstance.memory.getContextSummary(conversationId);
+      const recentMessages = await redInstance.memory.getContextForConversation(conversationId);
       
-      // If we have a conversation ID, get the context with history/summary
-      if (conversationId) {
-        const contextMessages = await redInstance.memory.getContextForConversation(conversationId);
-        messages = contextMessages.map(m => ({ role: m.role, content: m.content }));
+      // Since Ollama doesn't combine system messages, we append summary
+      // as a contextual user message instead (less intrusive than overriding system prompt)
+      if (summary) {
+        messages.push({
+          role: 'user',
+          content: `[Previous conversation context: ${summary}]`
+        });
       }
       
-      // Add current user message
-      messages.push({ role: 'user', content: userText });
-      
-      // Invoke the model with full context (streaming will be captured by streamEvents at the graph level)
-      const aiMessage = await redInstance.localModel.invoke(messages);
-      return { response: aiMessage };
-    } catch (err) {
-      console.error('[Chat Node] Error invoking model:', err);
-      return { response: { content: 'Error processing request.' } };
+      // Add recent conversation messages (user/assistant pairs)
+      messages.push(...recentMessages.map(msg => ({
+        role: msg.role,
+        content: msg.content
+      })));
     }
-  } catch (err) {
-    console.error('[Chat Node] Unexpected error:', err);
-    return { response: { content: 'This is a placeholder response from the chat node.' } };
+
+    // Add the current user query
+    messages.push({
+      role: 'user',
+      content: query.message
+    });
+
+    // Invoke the local model with context
+    // (streaming will be captured by streamEvents at the graph level)
+    const aiMessage = await redInstance.localModel.invoke(messages);
+    
+    return { response: aiMessage };
+    
+  } catch (error) {
+    console.error('[Chat Node] Error:', error);
+    return { response: { content: 'Error processing request.' } };
   }
-}
+};
