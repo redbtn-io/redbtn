@@ -2,34 +2,19 @@
   "name": "@redbtn/ai",
   "version": "0.0.1",
   "description": "",
-  "author": "George Abreu Jr. <george@redbtn.io> (https://georgeanthony.net/)",
-  "license": "GPL-3.0-only",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "index.js",
   "scripts": {
-    "prepare": "tsc -d"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "files": [
-    "dist/",
-    "LICENSE",
-    "README.md",
-    "package.json"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/redbtn-io/ai.git"
-  },
-  "bugs": {
-    "url": "https://github.com/redbtn-io/ai/issues"
-  },
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "openai": "^4.67.3",
-    "wav": "^1.0.2",
-    "ws": "^8.18.0"
+    "@langchain/langgraph": "^0.4.9",
+    "@langchain/ollama": "^0.2.4",
+    "@langchain/openai": "^0.6.13",
+    "typescript": "^5.9.2"
   },
   "devDependencies": {
-    "@types/node": "^20.12.12",
-    "@types/ws": "^8.5.12",
-    "typescript": "^5.4.5"
+    "@types/node": "^24.5.2"
   }
 }
