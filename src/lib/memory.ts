@@ -4,7 +4,7 @@
  */
 
 import Redis from 'ioredis';
-import { encoding_for_model } from 'tiktoken';
+import { countTokens, freeTiktoken } from './tokenizer';
 
 export interface ConversationMessage {
   role: 'system' | 'user' | 'assistant';
@@ -18,18 +18,17 @@ export interface ConversationMetadata {
   lastUpdated: number;
   summaryGenerated: boolean;
   totalTokens?: number; // Total tokens in conversation
+  title?: string; // Generated or user-set title
+  titleSetByUser?: boolean; // Whether title was manually set by user
 }
 
 export class MemoryManager {
   private redis: Redis;
   private readonly MAX_CONTEXT_TOKENS = parseInt(process.env.MAX_CONTEXT_TOKENS || '30000');
   private readonly SUMMARY_CUSHION_TOKENS = parseInt(process.env.SUMMARY_CUSHION_TOKENS || '2000');
-  private tokenEncoder: any;
 
   constructor(redisUrl: string) {
     this.redis = new Redis(redisUrl);
-    // Initialize tiktoken encoder for GPT-4/GPT-3.5 compatible counting
-    this.tokenEncoder = encoding_for_model('gpt-4');
   }
 
   /**
@@ -51,11 +50,11 @@ export class MemoryManager {
   /**
    * Count tokens in a message
    */
-  private countMessageTokens(message: ConversationMessage): number {
+  private async countMessageTokens(message: ConversationMessage): Promise<number> {
     try {
       // Format: role + content + overhead (4 tokens per message for formatting)
-      const roleTokens = this.tokenEncoder.encode(message.role).length;
-      const contentTokens = this.tokenEncoder.encode(message.content).length;
+      const roleTokens = await countTokens(message.role);
+      const contentTokens = await countTokens(message.content);
       return roleTokens + contentTokens + 4;
     } catch (error) {
       // Fallback: rough estimate (1 token ≈ 4 characters)
@@ -66,8 +65,12 @@ export class MemoryManager {
   /**
    * Count tokens in multiple messages
    */
-  private countMessagesTokens(messages: ConversationMessage[]): number {
-    return messages.reduce((total, msg) => total + this.countMessageTokens(msg), 0);
+  private async countMessagesTokens(messages: ConversationMessage[]): Promise<number> {
+    let total = 0;
+    for (const msg of messages) {
+      total += await this.countMessageTokens(msg);
+    }
+    return total;
   }
 
   /**
@@ -83,7 +86,7 @@ export class MemoryManager {
     
     // Work backwards from most recent message
     for (let i = messages.length - 1; i >= 0; i--) {
-      const msgTokens = this.countMessageTokens(messages[i]);
+      const msgTokens = await this.countMessageTokens(messages[i]);
       
       if (totalTokens + msgTokens <= this.MAX_CONTEXT_TOKENS) {
         recentMessages.unshift(messages[i]);
@@ -164,7 +167,9 @@ export class MemoryManager {
       messageCount: parseInt(data.messageCount || '0'),
       lastUpdated: parseInt(data.lastUpdated || '0'),
       summaryGenerated: data.summaryGenerated === 'true',
-      totalTokens: data.totalTokens ? parseInt(data.totalTokens) : undefined
+      totalTokens: data.totalTokens ? parseInt(data.totalTokens) : undefined,
+      title: data.title || undefined,
+      titleSetByUser: data.titleSetByUser === 'true' || undefined
     };
   }
 
@@ -177,7 +182,7 @@ export class MemoryManager {
     
     // Calculate total tokens
     const messages = await this.getMessages(conversationId);
-    const totalTokens = this.countMessagesTokens(messages);
+    const totalTokens = await this.countMessagesTokens(messages);
     
     await this.redis.hset(key, {
       messageCount: messageCount.toString(),
@@ -192,7 +197,7 @@ export class MemoryManager {
    */
   async needsSummarization(conversationId: string): Promise<boolean> {
     const messages = await this.getMessages(conversationId);
-    const totalTokens = this.countMessagesTokens(messages);
+    const totalTokens = await this.countMessagesTokens(messages);
     
     // Trigger summarization when we exceed the context limit + cushion
     return totalTokens > (this.MAX_CONTEXT_TOKENS + this.SUMMARY_CUSHION_TOKENS);
@@ -212,7 +217,7 @@ export class MemoryManager {
     
     // Work backwards to find where to cut
     for (let i = messages.length - 1; i >= 0; i--) {
-      const msgTokens = this.countMessageTokens(messages[i]);
+      const msgTokens = await this.countMessageTokens(messages[i]);
       
       if (recentTokens + msgTokens <= this.MAX_CONTEXT_TOKENS) {
         recentTokens += msgTokens;
@@ -353,7 +358,7 @@ ${contentToSummarize}`;
    */
   async getTokenCount(conversationId: string): Promise<number> {
     const messages = await this.getMessages(conversationId);
-    return this.countMessagesTokens(messages);
+    return await this.countMessagesTokens(messages);
   }
 
   /**
@@ -361,7 +366,7 @@ ${contentToSummarize}`;
    */
   async getContextTokenCount(conversationId: string): Promise<number> {
     const contextMessages = await this.getContextForConversation(conversationId);
-    return this.countMessagesTokens(contextMessages);
+    return await this.countMessagesTokens(contextMessages);
   }
 
   /**
@@ -377,7 +382,7 @@ ${contentToSummarize}`;
    * Close Redis connection and free tokenizer
    */
   async close(): Promise<void> {
-    this.tokenEncoder.free();
+    freeTiktoken();
     await this.redis.quit();
   }
 }

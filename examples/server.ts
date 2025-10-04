@@ -11,15 +11,20 @@ import cors from 'cors';
 import crypto from 'crypto';
 import { Red, RedConfig } from '../src/index';
 
+// Check if running in think mode (no HTTP server, just autonomous thinking)
+const THINK_MODE = process.env.THINK === 'true' || process.env.THINK === '1';
+
 // Generate a fresh bearer token on each server startup (or use provided one from env)
 // IMPORTANT: This MUST be declared before any other code to ensure it's only generated once
 const BEARER_TOKEN = process.env.BEARER_TOKEN || (() => {
   const token = `red_ai_sk_${crypto.randomBytes(32).toString('hex')}`;
-  console.log(`🔐 Generated bearer token: ${token}`);
+  if (!THINK_MODE) {
+    console.log(`🔐 Generated bearer token: ${token}`);
+  }
   return token;
 })();
 
-if (process.env.BEARER_TOKEN) {
+if (process.env.BEARER_TOKEN && !THINK_MODE) {
   console.log(`🔑 Using provided bearer token: ${BEARER_TOKEN}`);
 }
 
@@ -35,7 +40,8 @@ app.use(cors({
   maxAge: 86400 // 24 hours
 }));
 
-app.use(express.json());
+// Increase JSON payload limit to 100MB (default is 100kb)
+app.use(express.json({ limit: '100mb' }));
 
 // Authentication middleware
 function authenticateToken(req: Request, res: Response, next: any) {
@@ -105,6 +111,13 @@ interface ChatCompletionRequest {
   frequency_penalty?: number;
   presence_penalty?: number;
   stop?: string | string[];
+  // OpenWebUI and other clients may send conversation IDs under various field names
+  chat_id?: string;
+  conversation_id?: string;
+  conversationId?: string;
+  session_id?: string;
+  sessionId?: string;
+  [key: string]: any; // Allow other fields
 }
 
 interface ChatCompletionResponse {
@@ -159,6 +172,50 @@ function getConversationIdFromHeader(req: Request): string | undefined {
   return req.headers['x-conversation-id'] as string | undefined;
 }
 
+// Extract conversation ID from request body, checking multiple possible field names
+function getConversationIdFromBody(body: ChatCompletionRequest): string | undefined {
+  // Check common field names that clients might use
+  const possibleFields = [
+    'chat_id',
+    'chatId', 
+    'conversation_id',
+    'conversationId',
+    'session_id',
+    'sessionId',
+    'thread_id',
+    'threadId'
+  ];
+  
+  for (const field of possibleFields) {
+    if (body[field]) {
+      console.log(`📝 Found conversation ID in body.${field}: ${body[field]}`);
+      return body[field] as string;
+    }
+  }
+  
+  return undefined;
+}
+
+// Generate a stable conversation ID from the message history
+// Uses the first user message to create a consistent ID for the same conversation
+function generateStableConversationId(messages: ChatCompletionRequest['messages']): string {
+  // Find the first user message in the conversation
+  const firstUserMessage = messages.find(m => m.role === 'user');
+  
+  if (!firstUserMessage) {
+    // Fallback: generate random ID if no user message found
+    return `conv_${crypto.randomBytes(8).toString('hex')}`;
+  }
+  
+  // Create a stable hash from the first user message
+  const hash = crypto.createHash('sha256')
+    .update(firstUserMessage.content)
+    .digest('hex')
+    .substring(0, 16);
+  
+  return `conv_${hash}`;
+}
+
 // Chat completions handler (used by both /chat/completions and /v1/chat/completions)
 async function handleChatCompletion(req: Request, res: Response) {
   try {
@@ -179,8 +236,25 @@ async function handleChatCompletion(req: Request, res: Response) {
     const modelName = body.model || 'Red';
     const userMessage = extractUserMessage(body.messages);
     
-    // Get conversation ID from header (if provided), otherwise Red will auto-generate
-    const conversationId = getConversationIdFromHeader(req);
+    // Debug: Log comprehensive request info to understand what OpenWebUI sends
+    console.log(`\n📨 === Request Details ===`);
+    console.log(`📋 Body keys: ${Object.keys(body).join(', ')}`);
+    console.log(`🔑 Headers: ${JSON.stringify(req.headers, null, 2)}`);
+    console.log(`🔍 Query params: ${JSON.stringify(req.query, null, 2)}`);
+    console.log(`🛣️  URL: ${req.url}`);
+    console.log(`📦 Full body (first 500 chars): ${JSON.stringify(body).substring(0, 500)}`);
+    console.log(`========================\n`);
+    
+    // Get conversation ID from:
+    // 1. Request body (chat_id, conversation_id, etc.) - for custom clients
+    // 2. Request header (X-Conversation-ID) - for custom clients
+    // 3. Generate stable ID from first user message - for OpenWebUI and stateless clients
+    const conversationId = getConversationIdFromBody(body) || 
+                          getConversationIdFromHeader(req) || 
+                          generateStableConversationId(body.messages);
+    
+    console.log(`🔗 Using conversation ID: ${conversationId}`);
+
 
     // Streaming mode
     if (body.stream) {
@@ -222,7 +296,26 @@ async function handleChatCompletion(req: Request, res: Response) {
 
       // Stream content chunks - character by character
       let fullResponse = '';
+      let firstTokenTime: number | null = null;
+      let actualConversationId: string | undefined = conversationId;
+      const streamStartTime = Date.now();
+
       for await (const chunk of stream) {
+        // First chunk is metadata containing the actual conversationId
+        if (typeof chunk === 'object' && chunk._metadata && chunk.conversationId) {
+          actualConversationId = chunk.conversationId;
+          continue; // Skip processing metadata, move to next chunk
+        }
+        
+        // Log time to first token (include conversationId if present)
+        if (firstTokenTime === null && typeof chunk === 'string') {
+          firstTokenTime = Date.now() - streamStartTime;
+          if (actualConversationId) {
+            console.log(`⏱️  Time to first token for ${actualConversationId}: ${firstTokenTime}ms`);
+          } else {
+            console.log(`⏱️  Time to first token: ${firstTokenTime}ms`);
+          }
+        }
         if (typeof chunk === 'string') {
           fullResponse += chunk; // Accumulate for storage
           
@@ -428,21 +521,33 @@ app.get('/v1', (req: Request, res: Response) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 
-initRed().then(() => {
-  app.listen(PORT, () => {
-    console.log(`🚀 Red AI API Server running on http://localhost:${PORT}`);
-    console.log(`📡 OpenAI-compatible endpoint: http://localhost:${PORT}/v1/chat/completions`);
-    console.log(`📋 Models endpoint: http://localhost:${PORT}/v1/models`);
-    console.log(`💚 Health check: http://localhost:${PORT}/health`);
-    console.log('');
-    console.log('🔑 Bearer Token for OpenWebUI:');
-    console.log(`   ${BEARER_TOKEN}`);
-    console.log('');
-    console.log('💡 Add this to OpenWebUI:');
-    console.log('   Settings → Connections → Add OpenAI API');
-    console.log(`   API Base URL: http://localhost:${PORT}/v1`);
-    console.log(`   API Key: ${BEARER_TOKEN}`);
-  });
+initRed().then(async () => {
+  if (THINK_MODE) {
+    // Think mode: Run autonomous thinking loop without HTTP server
+    console.log('🧠 Red AI starting in THINK mode...');
+    console.log('🔄 Running autonomous thinking loop');
+    console.log('   Press Ctrl+C to stop\n');
+    
+    // Run the think loop
+    await red.think();
+    
+  } else {
+    // Normal API server mode
+    app.listen(PORT, () => {
+      console.log(`🚀 Red AI API Server running on http://localhost:${PORT}`);
+      console.log(`📡 OpenAI-compatible endpoint: http://localhost:${PORT}/v1/chat/completions`);
+      console.log(`📋 Models endpoint: http://localhost:${PORT}/v1/models`);
+      console.log(`💚 Health check: http://localhost:${PORT}/health`);
+      console.log('');
+      console.log('🔑 Bearer Token for OpenWebUI:');
+      console.log(`   ${BEARER_TOKEN}`);
+      console.log('');
+      console.log('💡 Add this to OpenWebUI:');
+      console.log('   Settings → Connections → Add OpenAI API');
+      console.log(`   API Base URL: http://localhost:${PORT}/v1`);
+      console.log(`   API Key: ${BEARER_TOKEN}`);
+    });
+  }
 }).catch(error => {
   console.error('Failed to initialize Red AI:', error);
   process.exit(1);

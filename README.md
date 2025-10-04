@@ -308,6 +308,30 @@ See [`/examples/SERVER.md`](examples/SERVER.md) for complete documentation.
 
 ---
 
+## 🚀 Deployment Options
+
+Red AI supports **two deployment strategies** to give you maximum flexibility:
+
+### 1. Standalone Express Server (Traditional)
+- ✅ Fast cold starts (~500ms)
+- ✅ Full tiktoken support
+- ✅ OpenWebUI compatible
+- ✅ Can run in specialized modes
+- ❌ Requires always-on server
+
+### 2. Next.js Serverless (Modern)
+- ✅ Deploy to Vercel/AWS Lambda/Cloudflare
+- ✅ Auto-scaling (0→∞)
+- ✅ Built-in custom UI
+- ✅ Global CDN
+- ❌ Cold starts on low traffic
+
+Both options share the same core `src/` library for consistent behavior.
+
+**See [DEPLOYMENT.md](./DEPLOYMENT.md) for detailed deployment guides.**
+
+---
+
 ## 🔄 Migration Guide
 
 If you had code using the old API:

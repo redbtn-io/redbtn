@@ -7,10 +7,12 @@
 import 'dotenv/config';
 
 import { ChatOllama } from "@langchain/ollama";
-import { createLocalModel, createOpenAIModel } from "./lib/models";
 import { ChatOpenAI } from "@langchain/openai";
+import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
+
 import { redGraph } from "./lib/graphs/red";
 import { MemoryManager } from "./lib/memory";
+import { createGeminiModel, createLocalModel, createOpenAIModel } from "./lib/models";
 
 // --- Type Definitions ---
 
@@ -54,6 +56,7 @@ export class Red {
   // Properties to hold the configured model instances
   public localModel!: ChatOllama;
   public openAIModel?: ChatOpenAI;
+  public geminiModel?: ChatGoogleGenerativeAI;
   public memory!: MemoryManager;
 
   /**
@@ -66,6 +69,7 @@ export class Red {
     // Initialize the model instances
     this.localModel = createLocalModel(config);
     this.openAIModel = createOpenAIModel();
+    this.geminiModel = createGeminiModel();
     
     // Initialize memory manager
     this.memory = new MemoryManager(config.redisUrl);
@@ -162,8 +166,8 @@ export class Red {
    * Automatically manages conversation history, memory, and summarization.
    * @param query The user's input or request data (must have a 'message' property)
    * @param options Metadata about the source of the request and conversation settings
-   * @returns For non-streaming: the full AIMessage object with content, tokens, and metadata.
-   *          For streaming: an async generator that yields string chunks, then finally yields the full AIMessage.
+   * @returns For non-streaming: the full AIMessage object with content, tokens, metadata, and conversationId.
+   *          For streaming: an async generator that yields metadata first (with conversationId), then string chunks, then finally the full AIMessage.
    */
   public async respond(query: { message: string }, options: InvokeOptions = {}): Promise<any | AsyncGenerator<string | any, void, unknown>> {
     // Generate conversation ID if not provided
@@ -198,20 +202,30 @@ export class Red {
         timestamp: Date.now()
       });
       
+      // Get message count for title generation
+      const metadata = await this.memory.getMetadata(conversationId);
+      const messageCount = metadata?.messageCount || 0;
+      
       // Trigger background summarization (non-blocking)
       this._summarizeInBackground(conversationId);
       
-      // Return the full AIMessage object directly
-      return response;
+      // Trigger background title generation (non-blocking)
+      this._generateTitleInBackground(conversationId, messageCount);
+      
+      // Attach conversationId to response for server access
+      return { ...response, conversationId };
     }
   }
 
   /**
    * Internal method to handle streaming responses through the graph with memory management.
-   * Yields string chunks as they arrive, then yields the final AIMessage object with complete metadata.
+   * Yields metadata first (with conversationId), then string chunks, then the final AIMessage object.
    * @private
    */
   private async *_streamThroughGraphWithMemory(initialState: any, conversationId: string): AsyncGenerator<string | any, void, unknown> {
+    // Yield metadata first so server can capture conversationId immediately
+    yield { _metadata: true, conversationId };
+    
     // Use LangGraph's streamEvents to get token-level streaming
     const stream = redGraph.streamEvents(initialState, { version: "v1" });
     let finalMessage: any = null;
@@ -242,8 +256,15 @@ export class Red {
         timestamp: Date.now()
       });
       
+      // Get message count for title generation
+      const metadata = await this.memory.getMetadata(conversationId);
+      const messageCount = metadata?.messageCount || 0;
+      
       // Trigger background summarization (non-blocking)
       this._summarizeInBackground(conversationId);
+      
+      // Trigger background title generation (non-blocking)
+      this._generateTitleInBackground(conversationId, messageCount);
     }
     
     // After all chunks are sent, yield the final AIMessage with complete token data
@@ -261,6 +282,75 @@ export class Red {
       const response = await this.localModel.invoke([{ role: 'user', content: prompt }]);
       return response.content as string;
     }).catch(err => console.error('[Red] Summarization failed:', err));
+  }
+
+  /**
+   * Generate a title for the conversation based on the first few messages
+   * Runs after 2nd message (initial title) and 6th message (refined title)
+   * @private
+   */
+  private async _generateTitleInBackground(conversationId: string, messageCount: number): Promise<void> {
+    try {
+      // Only generate title after 2nd or 6th message
+      if (messageCount !== 2 && messageCount !== 6) {
+        return;
+      }
+
+      // Check if title was manually set by user
+      const metadata = await this.memory.getMetadata(conversationId);
+      if (metadata?.titleSetByUser) {
+        return; // Don't override user-set titles after 6th message
+      }
+
+      // Get recent messages for context
+      const messages = await this.memory.getMessages(conversationId);
+      const conversationText = messages
+        .slice(0, Math.min(6, messages.length)) // Use first 6 messages max
+        .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+        .join('\n');
+
+      // Create prompt for title generation
+      const titlePrompt = `Based on this conversation, generate a short, descriptive title (3-6 words max). Only respond with the title, nothing else:
+
+${conversationText}`;
+
+      // Generate title using LLM
+      const response = await this.localModel.invoke([{ role: 'user', content: titlePrompt }]);
+      const title = (response.content as string).trim().replace(/^["']|["']$/g, ''); // Remove quotes if any
+
+      // Store title in metadata
+      const metaKey = `conversation:${conversationId}:metadata`;
+      await this.memory['redis'].hset(metaKey, 'title', title);
+      
+      console.log(`[Red] Generated title for ${conversationId}: "${title}"`);
+    } catch (err) {
+      console.error('[Red] Title generation failed:', err);
+    }
+  }
+
+  /**
+   * Set a custom title for a conversation (set by user)
+   * This prevents automatic title generation from overwriting it
+   * @param conversationId The conversation ID
+   * @param title The custom title to set
+   */
+  public async setConversationTitle(conversationId: string, title: string): Promise<void> {
+    const metaKey = `conversation:${conversationId}:metadata`;
+    await this.memory['redis'].hset(metaKey, {
+      'title': title,
+      'titleSetByUser': 'true'
+    });
+    console.log(`[Red] User set title for ${conversationId}: "${title}"`);
+  }
+
+  /**
+   * Get the title for a conversation
+   * @param conversationId The conversation ID
+   * @returns The title or null if not set
+   */
+  public async getConversationTitle(conversationId: string): Promise<string | null> {
+    const metadata = await this.memory.getMetadata(conversationId);
+    return metadata?.title || null;
   }
 
 }

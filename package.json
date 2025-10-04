@@ -1,16 +1,27 @@
 {
   "name": "@redbtn/ai",
   "version": "0.0.1",
-  "description": "",
-  "main": "index.js",
+  "description": "Red AI Library - Graph-based AI agent built on LangChain and LangGraph",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "server": "npx tsx examples/server.ts",
-    "dev": "npx tsx watch examples/server.ts"
+    "dev:server": "npx tsx watch examples/server.ts",
+    "start:server": "npx tsx examples/server.ts",
+    "think": "THINK=true npx tsx examples/server.ts",
+    "build": "tsc",
+    "pack": "npm run build && npm pack",
+    "prepublishOnly": "npm run build"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@langchain/google-genai": "^0.2.18",
     "@langchain/langgraph": "^0.4.9",
     "@langchain/ollama": "^0.2.4",
     "@langchain/openai": "^0.6.13",

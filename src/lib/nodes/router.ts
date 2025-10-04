@@ -2,25 +2,13 @@
 import { InvokeOptions } from '../..';
 
 /**
- * Defines the state that flows through the redGraph.
- * It includes the original query and the invocation options.
- */
-interface RedGraphState {
-  query: object;
-  options: InvokeOptions;
-  response?: string;
-  // This field will be populated by the router to direct the next step.
-  nextGraph?: 'homeGraph' | 'assistantGraph' | 'chat'; 
-}
-
-/**
  * The first node in redGraph, acting as a router.
  * It directs the flow to a specialized graph or continues within redGraph
  * based on the application source provided in the options.
- * * @param state The current state of the graph.
+ * @param state The current state of the graph.
  * @returns A partial state object indicating the next step.
  */
-export async function routerNode(state: RedGraphState): Promise<Partial<RedGraphState>> {
+export async function routerNode(state: any): Promise<Partial<any>> {
   const application = state.options?.source?.application;
 
   switch (application) {
