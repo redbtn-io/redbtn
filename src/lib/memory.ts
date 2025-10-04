@@ -102,9 +102,10 @@ export class MemoryManager {
   /**
    * Get conversation summary (if exists) for manual inclusion in system prompts.
    * Returns null if no summary has been generated yet.
+   * This returns the TRAILING summary (old trimmed messages).
    */
   async getContextSummary(conversationId: string): Promise<string | null> {
-    return await this.getSummary(conversationId);
+    return await this.getTrailingSummary(conversationId);
   }
 
   /**
@@ -131,24 +132,41 @@ export class MemoryManager {
   }
 
   /**
-   * Get conversation summary
+   * Get trailing summary (old trimmed messages)
    */
-  async getSummary(conversationId: string): Promise<string | null> {
-    const key = `conversation:${conversationId}:summary`;
+  async getTrailingSummary(conversationId: string): Promise<string | null> {
+    const key = `conversation:${conversationId}:summary:trailing`;
     return await this.redis.get(key);
   }
 
   /**
-   * Store conversation summary
+   * Store trailing summary (old trimmed messages)
    */
-  async setSummary(conversationId: string, summary: string): Promise<void> {
-    const summaryKey = `conversation:${conversationId}:summary`;
+  async setTrailingSummary(conversationId: string, summary: string): Promise<void> {
+    const summaryKey = `conversation:${conversationId}:summary:trailing`;
     const metaKey = `conversation:${conversationId}:metadata`;
     
     await this.redis.set(summaryKey, summary);
-    await this.redis.hset(metaKey, 'summaryGenerated', 'true');
-    await this.redis.hdel(metaKey, 'needsSummaryGeneration');
+    await this.redis.hset(metaKey, 'trailingSummaryGenerated', 'true');
+    await this.redis.hdel(metaKey, 'needsTrailingSummaryGeneration');
     await this.redis.hdel(metaKey, 'contentToSummarize');
+  }
+
+  /**
+   * Get executive summary (full conversation overview)
+   */
+  async getExecutiveSummary(conversationId: string): Promise<string | null> {
+    const key = `conversation:${conversationId}:summary:executive`;
+    return await this.redis.get(key);
+  }
+
+  /**
+   * Store executive summary (full conversation overview)
+   */
+  async setExecutiveSummary(conversationId: string, summary: string): Promise<void> {
+    const summaryKey = `conversation:${conversationId}:summary:executive`;
+    await this.redis.set(summaryKey, summary);
+    console.log(`[Memory] Updated executive summary for ${conversationId}`);
   }
 
   /**
@@ -209,7 +227,7 @@ export class MemoryManager {
    */
   async trimAndSummarize(conversationId: string): Promise<void> {
     const messages = await this.getMessages(conversationId);
-    const existingSummary = await this.getSummary(conversationId);
+    const existingSummary = await this.getTrailingSummary(conversationId);
     
     // Calculate how many tokens we need to keep for recent context
     let recentTokens = 0;
@@ -262,9 +280,9 @@ export class MemoryManager {
       .join('\n');
     
     // Return the content to summarize (caller will invoke LLM)
-    // Store a marker that we need to generate summary
+    // Store a marker that we need to generate trailing summary
     const metaKey = `conversation:${conversationId}:metadata`;
-    await this.redis.hset(metaKey, 'needsSummaryGeneration', 'true');
+    await this.redis.hset(metaKey, 'needsTrailingSummaryGeneration', 'true');
     await this.redis.hset(metaKey, 'contentToSummarize', contentToSummarize);
     
     // Update metadata
@@ -280,11 +298,11 @@ export class MemoryManager {
   }
   
   /**
-   * Check if summary generation is pending
+   * Check if trailing summary generation is pending
    */
   async needsSummaryGeneration(conversationId: string): Promise<boolean> {
     const metaKey = `conversation:${conversationId}:metadata`;
-    const value = await this.redis.hget(metaKey, 'needsSummaryGeneration');
+    const value = await this.redis.hget(metaKey, 'needsTrailingSummaryGeneration');
     return value === 'true';
   }
 
@@ -331,8 +349,8 @@ export class MemoryManager {
       // Generate summary using the provided LLM invoker
       const summary = await llmInvoker(summaryPrompt);
       
-      // Store the summary
-      await this.setSummary(conversationId, summary);
+      // Store the trailing summary
+      await this.setTrailingSummary(conversationId, summary);
       
       const newTokenCount = await this.getTokenCount(conversationId);
       console.log(`[Memory] Summarization complete for ${conversationId}: trimmed to ${newTokenCount} tokens`);
@@ -341,6 +359,46 @@ export class MemoryManager {
     } catch (error) {
       console.error('[Memory] Summarization error:', error);
       return false;
+    }
+  }
+
+  /**
+   * Generate executive summary (full conversation overview).
+   * Should be called after 3rd+ AI responses.
+   * @param llmInvoker A function that takes a prompt and returns the LLM's response
+   */
+  async generateExecutiveSummary(
+    conversationId: string,
+    llmInvoker: (prompt: string) => Promise<string>
+  ): Promise<void> {
+    try {
+      const messages = await this.getMessages(conversationId);
+      
+      if (messages.length === 0) {
+        return;
+      }
+      
+      // Build full conversation text
+      const conversationText = messages
+        .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+        .join('\n');
+      
+      const prompt = `Provide a comprehensive executive summary of the following conversation. Focus on:
+- User's goals and preferences
+- Key topics discussed
+- Important decisions or conclusions
+- Context that would be useful for future interactions
+
+Keep it concise but informative (200-400 words). Only respond with the summary itself:
+
+${conversationText}`;
+      
+      const summary = await llmInvoker(prompt);
+      await this.setExecutiveSummary(conversationId, summary);
+      
+      console.log(`[Memory] Generated executive summary for ${conversationId}`);
+    } catch (error) {
+      console.error('[Memory] Executive summary generation error:', error);
     }
   }
 
@@ -374,7 +432,8 @@ ${contentToSummarize}`;
    */
   async deleteConversation(conversationId: string): Promise<void> {
     await this.redis.del(`conversation:${conversationId}:messages`);
-    await this.redis.del(`conversation:${conversationId}:summary`);
+    await this.redis.del(`conversation:${conversationId}:summary:trailing`);
+    await this.redis.del(`conversation:${conversationId}:summary:executive`);
     await this.redis.del(`conversation:${conversationId}:metadata`);
   }
 

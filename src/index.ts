@@ -186,6 +186,24 @@ export class Red {
       redInstance: this, // Pass the entire instance into the graph
     };
 
+    // Inject a system message into the graph state for every respond() call.
+    // Use env override if available so this can be configured without code changes.
+    const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || `You are Red, an AI assistant developed by redbtn.io.
+Current date: ${new Date().toLocaleDateString()}
+Device: ${options.source?.device || 'unknown'}
+Application: ${options.source?.application || 'unknown'}
+
+CRITICAL RULES:
+1. NEVER mention "knowledge cutoff", "training data", "as of my knowledge", or any limitations
+2. NEVER introduce yourself unless this is the FIRST message in a new conversation or you're asked to do so
+3. NEVER add disclaimers like "please note" or "for the most up-to-date information", and don't repeat the query to the user
+4. If you have search results, use them directly and confidently
+5. Be concise and helpful - answer the question directly without extra explanations`;
+    // Attach as `systemMessage` so the chat node can include it while still loading
+    // memory and the user query (we avoid pre-populating `messages` which would
+    // prevent chatNode from inserting memory context).
+    (initialState as any).systemMessage = SYSTEM_PROMPT;
+
     // Check if streaming is requested
     if (options.stream) {
       // Use LangGraph's streaming capabilities to stream through the graph
@@ -230,21 +248,54 @@ export class Red {
     const stream = redGraph.streamEvents(initialState, { version: "v1" });
     let finalMessage: any = null;
     let fullContent = '';
+    let streamedTokens = false;
     
     for await (const event of stream) {
-      // Yield streaming content chunks
-      if (event.event === "on_llm_stream" && event.data?.chunk?.content) {
+      // Filter out LLM calls from router and toolPicker nodes (classification/tool selection)
+      // Check multiple event properties to identify the source node
+      const eventName = event.name || '';
+      const eventTags = event.tags || [];
+      const runName = event.metadata?.langgraph_node || '';
+      
+      // A node is router/toolPicker if any identifier contains those strings
+      const isRouterOrToolPicker = 
+        eventName.toLowerCase().includes('router') || 
+        eventName.toLowerCase().includes('toolpicker') ||
+        runName.toLowerCase().includes('router') ||
+        runName.toLowerCase().includes('toolpicker') ||
+        eventTags.some((tag: string) => tag.toLowerCase().includes('router') || tag.toLowerCase().includes('toolpicker'));
+      
+      // Yield streaming content chunks (for models that stream tokens)
+      // But only from the chat node, not router/toolPicker
+      if (event.event === "on_llm_stream" && event.data?.chunk?.content && !isRouterOrToolPicker) {
         const content = event.data.chunk.content;
         fullContent += content;
+        streamedTokens = true;
         yield content;
       }
       // Capture the final message when LLM completes - use on_llm_end
-      if (event.event === "on_llm_end") {
+      // Only from chat node
+      if (event.event === "on_llm_end" && !isRouterOrToolPicker) {
         // The AIMessage is nested in the generations array
         const generations = event.data?.output?.generations;
         if (generations && generations[0] && generations[0][0]?.message) {
           finalMessage = generations[0][0].message;
         }
+      }
+    }
+    
+    // If no tokens were streamed (e.g., when using tool calls like 'speak'),
+    // get the final content and stream it character by character
+    if (!streamedTokens && finalMessage && finalMessage.content) {
+      fullContent = finalMessage.content;
+      
+      // Stream the content character by character for smooth UX
+      const words = fullContent.split(' ');
+      for (let i = 0; i < words.length; i++) {
+        const word = words[i];
+        yield i === 0 ? word : ' ' + word;
+        // Small delay for smooth streaming effect (optional)
+        await new Promise(resolve => setTimeout(resolve, 20));
       }
     }
     
@@ -265,6 +316,11 @@ export class Red {
       
       // Trigger background title generation (non-blocking)
       this._generateTitleInBackground(conversationId, messageCount);
+      
+      // Trigger executive summary generation after 3rd+ message (non-blocking)
+      if (messageCount >= 3) {
+        this._generateExecutiveSummaryInBackground(conversationId);
+      }
     }
     
     // After all chunks are sent, yield the final AIMessage with complete token data
@@ -282,6 +338,18 @@ export class Red {
       const response = await this.localModel.invoke([{ role: 'user', content: prompt }]);
       return response.content as string;
     }).catch(err => console.error('[Red] Summarization failed:', err));
+  }
+
+  /**
+   * Generate executive summary in background (non-blocking)
+   * Called after 3rd+ AI response
+   * @private
+   */
+  private _generateExecutiveSummaryInBackground(conversationId: string): void {
+    this.memory.generateExecutiveSummary(conversationId, async (prompt) => {
+      const response = await this.localModel.invoke([{ role: 'user', content: prompt }]);
+      return response.content as string;
+    }).catch(err => console.error('[Red] Executive summary generation failed:', err));
   }
 
   /**
