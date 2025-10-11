@@ -5,6 +5,7 @@
 import type { MemoryManager } from '../../lib/memory/memory';
 import type { ChatOllama } from '@langchain/ollama';
 import { extractThinking } from '../../lib/utils/thinking';
+import { getDatabase } from '../../lib/memory/database';
 
 /**
  * Generate a title for the conversation based on the first few messages
@@ -48,9 +49,13 @@ ${conversationText}`;
     const { cleanedContent } = extractThinking(rawContent);
     const title = cleanedContent.trim().replace(/^["']|["']$/g, ''); // Remove quotes if any
 
-    // Store title in metadata
+    // Store title in Redis metadata
     const metaKey = `conversation:${conversationId}:metadata`;
     await memory['redis'].hset(metaKey, 'title', title);
+    
+    // Also update title in MongoDB database
+    const database = await getDatabase();
+    await database.updateConversationTitle(conversationId, title);
     
     console.log(`[Red] Generated title for ${conversationId}: "${title}"`);
   } catch (err) {
@@ -72,6 +77,11 @@ export async function setConversationTitle(
     'title': title,
     'titleSetByUser': 'true'
   });
+  
+  // Also update title in MongoDB database
+  const database = await getDatabase();
+  await database.updateConversationTitle(conversationId, title);
+  
   console.log(`[Red] User set title for ${conversationId}: "${title}"`);
 }
 
