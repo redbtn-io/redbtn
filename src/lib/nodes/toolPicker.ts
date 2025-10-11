@@ -1,6 +1,7 @@
 import { Red } from '../..';
 import { allTools } from '../tools';
 import { SystemMessage } from '@langchain/core/messages';
+import { extractThinking, logThinking } from '../utils/thinking';
 
 /**
  * The toolPicker node executes web_search tool before routing to chat.
@@ -13,74 +14,232 @@ import { SystemMessage } from '@langchain/core/messages';
 export async function toolPickerNode(state: any): Promise<Partial<any>> {
   const query = state.query?.message || '';
   const redInstance: Red = state.redInstance;
+  const toolAction = state.toolAction || 'web_search';
+  const toolParam = state.toolParam || '';
+  const generationId = state.options?.generationId;
   const conversationId = state.options?.conversationId;
 
   try {
-    console.log('[ToolPicker] Executing web_search for:', query.substring(0, 60) + '...');
+    // Log tool execution start
+    const toolEmojis: Record<string, string> = {
+      'web_search': '🔍',
+      'scrape_url': '📄',
+      'system_command': '⚙️',
+    };
+    const emoji = toolEmojis[toolAction] || '🔧';
     
-    // Get executive summary for context (if exists)
-    let executiveSummary = '';
-    if (conversationId) {
-      const summary = await redInstance.memory.getExecutiveSummary(conversationId);
-      if (summary) {
-        executiveSummary = `\n\n[Conversation Context]\n${summary}\n`;
-        console.log('[ToolPicker] Including executive summary in search context');
+    await redInstance.logger.log({
+      level: 'info',
+      category: 'tool',
+      message: `<yellow>${emoji} Executing tool:</yellow> <bold>${toolAction}</bold>`,
+      generationId,
+      conversationId,
+      metadata: { tool: toolAction, param: toolParam },
+    });
+    
+    let result = '';
+    let toolUsed = toolAction;
+    let searchQuery = query; // Default to original query
+    
+    // For web_search, let LLM optimize the search terms
+    if (toolAction === 'web_search') {
+      await redInstance.logger.log({
+        level: 'debug',
+        category: 'tool',
+        message: `<dim>Optimizing search query...</dim>`,
+        generationId,
+        conversationId,
+      });
+      
+      const currentDate = new Date().toLocaleDateString('en-US', { 
+        weekday: 'long', 
+        year: 'numeric', 
+        month: 'long', 
+        day: 'numeric' 
+      });
+      
+      const searchOptimization = await redInstance.localModel.invoke([
+        {
+          role: 'system',
+          content: `You are a search query optimizer for an Artificial Intelligence named Red.
+          Today's date: ${currentDate}. 
+          
+          Extract the key search terms from the user's prompt. 
+
+          Return ONLY the optimized search query, nothing else.`
+        },
+        {
+          role: 'user',
+          content: query
+        }
+      ]);
+      
+      const { thinking, cleanedContent } = extractThinking(searchOptimization.content.toString());
+      
+      // Log optimization thinking
+      if (thinking && generationId && conversationId) {
+        await redInstance.logger.logThought({
+          content: thinking,
+          source: 'toolPicker-search-optimization',
+          generationId,
+          conversationId,
+        });
       }
+      
+      logThinking(thinking, 'ToolPicker (Search Optimization)');
+      searchQuery = cleanedContent.trim();
+      
+      await redInstance.logger.log({
+        level: 'info',
+        category: 'tool',
+        message: `<cyan>Optimized search:</cyan> <dim>"${query.substring(0, 40)}${query.length > 40 ? '...' : ''}"</dim> → <green>"${searchQuery}"</green>`,
+        generationId,
+        conversationId,
+        metadata: { originalQuery: query, optimizedQuery: searchQuery },
+      });
     }
     
-    // Find and execute web_search tool with the user's query + context
-    const webSearchTool = allTools.find(t => t.name === 'web_search');
-    
-    if (!webSearchTool) {
-      console.error('[ToolPicker] web_search tool not found');
-      return { selectedTools: [], messages: [] };
+    // Execute the specific tool the router chose
+    if (toolAction === 'web_search') {
+      const webSearchTool = allTools.find(t => t.name === 'web_search');
+      if (!webSearchTool) {
+        await redInstance.logger.log({
+          level: 'error',
+          category: 'tool',
+          message: `<red>✗ Tool not found:</red> web_search`,
+          generationId,
+          conversationId,
+        });
+        return { selectedTools: [], messages: [], toolStatus: 'error: tool not found' };
+      }
+      result = await webSearchTool.invoke({ query: searchQuery });
+      
+    } else if (toolAction === 'scrape_url') {
+      const scrapeTool = allTools.find(t => t.name === 'scrape_url');
+      if (!scrapeTool) {
+        await redInstance.logger.log({
+          level: 'error',
+          category: 'tool',
+          message: `<red>✗ Tool not found:</red> scrape_url`,
+          generationId,
+          conversationId,
+        });
+        return { selectedTools: [], messages: [], toolStatus: 'error: tool not found' };
+      }
+      const urlToScrape = toolParam || query;
+      await redInstance.logger.log({
+        level: 'debug',
+        category: 'tool',
+        message: `<dim>Scraping URL: ${urlToScrape}</dim>`,
+        generationId,
+        conversationId,
+      });
+      result = await scrapeTool.invoke({ url: urlToScrape });
+      
+    } else if (toolAction === 'system_command') {
+      const commandTool = allTools.find(t => t.name === 'send_command');
+      if (!commandTool) {
+        await redInstance.logger.log({
+          level: 'error',
+          category: 'tool',
+          message: `<red>✗ Tool not found:</red> send_command`,
+          generationId,
+          conversationId,
+        });
+        return { selectedTools: [], messages: [], toolStatus: 'error: tool not found' };
+      }
+      const command = toolParam || query;
+      await redInstance.logger.log({
+        level: 'debug',
+        category: 'tool',
+        message: `<dim>Executing command: ${command}</dim>`,
+        generationId,
+        conversationId,
+      });
+      result = await commandTool.invoke({ command });
     }
-
-    // Build enhanced query with context
-    const enhancedQuery = executiveSummary 
-      ? `${query}${executiveSummary}`
-      : query;
-
-    const result = await webSearchTool.invoke({ query: enhancedQuery });
     
-    // Check if search results are relevant using LLM
-    console.log('[ToolPicker] Validating search result relevance...');
-    const relevanceCheck = await redInstance.localModel.invoke([
+    // Log tool completion
+    await redInstance.logger.log({
+      level: 'success',
+      category: 'tool',
+      message: `<green>✓ Tool completed:</green> <bold>${toolAction}</bold> <dim>(${result.length} chars)</dim>`,
+      generationId,
+      conversationId,
+      metadata: { tool: toolAction, resultLength: result.length },
+    });
+    
+    // Extract and summarize the information
+    await redInstance.logger.log({
+      level: 'debug',
+      category: 'tool',
+      message: `<dim>Extracting key information...</dim>`,
+      generationId,
+      conversationId,
+    });
+    const currentDate = new Date().toLocaleDateString('en-US', { 
+      weekday: 'long', 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    });
+    
+    const extractedInfo = await redInstance.localModel.invoke([
       {
         role: 'system',
-        content: 'You are a search quality evaluator. Determine if the search results provide useful information to answer the user query. Reply with ONLY "RELEVANT" or "NOT_RELEVANT".'
+        content: `Today's date: ${currentDate}. You are an information extraction expert. Extract key facts and data to answer the user's query accurately and concisely.`
       },
       {
         role: 'user',
-        content: `User Query: ${query}\n\nSearch Results:\n${result}\n\nAre these results relevant and useful for answering the query?`
+        content: `User Query: ${query}\n\nTool Results:\n${result}\n\nExtract and summarize the key information that answers this query:`
       }
     ]);
+
+    let summary = extractedInfo.content.toString().trim();
     
-    const relevanceResponse = relevanceCheck.content.toString().trim().toUpperCase();
-    const isRelevant = relevanceResponse.includes('RELEVANT') && !relevanceResponse.includes('NOT_RELEVANT');
+    // Extract and log thinking if present (safe for all models)
+    const { thinking, cleanedContent } = extractThinking(summary);
     
-    if (!isRelevant) {
-      console.log('[ToolPicker] Search results deemed not relevant - falling back to direct answer');
-      return { 
-        selectedTools: ['web_search'], 
-        messages: [
-          new SystemMessage(`[Web Search Note]\nSearch was performed but results were not relevant to the query. Answer based on your knowledge instead.`)
-        ] 
-      };
+    // Log extraction thinking
+    if (thinking && generationId && conversationId) {
+      await redInstance.logger.logThought({
+        content: thinking,
+        source: 'toolPicker-extraction',
+        generationId,
+        conversationId,
+      });
     }
     
-    console.log('[ToolPicker] Search results validated as relevant');
+    logThinking(thinking, 'ToolPicker');
+    summary = cleanedContent;
     
-    // Add tool result as a SystemMessage (proper LangChain message type)
+    await redInstance.logger.log({
+      level: 'success',
+      category: 'tool',
+      message: `<green>✓ Information extracted</green> <dim>(${summary.length} chars)</dim>`,
+      generationId,
+      conversationId,
+      metadata: { summaryLength: summary.length },
+    });
+    
+    // Add extracted/summarized info as a SystemMessage
     return {
-      selectedTools: ['web_search'],
+      selectedTools: [toolUsed],
       messages: [
-        new SystemMessage(`[Web Search Results]\n${result}\n\nUse this information to answer the user's query.`)
+        new SystemMessage(`[INTERNAL CONTEXT - User cannot see this]\nRelevant information found:\n\n${summary}\n\nUse this information to answer the user's query directly and confidently. Do not say "according to search results" or reference external sources - answer as if you know this information.`)
       ]
     };
 
   } catch (error) {
-    console.error('[ToolPicker] Error executing tool:', error);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    await redInstance.logger.log({
+      level: 'error',
+      category: 'tool',
+      message: `<red>✗ Tool execution error:</red> ${errorMessage}`,
+      generationId,
+      conversationId,
+      metadata: { error: errorMessage, tool: toolAction },
+    });
     return { selectedTools: [], messages: [] };
   }
 }

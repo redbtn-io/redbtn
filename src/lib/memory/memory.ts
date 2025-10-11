@@ -1,10 +1,11 @@
 /**
  * @file src/lib/memory.ts
- * @description Conversation memory management with Redis storage
+ * @description Conversation memory management with MongoDB persistence and Redis caching
  */
 
 import Redis from 'ioredis';
-import { countTokens, freeTiktoken } from './tokenizer';
+import { countTokens, freeTiktoken } from '../utils/tokenizer';
+import { getDatabase, StoredMessage } from './database';
 
 export interface ConversationMessage {
   role: 'system' | 'user' | 'assistant';
@@ -24,10 +25,13 @@ export interface ConversationMetadata {
 
 export class MemoryManager {
   private redis: Redis;
+  public readonly redisUrl: string;
   private readonly MAX_CONTEXT_TOKENS = parseInt(process.env.MAX_CONTEXT_TOKENS || '30000');
   private readonly SUMMARY_CUSHION_TOKENS = parseInt(process.env.SUMMARY_CUSHION_TOKENS || '2000');
+  private readonly REDIS_MESSAGE_LIMIT = 100; // Keep last 100 messages in Redis for hot context
 
   constructor(redisUrl: string) {
+    this.redisUrl = redisUrl;
     this.redis = new Redis(redisUrl);
   }
 
@@ -110,32 +114,102 @@ export class MemoryManager {
 
   /**
    * Add a new message to the conversation
+   * Stores in both MongoDB (persistence) and Redis (hot cache of last 100 messages)
    */
   async addMessage(conversationId: string, message: ConversationMessage): Promise<void> {
-    const key = `conversation:${conversationId}:messages`;
+    const key = `conversations:${conversationId}:messages`;
     
-    // Add message to Redis list
+    // Store in MongoDB for persistence (non-blocking, ignore errors)
+    getDatabase().storeMessage({
+      conversationId,
+      role: message.role,
+      content: message.content,
+      timestamp: new Date(message.timestamp),
+      metadata: {}
+    }).catch(err => {
+      console.warn('[Memory] Failed to save message to MongoDB:', err.message);
+    });
+    
+    // Add to Redis (hot cache)
     await this.redis.rpush(key, JSON.stringify(message));
+    
+    // Trim Redis to keep only last 100 messages
+    const messageCount = await this.redis.llen(key);
+    if (messageCount > this.REDIS_MESSAGE_LIMIT) {
+      const trimCount = messageCount - this.REDIS_MESSAGE_LIMIT;
+      await this.redis.ltrim(key, trimCount, -1);
+      console.log(`[Memory] Trimmed ${trimCount} old messages from Redis cache for ${conversationId}`);
+    }
     
     // Update metadata
     await this.updateMetadata(conversationId);
   }
 
   /**
-   * Get all messages for a conversation
+   * Get all messages for a conversation from MongoDB (full history)
+   * For recent hot context, messages are served from Redis cache
    */
   async getMessages(conversationId: string): Promise<ConversationMessage[]> {
-    const key = `conversation:${conversationId}:messages`;
+    // Try Redis first (hot cache - last 100 messages)
+    const key = `conversations:${conversationId}:messages`;
     const messagesJson = await this.redis.lrange(key, 0, -1);
     
-    return messagesJson.map((json: string) => JSON.parse(json));
+    if (messagesJson.length > 0) {
+      return messagesJson.map((json: string) => JSON.parse(json));
+    }
+    
+    // If not in Redis, try to fetch from MongoDB and populate Redis
+    try {
+      const db = getDatabase();
+      const dbMessages = await db.getLastMessages(conversationId, this.REDIS_MESSAGE_LIMIT);
+      
+      if (dbMessages.length > 0) {
+        // Populate Redis cache
+        const pipeline = this.redis.pipeline();
+        for (const msg of dbMessages) {
+          const convMsg: ConversationMessage = {
+            role: msg.role,
+            content: msg.content,
+            timestamp: msg.timestamp.getTime()
+          };
+          pipeline.rpush(key, JSON.stringify(convMsg));
+        }
+        await pipeline.exec();
+        
+        console.log(`[Memory] Populated Redis cache with ${dbMessages.length} messages from MongoDB for ${conversationId}`);
+        
+        return dbMessages.map(msg => ({
+          role: msg.role,
+          content: msg.content,
+          timestamp: msg.timestamp.getTime()
+        }));
+      }
+    } catch (error) {
+      console.warn('[Memory] Failed to fetch from MongoDB:', error instanceof Error ? error.message : String(error));
+    }
+    
+    return [];
+  }
+
+  /**
+   * Get all messages from MongoDB (for full conversation history)
+   */
+  async getAllMessagesFromDB(conversationId: string): Promise<ConversationMessage[]> {
+    const db = getDatabase();
+    const dbMessages = await db.getMessages(conversationId);
+    
+    return dbMessages.map(msg => ({
+      role: msg.role,
+      content: msg.content,
+      timestamp: msg.timestamp.getTime()
+    }));
   }
 
   /**
    * Get trailing summary (old trimmed messages)
    */
   async getTrailingSummary(conversationId: string): Promise<string | null> {
-    const key = `conversation:${conversationId}:summary:trailing`;
+    const key = `conversations:${conversationId}:summary:trailing`;
     return await this.redis.get(key);
   }
 
@@ -143,8 +217,8 @@ export class MemoryManager {
    * Store trailing summary (old trimmed messages)
    */
   async setTrailingSummary(conversationId: string, summary: string): Promise<void> {
-    const summaryKey = `conversation:${conversationId}:summary:trailing`;
-    const metaKey = `conversation:${conversationId}:metadata`;
+    const summaryKey = `conversations:${conversationId}:summary:trailing`;
+    const metaKey = `conversations:${conversationId}:metadata`;
     
     await this.redis.set(summaryKey, summary);
     await this.redis.hset(metaKey, 'trailingSummaryGenerated', 'true');
@@ -156,7 +230,7 @@ export class MemoryManager {
    * Get executive summary (full conversation overview)
    */
   async getExecutiveSummary(conversationId: string): Promise<string | null> {
-    const key = `conversation:${conversationId}:summary:executive`;
+    const key = `conversations:${conversationId}:summary:executive`;
     return await this.redis.get(key);
   }
 
@@ -164,7 +238,7 @@ export class MemoryManager {
    * Store executive summary (full conversation overview)
    */
   async setExecutiveSummary(conversationId: string, summary: string): Promise<void> {
-    const summaryKey = `conversation:${conversationId}:summary:executive`;
+    const summaryKey = `conversations:${conversationId}:summary:executive`;
     await this.redis.set(summaryKey, summary);
     console.log(`[Memory] Updated executive summary for ${conversationId}`);
   }
@@ -173,7 +247,7 @@ export class MemoryManager {
    * Get conversation metadata
    */
   async getMetadata(conversationId: string): Promise<ConversationMetadata | null> {
-    const key = `conversation:${conversationId}:metadata`;
+    const key = `conversations:${conversationId}:metadata`;
     const data = await this.redis.hgetall(key);
     
     if (Object.keys(data).length === 0) {
@@ -195,8 +269,8 @@ export class MemoryManager {
    * Update conversation metadata
    */
   private async updateMetadata(conversationId: string): Promise<void> {
-    const key = `conversation:${conversationId}:metadata`;
-    const messageCount = await this.redis.llen(`conversation:${conversationId}:messages`);
+    const key = `conversations:${conversationId}:metadata`;
+    const messageCount = await this.redis.llen(`conversations:${conversationId}:messages`);
     
     // Calculate total tokens
     const messages = await this.getMessages(conversationId);
@@ -261,7 +335,7 @@ export class MemoryManager {
     const messagesToKeep = messages.slice(keepFromIndex);
     
     // Clear old messages and store only recent ones
-    const messagesKey = `conversation:${conversationId}:messages`;
+    const messagesKey = `conversations:${conversationId}:messages`;
     await this.redis.del(messagesKey);
     
     for (const msg of messagesToKeep) {
@@ -281,7 +355,7 @@ export class MemoryManager {
     
     // Return the content to summarize (caller will invoke LLM)
     // Store a marker that we need to generate trailing summary
-    const metaKey = `conversation:${conversationId}:metadata`;
+    const metaKey = `conversations:${conversationId}:metadata`;
     await this.redis.hset(metaKey, 'needsTrailingSummaryGeneration', 'true');
     await this.redis.hset(metaKey, 'contentToSummarize', contentToSummarize);
     
@@ -293,7 +367,7 @@ export class MemoryManager {
    * Get content that needs to be summarized (after trimAndSummarize was called)
    */
   async getContentToSummarize(conversationId: string): Promise<string | null> {
-    const metaKey = `conversation:${conversationId}:metadata`;
+    const metaKey = `conversations:${conversationId}:metadata`;
     return await this.redis.hget(metaKey, 'contentToSummarize');
   }
   
@@ -301,7 +375,7 @@ export class MemoryManager {
    * Check if trailing summary generation is pending
    */
   async needsSummaryGeneration(conversationId: string): Promise<boolean> {
-    const metaKey = `conversation:${conversationId}:metadata`;
+    const metaKey = `conversations:${conversationId}:metadata`;
     const value = await this.redis.hget(metaKey, 'needsTrailingSummaryGeneration');
     return value === 'true';
   }
@@ -431,10 +505,10 @@ ${contentToSummarize}`;
    * Delete a conversation (for cleanup/testing)
    */
   async deleteConversation(conversationId: string): Promise<void> {
-    await this.redis.del(`conversation:${conversationId}:messages`);
-    await this.redis.del(`conversation:${conversationId}:summary:trailing`);
-    await this.redis.del(`conversation:${conversationId}:summary:executive`);
-    await this.redis.del(`conversation:${conversationId}:metadata`);
+    await this.redis.del(`conversations:${conversationId}:messages`);
+    await this.redis.del(`conversations:${conversationId}:summary:trailing`);
+    await this.redis.del(`conversations:${conversationId}:summary:executive`);
+    await this.redis.del(`conversations:${conversationId}:metadata`);
   }
 
   /**

@@ -11,7 +11,7 @@ const searchSchema = z.object({
  */
 class WebSearchTool extends StructuredTool {
   name = "web_search";
-  description = "Search the web using Google and get actual content from the pages. Use this when you need current information, facts, news, or data that you don't have in your training data. Returns up to 5 search results with titles, snippets, URLs, and 200 tokens of body content from each page.";
+  description = "Search the web using Google and get actual content from the pages. Use this when you need current information, facts, news, or data that you don't have in your training data. Returns up to 10 search results with titles, snippets, URLs, and relevant body content from each page.";
   schema = searchSchema as any; // Type assertion to bypass deep instantiation
 
   async _call({ query }: { query: string }): Promise<string> {
@@ -30,7 +30,7 @@ class WebSearchTool extends StructuredTool {
 
       console.log(`[Web Search Tool] Searching for: "${query}"`);
       const searchStartTime = Date.now();
-      const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${searchEngineId}&q=${encodeURIComponent(query)}&num=5`;
+      const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${searchEngineId}&q=${encodeURIComponent(query)}&num=10`;
       
       const response = await fetch(url);
       const searchDuration = Date.now() - searchStartTime;
@@ -51,7 +51,7 @@ class WebSearchTool extends StructuredTool {
       console.log(`[Web Search Tool] Scraping ${data.items.length} results...`);
       const scrapeStartTime = Date.now();
       const scrapePromises = data.items.map((item: any) => 
-        this.scrapeUrl(item.link).catch(err => `Error: ${err.message}`)
+        this.scrapeUrl(item.link, query).catch(err => `Error: ${err.message}`)
       );
       
       const scrapedContents = await Promise.all(scrapePromises);
@@ -65,7 +65,7 @@ class WebSearchTool extends StructuredTool {
    Snippet: ${item.snippet}
    URL: ${item.link}
    
-   Content preview:
+   Content:
    ${content}`;
       }).join('\n\n---\n\n');
 
@@ -81,16 +81,17 @@ class WebSearchTool extends StructuredTool {
   }
 
   /**
-   * Scrape a URL and extract text content, limited to 200 tokens
+   * Scrape a URL and extract relevant text content based on query keywords
+   * Extracts up to 1500 tokens of the most relevant content
    */
-  private async scrapeUrl(url: string): Promise<string> {
+  private async scrapeUrl(url: string, query: string): Promise<string> {
     const scrapeStart = Date.now();
     try {
       const response = await fetch(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (compatible; RedBot/1.0; +https://redbtn.io)'
         },
-        signal: AbortSignal.timeout(5000) // 5 second timeout per page
+        signal: AbortSignal.timeout(8000) // 8 second timeout per page
       });
 
       if (!response.ok) {
@@ -112,10 +113,11 @@ class WebSearchTool extends StructuredTool {
         return '[No text content found]';
       }
 
-      const truncated = this.truncateToTokens(textContent, 200);
+      // Extract relevant sections based on query keywords
+      const relevantContent = this.extractRelevantSections(textContent, query, 1500);
       const duration = Date.now() - scrapeStart;
-      console.log(`[Web Search Tool] ⏱️  ${url} - Success (${duration}ms, ${truncated.length} chars)`);
-      return truncated;
+      console.log(`[Web Search Tool] ⏱️  ${url} - Success (${duration}ms, ${relevantContent.length} chars)`);
+      return relevantContent;
     } catch (error: any) {
       const duration = Date.now() - scrapeStart;
       if (error.name === 'AbortError' || error.name === 'TimeoutError') {
@@ -125,6 +127,91 @@ class WebSearchTool extends StructuredTool {
       console.log(`[Web Search Tool] ⏱️  ${url} - Error (${duration}ms): ${error.message}`);
       return `[Error: ${error.message}]`;
     }
+  }
+
+  /**
+   * Extract the most relevant sections from text based on query keywords
+   * Uses keyword matching to find paragraphs/sections that contain query terms
+   */
+  private extractRelevantSections(text: string, query: string, maxTokens: number): string {
+    // Extract keywords from query (remove common words)
+    const stopWords = new Set(['a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 
+      'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could', 'may', 'might',
+      'what', 'when', 'where', 'who', 'which', 'why', 'how', 'for', 'to', 'of', 'in', 'on', 'at',
+      'by', 'with', 'from', 'about', 'as', 'into', 'through', 'during', 'before', 'after', 'above',
+      'below', 'between', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'all', 'any',
+      'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only',
+      'own', 'same', 'so', 'than', 'too', 'very', 'can', 'just', 'today', 'tonight', 'this', 'that']);
+    
+    const keywords = query.toLowerCase()
+      .split(/\s+/)
+      .filter(word => word.length > 2 && !stopWords.has(word));
+    
+    if (keywords.length === 0) {
+      // No meaningful keywords, just truncate from beginning
+      return this.truncateToTokens(text, maxTokens);
+    }
+    
+    // Split text into sentences
+    const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+    
+    // Score each sentence based on keyword matches
+    const scoredSentences = sentences.map(sentence => {
+      const lowerSentence = sentence.toLowerCase();
+      let score = 0;
+      
+      for (const keyword of keywords) {
+        const regex = new RegExp(`\\b${keyword}\\w*\\b`, 'gi');
+        const matches = lowerSentence.match(regex);
+        if (matches) {
+          score += matches.length * 10; // Weight keyword matches heavily
+        }
+      }
+      
+      // Bonus for sentences with numbers (often contain useful data like dates, scores, times)
+      if (/\d+/.test(sentence)) {
+        score += 5;
+      }
+      
+      return { sentence: sentence.trim(), score };
+    });
+    
+    // Sort by score (highest first) and collect relevant content
+    scoredSentences.sort((a, b) => b.score - a.score);
+    
+    let collectedText = '';
+    const usedSentences = new Set<string>();
+    
+    // First pass: collect high-scoring sentences
+    for (const item of scoredSentences) {
+      if (item.score > 0 && !usedSentences.has(item.sentence)) {
+        const potentialText = collectedText + (collectedText ? ' ' : '') + item.sentence;
+        const tokenCount = this.estimateTokens(potentialText);
+        
+        if (tokenCount > maxTokens) {
+          break;
+        }
+        
+        collectedText = potentialText;
+        usedSentences.add(item.sentence);
+      }
+    }
+    
+    // If we didn't collect enough content, add some context from the beginning
+    if (this.estimateTokens(collectedText) < maxTokens * 0.5) {
+      const beginningText = sentences.slice(0, 10).map(s => s.trim()).join(' ');
+      const combined = beginningText + ' ... ' + collectedText;
+      return this.truncateToTokens(combined, maxTokens);
+    }
+    
+    return collectedText || this.truncateToTokens(text, maxTokens);
+  }
+
+  /**
+   * Estimate token count (rough approximation: 1 token ≈ 4 characters)
+   */
+  private estimateTokens(text: string): number {
+    return Math.ceil(text.length / 4);
   }
 
   /**

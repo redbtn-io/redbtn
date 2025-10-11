@@ -11,8 +11,34 @@ import { ChatOpenAI } from "@langchain/openai";
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 
 import { redGraph } from "./lib/graphs/red";
-import { MemoryManager } from "./lib/memory";
+import { MemoryManager } from "./lib/memory/memory";
+import { MessageQueue } from "./lib/memory/queue";
+import { Logger } from "./lib/logs/logger";
 import { createGeminiModel, createLocalModel, createOpenAIModel } from "./lib/models";
+import * as background from "./functions/background";
+import { respond as respondFunction } from "./functions/respond";
+
+// Export database utilities for external use
+export { 
+  getDatabase, 
+  resetDatabase,
+  DatabaseManager, 
+  StoredMessage, 
+  Conversation,
+  StoredLog,
+  Generation,
+  BaseDocument,
+} from "./lib/memory/database";
+
+// Export message queue for background processing
+export { MessageQueue, MessageGenerationState } from "./lib/memory/queue";
+
+// Export logging system
+export * from "./lib/logs";
+export { PersistentLogger } from "./lib/logs/persistent-logger";
+
+// Export thinking utilities for DeepSeek-R1 and similar models
+export { extractThinking, logThinking, extractAndLogThinking } from "./lib/utils/thinking";
 
 // --- Type Definitions ---
 
@@ -38,6 +64,8 @@ export interface InvokeOptions {
   };
   stream?: boolean; // Flag to enable streaming responses
   conversationId?: string; // Optional conversation ID - will be auto-generated if not provided
+  generationId?: string; // Optional generation ID - will be auto-generated if not provided
+  messageId?: string; // Optional message ID for Redis pub/sub streaming
 }
 
 // --- The Red Library Class ---
@@ -52,12 +80,16 @@ export class Red {
   private isThinking: boolean = false;
   private baseState: object = {};
   private nodeId?: string;
+  private heartbeatInterval?: NodeJS.Timeout;
 
   // Properties to hold the configured model instances
   public localModel!: ChatOllama;
   public openAIModel?: ChatOpenAI;
   public geminiModel?: ChatGoogleGenerativeAI;
   public memory!: MemoryManager;
+  public messageQueue!: MessageQueue;
+  public logger!: Logger;
+  private redis!: any; // Redis client for heartbeat
 
   /**
    * Constructs a new instance of the Red AI engine.
@@ -73,6 +105,14 @@ export class Red {
     
     // Initialize memory manager
     this.memory = new MemoryManager(config.redisUrl);
+    
+    // Initialize message queue with same Redis connection
+    const redis = new (require('ioredis'))(config.redisUrl);
+    this.redis = redis;
+    this.messageQueue = new MessageQueue(redis);
+    
+    // Initialize logger with same Redis connection
+    this.logger = new Logger(redis);
   }
 
   // --- Private Internal Methods ---
@@ -117,17 +157,33 @@ export class Red {
 
     if (nodeId) {
       this.nodeId = nodeId;
+    } else {
+      // Generate a default nodeId if not provided
+      this.nodeId = `node_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     }
 
-    console.log(`Loading base state for node: ${this.nodeId || 'primary'}...`);
+    console.log(`Loading base state for node: ${this.nodeId}...`);
     
     // TODO: Implement the actual state fetching logic from Redis using `this.config.redisUrl`.
     // The `nodeId` can be used to fetch a specific state for recovery or distributed operation.
     
     this.baseState = { loadedAt: new Date(), nodeId: this.nodeId };
     this.isLoaded = true;
+    
+    // Start heartbeat to register node as active
+    this.heartbeatInterval = background.startHeartbeat(this.nodeId, this.redis);
+    
     console.log('Base state loaded successfully.');
   }
+
+  /**
+   * Gets a list of all currently active nodes.
+   * @returns Array of active node IDs
+   */
+  public async getActiveNodes(): Promise<string[]> {
+    return background.getActiveNodes(this.redis);
+  }
+  
   /**
    * Starts the autonomous, continuous "thinking" loop. The loop runs internally
    * until `stopThinking()` is called.
@@ -162,6 +218,28 @@ export class Red {
   }
 
   /**
+   * Gracefully shuts down the Red instance, stopping heartbeat and cleaning up resources.
+   */
+  public async shutdown(): Promise<void> {
+    console.log(`[Red] Shutting down node: ${this.nodeId}...`);
+    
+    // Stop thinking if active
+    this.stopThinking();
+    
+    // Stop heartbeat
+    await background.stopHeartbeat(this.nodeId, this.redis, this.heartbeatInterval);
+    this.heartbeatInterval = undefined;
+    
+    // Close Redis connection
+    if (this.redis) {
+      await this.redis.quit();
+    }
+    
+    this.isLoaded = false;
+    console.log('[Red] Shutdown complete');
+  }
+
+  /**
    * Handles a direct, on-demand request from a user-facing application.
    * Automatically manages conversation history, memory, and summarization.
    * @param query The user's input or request data (must have a 'message' property)
@@ -170,230 +248,7 @@ export class Red {
    *          For streaming: an async generator that yields metadata first (with conversationId), then string chunks, then finally the full AIMessage.
    */
   public async respond(query: { message: string }, options: InvokeOptions = {}): Promise<any | AsyncGenerator<string | any, void, unknown>> {
-    // Generate conversation ID if not provided
-    const conversationId = options.conversationId || this.memory.generateConversationId(query.message);
-    
-    // Store user message in memory
-    await this.memory.addMessage(conversationId, {
-      role: 'user',
-      content: query.message,
-      timestamp: Date.now()
-    });
-    
-    const initialState = {
-      query,
-      options: { ...options, conversationId }, // Ensure conversationId is in options
-      redInstance: this, // Pass the entire instance into the graph
-    };
-
-    // Inject a system message into the graph state for every respond() call.
-    // Use env override if available so this can be configured without code changes.
-    const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || `You are Red, an AI assistant developed by redbtn.io.
-Current date: ${new Date().toLocaleDateString()}
-Device: ${options.source?.device || 'unknown'}
-Application: ${options.source?.application || 'unknown'}
-
-CRITICAL RULES:
-1. NEVER mention "knowledge cutoff", "training data", "as of my knowledge", or any limitations
-2. NEVER introduce yourself unless this is the FIRST message in a new conversation or you're asked to do so
-3. NEVER add disclaimers like "please note" or "for the most up-to-date information", and don't repeat the query to the user
-4. If you have search results, use them directly and confidently
-5. Be concise and helpful - answer the question directly without extra explanations`;
-    // Attach as `systemMessage` so the chat node can include it while still loading
-    // memory and the user query (we avoid pre-populating `messages` which would
-    // prevent chatNode from inserting memory context).
-    (initialState as any).systemMessage = SYSTEM_PROMPT;
-
-    // Check if streaming is requested
-    if (options.stream) {
-      // Use LangGraph's streaming capabilities to stream through the graph
-      return this._streamThroughGraphWithMemory(initialState, conversationId);
-    } else {
-      // Invoke the graph and return the full AIMessage
-      const result = await redGraph.invoke(initialState);
-      const response = result.response;
-      
-      // Store assistant response in memory
-      await this.memory.addMessage(conversationId, {
-        role: 'assistant',
-        content: typeof response.content === 'string' ? response.content : JSON.stringify(response.content),
-        timestamp: Date.now()
-      });
-      
-      // Get message count for title generation
-      const metadata = await this.memory.getMetadata(conversationId);
-      const messageCount = metadata?.messageCount || 0;
-      
-      // Trigger background summarization (non-blocking)
-      this._summarizeInBackground(conversationId);
-      
-      // Trigger background title generation (non-blocking)
-      this._generateTitleInBackground(conversationId, messageCount);
-      
-      // Attach conversationId to response for server access
-      return { ...response, conversationId };
-    }
-  }
-
-  /**
-   * Internal method to handle streaming responses through the graph with memory management.
-   * Yields metadata first (with conversationId), then string chunks, then the final AIMessage object.
-   * @private
-   */
-  private async *_streamThroughGraphWithMemory(initialState: any, conversationId: string): AsyncGenerator<string | any, void, unknown> {
-    // Yield metadata first so server can capture conversationId immediately
-    yield { _metadata: true, conversationId };
-    
-    // Use LangGraph's streamEvents to get token-level streaming
-    const stream = redGraph.streamEvents(initialState, { version: "v1" });
-    let finalMessage: any = null;
-    let fullContent = '';
-    let streamedTokens = false;
-    
-    for await (const event of stream) {
-      // Filter out LLM calls from router and toolPicker nodes (classification/tool selection)
-      // Check multiple event properties to identify the source node
-      const eventName = event.name || '';
-      const eventTags = event.tags || [];
-      const runName = event.metadata?.langgraph_node || '';
-      
-      // A node is router/toolPicker if any identifier contains those strings
-      const isRouterOrToolPicker = 
-        eventName.toLowerCase().includes('router') || 
-        eventName.toLowerCase().includes('toolpicker') ||
-        runName.toLowerCase().includes('router') ||
-        runName.toLowerCase().includes('toolpicker') ||
-        eventTags.some((tag: string) => tag.toLowerCase().includes('router') || tag.toLowerCase().includes('toolpicker'));
-      
-      // Yield streaming content chunks (for models that stream tokens)
-      // But only from the chat node, not router/toolPicker
-      if (event.event === "on_llm_stream" && event.data?.chunk?.content && !isRouterOrToolPicker) {
-        const content = event.data.chunk.content;
-        fullContent += content;
-        streamedTokens = true;
-        yield content;
-      }
-      // Capture the final message when LLM completes - use on_llm_end
-      // Only from chat node
-      if (event.event === "on_llm_end" && !isRouterOrToolPicker) {
-        // The AIMessage is nested in the generations array
-        const generations = event.data?.output?.generations;
-        if (generations && generations[0] && generations[0][0]?.message) {
-          finalMessage = generations[0][0].message;
-        }
-      }
-    }
-    
-    // If no tokens were streamed (e.g., when using tool calls like 'speak'),
-    // get the final content and stream it character by character
-    if (!streamedTokens && finalMessage && finalMessage.content) {
-      fullContent = finalMessage.content;
-      
-      // Stream the content character by character for smooth UX
-      const words = fullContent.split(' ');
-      for (let i = 0; i < words.length; i++) {
-        const word = words[i];
-        yield i === 0 ? word : ' ' + word;
-        // Small delay for smooth streaming effect (optional)
-        await new Promise(resolve => setTimeout(resolve, 20));
-      }
-    }
-    
-    // Store assistant response in memory (after streaming completes)
-    if (fullContent) {
-      await this.memory.addMessage(conversationId, {
-        role: 'assistant',
-        content: fullContent,
-        timestamp: Date.now()
-      });
-      
-      // Get message count for title generation
-      const metadata = await this.memory.getMetadata(conversationId);
-      const messageCount = metadata?.messageCount || 0;
-      
-      // Trigger background summarization (non-blocking)
-      this._summarizeInBackground(conversationId);
-      
-      // Trigger background title generation (non-blocking)
-      this._generateTitleInBackground(conversationId, messageCount);
-      
-      // Trigger executive summary generation after 3rd+ message (non-blocking)
-      if (messageCount >= 3) {
-        this._generateExecutiveSummaryInBackground(conversationId);
-      }
-    }
-    
-    // After all chunks are sent, yield the final AIMessage with complete token data
-    if (finalMessage) {
-      yield finalMessage;
-    }
-  }
-  
-  /**
-   * Trigger summarization in background (non-blocking)
-   * @private
-   */
-  private _summarizeInBackground(conversationId: string): void {
-    this.memory.summarizeIfNeeded(conversationId, async (prompt) => {
-      const response = await this.localModel.invoke([{ role: 'user', content: prompt }]);
-      return response.content as string;
-    }).catch(err => console.error('[Red] Summarization failed:', err));
-  }
-
-  /**
-   * Generate executive summary in background (non-blocking)
-   * Called after 3rd+ AI response
-   * @private
-   */
-  private _generateExecutiveSummaryInBackground(conversationId: string): void {
-    this.memory.generateExecutiveSummary(conversationId, async (prompt) => {
-      const response = await this.localModel.invoke([{ role: 'user', content: prompt }]);
-      return response.content as string;
-    }).catch(err => console.error('[Red] Executive summary generation failed:', err));
-  }
-
-  /**
-   * Generate a title for the conversation based on the first few messages
-   * Runs after 2nd message (initial title) and 6th message (refined title)
-   * @private
-   */
-  private async _generateTitleInBackground(conversationId: string, messageCount: number): Promise<void> {
-    try {
-      // Only generate title after 2nd or 6th message
-      if (messageCount !== 2 && messageCount !== 6) {
-        return;
-      }
-
-      // Check if title was manually set by user
-      const metadata = await this.memory.getMetadata(conversationId);
-      if (metadata?.titleSetByUser) {
-        return; // Don't override user-set titles after 6th message
-      }
-
-      // Get recent messages for context
-      const messages = await this.memory.getMessages(conversationId);
-      const conversationText = messages
-        .slice(0, Math.min(6, messages.length)) // Use first 6 messages max
-        .map(m => `${m.role.toUpperCase()}: ${m.content}`)
-        .join('\n');
-
-      // Create prompt for title generation
-      const titlePrompt = `Based on this conversation, generate a short, descriptive title (3-6 words max). Only respond with the title, nothing else:
-
-${conversationText}`;
-
-      // Generate title using LLM
-      const response = await this.localModel.invoke([{ role: 'user', content: titlePrompt }]);
-      const title = (response.content as string).trim().replace(/^["']|["']$/g, ''); // Remove quotes if any
-
-      // Store title in metadata
-      const metaKey = `conversation:${conversationId}:metadata`;
-      await this.memory['redis'].hset(metaKey, 'title', title);
-      
-      console.log(`[Red] Generated title for ${conversationId}: "${title}"`);
-    } catch (err) {
-      console.error('[Red] Title generation failed:', err);
-    }
+    return respondFunction(this, query, options);
   }
 
   /**
@@ -403,12 +258,7 @@ ${conversationText}`;
    * @param title The custom title to set
    */
   public async setConversationTitle(conversationId: string, title: string): Promise<void> {
-    const metaKey = `conversation:${conversationId}:metadata`;
-    await this.memory['redis'].hset(metaKey, {
-      'title': title,
-      'titleSetByUser': 'true'
-    });
-    console.log(`[Red] User set title for ${conversationId}: "${title}"`);
+    return background.setConversationTitle(conversationId, title, this.memory);
   }
 
   /**
@@ -417,8 +267,7 @@ ${conversationText}`;
    * @returns The title or null if not set
    */
   public async getConversationTitle(conversationId: string): Promise<string | null> {
-    const metadata = await this.memory.getMetadata(conversationId);
-    return metadata?.title || null;
+    return background.getConversationTitle(conversationId, this.memory);
   }
 
 }

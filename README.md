@@ -7,8 +7,11 @@
 ## 🚀 Features
 
 - **Graph-Based Architecture**: Built on LangGraph for flexible, composable AI workflows
-- **Intelligent Routing**: Automatic routing based on application context
+- **Intelligent Routing**: Automatic routing based on application context and query analysis
+- **Web Search & Scraping**: Built-in tools for real-time web search and content extraction
 - **Unified Streaming**: Seamless streaming and non-streaming modes with the same API
+- **Stream Reconnection**: Redis-backed message queue with pub/sub for reliable mobile streaming
+- **Persistent Memory**: MongoDB for long-term message storage, Redis for hot state and summaries
 - **Token Tracking**: Complete access to token usage and performance metrics
 - **Type-Safe**: Full TypeScript support with type guards
 - **Extensible**: Easy to add custom nodes and graphs
@@ -55,9 +58,9 @@ The Red AI library provides a unified interface for both streaming and non-strea
 
 ```typescript
 interface RedConfig {
-  redisUrl: string;        // Redis connection for global state
-  vectorDbUrl: string;     // Vector database for memory
-  databaseUrl: string;     // Traditional database for long-term storage
+  redisUrl: string;        // Redis connection for global state & hot memory
+  vectorDbUrl: string;     // Vector database for embeddings (future)
+  databaseUrl: string;     // MongoDB URL for long-term message persistence
   defaultLlmUrl: string;   // Default LLM endpoint (e.g., Ollama)
   llmEndpoints?: {         // Optional: named LLM endpoints
     [agentName: string]: string;
@@ -70,6 +73,13 @@ interface RedConfig {
 ```typescript
 const red = new Red(config);
 await red.load(nodeId?: string);  // Optional node ID for distributed systems
+
+// Access subsystems:
+red.memory         // MemoryManager - conversation history & summaries
+red.messageQueue   // MessageQueue - streaming state & reconnection
+red.localModel     // ChatOllama instance
+red.geminiModel    // ChatGoogleGenerativeAI instance (optional)
+red.openAIModel    // ChatOpenAI instance (optional)
 ```
 
 ### Response Options
@@ -80,9 +90,40 @@ interface InvokeOptions {
     device?: 'phone' | 'speaker' | 'web';
     application?: 'redHome' | 'redChat' | 'redAssistant';
   };
-  stream?: boolean;  // Enable streaming mode
+  stream?: boolean;          // Enable streaming mode
+  conversationId?: string;   // Optional - auto-generated if omitted
 }
 ```
+
+### MessageQueue & Stream Reconnection
+
+The `MessageQueue` class provides Redis-backed streaming with pub/sub for reliable reconnection:
+
+```typescript
+// Start tracking a message generation
+await red.messageQueue.startGeneration(conversationId, messageId);
+
+// Append content as it streams in
+await red.messageQueue.appendContent(messageId, chunk);
+
+// Complete the generation
+await red.messageQueue.completeGeneration(messageId, metadata);
+
+// Subscribe to a message stream (yields existing + new content)
+for await (const event of red.messageQueue.subscribeToMessage(messageId)) {
+  if (event.type === 'chunk') {
+    console.log(event.content);
+  } else if (event.type === 'complete') {
+    console.log('Done:', event.metadata);
+  }
+}
+```
+
+**Key Features:**
+- **Redis Pub/Sub**: Real-time chunk delivery to multiple subscribers
+- **Reconnection**: Clients can disconnect and reconnect to ongoing streams
+- **Accumulated Content**: New subscribers receive all previous chunks immediately
+- **1-hour TTL**: Transient state cleanup after completion
 
 ---
 
@@ -135,8 +176,14 @@ const stream = await red.respond(
   { source: { application: 'redChat' }, stream: true }
 );
 
+let conversationId: string | undefined;
+
 for await (const chunk of stream) {
-  if (typeof chunk === 'string') {
+  // First chunk is metadata with conversationId
+  if (typeof chunk === 'object' && chunk._metadata) {
+    conversationId = chunk.conversationId;
+    console.log('Conversation ID:', conversationId);
+  } else if (typeof chunk === 'string') {
     // Text chunk - display in real-time
     process.stdout.write(chunk);
   } else {
@@ -229,20 +276,22 @@ console.log(`Total duration: ${response.response_metadata.total_duration}ns`);
 
 ## 🏗️ Architecture
 
-### Single Response Object
-- **No redundancy**: One source of truth for response data
-- **Full transparency**: Direct access to all LLM response properties
-- **Future-proof**: New LLM features automatically available
+### Multi-Layer Memory System
+- **Redis (Hot)**: Active conversation state, summaries, generating message tracking
+- **MongoDB (Persistent)**: Complete message history, searchable, survives Redis flushes
+- **Executive Summaries**: Auto-generated after 3+ messages for quick context retrieval
+
+### Stream Reconnection Architecture
+- **Decoupled Generation**: LLM generation runs independently of HTTP transport
+- **Redis Pub/Sub**: Real-time chunk publishing to `message:stream:{messageId}` channels
+- **Accumulated Content**: New subscribers instantly receive all previous chunks
+- **MessageQueue API**: `subscribeToMessage()` async generator for easy consumption
 
 ### Unified Streaming
 - **Consistent patterns**: Both modes go through the same graph execution
 - **Token-level streaming**: Real-time chunks during generation
 - **Complete metadata**: Full token counts and performance data at the end
-
-### Graph-First Design
-- **Routing preserved**: All requests go through the router node
-- **State management**: Full graph state flows through nodes
-- **Extensible**: Easy to add new nodes without changing the API
+- **Mobile-friendly**: Streams survive app switching and network interruptions
 
 ### Graph Structure
 
@@ -252,31 +301,50 @@ console.log(`Total duration: ${response.response_metadata.total_duration}ns`);
 └────┬────┘
      │
      ▼
-┌─────────┐
-│ Router  │  ──→ Analyzes source and routes to appropriate graph
-└────┬────┘
+┌──────────┐
+│  Router  │  ──→ Analyzes query, decides: CHAT, SCRAPE_URL, or SEARCH
+└────┬─────┘
      │
-     ▼
-┌─────────┐
-│  Chat   │  ──→ Processes queries and generates responses
-└────┬────┘
-     │
-     ▼
-┌─────────┐
-│   End   │
-└─────────┘
+     ├─────→ CHAT ────────┐
+     │                    │
+     ├─────→ SCRAPE_URL ──┤
+     │          ↓         │
+     │     ┌──────────┐   │
+     │     │ToolPicker│   │
+     │     └────┬─────┘   │
+     │          ↓         │
+     │     ┌──────────┐   │
+     └─────→│ToolNode │   │
+               └────┬─────┘
+                    ↓
+               ┌─────────┐
+               │ChatNode │  ──→ Generates final response with context
+               └────┬────┘
+                    │
+                    ▼
+               ┌─────────┐
+               │   End   │
+               └─────────┘
 ```
+
+**Flow:**
+1. **Router**: Classifies query intent (chat, scrape, search)
+2. **ToolPicker** (if needed): Selects and executes web search/scrape tools
+3. **ToolNode** (if needed): Processes tool results and extracts key info
+4. **ChatNode**: Generates response using conversation memory + tool results
+5. **Memory**: Auto-saves to MongoDB, updates Redis summaries, generates titles
 
 ---
 
 ## 📋 Examples
 
 See:
-- [`/examples/token-access.ts`](examples/token-access.ts) - Detailed token usage examples
+- [`/examples/test-streaming.ts`](examples/test-streaming.ts) - Streaming examples with reconnection
+- [`/examples/test-router.ts`](examples/test-router.ts) - Router and tool usage examples
+- [`/examples/test-toolnode.ts`](examples/test-toolnode.ts) - Web search and scraping demos
 - [`/examples/server.ts`](examples/server.ts) - OpenAI-compatible API server
 - [`/examples/client.ts`](examples/client.ts) - Example API client in TypeScript
 - [`/examples/SERVER.md`](examples/SERVER.md) - API server documentation and deployment guide
-- [`/examples/test-api.sh`](examples/test-api.sh) - API testing script
 
 ### Running the API Server
 
