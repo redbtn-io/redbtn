@@ -12,10 +12,10 @@ import { extractThinking } from '../../lib/utils/thinking';
 export function summarizeInBackground(
   conversationId: string,
   memory: MemoryManager,
-  localModel: ChatOllama
+  chatModel: ChatOllama
 ): void {
   memory.summarizeIfNeeded(conversationId, async (prompt) => {
-    const response = await localModel.invoke([{ role: 'user', content: prompt }]);
+    const response = await chatModel.invoke([{ role: 'user', content: prompt }]);
     const rawContent = response.content as string;
     
     // Extract thinking (if present) and return cleaned content
@@ -31,10 +31,10 @@ export function summarizeInBackground(
 export function generateExecutiveSummaryInBackground(
   conversationId: string,
   memory: MemoryManager,
-  localModel: ChatOllama
+  chatModel: ChatOllama
 ): void {
   memory.generateExecutiveSummary(conversationId, async (prompt) => {
-    const response = await localModel.invoke([{ role: 'user', content: prompt }]);
+    const response = await chatModel.invoke([{ role: 'user', content: prompt }]);
     const rawContent = response.content as string;
     
     // Extract thinking (if present) and return cleaned content

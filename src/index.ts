@@ -14,7 +14,7 @@ import { redGraph } from "./lib/graphs/red";
 import { MemoryManager } from "./lib/memory/memory";
 import { MessageQueue } from "./lib/memory/queue";
 import { Logger } from "./lib/logs/logger";
-import { createGeminiModel, createLocalModel, createOpenAIModel } from "./lib/models";
+import { createGeminiModel, createChatModel, createWorkerModel, createOpenAIModel } from "./lib/models";
 import * as background from "./functions/background";
 import { respond as respondFunction } from "./functions/respond";
 
@@ -49,7 +49,8 @@ export interface RedConfig {
   redisUrl: string; // URL for connecting to the Redis instance, global state store
   vectorDbUrl: string; // URL for connecting to the vector database, short to medium term memory
   databaseUrl: string; // URL for connecting to the traditional database, long term memory
-  defaultLlmUrl: string; // URL for the default local LLM (e.g., Ollama)
+  chatLlmUrl: string; // URL for the chat LLM (e.g., Ollama on 192.168.1.4:11434)
+  workLlmUrl: string; // URL for the worker LLM (e.g., Ollama on 192.168.1.3:11434)
   llmEndpoints?: { [agentName: string]: string }; // Map of named agents to specific LLM endpoint URLs
 }
 
@@ -83,7 +84,8 @@ export class Red {
   private heartbeatInterval?: NodeJS.Timeout;
 
   // Properties to hold the configured model instances
-  public localModel!: ChatOllama;
+  public chatModel!: ChatOllama; // Primary chat interaction model
+  public workerModel!: ChatOllama; // Background tasks and tool execution model
   public openAIModel?: ChatOpenAI;
   public geminiModel?: ChatGoogleGenerativeAI;
   public memory!: MemoryManager;
@@ -99,7 +101,8 @@ export class Red {
     this.config = config;
 
     // Initialize the model instances
-    this.localModel = createLocalModel(config);
+    this.chatModel = createChatModel(config);
+    this.workerModel = createWorkerModel(config);
     this.openAIModel = createOpenAIModel();
     this.geminiModel = createGeminiModel();
     

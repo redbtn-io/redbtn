@@ -39,6 +39,10 @@ const RedGraphState = Annotation.Root({
   selectedTools: Annotation<string[]>({
     reducer: (x: string[], y: string[]) => y,
     default: () => []
+  }),
+  // messageId for linking to Redis pub/sub and event publishing
+  messageId: Annotation<string | undefined>({
+    reducer: (x: string | undefined, y: string | undefined) => y
   })
 });
 

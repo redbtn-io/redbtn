@@ -58,7 +58,7 @@ export async function toolPickerNode(state: any): Promise<Partial<any>> {
         day: 'numeric' 
       });
       
-      const searchOptimization = await redInstance.localModel.invoke([
+      const searchOptimization = await redInstance.chatModel.invoke([
         {
           role: 'system',
           content: `You are a search query optimizer for an Artificial Intelligence named Red.
@@ -100,6 +100,15 @@ export async function toolPickerNode(state: any): Promise<Partial<any>> {
     }
     
     // Execute the specific tool the router chose
+    // Pass config with metadata for tool event publishing
+    const toolConfig = {
+      metadata: {
+        redInstance,
+        messageId: state.messageId,
+        conversationId,
+      }
+    };
+    
     if (toolAction === 'web_search') {
       const webSearchTool = allTools.find(t => t.name === 'web_search');
       if (!webSearchTool) {
@@ -112,7 +121,9 @@ export async function toolPickerNode(state: any): Promise<Partial<any>> {
         });
         return { selectedTools: [], messages: [], toolStatus: 'error: tool not found' };
       }
-      result = await webSearchTool.invoke({ query: searchQuery });
+      
+      // Tools now publish their own events via IntegratedPublisher
+      result = await webSearchTool.invoke({ query: searchQuery }, toolConfig);
       
     } else if (toolAction === 'scrape_url') {
       const scrapeTool = allTools.find(t => t.name === 'scrape_url');
@@ -134,7 +145,7 @@ export async function toolPickerNode(state: any): Promise<Partial<any>> {
         generationId,
         conversationId,
       });
-      result = await scrapeTool.invoke({ url: urlToScrape });
+      result = await scrapeTool.invoke({ url: urlToScrape }, toolConfig);
       
     } else if (toolAction === 'system_command') {
       const commandTool = allTools.find(t => t.name === 'send_command');
@@ -156,7 +167,7 @@ export async function toolPickerNode(state: any): Promise<Partial<any>> {
         generationId,
         conversationId,
       });
-      result = await commandTool.invoke({ command });
+      result = await commandTool.invoke({ command }, toolConfig);
     }
     
     // Log tool completion
@@ -184,7 +195,7 @@ export async function toolPickerNode(state: any): Promise<Partial<any>> {
       day: 'numeric' 
     });
     
-    const extractedInfo = await redInstance.localModel.invoke([
+    const extractedInfo = await redInstance.chatModel.invoke([
       {
         role: 'system',
         content: `Today's date: ${currentDate}. You are an information extraction expert. Extract key facts and data to answer the user's query accurately and concisely.`

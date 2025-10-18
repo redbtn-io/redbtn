@@ -6,24 +6,44 @@ import { RedConfig } from "../index"; // Import the config type
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 
 /**
- * Creates a fast chat model instance based on the provided configuration.
+ * Creates a chat model instance based on the provided configuration.
+ * This is the primary model used for chat interactions.
  * Supports DeepSeek-R1 and other Ollama models.
  * @param config The Red configuration object.
  * @returns A configured instance of ChatOllama.
  */
-export function createLocalModel(config: RedConfig): ChatOllama {
+export function createChatModel(config: RedConfig): ChatOllama {
   // Allow model override via environment variable
   const modelName = process.env.OLLAMA_MODEL || "Red";
   
   return new ChatOllama({
-    baseUrl: config.defaultLlmUrl || 
+    baseUrl: config.chatLlmUrl || 
+      process.env.CHAT_LLM_URL || 
       process.env.OLLAMA_BASE_URL || 
-      "http://localhost:11434", // Use the URL from the config
+      "http://localhost:11434",
     model: modelName,
     temperature: 0.0,
-    // NOTE: DeepSeek-R1 reasoning models can take 2-5 minutes to respond
-    // If using remote Ollama (llm.redbtn.io), ensure reverse proxy timeout is set to at least 300s
-    // Example nginx config: proxy_read_timeout 300s;
+    keepAlive: -1,
+  });
+}
+
+/**
+ * Creates a worker model instance based on the provided configuration.
+ * This model is used for background tasks and tool execution.
+ * @param config The Red configuration object.
+ * @returns A configured instance of ChatOllama.
+ */
+export function createWorkerModel(config: RedConfig): ChatOllama {
+  // Allow model override via environment variable
+  const modelName = process.env.OLLAMA_WORKER_MODEL || process.env.OLLAMA_MODEL || "Red";
+  
+  return new ChatOllama({
+    baseUrl: config.workLlmUrl || 
+      process.env.WORK_LLM_URL || 
+      "http://localhost:11434",
+    model: modelName,
+    temperature: 0.0,
+    keepAlive: -1,
   });
 }
 

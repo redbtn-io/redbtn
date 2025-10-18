@@ -54,7 +54,7 @@ export const routerNode = async (state: any) => {
       day: 'numeric' 
     });
     
-    const routingDecision = await redInstance.localModel.invoke([
+    const routingDecision = await redInstance.chatModel.invoke([
       {
         role: 'system',
         content: `You are a routing cognition node for an Artificial Intelligence named Red.
@@ -149,16 +149,12 @@ User message: ${query}`
     console.log(`[Router] Decision: ${decision || 'CHAT'} (from ${cleanedContent.substring(0, 50)}${cleanedContent.length > 50 ? '...' : ''})`);
     
     if (decision.startsWith('WEB_SEARCH')) {
-      // Publish tool status to frontend
-      if (messageId) {
-        console.log(`[Router] Publishing tool_status to Redis for ${messageId}: web_search`);
-        await redInstance.messageQueue.publishToolStatus(messageId, {
-          status: '🔍 Searching the web...',
-          action: 'web_search'
-        });
-        console.log(`[Router] tool_status published successfully`);
-      }
-      
+      // Publish tool_status so frontend knows we're searching
+      await redInstance.messageQueue.publishToolStatus(messageId, {
+        status: '🔍 Searching the web...',
+        action: 'web_search'
+      });
+
       await redInstance.logger.log({
         level: 'success',
         category: 'router',

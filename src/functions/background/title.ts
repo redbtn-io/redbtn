@@ -15,7 +15,7 @@ export async function generateTitleInBackground(
   conversationId: string,
   messageCount: number,
   memory: MemoryManager,
-  localModel: ChatOllama
+  chatModel: ChatOllama
 ): Promise<void> {
   try {
     // Only generate title after 2nd or 6th message
@@ -37,17 +37,23 @@ export async function generateTitleInBackground(
       .join('\n');
 
     // Create prompt for title generation
-    const titlePrompt = `Based on this conversation, generate a short, descriptive title (3-6 words max). Only respond with the title, nothing else:
+    const titlePrompt = `Based on this conversation, generate a short, descriptive title (5 words max). Only respond with the title, nothing else:
 
 ${conversationText}`;
 
     // Generate title using LLM
-    const response = await localModel.invoke([{ role: 'user', content: titlePrompt }]);
+    const response = await chatModel.invoke([{ role: 'user', content: titlePrompt }]);
     const rawContent = response.content as string;
     
     // Extract thinking (if present) and get cleaned content
     const { cleanedContent } = extractThinking(rawContent);
-    const title = cleanedContent.trim().replace(/^["']|["']$/g, ''); // Remove quotes if any
+    let title = cleanedContent.trim().replace(/^["']|["']$/g, ''); // Remove quotes if any
+    
+    // Enforce 5 word limit
+    const words = title.split(/\s+/);
+    if (words.length > 5) {
+      title = words.slice(0, 5).join(' ');
+    }
 
     // Store title in Redis metadata
     const metaKey = `conversation:${conversationId}:metadata`;

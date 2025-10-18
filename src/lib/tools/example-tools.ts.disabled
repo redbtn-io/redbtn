@@ -1,0 +1,295 @@
+/**
+ * Example: Web Search Tool   
+  // Create tool event publisher
+  let publisher: any = null;
+  // if (messageId) {
+  //   publisher = createIntegratedPublisher(
+  //     messageQueue,
+  //     'web_search',
+  //     'Web Search',
+  //     messageId,
+  //     conversationId
+  //   );
+  //   
+  //   // Publish tool start
+  //   await publisher.publishStart({
+  //     input: { query, maxResults },
+  //     expectedDuration: 3000, // Estimate 3 seconds
+  //   });
+  // }
+  
+  try {ublishing
+ * 
+ * This demonstrates how to integrate any tool with the unified tool event system.
+ * Copy this pattern for database queries, code execution, API calls, etc.
+ */
+
+import type { MessageQueue } from '../memory/queue';
+// import { createIntegratedPublisher } from '../events/integrated-publisher'; // Not implemented yet
+
+export interface WebSearchOptions {
+  query: string;
+  maxResults?: number;
+  messageId?: string;
+  conversationId: string;
+}
+
+export interface WebSearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+  relevance: number;
+}
+
+/**
+ * Example web search tool with full event publishing
+ */
+export async function webSearchWithEvents(
+  messageQueue: MessageQueue,
+  options: WebSearchOptions
+): Promise<WebSearchResult[]> {
+  const { query, maxResults = 5, messageId, conversationId } = options;
+  
+  // Create tool event publisher
+  let publisher: any = null;
+  if (messageId) {
+    // publisher = createIntegratedPublisher(
+      messageQueue,
+      'web_search',
+      'Web Search',
+      messageId,
+      conversationId
+    );
+    
+    // Publish tool start
+    await publisher.publishStart({
+      input: { query, maxResults },
+      expectedDuration: 3000, // Estimate 3 seconds
+    });
+  }
+  
+  try {
+    // Step 1: Searching
+    if (publisher) {
+      await publisher.publishProgress('Searching the web...', {
+        progress: 20,
+        data: { query, maxResults },
+      });
+    }
+    
+    // Simulate search API call
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Mock results (replace with actual search API)
+    const mockResults: WebSearchResult[] = [
+      {
+        title: 'Example Result 1',
+        url: 'https://example.com/1',
+        snippet: 'This is an example search result...',
+        relevance: 0.95,
+      },
+      {
+        title: 'Example Result 2',
+        url: 'https://example.com/2',
+        snippet: 'Another relevant result...',
+        relevance: 0.87,
+      },
+    ];
+    
+    // Step 2: Found results
+    if (publisher) {
+      await publisher.publishProgress(`Found ${mockResults.length} results`, {
+        progress: 50,
+        data: { 
+          resultsFound: mockResults.length,
+          topResult: mockResults[0]?.title,
+        },
+      });
+    }
+    
+    // Simulate processing time
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Step 3: Extracting content
+    if (publisher) {
+      await publisher.publishProgress('Extracting content from pages...', {
+        progress: 75,
+        data: { pagesProcessing: mockResults.length },
+      });
+    }
+    
+    // Simulate content extraction
+    await new Promise(resolve => setTimeout(resolve, 800));
+    
+    // Step 4: Complete
+    if (publisher) {
+      await publisher.publishComplete(
+        { results: mockResults },
+        {
+          sitesSearched: mockResults.length,
+          totalRelevance: mockResults.reduce((sum, r) => sum + r.relevance, 0),
+        }
+      );
+    }
+    
+    return mockResults;
+    
+  } catch (error) {
+    // Publish error if something goes wrong
+    if (publisher) {
+      await publisher.publishError(
+        error instanceof Error ? error.message : String(error),
+        'SEARCH_FAILED'
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * Example: Database Query Tool
+ */
+export async function databaseQueryWithEvents(
+  messageQueue: MessageQueue,
+  options: {
+    query: string;
+    messageId?: string;
+    conversationId: string;
+  }
+): Promise<any[]> {
+  const { query, messageId, conversationId } = options;
+  
+  let publisher: any = null;
+  if (messageId) {
+    // publisher = createIntegratedPublisher(
+      messageQueue,
+      'database_query',
+      'Database Query',
+      messageId,
+      conversationId
+    );
+    
+    await publisher.publishStart({ input: { query } });
+  }
+  
+  try {
+    // Step 1: Connecting
+    if (publisher) {
+      await publisher.publishProgress('Connecting to database...', { progress: 25 });
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+    
+    // Step 2: Executing
+    if (publisher) {
+      await publisher.publishProgress('Executing query...', { progress: 50 });
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Mock results
+    const results = [
+      { id: 1, name: 'Example Record' },
+      { id: 2, name: 'Another Record' },
+    ];
+    
+    // Step 3: Processing
+    if (publisher) {
+      await publisher.publishProgress('Processing results...', { 
+        progress: 75,
+        data: { recordCount: results.length },
+      });
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+    
+    // Complete
+    if (publisher) {
+      await publisher.publishComplete(
+        { rows: results },
+        { recordsQueried: results.length }
+      );
+    }
+    
+    return results;
+    
+  } catch (error) {
+    if (publisher) {
+      await publisher.publishError(
+        error instanceof Error ? error.message : String(error),
+        'QUERY_FAILED'
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * Example: Code Execution Tool
+ */
+export async function codeExecutionWithEvents(
+  messageQueue: MessageQueue,
+  options: {
+    code: string;
+    language: string;
+    messageId?: string;
+    conversationId: string;
+  }
+): Promise<{ output: string; exitCode: number }> {
+  const { code, language, messageId, conversationId } = options;
+  
+  let publisher: any = null;
+  if (messageId) {
+    // publisher = createIntegratedPublisher(
+      messageQueue,
+      'code_execution',
+      'Code Execution',
+      messageId,
+      conversationId
+    );
+    
+    await publisher.publishStart({ 
+      input: { language, codeLength: code.length },
+    });
+  }
+  
+  try {
+    // Step 1: Starting interpreter
+    if (publisher) {
+      await publisher.publishProgress(`Starting ${language} interpreter...`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 300));
+    
+    // Step 2: Executing
+    if (publisher) {
+      await publisher.publishProgress('Executing code...', { progress: 50 });
+    }
+    
+    // Simulate execution
+    const output = 'Hello, World!\n';
+    
+    // Stream output character by character
+    if (publisher) {
+      for (const char of output) {
+        await publisher.publishStreamingContent(char);
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+    
+    // Complete
+    if (publisher) {
+      await publisher.publishComplete(
+        { output, exitCode: 0 },
+        { executionTime: publisher.getElapsedTime() }
+      );
+    }
+    
+    return { output, exitCode: 0 };
+    
+  } catch (error) {
+    if (publisher) {
+      await publisher.publishError(
+        error instanceof Error ? error.message : String(error),
+        'EXECUTION_FAILED'
+      );
+    }
+    throw error;
+  }
+}

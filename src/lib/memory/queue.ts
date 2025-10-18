@@ -10,6 +10,8 @@ export interface MessageGenerationState {
   messageId: string;
   status: 'generating' | 'completed' | 'error';
   content: string;
+  thinking?: string; // Accumulated thinking/reasoning content
+  toolEvents?: any[]; // Accumulated tool events for reconnection replay
   startedAt: number;
   completedAt?: number;
   error?: string;
@@ -213,24 +215,50 @@ export class MessageQueue {
    * Publish thinking/reasoning content chunk by chunk
    */
   async publishThinkingChunk(messageId: string, chunk: string): Promise<void> {
+    // Accumulate thinking content in Redis state for reconnection
+    const key = `${this.CONTENT_KEY_PREFIX}${messageId}`;
+    const stateJson = await this.redis.get(key);
+    
+    if (stateJson) {
+      const state: MessageGenerationState = JSON.parse(stateJson);
+      state.thinking = (state.thinking || '') + chunk;
+      await this.redis.setex(key, this.STATE_TTL, JSON.stringify(state));
+    }
+    
     // Silent - too noisy to log each chunk
     await this.redis.publish(
       `${this.PUBSUB_PREFIX}${messageId}`,
-      JSON.stringify({ type: 'thinking_chunk', content: chunk })
+      JSON.stringify({ type: 'chunk', content: chunk, thinking: true })
     );
   }
 
   /**
-   * Publish thinking/reasoning content (legacy - for full blocks)
+   * Publish tool event to Redis pub/sub
+   * Simple wrapper that doesn't require ToolEvent types
    */
-  async publishThinking(messageId: string, thinking: string): Promise<void> {
-    // Publish thinking event
+  async publishToolEvent(messageId: string, event: any): Promise<void> {
+    // Accumulate tool events in Redis state for reconnection
+    const key = `${this.CONTENT_KEY_PREFIX}${messageId}`;
+    const stateJson = await this.redis.get(key);
+    
+    if (stateJson) {
+      const state: MessageGenerationState = JSON.parse(stateJson);
+      if (!state.toolEvents) {
+        state.toolEvents = [];
+      }
+      state.toolEvents.push(event);
+      await this.redis.setex(key, this.STATE_TTL, JSON.stringify(state));
+    }
+    
+    // Also publish to real-time pub/sub
     await this.redis.publish(
       `${this.PUBSUB_PREFIX}${messageId}`,
-      JSON.stringify({ type: 'thinking', content: thinking })
+      JSON.stringify({ type: 'tool_event', event })
     );
     
-    console.log(`[MessageQueue] Published thinking for ${messageId} (${thinking.length} chars)`);
+    if (event.type !== 'tool_progress') {
+      console.log(`[MessageQueue] Published tool event: ${event.type} for ${event.toolName || event.toolId}`);
+    }
   }
 
   /**
@@ -312,14 +340,16 @@ export class MessageQueue {
    * Returns an async generator that yields chunks, completion, or errors
    */
   async *subscribeToMessage(messageId: string): AsyncGenerator<{
-    type: 'init' | 'chunk' | 'status' | 'thinking_chunk' | 'thinking' | 'complete' | 'error' | 'tool_status';
+    type: 'init' | 'chunk' | 'status' | 'thinking' | 'complete' | 'error' | 'tool_status' | 'tool_event';
     content?: string;
+    thinking?: boolean; // Flag for chunk events to indicate thinking/reasoning content
     existingContent?: string;
     metadata?: MessageGenerationState['metadata'];
     error?: string;
     action?: string;
     description?: string;
     status?: string;
+    event?: any;
   }> {
     // First, get any existing content
     const state = await this.getMessageState(messageId);
@@ -410,15 +440,16 @@ export class MessageQueue {
         const event = JSON.parse(message);
         
         if (event.type === 'chunk') {
-          yield { type: 'chunk', content: event.content };
+          // Forward chunk events with thinking property if present
+          yield { type: 'chunk', content: event.content, thinking: event.thinking };
         } else if (event.type === 'status') {
           yield { type: 'status', action: event.action, description: event.description };
-        } else if (event.type === 'thinking_chunk') {
-          yield { type: 'thinking_chunk', content: event.content };
         } else if (event.type === 'thinking') {
           yield { type: 'thinking', content: event.content };
         } else if (event.type === 'tool_status') {
           yield { type: 'tool_status', status: event.status, action: event.action };
+        } else if (event.type === 'tool_event') {
+          yield { type: 'tool_event', event: event.event };
         } else if (event.type === 'complete') {
           yield { type: 'complete', metadata: event.metadata };
           break;

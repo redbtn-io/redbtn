@@ -5,12 +5,14 @@
 
 import Redis from 'ioredis';
 import { countTokens, freeTiktoken } from '../utils/tokenizer';
-import { getDatabase, StoredMessage } from './database';
+import { getDatabase, StoredMessage, StoredToolExecution } from './database';
 
 export interface ConversationMessage {
+  id?: string; // Optional message ID (e.g., msg_1234567890_abc123def)
   role: 'system' | 'user' | 'assistant';
   content: string;
   timestamp: number;
+  toolExecutions?: StoredToolExecution[]; // Tool executions for this message
 }
 
 export interface ConversationMetadata {
@@ -121,10 +123,12 @@ export class MemoryManager {
     
     // Store in MongoDB for persistence (non-blocking, ignore errors)
     getDatabase().storeMessage({
+      messageId: message.id, // Include the original message ID
       conversationId,
       role: message.role,
       content: message.content,
       timestamp: new Date(message.timestamp),
+      toolExecutions: message.toolExecutions || [], // Include tool executions
       metadata: {}
     }).catch(err => {
       console.warn('[Memory] Failed to save message to MongoDB:', err.message);
@@ -168,9 +172,11 @@ export class MemoryManager {
         const pipeline = this.redis.pipeline();
         for (const msg of dbMessages) {
           const convMsg: ConversationMessage = {
+            id: msg.messageId, // Include message ID
             role: msg.role,
             content: msg.content,
-            timestamp: msg.timestamp.getTime()
+            timestamp: msg.timestamp.getTime(),
+            toolExecutions: msg.toolExecutions || [] // Include tool executions
           };
           pipeline.rpush(key, JSON.stringify(convMsg));
         }
@@ -179,9 +185,11 @@ export class MemoryManager {
         console.log(`[Memory] Populated Redis cache with ${dbMessages.length} messages from MongoDB for ${conversationId}`);
         
         return dbMessages.map(msg => ({
+          id: msg.messageId, // Include message ID
           role: msg.role,
           content: msg.content,
-          timestamp: msg.timestamp.getTime()
+          timestamp: msg.timestamp.getTime(),
+          toolExecutions: msg.toolExecutions || [] // Include tool executions
         }));
       }
     } catch (error) {
@@ -199,9 +207,11 @@ export class MemoryManager {
     const dbMessages = await db.getMessages(conversationId);
     
     return dbMessages.map(msg => ({
+      id: msg.messageId, // Include message ID
       role: msg.role,
       content: msg.content,
-      timestamp: msg.timestamp.getTime()
+      timestamp: msg.timestamp.getTime(),
+      toolExecutions: msg.toolExecutions || [] // Include tool executions
     }));
   }
 

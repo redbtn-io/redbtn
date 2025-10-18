@@ -41,7 +41,7 @@ export const chatNode = async (state: any): Promise<any> => {
 
     // Never bind tools in chat node - tools are only executed by toolPicker
     // This prevents infinite loops where the LLM keeps calling tools
-    const modelWithTools = redInstance.localModel;
+    const modelWithTools = redInstance.chatModel;
 
     // Build messages array - start with existing messages from state
     let messages: any[] = [...(state.messages || [])];
@@ -138,22 +138,33 @@ export const chatNode = async (state: any): Promise<any> => {
     console.log(`[Chat] Total length: ${fullContent.length} chars`);
     console.log('='.repeat(80));
     
-    // Construct AIMessage from accumulated content
+    // Clean thinking tags from content before storing/returning
+    // Import thinking utilities
+    const { extractThinking } = await import('../utils/thinking');
+    const { thinking, cleanedContent } = extractThinking(fullContent);
+    
+    if (thinking) {
+      console.log('[Chat] Extracted thinking length:', thinking.length);
+    }
+    console.log('[Chat] Cleaned content length:', cleanedContent.length);
+    
+    // Construct AIMessage from cleaned content (without thinking tags)
     const aiMessage: AIMessage = new AIMessage({
-      content: fullContent,
+      content: cleanedContent,
       usage_metadata,
       response_metadata,
     });
     
-    // Log response metadata (including thinking tags if present)
+    // Log response metadata (using cleaned content length)
     await redInstance.logger.log({
       level: 'success',
       category: 'chat',
-      message: `<green>✓ Response generated</green> <dim>(${fullContent.length} chars, ${usage_metadata?.total_tokens || 0} tokens)</dim>`,
+      message: `<green>✓ Response generated</green> <dim>(${cleanedContent.length} chars cleaned, ${fullContent.length} raw, ${usage_metadata?.total_tokens || 0} tokens)</dim>`,
       generationId,
       conversationId,
       metadata: {
-        contentLength: fullContent.length,
+        contentLength: cleanedContent.length,
+        rawContentLength: fullContent.length,
         tokens: usage_metadata,
         model: response_metadata?.model,
       },

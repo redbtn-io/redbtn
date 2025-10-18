@@ -14,8 +14,53 @@ class WebSearchTool extends StructuredTool {
   description = "Search the web using Google and get actual content from the pages. Use this when you need current information, facts, news, or data that you don't have in your training data. Returns up to 10 search results with titles, snippets, URLs, and relevant body content from each page.";
   schema = searchSchema as any; // Type assertion to bypass deep instantiation
 
-  async _call({ query }: { query: string }): Promise<string> {
+  async _call({ query }: { query: string }, runManager?: any): Promise<string> {
     const startTime = Date.now();
+    
+    // Check ALL arguments passed to this function
+    console.log(`[Web Search Tool] _call invoked with ${arguments.length} arguments`);
+    console.log(`[Web Search Tool] arg[0] (input):`, arguments[0]);
+    console.log(`[Web Search Tool] arg[1] (runManager):`, typeof arguments[1]);
+    console.log(`[Web Search Tool] arg[2] (config):`, typeof arguments[2], arguments[2]);
+    
+    const config = arguments[2];
+    
+    // Get tool event publisher from config if available
+    let publisher: any = null;
+    const { createIntegratedPublisher } = await import('../events/integrated-publisher');
+    const redInstance = config?.metadata?.redInstance;
+    const messageId = config?.metadata?.messageId;
+    const conversationId = config?.metadata?.conversationId;
+    
+    console.log(`[Web Search Tool] Config check:`, {
+      hasConfig: !!config,
+      hasMetadata: !!config?.metadata,
+      hasRedInstance: !!redInstance,
+      hasMessageQueue: !!redInstance?.messageQueue,
+      messageId,
+      conversationId
+    });
+    
+    if (redInstance?.messageQueue && messageId && conversationId) {
+      console.log(`[Web Search Tool] Creating publisher...`);
+      publisher = createIntegratedPublisher(
+        redInstance.messageQueue,
+        'web_search',
+        'Web Search',
+        messageId,
+        conversationId
+      );
+      
+      console.log(`[Web Search Tool] Publishing start event...`);
+      await publisher.publishStart({
+        input: { query, maxResults: 10 },
+        expectedDuration: 5000,
+      });
+      console.log(`[Web Search Tool] Start event published!`);
+    } else {
+      console.log(`[Web Search Tool] Cannot create publisher - missing required data`);
+    }
+    
     try {
       const apiKey = process.env.GOOGLE_API_KEY;
       const searchEngineId = process.env.GOOGLE_SEARCH_ENGINE_ID || process.env.GOOGLE_CSE_ID;
@@ -29,6 +74,13 @@ class WebSearchTool extends StructuredTool {
       }
 
       console.log(`[Web Search Tool] Searching for: "${query}"`);
+      if (publisher) {
+        await publisher.publishProgress('Searching Google...', {
+          progress: 10,
+          data: { query, provider: 'Google Custom Search' }
+        });
+      }
+      
       const searchStartTime = Date.now();
       const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${searchEngineId}&q=${encodeURIComponent(query)}&num=10`;
       
@@ -38,17 +90,40 @@ class WebSearchTool extends StructuredTool {
       
       if (!response.ok) {
         const errorData = await response.text();
-        return `Error searching Google: ${response.status} ${response.statusText}. ${errorData}`;
+        const error = `Error searching Google: ${response.status} ${response.statusText}. ${errorData}`;
+        if (publisher) await publisher.publishError(error, 'SEARCH_API_ERROR');
+        return error;
       }
 
       const data = await response.json();
 
       if (!data.items || data.items.length === 0) {
-        return `No results found for query: "${query}"`;
+        const error = `No results found for query: "${query}"`;
+        if (publisher) {
+          await publisher.publishComplete(
+            { resultsFound: 0 },
+            { duration: Date.now() - startTime }
+          );
+        }
+        return error;
+      }
+
+      if (publisher) {
+        await publisher.publishProgress(`Found ${data.items.length} results`, {
+          progress: 30,
+          data: { resultCount: data.items.length }
+        });
       }
 
       // Scrape each result URL in parallel
       console.log(`[Web Search Tool] Scraping ${data.items.length} results...`);
+      if (publisher) {
+        await publisher.publishProgress(`Extracting content from ${data.items.length} pages...`, {
+          progress: 40,
+          data: { resultCount: data.items.length }
+        });
+      }
+      
       const scrapeStartTime = Date.now();
       const scrapePromises = data.items.map((item: any) => 
         this.scrapeUrl(item.link, query).catch(err => `Error: ${err.message}`)
@@ -72,11 +147,22 @@ class WebSearchTool extends StructuredTool {
       const totalDuration = Date.now() - startTime;
       console.log(`[Web Search Tool] ⏱️  Total execution time: ${totalDuration}ms`);
 
+      if (publisher) {
+        await publisher.publishComplete(
+          { resultsFound: data.items.length, query },
+          { duration: totalDuration, searchDuration, scrapeDuration }
+        );
+      }
+
       return `Search results for "${query}":\n\n${results}`;
     } catch (error) {
       const totalDuration = Date.now() - startTime;
       console.error(`[Web Search Tool] Error after ${totalDuration}ms:`, error);
-      return `Error performing web search: ${error instanceof Error ? error.message : String(error)}`;
+      const errorMessage = `Error performing web search: ${error instanceof Error ? error.message : String(error)}`;
+      if (publisher) {
+        await publisher.publishError(errorMessage, 'SEARCH_FAILED');
+      }
+      return errorMessage;
     }
   }
 

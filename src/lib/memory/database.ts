@@ -14,13 +14,51 @@ export interface BaseDocument {
 }
 
 /**
+ * Tool execution step interface for AI library
+ */
+export interface StoredToolStep extends BaseDocument {
+  step: string;
+  timestamp: Date;
+  progress?: number;
+  data?: any;
+}
+
+/**
+ * Tool execution interface for AI library
+ */
+export interface StoredToolExecution extends BaseDocument {
+  toolId: string;
+  toolType: string; // 'thinking', 'web_search', 'database_query', etc.
+  toolName: string;
+  status: 'running' | 'completed' | 'error';
+  startTime: Date;
+  endTime?: Date;
+  duration?: number;
+  
+  // Progress tracking
+  steps: StoredToolStep[];
+  currentStep?: string;
+  progress?: number;
+  
+  // Streaming content (for thinking, code output, etc.)
+  streamingContent?: string;
+  
+  // Results and metadata
+  result?: any;
+  error?: string;
+  metadata?: Record<string, any>;
+}
+
+/**
  * Stored message interface for conversation history
  */
 export interface StoredMessage extends BaseDocument {
+  messageId?: string; // Original message ID from the request (e.g., msg_1234567890_abc123def)
   conversationId: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: Date;
+  toolExecutions?: StoredToolExecution[]; // Tool executions for this message
   metadata?: {
     model?: string;
     tokens?: {
@@ -230,11 +268,20 @@ class DatabaseManager {
     // Thoughts collection (stores thinking/reasoning separately from messages)
     const thoughts = this.db.collection<StoredThought>(this.COLLECTIONS.THOUGHTS);
     await thoughts.createIndex({ thoughtId: 1 }, { unique: true });
+    
+    // Single field indexes for basic queries
     await thoughts.createIndex({ conversationId: 1 });
     await thoughts.createIndex({ messageId: 1 });
     await thoughts.createIndex({ generationId: 1 });
     await thoughts.createIndex({ timestamp: -1 });
     await thoughts.createIndex({ source: 1 });
+    
+    // Composite indexes for optimized multi-field queries
+    await thoughts.createIndex({ messageId: 1, timestamp: -1 });           // messageId + time sort
+    await thoughts.createIndex({ conversationId: 1, timestamp: -1 });      // conversation + time sort
+    await thoughts.createIndex({ generationId: 1, timestamp: 1 });         // generation + time sort
+    await thoughts.createIndex({ source: 1, conversationId: 1, timestamp: -1 }); // multi-field query with sort
+    
     this.collections.set(this.COLLECTIONS.THOUGHTS, thoughts);
   }
 
