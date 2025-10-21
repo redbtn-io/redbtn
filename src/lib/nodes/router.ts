@@ -65,24 +65,24 @@ export const routerNode = async (state: any) => {
         role: 'user',
         content: `Analyze the user's message and classify it into ONE category.
 
-Categories:
-- WEB_SEARCH = needs current/recent information from the internet, anything current events related, sports cores, weather, news, stock prices, etc.
-- SCRAPE_URL = user provided a specific URL to read
-- SYSTEM_COMMAND = user wants to execute a system command (e.g. list files, read a file, run a script, etc.)
-- CHAT = everything else (greetings, questions, general knowledge)
+        Categories:
+        - WEB_SEARCH = needs current/recent information from the internet, anything current events related, sports cores, weather, news, stock prices, etc. or user asked to conduct a search/find something online
+        - SCRAPE_URL = user provided a specific URL to read
+        - SYSTEM_COMMAND = user wants to execute a system command (e.g. list files, read a file, run a script, etc.)
+        - CHAT = everything else (greetings, questions, general knowledge)
 
-Your response MUST be EXACTLY one of these formats:
-- WEB_SEARCH
-- SCRAPE_URL: [url]
-- SYSTEM_COMMAND: [command]
-- CHAT
+        Your response MUST be EXACTLY one of these formats:
+        - WEB_SEARCH
+        - SCRAPE_URL: [url]
+        - SYSTEM_COMMAND: [command]
+        - CHAT
 
-Use <think> tags for your reasoning, then give ONLY the category name outside the tags.
+        Use <think> tags for your reasoning, then give ONLY the category name outside the tags.
 
-${contextSummary ? `Use the following context to help classify the message:
-${contextSummary}` : ''}
+        ${contextSummary ? `Use the following context to help classify the message:
+        ${contextSummary}` : ''}
 
-User message: ${query}`
+        User message: ${query}`
       }
     ]);
     
@@ -161,9 +161,9 @@ User message: ${query}`
         message: `<green>→ Route:</green> <bold>WEB_SEARCH</bold>`,
         generationId,
         conversationId,
-        metadata: { decision: 'WEB_SEARCH', nextGraph: 'toolPicker', toolAction: 'web_search' },
+        metadata: { decision: 'WEB_SEARCH', nextGraph: 'search' },
       });
-      return { nextGraph: 'toolPicker', toolAction: 'web_search' };
+      return { nextGraph: 'search' };
     }
     
     if (decision.startsWith('SCRAPE_URL')) {
@@ -184,9 +184,9 @@ User message: ${query}`
         message: `<green>→ Route:</green> <bold>SCRAPE_URL</bold> <dim>${url}</dim>`,
         generationId,
         conversationId,
-        metadata: { decision: 'SCRAPE_URL', url, nextGraph: 'toolPicker', toolAction: 'scrape_url' },
+        metadata: { decision: 'SCRAPE_URL', url, nextGraph: 'scrape' },
       });
-      return { nextGraph: 'toolPicker', toolAction: 'scrape_url', toolParam: url };
+      return { nextGraph: 'scrape', toolParam: url };
     }
     
     if (decision.startsWith('SYSTEM_COMMAND')) {
@@ -207,9 +207,9 @@ User message: ${query}`
         message: `<green>→ Route:</green> <bold>SYSTEM_COMMAND</bold> <dim>${command}</dim>`,
         generationId,
         conversationId,
-        metadata: { decision: 'SYSTEM_COMMAND', command, nextGraph: 'toolPicker', toolAction: 'system_command' },
+        metadata: { decision: 'SYSTEM_COMMAND', command, nextGraph: 'command' },
       });
-      return { nextGraph: 'toolPicker', toolAction: 'system_command', toolParam: command };
+      return { nextGraph: 'command', toolParam: command };
     }
     
     // Default to CHAT

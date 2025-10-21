@@ -233,6 +233,17 @@ export class MessageQueue {
   }
 
   /**
+   * Publish thinking complete event (when </think> tag is closed)
+   */
+  async publishThinkingComplete(messageId: string): Promise<void> {
+    console.log('[MessageQueue] Publishing thinking complete event for', messageId);
+    await this.redis.publish(
+      `${this.PUBSUB_PREFIX}${messageId}`,
+      JSON.stringify({ type: 'thinkingComplete' })
+    );
+  }
+
+  /**
    * Publish tool event to Redis pub/sub
    * Simple wrapper that doesn't require ToolEvent types
    */

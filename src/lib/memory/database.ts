@@ -734,6 +734,69 @@ class DatabaseManager {
     } as Filter<StoredLog>);
   }
 
+  /**
+   * Get all conversations that have logs with counts and metadata
+   */
+  async getConversationsWithLogs(): Promise<Array<{
+    conversationId: string;
+    title?: string;
+    lastLogTime: Date;
+    logCount: number;
+    generationCount: number;
+  }>> {
+    await this.ensureConnected();
+    const logsCol = this.getCollection<StoredLog>(this.COLLECTIONS.LOGS);
+    const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
+    const generationsCol = this.getCollection<Generation>(this.COLLECTIONS.GENERATIONS);
+    
+    // Aggregate logs by conversationId
+    const logAggregation = await logsCol.aggregate([
+      {
+        $group: {
+          _id: '$conversationId',
+          logCount: { $sum: 1 },
+          lastLogTime: { $max: '$timestamp' }
+        }
+      },
+      { $sort: { lastLogTime: -1 } }
+    ]).toArray();
+    
+    // Get generation counts
+    const generationAggregation = await generationsCol.aggregate([
+      {
+        $group: {
+          _id: '$conversationId',
+          generationCount: { $sum: 1 }
+        }
+      }
+    ]).toArray();
+    
+    // Create maps for quick lookup
+    const generationMap = new Map(
+      generationAggregation.map(g => [g._id, g.generationCount])
+    );
+    
+    // Build result with conversation titles
+    const results = await Promise.all(
+      logAggregation.map(async (agg: any) => {
+        const conversationId = agg._id;
+        
+        // Try to get conversation title
+        const conversation = await conversationsCol.findOne({ conversationId });
+        
+        return {
+          conversationId,
+          title: conversation?.title,
+          lastLogTime: agg.lastLogTime,
+          logCount: agg.logCount,
+          generationCount: generationMap.get(conversationId) || 0
+        };
+      })
+    );
+    
+    return results;
+  }
+
   // ==========================================================================
   // GENERATION OPERATIONS (New)
   // ==========================================================================

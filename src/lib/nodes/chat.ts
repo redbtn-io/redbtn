@@ -1,5 +1,4 @@
 import { InvokeOptions, Red } from '../../index';
-import { allTools } from '../tools';
 import { AIMessage } from '@langchain/core/messages';
 import { extractThinking, logThinking } from '../utils/thinking';
 
@@ -39,8 +38,8 @@ export const chatNode = async (state: any): Promise<any> => {
       conversationId,
     });
 
-    // Never bind tools in chat node - tools are only executed by toolPicker
-    // This prevents infinite loops where the LLM keeps calling tools
+    // Use the base chat model without tools
+    // Tools are executed by dedicated nodes (search, scrape, command) routed by the router
     const modelWithTools = redInstance.chatModel;
 
     // Build messages array - start with existing messages from state

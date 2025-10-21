@@ -26,13 +26,33 @@ export async function respond(
   
   // Extract messageId for Redis pub/sub (if provided)
   const messageId = (options as any).messageId;
-  console.log(`[Respond] Starting response with messageId: ${messageId || 'NONE'}, conversationId: ${conversationId}`);
   
   // Start a new generation (will fail if one is already in progress)
   const generationId = await red.logger.startGeneration(conversationId);
   if (!generationId) {
+    await red.logger.log({
+      level: 'warn',
+      category: 'system',
+      message: 'Generation already in progress for conversation',
+      conversationId,
+      metadata: { query: query.message.substring(0, 100) }
+    });
     throw new Error('A generation is already in progress for this conversation');
   }
+  
+  // Log generation start
+  await red.logger.log({
+    level: 'info',
+    category: 'system',
+    message: `<cyan>Starting generation</cyan> <dim>${generationId}</dim>`,
+    generationId,
+    conversationId,
+    metadata: {
+      messageId,
+      queryLength: query.message.length,
+      source: options.source
+    }
+  });
   
   // Store user message in memory
   await red.memory.addMessage(conversationId, {
@@ -59,9 +79,11 @@ Application: ${options.source?.application || 'unknown'}
 CRITICAL RULES:
 1. NEVER mention "knowledge cutoff", "training data", "as of my knowledge", or any limitations
 2. NEVER introduce yourself unless this is the FIRST message in a new conversation or you're asked to do so
-3. NEVER add disclaimers like "please note" or "for the most up-to-date information", and don't repeat the query to the user
-4. If you have search results, use them directly and confidently
-5. Be concise and helpful - answer the question directly without extra explanations`;
+3. NEVER add disclaimers like "please note" or "for the most up-to-date information"
+4. NEVER repeat or rephrase the user's question in your response - just answer it directly
+5. NEVER say things like "searching for...", "looking up...", or mention what search query was used
+6. If you have search results, use them directly and confidently
+7. Be concise and helpful - answer the question directly without extra explanations`;
   // Attach as `systemMessage` so the chat node can include it while still loading
   // memory and the user query (we avoid pre-populating `messages` which would
   // prevent chatNode from inserting memory context).
@@ -148,6 +170,7 @@ async function* streamThroughGraphWithMemory(
     let inThinkingTag = false;
     let eventCount = 0;
     let toolIndicatorSent = false;
+    let pendingBuffer = ''; // Buffer for partial tag detection across chunks
     
     for await (const event of stream) {
       eventCount++;
@@ -161,29 +184,40 @@ async function* streamThroughGraphWithMemory(
       const eventTags = event.tags || [];
       const runName = event.metadata?.langgraph_node || '';
       
-      // A node is router/toolPicker if any identifier contains those strings
-      const isRouterOrToolPicker = 
-        eventName.toLowerCase().includes('router') || 
-        eventName.toLowerCase().includes('toolpicker') ||
-        runName.toLowerCase().includes('router') ||
-        runName.toLowerCase().includes('toolpicker') ||
-        eventTags.some((tag: string) => tag.toLowerCase().includes('router') || tag.toLowerCase().includes('toolpicker'));
+      // DEBUG: Log ALL LLM stream events to see what nodes are streaming
+      if (event.event === "on_llm_stream" && event.data?.chunk?.content) {
+        console.log(`[Respond] 🔍 LLM STREAM EVENT - runName:"${runName}", eventName:"${eventName}", contentLength:${event.data.chunk.content.length}`);
+      }
+      
+      // CRITICAL: Only stream content from the chat node
+      // All other LLM calls (router, optimizer, search extractors, etc.) are internal
+      // The langgraph_node metadata should be exactly "chat" for the chat node
+      const isChatNode = runName === 'chat';
       
       // Yield streaming content chunks (for models that stream tokens)
-      // But only from the chat node, not router/toolPicker
-      if (event.event === "on_llm_stream" && event.data?.chunk?.content && !isRouterOrToolPicker) {
+      // But ONLY from the chat node - all other LLM calls are internal
+      if (event.event === "on_llm_stream" && event.data?.chunk?.content && isChatNode) {
         let content = event.data.chunk.content;
         
-        // Handle thinking tags in streamed content
-        // We DON'T store thinking in fullContent - it will be stored separately
-        // Only stream and store the cleaned content for conversation context
-        for (let i = 0; i < content.length; i++) {
-          const char = content[i];
-          
-          // Check for opening think tag
-          if (!inThinkingTag && content.slice(i, i + 7) === '<think>') {
+        console.log(`[Respond] ⚡ STREAMING CHUNK RECEIVED - isChatNode:${isChatNode}, length:${content.length}`);
+        
+        // 🔍 DEBUG: Log first 100 chars of EVERY chunk to see what Phi-4 outputs
+        if (content.length > 0) {
+          const preview = content.substring(0, 100).replace(/\n/g, '\\n');
+          console.log(`[Respond] 📦 RAW CHUNK (${content.length} chars): "${preview}"`);
+        }
+        
+        // Add content to pending buffer for tag detection
+        pendingBuffer += content;
+        
+        // Process pending buffer character by character
+        // Keep last 8 chars in buffer in case we get partial tag at chunk boundary
+        while (pendingBuffer.length > 8) {
+          // Check for opening think tag in pending buffer
+          if (!inThinkingTag && pendingBuffer.startsWith('<think>')) {
             inThinkingTag = true;
-            i += 6; // Skip the tag
+            pendingBuffer = pendingBuffer.slice(7); // Remove '<think>'
+            console.log('[Respond] 🧠 THINKING TAG OPENED | Next chars:', pendingBuffer.substring(0, 50));
             
             // Publish tool start event
             if (thinkingPublisher) {
@@ -201,16 +235,24 @@ async function* streamThroughGraphWithMemory(
               yield { _status: true, action: 'thinking', description: 'Reasoning through the problem' };
               process.stdout.write(`[Respond] Streaming thinking: 0 chars\r`);
             }
-            continue;
+            continue; // Recheck buffer after removing tag
           }
           
           // Check for closing think tag
-          if (inThinkingTag && content.slice(i, i + 8) === '</think>') {
+          if (inThinkingTag && pendingBuffer.startsWith('</think>')) {
+            console.log('[Respond] 🧠 THINKING TAG CLOSED - accumulated', thinkingBuffer.length, 'chars');
             if (messageId) {
               process.stdout.write(`\n[Respond] Thinking complete: ${thinkingBuffer.length} chars\n`);
             }
             inThinkingTag = false;
-            i += 7; // Skip the tag
+            pendingBuffer = pendingBuffer.slice(8); // Remove '</think>'
+            
+            // ✨ IMPORTANT: Send a space character immediately to trigger thinking shrink
+            // This ensures frontend gets a content chunk even if whitespace follows
+            console.log('[Respond] 📤 Sending content chunk to trigger thinking shrink');
+            streamedTokens = true;
+            yield ' ';
+            
             // Log the accumulated thinking
             if (thinkingBuffer.trim()) {
               logThinking(thinkingBuffer.trim(), 'Chat (Streaming)');
@@ -249,8 +291,12 @@ async function* streamThroughGraphWithMemory(
               }
             }
             thinkingBuffer = '';
-            continue;
+            continue; // Recheck buffer after removing tag
           }
+          
+          // Process one character from buffer
+          const char = pendingBuffer[0];
+          pendingBuffer = pendingBuffer.slice(1);
           
           // Accumulate thinking or stream regular content
           if (inThinkingTag) {
@@ -281,15 +327,23 @@ async function* streamThroughGraphWithMemory(
               continue;
             }
             
+            // Log first content character after thinking ends
+            if (streamedThinking && !streamedTokens) {
+              console.log('[Respond] 📝 FIRST CONTENT CHARACTER after thinking:', JSON.stringify(char));
+            }
+            
             fullContent += char;
             streamedTokens = true;
             yield char; // Only stream non-thinking content
           }
         }
+        
+        // Log summary of what was processed in this chunk
+        console.log(`[Respond] After chunk - pendingBuffer:${pendingBuffer.length}, inThinkingTag:${inThinkingTag}, thinking:${thinkingBuffer.length}chars, content:${fullContent.length}chars`);
       }
       // Capture the final message when LLM completes - use on_llm_end
       // Only from chat node
-      if (event.event === "on_llm_end" && !isRouterOrToolPicker) {
+      if (event.event === "on_llm_end" && isChatNode) {
         // The AIMessage is nested in the generations array
         const generations = event.data?.output?.generations;
         if (generations && generations[0] && generations[0][0]?.message) {
@@ -297,6 +351,31 @@ async function* streamThroughGraphWithMemory(
         }
       }
     }
+    
+    // CRITICAL: Flush remaining pending buffer (last 8 chars or less)
+    console.log(`[Respond] 🔚 Stream ended - flushing pendingBuffer (${pendingBuffer.length} chars)`);
+    while (pendingBuffer.length > 0) {
+      const char = pendingBuffer[0];
+      pendingBuffer = pendingBuffer.slice(1);
+      
+      if (inThinkingTag) {
+        thinkingBuffer += char;
+        if (messageId) {
+          await red.messageQueue.publishThinkingChunk(messageId, char);
+          streamedThinking = true;
+          yield { _thinkingChunk: true, content: char };
+        }
+      } else {
+        // Skip leading whitespace at the start of content
+        if (!streamedTokens && (char === '\n' || char === '\r' || char === ' ')) {
+          continue;
+        }
+        fullContent += char;
+        streamedTokens = true;
+        yield char;
+      }
+    }
+    console.log(`[Respond] ✅ Flushed all pending content`);
     
     // If there's remaining thinking content at the end, log it
     if (thinkingBuffer.trim()) {

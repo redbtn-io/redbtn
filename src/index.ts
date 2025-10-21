@@ -13,7 +13,7 @@ import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { redGraph } from "./lib/graphs/red";
 import { MemoryManager } from "./lib/memory/memory";
 import { MessageQueue } from "./lib/memory/queue";
-import { Logger } from "./lib/logs/logger";
+import { PersistentLogger } from "./lib/logs/persistent-logger";
 import { createGeminiModel, createChatModel, createWorkerModel, createOpenAIModel } from "./lib/models";
 import * as background from "./functions/background";
 import { respond as respondFunction } from "./functions/respond";
@@ -90,7 +90,7 @@ export class Red {
   public geminiModel?: ChatGoogleGenerativeAI;
   public memory!: MemoryManager;
   public messageQueue!: MessageQueue;
-  public logger!: Logger;
+  public logger!: PersistentLogger;
   private redis!: any; // Redis client for heartbeat
 
   /**
@@ -114,8 +114,8 @@ export class Red {
     this.redis = redis;
     this.messageQueue = new MessageQueue(redis);
     
-    // Initialize logger with same Redis connection
-    this.logger = new Logger(redis);
+    // Initialize logger with MongoDB persistence
+    this.logger = new PersistentLogger(redis, this.nodeId || 'default');
   }
 
   // --- Private Internal Methods ---

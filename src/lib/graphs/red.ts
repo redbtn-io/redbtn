@@ -2,8 +2,9 @@ import { StateGraph, Annotation, END } from "@langchain/langgraph";
 import { InvokeOptions } from '../../index';
 import { routerNode } from "../nodes/router";
 import { chatNode } from "../nodes/chat";
-import { toolNode } from "../nodes/tool";
-import { toolPickerNode } from "../nodes/toolPicker";
+import { searchNode } from "../nodes/search";
+import { scrapeNode } from "../nodes/scrape";
+import { commandNode } from "../nodes/command";
 
 /**
  * 1. Define the State using Annotation
@@ -32,13 +33,8 @@ const RedGraphState = Annotation.Root({
   response: Annotation<any>({
     reducer: (x: any, y: any) => y
   }),
-  nextGraph: Annotation<'homeGraph' | 'assistantGraph' | 'chat' | 'toolPicker'>({
-    reducer: (x: 'homeGraph' | 'assistantGraph' | 'chat' | 'toolPicker', y: 'homeGraph' | 'assistantGraph' | 'chat' | 'toolPicker') => y
-  }),
-  // Track which tools were selected by toolPicker for this query
-  selectedTools: Annotation<string[]>({
-    reducer: (x: string[], y: string[]) => y,
-    default: () => []
+  nextGraph: Annotation<'homeGraph' | 'assistantGraph' | 'chat' | 'search' | 'scrape' | 'command'>({
+    reducer: (x: 'homeGraph' | 'assistantGraph' | 'chat' | 'search' | 'scrape' | 'command', y: 'homeGraph' | 'assistantGraph' | 'chat' | 'search' | 'scrape' | 'command') => y
   }),
   // messageId for linking to Redis pub/sub and event publishing
   messageId: Annotation<string | undefined>({
@@ -50,25 +46,13 @@ type RedGraphStateType = typeof RedGraphState.State;
 
 // --- Graph Definition ---
 
-// Helper function to determine if we should continue to tools or end
-function shouldContinue(state: RedGraphStateType): "tools" | typeof END {
-  const toolCalls = state.response?.tool_calls;
-  
-  // If the LLM makes tool calls, route to the tools node for execution
-  if (toolCalls && toolCalls.length > 0) {
-    return "tools";
-  }
-  
-  // Otherwise, end the graph (no tools to execute)
-  return END;
-}
-
 // Create a new graph instance
 const redGraphBuilder = new StateGraph(RedGraphState)
   .addNode("router", routerNode)
-  .addNode("toolPicker", toolPickerNode) // Pre-filter and execute tools if needed
+  .addNode("search", searchNode)     // Web search node
+  .addNode("scrape", scrapeNode)     // URL scraping node
+  .addNode("command", commandNode)   // Command execution node
   .addNode("chat", chatNode)
-  .addNode("tools", toolNode) // For follow-up tool calls from chat
   .addEdge("__start__", "router")
   .addConditionalEdges(
     "router",
@@ -76,19 +60,18 @@ const redGraphBuilder = new StateGraph(RedGraphState)
     {
       "homeGraph": END,
       "assistantGraph": END,
-      "toolPicker": "toolPicker", // Route to toolPicker when action needed
-      "chat": "chat", // Route directly to chat for conversation
+      "search": "search",     // Route to search when web search needed
+      "scrape": "scrape",     // Route to scrape when URL scraping needed
+      "command": "command",   // Route to command when system command needed
+      "chat": "chat",         // Route directly to chat for conversation
     }
   )
-  // After toolPicker executes tools, go to chat with results
-  .addEdge("toolPicker", "chat")
-  // After chat, check if we need to call MORE tools (for follow-ups)
-  .addConditionalEdges("chat", shouldContinue, {
-    tools: "tools",
-    [END]: END
-  })
-  // After follow-up tools, go back to chat to process results
-  .addEdge("tools", "chat");
+  // After tool nodes execute, go to chat with results
+  .addEdge("search", "chat")
+  .addEdge("scrape", "chat")
+  .addEdge("command", "chat")
+  // Chat is the final node - always end after generating response
+  .addEdge("chat", END);
 
 // Compile the graph into a runnable object
 export const redGraph = redGraphBuilder.compile();

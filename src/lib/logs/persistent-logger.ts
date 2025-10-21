@@ -264,6 +264,24 @@ export class PersistentLogger extends Logger {
   }
 
   /**
+   * Get all conversations that have logs with counts and metadata
+   */
+  async getConversationsWithLogs(): Promise<Array<{
+    conversationId: string;
+    title?: string;
+    lastLogTime: Date;
+    logCount: number;
+    generationCount: number;
+  }>> {
+    try {
+      return await this.db.getConversationsWithLogs();
+    } catch (error) {
+      console.error('[PersistentLogger] Failed to get conversations with logs:', error);
+      return [];
+    }
+  }
+
+  /**
    * Shutdown the logger and flush all pending writes
    */
   async shutdown(): Promise<void> {
