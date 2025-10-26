@@ -21,7 +21,7 @@ export function createChatModel(config: RedConfig): ChatOllama {
       process.env.CHAT_LLM_URL || 
       process.env.OLLAMA_BASE_URL || 
       "http://localhost:11434",
-    model: modelName,
+    model: "qwen3:14b",
     temperature: 0.0,
     keepAlive: -1,
   });

@@ -40,6 +40,21 @@ export { PersistentLogger } from "./lib/logs/persistent-logger";
 // Export thinking utilities for DeepSeek-R1 and similar models
 export { extractThinking, logThinking, extractAndLogThinking } from "./lib/utils/thinking";
 
+// Export RAG (Retrieval-Augmented Generation) components
+export { 
+  VectorStoreManager,
+  DocumentChunk,
+  SearchResult,
+  ChunkingConfig,
+  SearchConfig,
+  CollectionStats
+} from "./lib/memory/vectors";
+
+export { 
+  addToVectorStoreNode,
+  retrieveFromVectorStoreNode
+} from "./lib/nodes/rag";
+
 // --- Type Definitions ---
 
 /**
