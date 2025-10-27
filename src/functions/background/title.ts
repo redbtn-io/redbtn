@@ -2,7 +2,7 @@
  * Background title generation utilities
  */
 
-import type { MemoryManager } from '../../lib/memory/memory';
+import type { Red } from '../../index';
 import type { ChatOllama } from '@langchain/ollama';
 import { extractThinking } from '../../lib/utils/thinking';
 import { getDatabase } from '../../lib/memory/database';
@@ -14,7 +14,7 @@ import { getDatabase } from '../../lib/memory/database';
 export async function generateTitleInBackground(
   conversationId: string,
   messageCount: number,
-  memory: MemoryManager,
+  red: Red,
   chatModel: ChatOllama
 ): Promise<void> {
   try {
@@ -23,17 +23,37 @@ export async function generateTitleInBackground(
       return;
     }
 
-    // Check if title was manually set by user
-    const metadata = await memory.getMetadata(conversationId);
+    // Check if title was manually set by user via Context MCP
+    const metadataResult = await red.callMcpTool('get_conversation_metadata', {
+      conversationId
+    }, { conversationId });
+    
+    if (metadataResult.isError) {
+      console.error('[Title] Failed to get metadata:', metadataResult.content);
+      return;
+    }
+    
+    const metadata = JSON.parse(metadataResult.content?.[0]?.text || '{}');
     if (metadata?.titleSetByUser) {
       return; // Don't override user-set titles after 6th message
     }
 
-    // Get recent messages for context
-    const messages = await memory.getMessages(conversationId);
+    // Get recent messages for context via Context MCP
+    const messagesResult = await red.callMcpTool('get_messages', {
+      conversationId,
+      limit: 6,
+      source: 'auto'
+    }, { conversationId });
+    
+    if (messagesResult.isError) {
+      console.error('[Title] Failed to get messages:', messagesResult.content);
+      return;
+    }
+    
+    const messages = JSON.parse(messagesResult.content?.[0]?.text || '[]');
     const conversationText = messages
       .slice(0, Math.min(6, messages.length)) // Use first 6 messages max
-      .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+      .map((m: any) => `${m.role.toUpperCase()}: ${m.content}`)
       .join('\n');
 
     // Create prompt for title generation
@@ -55,9 +75,9 @@ ${conversationText}`;
       title = words.slice(0, 5).join(' ');
     }
 
-    // Store title in Redis metadata
+    // Store title in Redis metadata (use memory manager for direct access)
     const metaKey = `conversation:${conversationId}:metadata`;
-    await memory['redis'].hset(metaKey, 'title', title);
+    await red.memory['redis'].hset(metaKey, 'title', title);
     
     // Also update title in MongoDB database
     const database = await getDatabase();
@@ -76,10 +96,10 @@ ${conversationText}`;
 export async function setConversationTitle(
   conversationId: string,
   title: string,
-  memory: MemoryManager
+  red: Red
 ): Promise<void> {
   const metaKey = `conversation:${conversationId}:metadata`;
-  await memory['redis'].hset(metaKey, {
+  await red.memory['redis'].hset(metaKey, {
     'title': title,
     'titleSetByUser': 'true'
   });
@@ -96,8 +116,16 @@ export async function setConversationTitle(
  */
 export async function getConversationTitle(
   conversationId: string,
-  memory: MemoryManager
+  red: Red
 ): Promise<string | null> {
-  const metadata = await memory.getMetadata(conversationId);
+  const metadataResult = await red.callMcpTool('get_conversation_metadata', {
+    conversationId
+  }, { conversationId });
+  
+  if (metadataResult.isError) {
+    return null;
+  }
+  
+  const metadata = JSON.parse(metadataResult.content?.[0]?.text || '{}');
   return metadata?.title || null;
 }

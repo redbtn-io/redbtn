@@ -21,7 +21,7 @@ export function createChatModel(config: RedConfig): ChatOllama {
       process.env.CHAT_LLM_URL || 
       process.env.OLLAMA_BASE_URL || 
       "http://localhost:11434",
-    model: "qwen3:14b",
+    model: modelName,
     temperature: 0.0,
     keepAlive: -1,
   });
@@ -41,7 +41,7 @@ export function createWorkerModel(config: RedConfig): ChatOllama {
     baseUrl: config.workLlmUrl || 
       process.env.WORK_LLM_URL || 
       "http://localhost:11434",
-    model: modelName,
+    model: "granite4:tiny-h",
     temperature: 0.0,
     keepAlive: -1,
   });

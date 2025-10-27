@@ -21,7 +21,8 @@
     "think": "THINK=true npx tsx examples/server.ts",
     "build": "tsc",
     "pack": "npm run build && npm pack",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "db:fix-messageids": "npx tsx scripts/fix-null-messageids.ts"
   },
   "author": "",
   "license": "ISC",

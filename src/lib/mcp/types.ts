@@ -133,4 +133,9 @@ export interface ToolsListResult {
 export interface ToolCallParams {
   name: string;
   arguments: Record<string, unknown>;
+  _meta?: {
+    conversationId?: string;
+    generationId?: string;
+    messageId?: string;
+  };
 }

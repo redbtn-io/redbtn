@@ -6,7 +6,7 @@
  */
 
 import Redis from 'ioredis';
-import { WebServer, SystemServer } from './lib/mcp';
+import { WebServer, SystemServer, RagServer, ContextServer } from './lib/mcp';
 import { McpServer } from './lib/mcp/server';
 
 // Create Redis connections for each server
@@ -37,6 +37,18 @@ async function main() {
     });
     await systemServer.start();
     servers.push(systemServer);
+
+    // RAG Server (vector database operations)
+    const ragRedis = new Redis(redisUrl);
+    const ragServer = new RagServer(ragRedis);
+    await ragServer.start();
+    servers.push(ragServer);
+
+    // Context Server (conversation context and history)
+    const contextRedis = new Redis(redisUrl);
+    const contextServer = new ContextServer(contextRedis, redisUrl);
+    await contextServer.start();
+    servers.push(contextServer);
 
     console.log('[MCP Launcher] All servers started successfully');
     console.log('[MCP Launcher] Protocol: JSON-RPC 2.0 over Redis pub/sub');

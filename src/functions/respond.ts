@@ -21,11 +21,17 @@ export async function respond(
   query: { message: string },
   options: InvokeOptions = {}
 ): Promise<any | AsyncGenerator<string | any, void, unknown>> {
-  // Generate conversation ID if not provided
+  // Generate conversation ID if not provided (use memory directly for ID generation since it's a simple utility)
   const conversationId = options.conversationId || red.memory.generateConversationId(query.message);
   
-  // Extract messageId for Redis pub/sub (if provided)
-  const messageId = (options as any).messageId;
+  // Extract messageId for Redis pub/sub (if provided) - this is the request/generation ID
+  const requestId = (options as any).messageId;
+  
+  // Generate separate message IDs for user and assistant messages
+  const userMessageId = `msg_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  const assistantMessageId = `msg_${Date.now() + 1}_${Math.random().toString(36).substring(7)}`;
+  
+  console.log(`[Respond] Starting respond() - conversationId:${conversationId}, requestId:${requestId}, userMessageId:${userMessageId}, query:${query.message.substring(0, 50)}`);
   
   // Start a new generation (will fail if one is already in progress)
   const generationId = await red.logger.startGeneration(conversationId);
@@ -48,25 +54,27 @@ export async function respond(
     generationId,
     conversationId,
     metadata: {
-      messageId,
+      messageId: requestId,
       queryLength: query.message.length,
       source: options.source
     }
   });
   
-  // Store user message in memory
-  await red.memory.addMessage(conversationId, {
+  // Store user message via Context MCP
+  console.log(`[Respond] About to store user message - messageId:${userMessageId}`);
+  await red.callMcpTool('store_message', {
+    conversationId,
     role: 'user',
     content: query.message,
-    timestamp: Date.now(),
+    messageId: userMessageId, // Use unique user message ID
     toolExecutions: [] // User messages don't have tool executions
-  });
+  }, { conversationId, generationId, messageId: requestId });
   
   const initialState = {
     query,
     options: { ...options, conversationId, generationId }, // Add generationId to options
     redInstance: red, // Pass the entire instance into the graph
-    messageId, // Add messageId to state for tool event publishing
+    messageId: requestId, // Add requestId to state for tool event publishing
   };
 
   // Inject a system message into the graph state for every respond() call.
@@ -84,38 +92,39 @@ CRITICAL RULES:
 5. NEVER say things like "searching for...", "looking up...", or mention what search query was used
 6. If you have search results, use them directly and confidently
 7. Be concise and helpful - answer the question directly without extra explanations`;
-  // Attach as `systemMessage` so the chat node can include it while still loading
-  // memory and the user query (we avoid pre-populating `messages` which would
-  // prevent chatNode from inserting memory context).
+  // Attach as `systemMessage` so the responder node can use it
+  // Tool nodes may override this with their own system messages
   (initialState as any).systemMessage = SYSTEM_PROMPT;
 
   // Check if streaming is requested
   if (options.stream) {
     // Use LangGraph's streaming capabilities to stream through the graph
-    return streamThroughGraphWithMemory(red, initialState, conversationId, generationId, messageId);
+    return streamThroughGraphWithMemory(red, initialState, conversationId, generationId, requestId, assistantMessageId);
   } else {
     // Invoke the graph and return the full AIMessage
     const result = await redGraph.invoke(initialState);
     const response = result.response;
     
-    // Store assistant response in memory
-    await red.memory.addMessage(conversationId, {
-      id: messageId, // Include the message ID for consistent linking
+    // Store assistant response via Context MCP
+    await red.callMcpTool('store_message', {
+      conversationId,
       role: 'assistant',
       content: typeof response.content === 'string' ? response.content : JSON.stringify(response.content),
-      timestamp: Date.now(),
+      messageId: assistantMessageId, // Use unique assistant message ID
       toolExecutions: [] // TODO: Implement tool execution data collection
-    });
+    }, { conversationId, generationId, messageId: requestId });
     
-    // Get message count for title generation
-    const metadata = await red.memory.getMetadata(conversationId);
-    const messageCount = metadata?.messageCount || 0;
+    // Get message count for title generation via Context MCP
+    const metadataResult = await red.callMcpTool('get_conversation_metadata', {
+      conversationId
+    }, { conversationId, generationId, messageId: requestId });
+    const messageCount = metadataResult.isError ? 0 : JSON.parse(metadataResult.content?.[0]?.text || '{}').messageCount || 0;
     
     // Trigger background summarization (non-blocking)
     background.summarizeInBackground(conversationId, red.memory, red.chatModel);
     
     // Trigger background title generation (non-blocking)
-    background.generateTitleInBackground(conversationId, messageCount, red.memory, red.chatModel);
+    background.generateTitleInBackground(conversationId, messageCount, red, red.chatModel);
     
     // Attach conversationId to response for server access
     return { ...response, conversationId };
@@ -133,7 +142,8 @@ async function* streamThroughGraphWithMemory(
   initialState: any,
   conversationId: string,
   generationId: string,
-  messageId?: string
+  requestId?: string,
+  assistantMessageId?: string
 ): AsyncGenerator<string | any, void, unknown> {
   try {
     // Import thinking utilities
@@ -142,9 +152,9 @@ async function* streamThroughGraphWithMemory(
     // Import tool event system (disabled - not implemented yet)
     // const { createIntegratedPublisher } = await import('../lib/events/integrated-publisher');
     
-    // Create tool event publisher for thinking (if we have a messageId)
+    // Create tool event publisher for thinking (if we have a requestId)
     let thinkingPublisher: any = null;
-    // if (messageId) {
+    // if (requestId) {
     //   thinkingPublisher = createIntegratedPublisher(
     //     red.messageQueue,
     //     'thinking',
@@ -184,28 +194,15 @@ async function* streamThroughGraphWithMemory(
       const eventTags = event.tags || [];
       const runName = event.metadata?.langgraph_node || '';
       
-      // DEBUG: Log ALL LLM stream events to see what nodes are streaming
-      if (event.event === "on_llm_stream" && event.data?.chunk?.content) {
-        console.log(`[Respond] 🔍 LLM STREAM EVENT - runName:"${runName}", eventName:"${eventName}", contentLength:${event.data.chunk.content.length}`);
-      }
-      
-      // CRITICAL: Only stream content from the chat node
+      // CRITICAL: Only stream content from the responder node
       // All other LLM calls (router, optimizer, search extractors, etc.) are internal
-      // The langgraph_node metadata should be exactly "chat" for the chat node
-      const isChatNode = runName === 'chat';
+      // The langgraph_node metadata should be exactly "responder" for the responder node
+      const isResponderNode = runName === 'responder';
       
       // Yield streaming content chunks (for models that stream tokens)
-      // But ONLY from the chat node - all other LLM calls are internal
-      if (event.event === "on_llm_stream" && event.data?.chunk?.content && isChatNode) {
+      // But ONLY from the responder node - all other LLM calls are internal
+      if (event.event === "on_llm_stream" && event.data?.chunk?.content && isResponderNode) {
         let content = event.data.chunk.content;
-        
-        console.log(`[Respond] ⚡ STREAMING CHUNK RECEIVED - isChatNode:${isChatNode}, length:${content.length}`);
-        
-        // 🔍 DEBUG: Log first 100 chars of EVERY chunk to see what Phi-4 outputs
-        if (content.length > 0) {
-          const preview = content.substring(0, 100).replace(/\n/g, '\\n');
-          console.log(`[Respond] 📦 RAW CHUNK (${content.length} chars): "${preview}"`);
-        }
         
         // Add content to pending buffer for tag detection
         pendingBuffer += content;
@@ -227,8 +224,8 @@ async function* streamThroughGraphWithMemory(
             }
             
             // Emit status that thinking is starting (legacy)
-            if (messageId) {
-              await red.messageQueue.publishStatus(messageId, { 
+            if (requestId) {
+              await red.messageQueue.publishStatus(requestId, { 
                 action: 'thinking', 
                 description: 'Reasoning through the problem' 
               });
@@ -241,7 +238,7 @@ async function* streamThroughGraphWithMemory(
           // Check for closing think tag
           if (inThinkingTag && pendingBuffer.startsWith('</think>')) {
             console.log('[Respond] 🧠 THINKING TAG CLOSED - accumulated', thinkingBuffer.length, 'chars');
-            if (messageId) {
+            if (requestId) {
               process.stdout.write(`\n[Respond] Thinking complete: ${thinkingBuffer.length} chars\n`);
             }
             inThinkingTag = false;
@@ -275,7 +272,7 @@ async function* streamThroughGraphWithMemory(
                   const db = await import('../lib/memory/database').then(m => m.getDatabase());
                   const thoughtId = await db.storeThought({
                     thoughtId: `thought_${generationId}_${Date.now()}`,
-                    messageId, // IMPORTANT: Include messageId for linking to messages
+                    messageId: requestId, // Use requestId for thinking link
                     conversationId,
                     generationId,
                     source: 'chat',
@@ -308,9 +305,9 @@ async function* streamThroughGraphWithMemory(
             }
             
             // Stream thinking character-by-character via Redis pub/sub
-            if (messageId) {
+            if (requestId) {
               // Publish thinking chunk to Redis for real-time streaming
-              await red.messageQueue.publishThinkingChunk(messageId, char);
+              await red.messageQueue.publishThinkingChunk(requestId, char);
               
               // Track that we've streamed thinking
               streamedThinking = true;
@@ -337,13 +334,11 @@ async function* streamThroughGraphWithMemory(
             yield char; // Only stream non-thinking content
           }
         }
-        
-        // Log summary of what was processed in this chunk
-        console.log(`[Respond] After chunk - pendingBuffer:${pendingBuffer.length}, inThinkingTag:${inThinkingTag}, thinking:${thinkingBuffer.length}chars, content:${fullContent.length}chars`);
       }
+      
       // Capture the final message when LLM completes - use on_llm_end
-      // Only from chat node
-      if (event.event === "on_llm_end" && isChatNode) {
+      // Only from responder node
+      if (event.event === "on_llm_end" && isResponderNode) {
         // The AIMessage is nested in the generations array
         const generations = event.data?.output?.generations;
         if (generations && generations[0] && generations[0][0]?.message) {
@@ -353,15 +348,17 @@ async function* streamThroughGraphWithMemory(
     }
     
     // CRITICAL: Flush remaining pending buffer (last 8 chars or less)
-    console.log(`[Respond] 🔚 Stream ended - flushing pendingBuffer (${pendingBuffer.length} chars)`);
+    if (pendingBuffer.length > 0) {
+      process.stdout.write(`\r[Respond] Flushing ${pendingBuffer.length} remaining chars\n`);
+    }
     while (pendingBuffer.length > 0) {
       const char = pendingBuffer[0];
       pendingBuffer = pendingBuffer.slice(1);
       
       if (inThinkingTag) {
         thinkingBuffer += char;
-        if (messageId) {
-          await red.messageQueue.publishThinkingChunk(messageId, char);
+        if (requestId) {
+          await red.messageQueue.publishThinkingChunk(requestId, char);
           streamedThinking = true;
           yield { _thinkingChunk: true, content: char };
         }
@@ -375,7 +372,6 @@ async function* streamThroughGraphWithMemory(
         yield char;
       }
     }
-    console.log(`[Respond] ✅ Flushed all pending content`);
     
     // If there's remaining thinking content at the end, log it
     if (thinkingBuffer.trim()) {
@@ -397,7 +393,7 @@ async function* streamThroughGraphWithMemory(
             const db = await import('../lib/memory/database').then(m => m.getDatabase());
             const thoughtId = await db.storeThought({
               thoughtId: `thought_${generationId}`,
-              messageId, // IMPORTANT: Include messageId for linking to messages
+              messageId: requestId, // Use requestId for thinking link
               conversationId,
               generationId,
               source: 'chat',
@@ -407,14 +403,14 @@ async function* streamThroughGraphWithMemory(
                 model: red.chatModel.model,
               },
             });
-            console.log(`[Respond] Stored thinking: ${thoughtId} with messageId: ${messageId}`);
+            console.log(`[Respond] Stored thinking: ${thoughtId} with messageId: ${requestId}`);
             
             // Publish to Redis for real-time updates  
-            if (messageId) {
-              console.log(`[Respond] Publishing non-stream thinking to Redis for messageId: ${messageId}, length: ${thinking.length}`);
+            if (requestId) {
+              console.log(`[Respond] Publishing non-stream thinking to Redis for messageId: ${requestId}, length: ${thinking.length}`);
               // Publish thinking content chunk by chunk for consistent display
               for (const char of thinking) {
-                await red.messageQueue.publishThinkingChunk(messageId, char);
+                await red.messageQueue.publishThinkingChunk(requestId, char);
               }
               console.log(`[Respond] Published non-stream thinking successfully`);
             } else {
@@ -438,16 +434,20 @@ async function* streamThroughGraphWithMemory(
       }
     }
     
-    // Store assistant response in memory (after streaming completes)
+    // Store assistant response via Context MCP (after streaming completes)
+    console.log(`[Respond] Streaming complete - fullContent length:${fullContent?.length}, assistantMessageId:${assistantMessageId}`);
     if (fullContent) {
-      // Store content in memory for LLM context (already cleaned in streaming/non-streaming paths)
-      await red.memory.addMessage(conversationId, {
-        id: messageId, // Include the message ID for consistent linking
+      console.log(`[Respond] About to store assistant message - messageId:${assistantMessageId}, content length:${fullContent.length}`);
+      // Store content via MCP for LLM context (already cleaned in streaming/non-streaming paths)
+      console.log(`[Respond] Calling red.callMcpTool('store_message'...)`);
+      const storeResult = await red.callMcpTool('store_message', {
+        conversationId,
         role: 'assistant',
         content: fullContent,
-        timestamp: Date.now(),
+        messageId: assistantMessageId, // Use unique assistant message ID
         toolExecutions: [] // TODO: Implement tool execution data collection
-      });
+      }, { conversationId, generationId, messageId: requestId });
+      console.log(`[Respond] callMcpTool returned:`, storeResult?.isError ? 'ERROR' : 'SUCCESS');
       
       // Complete the generation
       await red.logger.completeGeneration(generationId, {
@@ -459,15 +459,17 @@ async function* streamThroughGraphWithMemory(
         tokens: finalMessage?.usage_metadata,
       });
       
-      // Get message count for title generation
-      const metadata = await red.memory.getMetadata(conversationId);
-      const messageCount = metadata?.messageCount || 0;
+      // Get message count for title generation via Context MCP
+      const metadataResult = await red.callMcpTool('get_conversation_metadata', {
+        conversationId
+      }, { conversationId, generationId, messageId: requestId });
+      const messageCount = metadataResult.isError ? 0 : JSON.parse(metadataResult.content?.[0]?.text || '{}').messageCount || 0;
       
       // Trigger background summarization (non-blocking)
       background.summarizeInBackground(conversationId, red.memory, red.chatModel);
       
       // Trigger background title generation (non-blocking)
-      background.generateTitleInBackground(conversationId, messageCount, red.memory, red.chatModel);
+      background.generateTitleInBackground(conversationId, messageCount, red, red.chatModel);
       
       // Trigger executive summary generation after 3rd+ message (non-blocking)
       if (messageCount >= 3) {

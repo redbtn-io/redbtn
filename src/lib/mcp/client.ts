@@ -39,8 +39,6 @@ export class McpClient {
    * Connect to MCP server
    */
   async connect(): Promise<void> {
-    console.log(`[MCP Client] Connecting to ${this.serverName}`);
-    
     // Subscribe to response channel
     await this.subscriber.subscribe(this.responseChannel);
     
@@ -50,15 +48,12 @@ export class McpClient {
         this.handleResponse(message);
       }
     });
-    
-    console.log(`[MCP Client] Connected to ${this.serverName}`);
   }
 
   /**
    * Disconnect from MCP server
    */
   async disconnect(): Promise<void> {
-    console.log(`[MCP Client] Disconnecting from ${this.serverName}`);
     await this.subscriber.unsubscribe(this.responseChannel);
     await this.subscriber.quit();
   }
@@ -93,10 +88,15 @@ export class McpClient {
   /**
    * Call a tool
    */
-  async callTool(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
+  async callTool(
+    name: string, 
+    args: Record<string, unknown>,
+    meta?: { conversationId?: string; generationId?: string; messageId?: string }
+  ): Promise<CallToolResult> {
     const params: ToolCallParams = {
       name,
       arguments: args,
+      _meta: meta,
     };
     
     return await this.sendRequest<CallToolResult>('tools/call', params as unknown as Record<string, unknown>);
@@ -162,7 +162,7 @@ export class McpClient {
       const pending = this.pendingRequests.get(id);
       
       if (!pending) {
-        console.warn(`[MCP Client] Received response for unknown request: ${id}`);
+        // Silently ignore - likely a race condition with cleanup
         return;
       }
       

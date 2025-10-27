@@ -17,6 +17,7 @@ import { PersistentLogger } from "./lib/logs/persistent-logger";
 import { createGeminiModel, createChatModel, createWorkerModel, createOpenAIModel } from "./lib/models";
 import * as background from "./functions/background";
 import { respond as respondFunction } from "./functions/respond";
+import { McpRegistry } from "./lib/mcp/registry";
 
 // Export database utilities for external use
 export { 
@@ -54,6 +55,18 @@ export {
   addToVectorStoreNode,
   retrieveFromVectorStoreNode
 } from "./lib/nodes/rag";
+
+// Export MCP (Model Context Protocol) components
+export {
+  McpClient,
+  McpRegistry,
+  McpServer,
+  WebServer,
+  SystemServer,
+  Tool,
+  CallToolResult,
+  ServerRegistration,
+} from "./lib/mcp";
 
 // --- Type Definitions ---
 
@@ -106,6 +119,7 @@ export class Red {
   public memory!: MemoryManager;
   public messageQueue!: MessageQueue;
   public logger!: PersistentLogger;
+  public mcpRegistry!: McpRegistry;
   private redis!: any; // Redis client for heartbeat
 
   /**
@@ -131,6 +145,9 @@ export class Red {
     
     // Initialize logger with MongoDB persistence
     this.logger = new PersistentLogger(redis, this.nodeId || 'default');
+    
+    // Initialize MCP registry for tool servers
+    this.mcpRegistry = new McpRegistry(redis.duplicate());
   }
 
   // --- Private Internal Methods ---
@@ -180,7 +197,7 @@ export class Red {
       this.nodeId = `node_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     }
 
-    console.log(`Loading base state for node: ${this.nodeId}...`);
+    process.stdout.write(`\rLoading node: ${this.nodeId}...`);
     
     // TODO: Implement the actual state fetching logic from Redis using `this.config.redisUrl`.
     // The `nodeId` can be used to fetch a specific state for recovery or distributed operation.
@@ -188,10 +205,21 @@ export class Red {
     this.baseState = { loadedAt: new Date(), nodeId: this.nodeId };
     this.isLoaded = true;
     
+    // Register MCP servers (web, system, rag, and context)
+    try {
+      await this.mcpRegistry.registerServer('web');
+      await this.mcpRegistry.registerServer('system');
+      await this.mcpRegistry.registerServer('rag');
+      await this.mcpRegistry.registerServer('context');
+      const tools = this.mcpRegistry.getAllTools();
+      process.stdout.write(`\r✓ Red AI initialized (${tools.length} MCP tools)\n`);
+    } catch (error) {
+      console.warn('⚠️ MCP server registration failed:', error);
+      console.warn('  Tool calls will fail. Make sure MCP servers are running: npm run mcp:start');
+    }
+    
     // Start heartbeat to register node as active
     this.heartbeatInterval = background.startHeartbeat(this.nodeId, this.redis);
-    
-    console.log('Base state loaded successfully.');
   }
 
   /**
@@ -248,6 +276,14 @@ export class Red {
     await background.stopHeartbeat(this.nodeId, this.redis, this.heartbeatInterval);
     this.heartbeatInterval = undefined;
     
+    // Disconnect from MCP servers
+    try {
+      await this.mcpRegistry.disconnectAll();
+      console.log('[Red] MCP clients disconnected');
+    } catch (error) {
+      console.warn('[Red] Error disconnecting MCP clients:', error);
+    }
+    
     // Close Redis connection
     if (this.redis) {
       await this.redis.quit();
@@ -276,7 +312,7 @@ export class Red {
    * @param title The custom title to set
    */
   public async setConversationTitle(conversationId: string, title: string): Promise<void> {
-    return background.setConversationTitle(conversationId, title, this.memory);
+    return background.setConversationTitle(conversationId, title, this);
   }
 
   /**
@@ -285,7 +321,113 @@ export class Red {
    * @returns The title or null if not set
    */
   public async getConversationTitle(conversationId: string): Promise<string | null> {
-    return background.getConversationTitle(conversationId, this.memory);
+    return background.getConversationTitle(conversationId, this);
+  }
+
+  /**
+   * Call an MCP tool by name with comprehensive logging
+   * Automatically routes to the correct MCP server
+   * @param toolName The name of the tool to call
+   * @param args The arguments to pass to the tool
+   * @param context Optional logging context (conversationId, generationId, messageId)
+   * @returns The tool execution result
+   */
+  public async callMcpTool(
+    toolName: string, 
+    args: Record<string, unknown>,
+    context?: { conversationId?: string; generationId?: string; messageId?: string }
+  ): Promise<any> {
+    const startTime = Date.now();
+    
+    // Log tool call start
+    await this.logger.log({
+      level: 'info',
+      category: 'mcp',
+      message: `📡 MCP Tool Call: ${toolName}`,
+      conversationId: context?.conversationId,
+      generationId: context?.generationId,
+      metadata: {
+        toolName,
+        args: this.sanitizeArgsForLogging(args),
+        protocol: 'MCP/JSON-RPC 2.0'
+      }
+    });
+
+    try {
+      const result = await this.mcpRegistry.callTool(toolName, args, {
+        conversationId: context?.conversationId,
+        generationId: context?.generationId,
+        messageId: context?.messageId
+      });
+      const duration = Date.now() - startTime;
+
+      // Log success
+      await this.logger.log({
+        level: result.isError ? 'warn' : 'success',
+        category: 'mcp',
+        message: result.isError 
+          ? `⚠️ MCP Tool Error: ${toolName} (${duration}ms)`
+          : `✓ MCP Tool Complete: ${toolName} (${duration}ms)`,
+        conversationId: context?.conversationId,
+        generationId: context?.generationId,
+        metadata: {
+          toolName,
+          duration,
+          isError: result.isError || false,
+          resultLength: result.content?.[0]?.text?.length || 0,
+          protocol: 'MCP/JSON-RPC 2.0'
+        }
+      });
+
+      return result;
+
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      // Log error
+      await this.logger.log({
+        level: 'error',
+        category: 'mcp',
+        message: `✗ MCP Tool Failed: ${toolName} (${duration}ms)`,
+        conversationId: context?.conversationId,
+        generationId: context?.generationId,
+        metadata: {
+          toolName,
+          duration,
+          error: errorMessage,
+          protocol: 'MCP/JSON-RPC 2.0'
+        }
+      });
+
+      throw error;
+    }
+  }
+
+  /**
+   * Sanitize arguments for logging (remove sensitive data, truncate long values)
+   */
+  private sanitizeArgsForLogging(args: Record<string, unknown>): Record<string, unknown> {
+    const sanitized: Record<string, unknown> = {};
+    
+    for (const [key, value] of Object.entries(args)) {
+      if (typeof value === 'string') {
+        // Truncate long strings
+        sanitized[key] = value.length > 200 ? value.substring(0, 200) + '...' : value;
+      } else {
+        sanitized[key] = value;
+      }
+    }
+    
+    return sanitized;
+  }
+
+  /**
+   * Get all available MCP tools
+   * @returns Array of available tools with their server info
+   */
+  public getMcpTools(): Array<{ server: string; tool: any }> {
+    return this.mcpRegistry.getAllTools();
   }
 
 }

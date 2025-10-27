@@ -59,8 +59,6 @@ export class McpRegistry {
       this.clients.set(serverName, client);
       this.servers.set(serverName, registration);
 
-      console.log(`[Registry] Registered server: ${serverName} with ${toolsList.tools.length} tools`);
-
     } catch (error) {
       console.error(`[Registry] Failed to register server ${serverName}:`, error);
       throw error;
@@ -77,7 +75,6 @@ export class McpRegistry {
       await client.disconnect();
       this.clients.delete(serverName);
       this.servers.delete(serverName);
-      console.log(`[Registry] Unregistered server: ${serverName}`);
     }
   }
 
@@ -133,20 +130,27 @@ export class McpRegistry {
   /**
    * Call a tool (automatically finds the right server)
    */
-  async callTool(toolName: string, args: Record<string, unknown>): Promise<any> {
+  async callTool(
+    toolName: string, 
+    args: Record<string, unknown>,
+    meta?: { conversationId?: string; generationId?: string; messageId?: string }
+  ): Promise<any> {
     const found = this.findTool(toolName);
     
     if (!found) {
       throw new Error(`Tool not found: ${toolName}`);
     }
 
+    console.log(`[Registry] Calling tool: ${toolName} on server: ${found.server}, role: ${args.role}`);
     const client = this.clients.get(found.server);
     
     if (!client) {
       throw new Error(`Client not found for server: ${found.server}`);
     }
 
-    return await client.callTool(toolName, args);
+    const result = await client.callTool(toolName, args, meta);
+    console.log(`[Registry] Tool ${toolName} returned, isError: ${result?.isError}`);
+    return result;
   }
 
   /**

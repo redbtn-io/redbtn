@@ -6,16 +6,19 @@
 import { Redis } from 'ioredis';
 import { McpServer } from '../server';
 import { CallToolResult } from '../types';
+import { McpEventPublisher } from '../event-publisher';
 
 export class WebServer extends McpServer {
-  private braveApiKey: string;
+  private googleApiKey: string;
+  private googleSearchEngineId: string;
 
-  constructor(redis: Redis, braveApiKey?: string) {
+  constructor(redis: Redis, googleApiKey?: string, googleSearchEngineId?: string) {
     super(redis, 'web', '1.0.0');
-    this.braveApiKey = braveApiKey || process.env.BRAVE_API_KEY || '';
+    this.googleApiKey = googleApiKey || process.env.GOOGLE_API_KEY || '';
+    this.googleSearchEngineId = googleSearchEngineId || process.env.GOOGLE_SEARCH_ENGINE_ID || process.env.GOOGLE_CSE_ID || '';
     
-    if (!this.braveApiKey) {
-      console.warn('[Web Server] No Brave API key provided - search will not work');
+    if (!this.googleApiKey || !this.googleSearchEngineId) {
+      console.warn('[Web Server] Google API credentials not configured - search will not work');
     }
   }
 
@@ -26,7 +29,7 @@ export class WebServer extends McpServer {
     // Define web_search tool
     this.defineTool({
       name: 'web_search',
-      description: 'Search the web using Brave Search API. Returns relevant web results for queries about current events, news, or any information that needs to be looked up online.',
+      description: 'Search the web using Google Custom Search API. Returns relevant web results for queries about current events, news, or any information that needs to be looked up online.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -36,7 +39,7 @@ export class WebServer extends McpServer {
           },
           count: {
             type: 'number',
-            description: 'Number of results to return (1-20, default: 5)'
+            description: 'Number of results to return (1-10, default: 5)'
           }
         },
         required: ['query']
@@ -71,14 +74,15 @@ export class WebServer extends McpServer {
    */
   protected async executeTool(
     name: string,
-    args: Record<string, unknown>
+    args: Record<string, unknown>,
+    meta?: { conversationId?: string; generationId?: string; messageId?: string }
   ): Promise<CallToolResult> {
     switch (name) {
       case 'web_search':
-        return await this.searchWeb(args);
+        return await this.searchWeb(args, meta);
       
       case 'scrape_url':
-        return await this.scrapeUrl(args);
+        return await this.scrapeUrl(args, meta);
       
       default:
         throw new Error(`Unknown tool: ${name}`);
@@ -88,42 +92,69 @@ export class WebServer extends McpServer {
   /**
    * Perform web search
    */
-  private async searchWeb(args: Record<string, unknown>): Promise<CallToolResult> {
+  private async searchWeb(
+    args: Record<string, unknown>,
+    meta?: { conversationId?: string; generationId?: string; messageId?: string }
+  ): Promise<CallToolResult> {
     const query = args.query as string;
-    const count = Math.min((args.count as number) || 5, 20);
+    const count = Math.min((args.count as number) || 5, 10);
 
-    if (!this.braveApiKey) {
+    // Create event publisher (use publishRedis for events)
+    const publisher = new McpEventPublisher(this.publishRedis, 'web_search', 'Web Search', meta);
+
+    await publisher.publishStart({ input: { query, count } });
+    await publisher.publishLog('info', `🔍 Web search: "${query.substring(0, 50)}${query.length > 50 ? '...' : ''}" (count=${count})`);
+
+    if (!this.googleApiKey || !this.googleSearchEngineId) {
+      const error = 'Google API credentials not configured';
+      await publisher.publishError(error);
+      await publisher.publishLog('error', `✗ ${error}`);
+      
       return {
         content: [{
           type: 'text',
-          text: 'Error: Brave API key not configured'
+          text: `Error: ${error}`
         }],
         isError: true
       };
     }
 
     try {
-      const response = await fetch(
-        `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`,
-        {
-          headers: {
-            'Accept': 'application/json',
-            'Accept-Encoding': 'gzip',
-            'X-Subscription-Token': this.braveApiKey
-          }
+      await publisher.publishProgress('Calling Google Custom Search API...', { progress: 30 });
+      
+      const url = new URL('https://www.googleapis.com/customsearch/v1');
+      url.searchParams.set('key', this.googleApiKey);
+      url.searchParams.set('cx', this.googleSearchEngineId);
+      url.searchParams.set('q', query);
+      url.searchParams.set('num', count.toString());
+
+      const response = await fetch(url.toString(), {
+        headers: {
+          'Accept': 'application/json',
         }
-      );
+      });
 
       if (!response.ok) {
-        throw new Error(`Brave API error: ${response.status} ${response.statusText}`);
+        const error = `Google API error: ${response.status} ${response.statusText}`;
+        await publisher.publishError(error);
+        await publisher.publishLog('error', `✗ ${error}`, { duration: publisher.getDuration() });
+        throw new Error(error);
       }
+
+      await publisher.publishProgress('Processing search results...', { progress: 60 });
 
       const data = await response.json() as any;
       
-      // Format results
-      const results = data.web?.results || [];
+      // Format results from Google Custom Search
+      const results = data.items || [];
+      const duration = publisher.getDuration();
+      
+      await publisher.publishLog('info', `✓ Received ${results.length} results in ${duration}ms`);
       
       if (results.length === 0) {
+        await publisher.publishComplete({ message: 'No results found' });
+        await publisher.publishLog('warn', '⚠️ No results found');
+        
         return {
           content: [{
             type: 'text',
@@ -137,9 +168,22 @@ export class WebServer extends McpServer {
       
       for (const result of results) {
         text += `**${result.title}**\n`;
-        text += `${result.url}\n`;
-        text += `${result.description || ''}\n\n`;
+        text += `${result.link}\n`;
+        text += `${result.snippet || ''}\n\n`;
       }
+
+      await publisher.publishComplete({
+        resultCount: results.length,
+        resultLength: text.length
+      }, {
+        duration,
+        protocol: 'MCP'
+      });
+
+      await publisher.publishLog('success', `✓ Complete - ${results.length} results, ${text.length} chars`, {
+        duration,
+        resultCount: results.length
+      });
 
       return {
         content: [{
@@ -150,6 +194,10 @@ export class WebServer extends McpServer {
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const duration = publisher.getDuration();
+      
+      await publisher.publishError(errorMessage);
+      await publisher.publishLog('error', `✗ Web search failed: ${errorMessage}`, { duration });
       
       return {
         content: [{
@@ -164,20 +212,35 @@ export class WebServer extends McpServer {
   /**
    * Scrape URL
    */
-  private async scrapeUrl(args: Record<string, unknown>): Promise<CallToolResult> {
+  private async scrapeUrl(
+    args: Record<string, unknown>,
+    meta?: { conversationId?: string; generationId?: string; messageId?: string }
+  ): Promise<CallToolResult> {
     const url = args.url as string;
 
+    // Create event publisher (use publishRedis for events)
+    const publisher = new McpEventPublisher(this.publishRedis, 'scrape_url', 'URL Scraper', meta);
+
+    await publisher.publishStart({ input: { url } });
+    await publisher.publishLog('info', `📄 Scraping URL: ${url}`);
+
     if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
+      const error = 'Invalid URL - must start with http:// or https://';
+      await publisher.publishError(error);
+      await publisher.publishLog('error', `✗ ${error}`);
+      
       return {
         content: [{
           type: 'text',
-          text: 'Error: Invalid URL - must start with http:// or https://'
+          text: `Error: ${error}`
         }],
         isError: true
       };
     }
 
     try {
+      await publisher.publishProgress('Calling Jina AI Reader API...', { progress: 30 });
+      
       // Use Jina AI Reader API
       const jinaUrl = `https://r.jina.ai/${url}`;
       const response = await fetch(jinaUrl, {
@@ -188,12 +251,23 @@ export class WebServer extends McpServer {
       });
 
       if (!response.ok) {
-        throw new Error(`Jina API error: ${response.status} ${response.statusText}`);
+        const error = `Jina API error: ${response.status} ${response.statusText}`;
+        await publisher.publishError(error);
+        await publisher.publishLog('error', `✗ ${error}`, { duration: publisher.getDuration() });
+        throw new Error(error);
       }
 
+      await publisher.publishProgress('Processing content...', { progress: 70 });
+
       const content = await response.text();
+      const duration = publisher.getDuration();
+
+      await publisher.publishLog('info', `✓ Received ${content.length} chars in ${duration}ms`);
 
       if (!content || content.trim().length === 0) {
+        await publisher.publishComplete({ message: 'No content extracted' });
+        await publisher.publishLog('warn', '⚠️ No content extracted');
+        
         return {
           content: [{
             type: 'text',
@@ -205,6 +279,18 @@ export class WebServer extends McpServer {
       // Add metadata
       const result = `# Content from ${url}\n\n${content}`;
 
+      await publisher.publishComplete({
+        contentLength: result.length
+      }, {
+        duration,
+        protocol: 'MCP'
+      });
+
+      await publisher.publishLog('success', `✓ Complete - ${result.length} chars`, {
+        duration,
+        contentLength: result.length
+      });
+
       return {
         content: [{
           type: 'text',
@@ -214,6 +300,10 @@ export class WebServer extends McpServer {
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const duration = publisher.getDuration();
+      
+      await publisher.publishError(errorMessage);
+      await publisher.publishLog('error', `✗ Scraping failed: ${errorMessage}`, { duration });
       
       return {
         content: [{

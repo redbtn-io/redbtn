@@ -8,6 +8,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { McpServer } from '../server';
 import { CallToolResult } from '../types';
+import { McpEventPublisher } from '../event-publisher';
 
 const execAsync = promisify(exec);
 
@@ -65,10 +66,11 @@ export class SystemServer extends McpServer {
    */
   protected async executeTool(
     name: string,
-    args: Record<string, unknown>
+    args: Record<string, unknown>,
+    meta?: { conversationId?: string; generationId?: string; messageId?: string }
   ): Promise<CallToolResult> {
     if (name === 'execute_command') {
-      return await this.executeCommand(args);
+      return await this.executeCommand(args, meta);
     }
 
     throw new Error(`Unknown tool: ${name}`);
@@ -77,14 +79,27 @@ export class SystemServer extends McpServer {
   /**
    * Execute system command
    */
-  private async executeCommand(args: Record<string, unknown>): Promise<CallToolResult> {
+  private async executeCommand(
+    args: Record<string, unknown>,
+    meta?: { conversationId?: string; generationId?: string; messageId?: string }
+  ): Promise<CallToolResult> {
     const command = (args.command as string || '').trim();
 
+    // Create event publisher (use publishRedis for events)
+    const publisher = new McpEventPublisher(this.publishRedis, 'execute_command', 'Command Execution', meta);
+
+    await publisher.publishStart({ input: { command: command.substring(0, 100) } });
+    await publisher.publishLog('info', `⚙️ Execute command: "${command.substring(0, 100)}${command.length > 100 ? '...' : ''}"`);
+
     if (!command) {
+      const error = 'No command provided';
+      await publisher.publishError(error);
+      await publisher.publishLog('error', `✗ ${error}`);
+      
       return {
         content: [{
           type: 'text',
-          text: 'Error: No command provided'
+          text: `Error: ${error}`
         }],
         isError: true
       };
@@ -93,21 +108,32 @@ export class SystemServer extends McpServer {
     // Check if command is allowed
     const baseCommand = command.split(' ')[0];
     if (!this.allowedCommands.includes(baseCommand)) {
+      const error = `Command '${baseCommand}' is not allowed. Allowed commands: ${this.allowedCommands.join(', ')}`;
+      await publisher.publishError(error);
+      await publisher.publishLog('warn', `🛡️ Security blocked: ${baseCommand}`);
+      
       return {
         content: [{
           type: 'text',
-          text: `Error: Command '${baseCommand}' is not allowed. Allowed commands: ${this.allowedCommands.join(', ')}`
+          text: `Error: ${error}`
         }],
         isError: true
       };
     }
 
+    await publisher.publishProgress('Security check passed, executing...', { progress: 30 });
+    await publisher.publishLog('info', `✓ Security check passed`);
+
     try {
+      await publisher.publishProgress(`Executing: ${command.substring(0, 60)}...`, { progress: 50 });
+      
       const { stdout, stderr } = await execAsync(command, {
         cwd: this.workingDirectory,
         timeout: 30000, // 30 second timeout
         maxBuffer: 1024 * 1024, // 1MB max output
       });
+
+      const duration = publisher.getDuration();
 
       let output = '';
       
@@ -123,6 +149,20 @@ export class SystemServer extends McpServer {
         output = '(Command executed successfully with no output)';
       }
 
+      await publisher.publishComplete({
+        stdoutLength: stdout.length,
+        stderrLength: stderr.length
+      }, {
+        duration,
+        protocol: 'MCP'
+      });
+
+      await publisher.publishLog('success', `✓ Complete in ${duration}ms - stdout: ${stdout.length} chars, stderr: ${stderr.length} chars`, {
+        duration,
+        stdoutLength: stdout.length,
+        stderrLength: stderr.length
+      });
+
       return {
         content: [{
           type: 'text',
@@ -134,6 +174,10 @@ export class SystemServer extends McpServer {
       const errorMessage = error.message || 'Unknown error';
       const stderr = error.stderr || '';
       const stdout = error.stdout || '';
+      const duration = publisher.getDuration();
+
+      await publisher.publishError(errorMessage);
+      await publisher.publishLog('error', `✗ Command failed: ${errorMessage}`, { duration });
 
       let errorText = `Command execution failed: ${errorMessage}\n`;
       

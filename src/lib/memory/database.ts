@@ -235,6 +235,18 @@ class DatabaseManager {
     const messages = this.db.collection<StoredMessage>(this.COLLECTIONS.MESSAGES);
     await messages.createIndex({ conversationId: 1, timestamp: 1 });
     await messages.createIndex({ timestamp: -1 });
+    
+    // Try to create unique index on messageId, but don't fail if it exists or has duplicates
+    try {
+      await messages.createIndex({ messageId: 1 }, { unique: true, sparse: true });
+    } catch (error: any) {
+      if (error.code === 11000) {
+        console.warn('[Database] ⚠️ Duplicate messageId values exist. Run migration to fix: npm run db:fix-messageids');
+      } else if (error.codeName !== 'IndexOptionsConflict' && error.codeName !== 'IndexAlreadyExists') {
+        console.warn('[Database] ⚠️ Failed to create messageId index:', error.message);
+      }
+    }
+    
     this.collections.set(this.COLLECTIONS.MESSAGES, messages);
 
     // Conversations collection
@@ -490,24 +502,37 @@ class DatabaseManager {
     await this.ensureConnected();
     const messagesCol = this.getCollection<StoredMessage>(this.COLLECTIONS.MESSAGES);
     
-    const result = await messagesCol.insertOne({
-      ...message,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    } as any);
-    
-    // Update conversation's updatedAt timestamp
-    const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
-    await conversationsCol.updateOne(
-      { conversationId: message.conversationId },
-      { 
-        $set: { updatedAt: new Date() },
-        $inc: { 'metadata.messageCount': 1 },
-      },
-      { upsert: true }
-    );
-    
-    return result.insertedId;
+    console.log(`[Database] storeMessage called - messageId:${message.messageId}, role:${message.role}`);
+    try {
+      const result = await messagesCol.insertOne({
+        ...message,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      } as any);
+      
+      console.log(`[Database] Message stored successfully - messageId:${message.messageId}, _id:${result.insertedId}`);
+      
+      // Update conversation's updatedAt timestamp
+      const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
+      await conversationsCol.updateOne(
+        { conversationId: message.conversationId },
+        { 
+          $set: { updatedAt: new Date() },
+          $inc: { 'metadata.messageCount': 1 },
+        },
+        { upsert: true }
+      );
+      
+      return result.insertedId;
+    } catch (error: any) {
+      // If duplicate key error (code 11000), message already exists - silently ignore
+      if (error.code === 11000) {
+        console.log(`[Database] Message ${message.messageId} already exists, skipping duplicate`);
+        // Return a dummy ObjectId since we don't have the real one
+        return new ObjectId();
+      }
+      throw error;
+    }
   }
 
   /**

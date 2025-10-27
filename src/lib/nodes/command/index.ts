@@ -1,18 +1,18 @@
 /**
  * Command Execution Node
  * 
- * Executes shell commands with detailed progress events:
+ * Executes shell commands via MCP with detailed progress events:
  * 1. Validates command for security
- * 2. Executes in bash shell
- * 3. Streams output in real-time
- * 4. Returns result for chat node
+ * 2. Calls execute_command MCP tool
+ * 3. Returns result for chat node
+ * 
+ * Note: This node now uses the MCP (Model Context Protocol) system server
+ * instead of direct execution for better security and architecture.
  */
 
 import { SystemMessage } from '@langchain/core/messages';
 import type { Red } from '../../..';
 import { createIntegratedPublisher } from '../../events/integrated-publisher';
-import { validateCommand, SecurityError } from './security';
-import { executeCommand } from './executor';
 
 interface CommandNodeState {
   query: { message: string };
@@ -37,14 +37,13 @@ export async function commandNode(state: CommandNodeState): Promise<Partial<any>
   
   // Get command from toolParam or query
   const command = state.toolParam || state.query?.message || '';
-  const timeout = 30000; // 30 seconds
 
   // Create event publisher for real-time updates
   let publisher: any = null;
   if (redInstance?.messageQueue && messageId && conversationId) {
     publisher = createIntegratedPublisher(
       redInstance.messageQueue,
-      'code_execution', // Using code_execution type for commands
+      'command', // Changed from 'code_execution' to match frontend expectations
       'Command Execution',
       messageId,
       conversationId
@@ -58,193 +57,155 @@ export async function commandNode(state: CommandNodeState): Promise<Partial<any>
     await redInstance.logger.log({
       level: 'info',
       category: 'tool',
-      message: `⚙️ Starting command execution`,
+      message: `⚙️ Starting command execution via MCP`,
       conversationId,
       generationId,
       metadata: { 
-        toolName: 'send_command',
-        command: command.substring(0, 100) 
+        toolName: 'execute_command',
+        command: command.substring(0, 100),
+        protocol: 'MCP/JSON-RPC 2.0'
       },
     });
 
     if (publisher) {
       await publisher.publishStart({
-        input: { command, timeout },
-        expectedDuration: 5000, // Most commands finish quickly
+        input: { command },
+        expectedDuration: 5000,
       });
     }
 
     // ==========================================
-    // STEP 2: Security Validation
+    // STEP 2: Call MCP execute_command Tool
     // ==========================================
     if (publisher) {
-      await publisher.publishProgress('Validating command security...', { progress: 10 });
-    }
-
-    try {
-      validateCommand(command);
-    } catch (error) {
-      if (error instanceof SecurityError) {
-        await redInstance.logger.log({
-          level: 'warn',
-          category: 'tool',
-          message: `🛡️ Command blocked: ${error.message}`,
-          conversationId,
-          generationId,
-          metadata: { 
-            command,
-            reason: error.message 
-          },
-        });
-
-        if (publisher) {
-          await publisher.publishError({
-            error: `Security validation failed: ${error.message}`,
-          });
-        }
-
-        return {
-          messages: [
-            new SystemMessage(
-              `[INTERNAL CONTEXT]\n` +
-              `Command blocked for security: ${error.message}\n` +
-              `Inform the user this command cannot be executed for safety reasons.`
-            )
-          ],
-          nextGraph: 'chat',
-        };
-      }
-      throw error;
-    }
-
-    await redInstance.logger.log({
-      level: 'info',
-      category: 'tool',
-      message: `✓ Security validation passed`,
-      conversationId,
-      generationId,
-    });
-
-    // ==========================================
-    // STEP 3: Execute Command
-    // ==========================================
-    if (publisher) {
-      await publisher.publishProgress(`Executing: ${command.substring(0, 60)}${command.length > 60 ? '...' : ''}`, {
+      await publisher.publishProgress(`Executing command via MCP...`, {
         progress: 30,
         data: { command: command.substring(0, 100) },
       });
     }
 
-    const result = await executeCommand(
-      command,
-      timeout,
-      (output) => {
-        // Stream output in real-time
-        if (publisher && output) {
-          publisher.publishProgress('Receiving output...', {
-            progress: 60,
-            streamingContent: output.substring(0, 500), // First 500 chars
-          });
-        }
-      }
-    );
+    const commandResult = await redInstance.callMcpTool('execute_command', {
+      command: command
+    }, {
+      conversationId,
+      generationId,
+      messageId
+    });
 
-    const duration = Date.now() - startTime;
-
-    // ==========================================
-    // STEP 4: Process Results
-    // ==========================================
-    if (result.timedOut) {
+    // Check for errors
+    if (commandResult.isError) {
+      const errorText = commandResult.content[0]?.text || 'Command execution failed';
+      
       await redInstance.logger.log({
         level: 'warn',
         category: 'tool',
-        message: `⏱️ Command timeout after ${timeout}ms`,
+        message: `🛡️ Command failed: ${errorText.substring(0, 200)}`,
         conversationId,
         generationId,
         metadata: { 
           command,
-          timeout,
-          duration 
+          error: errorText
         },
       });
 
       if (publisher) {
-        await publisher.publishError({
-          error: `Command timeout after ${timeout}ms`,
-        });
+        await publisher.publishError(errorText);
       }
 
       return {
         messages: [
           new SystemMessage(
             `[INTERNAL CONTEXT]\n` +
-            `Command timed out after ${timeout}ms\n` +
-            `Partial output: ${result.stdout}\n` +
-            `Inform the user the command took too long.`
+            `Command execution failed: ${errorText}\n` +
+            `Inform the user.`
           )
         ],
         nextGraph: 'chat',
       };
     }
 
-    if (result.exitCode !== 0) {
-      await redInstance.logger.log({
-        level: 'warn',
-        category: 'tool',
-        message: `⚠️ Command failed with exit code ${result.exitCode}`,
-        conversationId,
-        generationId,
-        metadata: { 
-          command,
-          exitCode: result.exitCode,
-          stderr: result.stderr.substring(0, 200),
-          duration 
-        },
-      });
-    } else {
-      await redInstance.logger.log({
-        level: 'success',
-        category: 'tool',
-        message: `✓ Command completed successfully in ${(duration / 1000).toFixed(1)}s`,
-        conversationId,
-        generationId,
-        metadata: { 
-          command,
-          duration,
-          outputLength: result.stdout.length 
-        },
-      });
-    }
+    const resultText = commandResult.content[0]?.text || 'Command completed with no output';
+    const duration = Date.now() - startTime;
+
+    await redInstance.logger.log({
+      level: 'success',
+      category: 'tool',
+      message: `✓ Command completed via MCP in ${(duration / 1000).toFixed(1)}s`,
+      conversationId,
+      generationId,
+      metadata: { 
+        command,
+        duration,
+        resultLength: resultText.length,
+        protocol: 'MCP/JSON-RPC 2.0'
+      },
+    });
 
     if (publisher) {
       await publisher.publishComplete({
-        result: result.stdout || result.stderr || 'Command completed with no output',
+        result: resultText,
         metadata: {
           duration,
-          exitCode: result.exitCode,
-          stdoutLength: result.stdout.length,
-          stderrLength: result.stderr.length,
-          outputTruncated: result.outputTruncated,
+          resultLength: resultText.length,
+          protocol: 'MCP',
         },
       });
     }
 
     // ==========================================
-    // STEP 5: Return Result for Chat
+    // STEP 3: Build Context with Command Result
     // ==========================================
-    const contextParts = [
-      `[INTERNAL CONTEXT - User cannot see this]`,
-      `Command executed: ${command}`,
-      `Exit code: ${result.exitCode}`,
-      result.stdout ? `\nOutput:\n${result.stdout}` : '',
-      result.stderr ? `\nErrors:\n${result.stderr}` : '',
-      result.outputTruncated ? '\n[Output was truncated due to length]' : '',
-      `\nUse this information to respond to the user.`,
-    ].filter(Boolean);
+    const messages: any[] = [];
+    
+    // Add system message
+    const systemMessage = `You are Red, an AI assistant developed by redbtn.io.
+Current date: ${new Date().toLocaleDateString()}
+
+CRITICAL RULES:
+1. Use the command execution result to answer the user's query
+2. Be direct, helpful, and conversational`;
+
+    messages.push({ role: 'system', content: systemMessage });
+    
+    // Load conversation context if we have one
+    if (conversationId) {
+      const contextResult = await redInstance.callMcpTool(
+        'get_context_history',
+        {
+          conversationId,
+          maxTokens: 25000,
+          includeSummary: true,
+          summaryType: 'trailing',
+          format: 'llm'
+        },
+        { conversationId, generationId, messageId }
+      );
+
+      if (!contextResult.isError && contextResult.content?.[0]?.text) {
+        const contextData = JSON.parse(contextResult.content[0].text);
+        const contextMessages = contextData.messages || [];
+        
+        // Filter out current user message
+        const userQuery = state.query?.message || command;
+        const filteredMessages = contextMessages.filter((msg: any) => 
+          !(msg.role === 'user' && msg.content === userQuery)
+        );
+        
+        messages.push(...filteredMessages);
+      }
+    }
+    
+    // Add user query with command result in brackets
+    const userQuery = state.query?.message || command;
+    const userQueryWithResult = `${userQuery}\n\n[Command Result: ${resultText}]`;
+    messages.push({
+      role: 'user',
+      content: userQueryWithResult
+    });
 
     return {
-      messages: [new SystemMessage(contextParts.join('\n'))],
-      nextGraph: 'chat',
+      messages,
+      nextGraph: 'responder',
     };
 
   } catch (error) {
@@ -265,20 +226,21 @@ export async function commandNode(state: CommandNodeState): Promise<Partial<any>
     });
 
     if (publisher) {
-      await publisher.publishError({
-        error: errorMessage,
-      });
+      await publisher.publishError(errorMessage);
     }
 
     return {
       messages: [
-        new SystemMessage(
-          `[INTERNAL CONTEXT]\n` +
-          `Command execution failed: ${errorMessage}\n` +
-          `Inform the user and offer alternative solutions.`
-        )
+        {
+          role: 'system',
+          content: `You are Red, an AI assistant. Command execution failed: ${errorMessage}. Inform the user and offer alternative solutions.`
+        },
+        {
+          role: 'user',
+          content: state.query?.message || command
+        }
       ],
-      nextGraph: 'chat',
+      nextGraph: 'responder',
     };
   }
 }

@@ -12,6 +12,9 @@ export * from './client';
 export * from './registry';
 export * from './servers/web';
 export * from './servers/system';
+export * from './servers/rag';
+export * from './servers/context';
+export * from './event-publisher';
 
 // Legacy exports for backward compatibility
 export { WebServer as WebSearchServer } from './servers/web';

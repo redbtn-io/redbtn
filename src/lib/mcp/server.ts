@@ -20,6 +20,7 @@ import {
 
 export abstract class McpServer {
   protected redis: Redis;
+  protected publishRedis: Redis; // Separate connection for publishing
   protected serverInfo: ServerInfo;
   protected capabilities: ServerCapabilities = {};
   protected tools: Map<string, Tool> = new Map();
@@ -29,6 +30,8 @@ export abstract class McpServer {
 
   constructor(redis: Redis, name: string, version: string) {
     this.redis = redis;
+    // Create a separate Redis connection for publishing
+    this.publishRedis = redis.duplicate();
     this.serverInfo = { name, version };
     this.requestChannel = `mcp:server:${name}:request`;
     this.responseChannel = `mcp:server:${name}:response`;
@@ -67,6 +70,7 @@ export abstract class McpServer {
     console.log(`[MCP Server] Stopping ${this.serverInfo.name}`);
     this.running = false;
     await this.redis.unsubscribe(this.requestChannel);
+    await this.publishRedis.quit();
     console.log(`[MCP Server] ${this.serverInfo.name} stopped`);
   }
 
@@ -80,7 +84,8 @@ export abstract class McpServer {
    */
   protected abstract executeTool(
     name: string,
-    args: Record<string, unknown>
+    args: Record<string, unknown>,
+    meta?: { conversationId?: string; generationId?: string; messageId?: string }
   ): Promise<CallToolResult>;
 
   /**
@@ -203,7 +208,7 @@ export abstract class McpServer {
    * Handle tools/call request
    */
   private async handleToolCall(params: ToolCallParams): Promise<CallToolResult> {
-    const { name, arguments: args } = params;
+    const { name, arguments: args, _meta } = params;
 
     if (!this.tools.has(name)) {
       throw {
@@ -214,14 +219,14 @@ export abstract class McpServer {
 
     console.log(`[MCP Server] ${this.serverInfo.name} executing tool: ${name}`);
     
-    return await this.executeTool(name, args);
+    return await this.executeTool(name, args, _meta);
   }
 
   /**
    * Send JSON-RPC response
    */
   private async sendResponse(response: JsonRpcResponse): Promise<void> {
-    await this.redis.publish(this.responseChannel, JSON.stringify(response));
+    await this.publishRedis.publish(this.responseChannel, JSON.stringify(response));
   }
 
   /**
@@ -234,6 +239,6 @@ export abstract class McpServer {
       params,
     };
     
-    await this.redis.publish(this.responseChannel, JSON.stringify(notification));
+    await this.publishRedis.publish(this.responseChannel, JSON.stringify(notification));
   }
 }

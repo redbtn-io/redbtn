@@ -1,21 +1,19 @@
 /**
  * Web Search Node
  * 
- * Executes web searches with detailed real-time progress events:
+ * Executes web searches via MCP with detailed real-time progress events:
  * 1. Optimizes the search query using LLM
- * 2. Searches Google Custom Search API
- * 3. Scrapes content from top results
- * 4. Extracts and summarizes relevant information
- * 5. Returns context for chat node
+ * 2. Calls web_search MCP tool (Google Custom Search API)
+ * 3. Returns context for chat node
+ * 
+ * Note: This node now uses the MCP (Model Context Protocol) web server
+ * instead of direct API calls for better architecture and reusability.
  */
 
 import { SystemMessage } from '@langchain/core/messages';
 import type { Red } from '../../..';
 import { createIntegratedPublisher } from '../../events/integrated-publisher';
-import { searchGoogle } from './google';
-import { scrapeSearchResults } from './scraper';
-import { optimizeSearchQuery, summarizeSearchResults } from './optimizer';
-import type { SearchResult } from './types';
+import { optimizeSearchQuery } from './optimizer';
 
 interface SearchNodeState {
   query: { message: string };
@@ -34,7 +32,7 @@ interface SearchNodeState {
 export async function searchNode(state: SearchNodeState): Promise<Partial<any>> {
   const startTime = Date.now();
   const redInstance: Red = state.redInstance;
-  const userQuery = state.query?.message || '';
+  const userQuery = state.toolParam || state.query?.message || '';
   const conversationId = state.options?.conversationId;
   const generationId = state.options?.generationId;
   const messageId = state.messageId;
@@ -46,7 +44,7 @@ export async function searchNode(state: SearchNodeState): Promise<Partial<any>> 
   if (redInstance?.messageQueue && messageId && conversationId) {
     publisher = createIntegratedPublisher(
       redInstance.messageQueue,
-      'web_search',
+      'search', // Changed from 'web_search' to match frontend expectations
       'Web Search',
       messageId,
       conversationId
@@ -60,20 +58,21 @@ export async function searchNode(state: SearchNodeState): Promise<Partial<any>> 
     await redInstance.logger.log({
       level: 'info',
       category: 'tool',
-      message: `🔍 Starting web search`,
+      message: `🔍 Starting web search via MCP`,
       conversationId,
       generationId,
       metadata: { 
         toolName: 'web_search',
         query: userQuery,
-        maxResults 
+        maxResults,
+        protocol: 'MCP/JSON-RPC 2.0'
       },
     });
 
     if (publisher) {
       await publisher.publishStart({
         input: { query: userQuery, maxResults },
-        expectedDuration: 12000, // ~12 seconds for full search + scrape
+        expectedDuration: 8000, // ~8 seconds for MCP call
       });
     }
 
@@ -104,18 +103,32 @@ export async function searchNode(state: SearchNodeState): Promise<Partial<any>> 
     });
 
     if (publisher) {
-      await publisher.publishProgress(`Searching Google for: "${optimizedQuery}"`, {
-        progress: 20,
+      await publisher.publishProgress(`Searching web for: "${optimizedQuery}"`, {
+        progress: 30,
         data: { optimizedQuery },
       });
     }
 
     // ==========================================
-    // STEP 3: Search Google
+    // STEP 3: Call MCP web_search Tool
     // ==========================================
-    const searchResults = await searchGoogle(optimizedQuery, maxResults);
+    const searchResult = await redInstance.callMcpTool('web_search', {
+      query: optimizedQuery,
+      count: maxResults
+    }, {
+      conversationId,
+      generationId,
+      messageId
+    });
 
-    if (searchResults.length === 0) {
+    // Check for errors
+    if (searchResult.isError) {
+      throw new Error(searchResult.content[0]?.text || 'Search failed');
+    }
+
+    const searchResultText = searchResult.content[0]?.text || '';
+
+    if (!searchResultText || searchResultText.includes('No results found')) {
       await redInstance.logger.log({
         level: 'warn',
         category: 'tool',
@@ -139,143 +152,88 @@ export async function searchNode(state: SearchNodeState): Promise<Partial<any>> 
       };
     }
 
-    await redInstance.logger.log({
-      level: 'success',
-      category: 'tool',
-      message: `✓ Found ${searchResults.length} search results`,
-      conversationId,
-      generationId,
-      metadata: { 
-        resultsCount: searchResults.length,
-        topResult: searchResults[0]?.title 
-      },
-    });
-
-    if (publisher) {
-      await publisher.publishProgress(`Found ${searchResults.length} results, extracting content...`, {
-        progress: 40,
-        data: { 
-          resultsCount: searchResults.length,
-          topResults: searchResults.slice(0, 3).map(r => r.title),
-        },
-      });
-    }
-
-    // ==========================================
-    // STEP 4: Scrape Result Pages
-    // ==========================================
-    const scrapedResults = await scrapeSearchResults(
-      searchResults,
-      (current, total, url) => {
-        const progress = 40 + Math.floor((current / total) * 40); // 40-80%
-        
-        if (publisher) {
-          publisher.publishProgress(`Reading page ${current}/${total}: ${new URL(url).hostname}`, {
-            progress,
-            data: { 
-              currentPage: current,
-              totalPages: total,
-              url: new URL(url).hostname,
-            },
-          });
-        }
-      }
-    );
-
-    const successfulScrapes = scrapedResults.filter(r => r.content).length;
-
-    await redInstance.logger.log({
-      level: 'success',
-      category: 'tool',
-      message: `✓ Extracted content from ${successfulScrapes}/${searchResults.length} pages`,
-      conversationId,
-      generationId,
-      metadata: { 
-        successfulScrapes,
-        totalResults: searchResults.length 
-      },
-    });
-
-    if (publisher) {
-      await publisher.publishProgress(`Analyzing content from ${successfulScrapes} pages...`, {
-        progress: 85,
-        data: { successfulScrapes },
-      });
-    }
-
-    // ==========================================
-    // STEP 5: Build Combined Results Text
-    // ==========================================
-    const combinedResults = scrapedResults
-      .map((result, index) => {
-        const parts = [
-          `[Result ${index + 1}]`,
-          `Title: ${result.title}`,
-          `URL: ${result.url}`,
-          `Snippet: ${result.snippet}`,
-        ];
-        
-        if (result.content) {
-          parts.push(`Content:\n${result.content}`);
-        }
-        
-        return parts.join('\n');
-      })
-      .join('\n\n---\n\n');
-
-    // ==========================================
-    // STEP 6: Extract & Summarize Key Info
-    // ==========================================
-    const { summary } = await summarizeSearchResults(
-      userQuery,
-      combinedResults,
-      redInstance,
-      conversationId,
-      generationId
-    );
-
     const duration = Date.now() - startTime;
 
     await redInstance.logger.log({
       level: 'success',
       category: 'tool',
-      message: `✓ Web search completed in ${(duration / 1000).toFixed(1)}s`,
+      message: `✓ Web search completed via MCP in ${(duration / 1000).toFixed(1)}s`,
       conversationId,
       generationId,
       metadata: { 
         duration,
-        summaryLength: summary.length,
-        resultsCount: searchResults.length,
-        scrapedCount: successfulScrapes,
+        resultLength: searchResultText.length,
+        optimizedQuery,
+        protocol: 'MCP/JSON-RPC 2.0'
       },
     });
 
     if (publisher) {
       await publisher.publishComplete({
-        result: summary,
+        result: searchResultText,
         metadata: {
           duration,
-          resultsCount: searchResults.length,
-          scrapedCount: successfulScrapes,
-          summaryLength: summary.length,
+          resultLength: searchResultText.length,
+          protocol: 'MCP',
         },
       });
     }
 
     // ==========================================
-    // STEP 7: Return Context for Chat
+    // STEP 4: Build Context with Search Results
     // ==========================================
+    // Load conversation context via Context MCP
+    const messages: any[] = [];
+    
+    // Add system message
+    const systemMessage = `You are Red, an AI assistant developed by redbtn.io.
+Current date: ${new Date().toLocaleDateString()}
+
+CRITICAL RULES:
+1. Use the search results provided to answer the user's query directly and confidently
+2. NEVER say "according to search results" or reference that you searched
+3. Answer as if you know this information naturally
+4. Be direct, helpful, and conversational`;
+
+    messages.push({ role: 'system', content: systemMessage });
+    
+    // Load conversation context if we have one
+    if (conversationId) {
+      const contextResult = await redInstance.callMcpTool(
+        'get_context_history',
+        {
+          conversationId,
+          maxTokens: 25000, // Leave room for search results
+          includeSummary: true,
+          summaryType: 'trailing',
+          format: 'llm'
+        },
+        { conversationId, generationId, messageId }
+      );
+
+      if (!contextResult.isError && contextResult.content?.[0]?.text) {
+        const contextData = JSON.parse(contextResult.content[0].text);
+        const contextMessages = contextData.messages || [];
+        
+        // Filter out the current user message (will be added with search results)
+        const filteredMessages = contextMessages.filter((msg: any) => 
+          !(msg.role === 'user' && msg.content === userQuery)
+        );
+        
+        messages.push(...filteredMessages);
+      }
+    }
+    
+    // Add the user's query with search results appended in brackets
+    const userQueryWithResults = `${userQuery}\n\n[Search Results: ${searchResultText}]`;
+    messages.push({
+      role: 'user',
+      content: userQueryWithResults
+    });
+
     return {
-      messages: [
-        new SystemMessage(
-          `[INTERNAL CONTEXT - User cannot see this]\n` +
-          `Relevant information found:\n\n${summary}\n\n` +
-          `Use this information to answer the user's query directly and confidently. ` +
-          `Do not say "according to search results" or reference external sources - ` +
-          `answer as if you know this information.`
-        )
-      ],
-      nextGraph: 'chat',
+      messages,
+      nextGraph: 'responder',
     };
 
   } catch (error) {
@@ -290,26 +248,28 @@ export async function searchNode(state: SearchNodeState): Promise<Partial<any>> 
       generationId,
       metadata: { 
         error: errorMessage,
-        duration 
+        duration,
+        query: userQuery
       },
     });
 
     if (publisher) {
-      await publisher.publishError({
-        error: errorMessage,
-      });
+      await publisher.publishError(errorMessage);
     }
 
-    // Return error context but continue to chat
+    // Return error context but continue to responder
     return {
       messages: [
-        new SystemMessage(
-          `[INTERNAL CONTEXT]\n` +
-          `Web search failed: ${errorMessage}\n` +
-          `Inform the user and try to help with existing knowledge.`
-        )
+        {
+          role: 'system',
+          content: `You are Red, an AI assistant. The web search failed with error: ${errorMessage}. Inform the user and try to help with existing knowledge.`
+        },
+        {
+          role: 'user',
+          content: userQuery
+        }
       ],
-      nextGraph: 'chat',
+      nextGraph: 'responder',
     };
   }
 }

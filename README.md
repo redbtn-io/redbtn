@@ -2,19 +2,21 @@
 
 [![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](https://opensource.org/licenses/ISC)
 
-> A powerful, graph-based AI agent library built on LangChain and LangGraph, providing intelligent routing and unified streaming/non-streaming interfaces.
+> A powerful, graph-based AI agent library built on LangChain and LangGraph with MCP (Model Context Protocol) integration, providing intelligent routing, persistent memory, and unified streaming/non-streaming interfaces.
 
 ## 🚀 Features
 
 - **Graph-Based Architecture**: Built on LangGraph for flexible, composable AI workflows
-- **Intelligent Routing**: Automatic routing based on application context and query analysis
-- **Web Search & Scraping**: Built-in tools for real-time web search and content extraction
+- **MCP Integration**: Model Context Protocol servers for modular tool management (context, RAG, web, system commands)
+- **Intelligent Routing**: Automatic routing based on query analysis (chat, web search, URL scraping, system commands)
+- **Web Search & Scraping**: Built-in tools via MCP for real-time web search and content extraction
 - **Unified Streaming**: Seamless streaming and non-streaming modes with the same API
 - **Stream Reconnection**: Redis-backed message queue with pub/sub for reliable mobile streaming
 - **Persistent Memory**: MongoDB for long-term message storage, Redis for hot state and summaries
+- **Comprehensive Logging**: MongoDB-persisted logs with categories, levels, and generation tracking
 - **Token Tracking**: Complete access to token usage and performance metrics
 - **Type-Safe**: Full TypeScript support with type guards
-- **Extensible**: Easy to add custom nodes and graphs
+- **Extensible**: Easy to add custom nodes, graphs, and MCP servers
 
 ## 📦 Installation
 
@@ -31,21 +33,37 @@ import { Red, RedConfig } from '@redbtn/ai';
 const config: RedConfig = {
   redisUrl: "redis://localhost:6379",
   vectorDbUrl: "http://localhost:8200",
-  databaseUrl: "http://localhost:5432",
-  defaultLlmUrl: "https://llm.example.com"
+  databaseUrl: "mongodb://localhost:27017/red-webapp",
+  chatLlmUrl: "http://192.168.1.4:11434",  // Primary chat model (Ollama)
+  workLlmUrl: "http://192.168.1.3:11434"   // Worker model for routing/tools
 };
 
 // Initialize and load
 const red = new Red(config);
 await red.load("my-node");
 
-// Get a response
+// Get a response (non-streaming)
 const response = await red.respond(
   { message: 'Hello!' },
-  { source: { application: 'redChat' } }
+  { conversationId: 'conv_123' }
 );
 
-console.log(response.content);  // "Hello! How can I help you?"
+console.log(response.content);         // "Hello! How can I help you?"
+console.log(response.usage_metadata);  // { input_tokens: 10, output_tokens: 5, ... }
+
+// Or stream the response
+const stream = await red.respond(
+  { message: 'Tell me a story' },
+  { stream: true, conversationId: 'conv_123' }
+);
+
+for await (const chunk of stream) {
+  if (typeof chunk === 'string') {
+    process.stdout.write(chunk);  // Real-time text
+  } else {
+    console.log('Tokens:', chunk.usage_metadata);  // Final metadata
+  }
+}
 ```
 
 ## 📚 Core Concepts
@@ -59,9 +77,10 @@ The Red AI library provides a unified interface for both streaming and non-strea
 ```typescript
 interface RedConfig {
   redisUrl: string;        // Redis connection for global state & hot memory
-  vectorDbUrl: string;     // Vector database for embeddings (future)
+  vectorDbUrl: string;     // Vector database URL for RAG embeddings
   databaseUrl: string;     // MongoDB URL for long-term message persistence
-  defaultLlmUrl: string;   // Default LLM endpoint (e.g., Ollama)
+  chatLlmUrl: string;      // Chat LLM endpoint (primary model for user interactions)
+  workLlmUrl: string;      // Worker LLM endpoint (for routing and tool execution)
   llmEndpoints?: {         // Optional: named LLM endpoints
     [agentName: string]: string;
   };
@@ -77,9 +96,12 @@ await red.load(nodeId?: string);  // Optional node ID for distributed systems
 // Access subsystems:
 red.memory         // MemoryManager - conversation history & summaries
 red.messageQueue   // MessageQueue - streaming state & reconnection
-red.localModel     // ChatOllama instance
-red.geminiModel    // ChatGoogleGenerativeAI instance (optional)
-red.openAIModel    // ChatOpenAI instance (optional)
+red.logger         // PersistentLogger - MongoDB-persisted logging system
+red.mcpRegistry    // McpRegistry - MCP tool server registry
+red.chatModel      // ChatOllama - primary chat model
+red.workerModel    // ChatOllama - worker model for routing/tools
+red.geminiModel    // ChatGoogleGenerativeAI - optional Gemini model
+red.openAIModel    // ChatOpenAI - optional OpenAI model
 ```
 
 ### Response Options
@@ -92,8 +114,16 @@ interface InvokeOptions {
   };
   stream?: boolean;          // Enable streaming mode
   conversationId?: string;   // Optional - auto-generated if omitted
+  generationId?: string;     // Optional - auto-generated if omitted (for logging)
+  messageId?: string;        // Optional - for Redis pub/sub streaming reconnection
 }
 ```
+
+**Important Notes:**
+- `conversationId`: If not provided, a new conversation is created with ID format `conv_{timestamp}_{random}`
+- `generationId`: Auto-generated for logging/tracking purposes, format `gen_{timestamp}_{random}`
+- `messageId`: Used for streaming reconnection via Redis pub/sub, passed from API layer
+- All IDs are automatically generated if omitted for convenience
 
 ### MessageQueue & Stream Reconnection
 
@@ -124,6 +154,45 @@ for await (const event of red.messageQueue.subscribeToMessage(messageId)) {
 - **Reconnection**: Clients can disconnect and reconnect to ongoing streams
 - **Accumulated Content**: New subscribers receive all previous chunks immediately
 - **1-hour TTL**: Transient state cleanup after completion
+
+### Logging System
+
+Red AI includes a comprehensive MongoDB-persisted logging system:
+
+```typescript
+// Log with context
+await red.logger.log({
+  level: 'info' | 'success' | 'warn' | 'error',
+  category: 'system' | 'router' | 'mcp' | 'memory' | 'responder' | 'tool',
+  message: 'Operation completed',
+  conversationId: 'conv_123',
+  generationId: 'gen_456',
+  metadata: { key: 'value' }
+});
+
+// Track generation lifecycle
+const genId = await red.logger.startGeneration(conversationId);
+await red.logger.completeGeneration(genId, {
+  response: 'Hello!',
+  tokens: { input: 10, output: 5, total: 15 }
+});
+await red.logger.failGeneration(genId, 'Error message');
+
+// Log thinking/reasoning
+await red.logger.logThought({
+  content: 'I should search the web for this',
+  source: 'router',
+  conversationId: 'conv_123',
+  generationId: 'gen_456'
+});
+```
+
+**Features:**
+- MongoDB persistence with indexes on conversationId, generationId, category
+- Colored console output with log levels
+- Generation lifecycle tracking (start, complete, fail)
+- Thinking/reasoning capture from models
+- Structured metadata support
 
 ---
 
@@ -210,15 +279,98 @@ for await (const chunk of stream) {
 
 ### Autonomous Thinking Loop
 
-Red can run continuously in an autonomous "thinking" mode:
+Red AI features an **autonomous thinking mode** that enables truly self-directed AI agents. When activated, each Red instance can continuously operate, research, and improve its knowledge base with minimal human intervention.
+
+**Core Concept:**
+- Each node instance runs an independent thinking loop
+- The agent prompts itself to work on projects, conduct research, and expand knowledge
+- User provides high-level direction and goals
+- The agent autonomously decides what to research, what tools to use, and how to improve
+- All learning is persisted across the three-tier memory system (Redis, Vector DB, MongoDB)
+
+**Memory Evolution:**
+- **Redis**: Captures current thoughts, active context, and working memory
+- **Vector DB**: Stores semantic knowledge for fast retrieval and pattern recognition
+- **MongoDB**: Archives complete history, reasoning chains, and long-term knowledge
+
+**Usage:**
 
 ```typescript
-// Start autonomous loop
+// Initialize and load Red instance
+const red = new Red(config);
+await red.load("autonomous-researcher");
+
+// Start autonomous thinking loop
 await red.think();
 
-// Stop when needed
+// Agent now runs continuously, self-prompting with:
+// - Research queries based on prior knowledge gaps
+// - Web searches to gather new information
+// - Document analysis and knowledge extraction
+// - Self-evaluation and knowledge consolidation
+// - Tool usage (search, scrape, commands) as needed
+
+// The loop continues until explicitly stopped
+// Stop when needed (gracefully completes current cycle)
 red.stopThinking();
 ```
+
+**Autonomous Capabilities:**
+- **Self-Directed Research**: Agent identifies knowledge gaps and researches independently
+- **Tool Selection**: Automatically chooses appropriate tools (web search, scraping, commands)
+- **Knowledge Building**: Continuously expands understanding through iterative research cycles
+- **Context Retention**: Builds on previous cycles using persistent memory
+- **Goal Pursuit**: Works toward user-defined objectives autonomously
+- **Learning Loops**: Each cycle improves the knowledge base for future cycles
+
+**Example Autonomous Session:**
+```typescript
+// User provides initial direction
+const red = new Red(config);
+await red.load("research-assistant");
+
+// Seed the agent with a goal (via conversation or direct state)
+await red.respond({ 
+  message: "Research and compile information about quantum computing applications in cryptography" 
+});
+
+// Start autonomous mode
+await red.think();
+
+// Agent will now:
+// 1. Break down the research topic into sub-questions
+// 2. Search the web for relevant papers and articles
+// 3. Scrape key resources for detailed information
+// 4. Store findings in vector DB for semantic retrieval
+// 5. Generate summaries and connect concepts
+// 6. Identify new questions and repeat
+// 7. Build comprehensive knowledge base over time
+
+// Hours or days later, stop the loop
+red.stopThinking();
+
+// All research is preserved in memory for future queries
+const summary = await red.respond({ 
+  message: "Summarize your findings on quantum cryptography" 
+});
+```
+
+**Implementation Details:**
+- Runs in a continuous `do-while` loop checking `isThinking` flag
+- 2-second delay between cycles to prevent runaway resource usage
+- Each cycle invokes the 'cognitionGraph' with autonomous cycle type
+- Graceful shutdown ensures current cycle completes before stopping
+- All progress persisted to MongoDB for resumption after restarts
+
+**Future Enhancements:**
+- Multi-agent collaboration (multiple Red instances working together)
+- Goal decomposition and task planning
+- Self-evaluation and quality metrics
+- Knowledge graph construction
+- Scheduled autonomous sessions
+- Priority-based research queuing
+
+---
 
 ### Type Guard Pattern
 
@@ -278,14 +430,71 @@ console.log(`Total duration: ${response.response_metadata.total_duration}ns`);
 
 ### Multi-Layer Memory System
 - **Redis (Hot)**: Active conversation state, summaries, generating message tracking
-- **MongoDB (Persistent)**: Complete message history, searchable, survives Redis flushes
+- **MongoDB (Persistent)**: Complete message history, logs, generations - searchable, survives Redis flushes
 - **Executive Summaries**: Auto-generated after 3+ messages for quick context retrieval
+- **Context MCP Server**: Centralized conversation management with 7 tools
+
+### MCP (Model Context Protocol) Architecture
+Red AI uses MCP for modular, extensible tool management:
+
+- **JSON-RPC 2.0 Protocol**: Standardized communication over Redis pub/sub
+- **Separate Processes**: Each MCP server runs independently for resilience
+- **Dynamic Tool Discovery**: Tools are discovered and registered at runtime
+- **Event Publishing**: Real-time tool execution events via Redis
+- **Metadata Support**: conversationId, generationId, messageId passed to all tools
+
+**Available MCP Servers:**
+
+1. **Context Server** (7 tools):
+   - `get_messages` - Retrieve conversation messages
+   - `get_context_history` - Get formatted context for LLM
+   - `get_summary` - Retrieve conversation summary
+   - `store_message` - Save messages to MongoDB
+   - `get_conversation_metadata` - Get metadata (message count, tokens)
+   - `get_token_count` - Calculate token usage
+   - `list_conversations` - List all conversations
+
+2. **Web Server** (2 tools):
+   - `search_web` - Tavily web search
+   - `scrape_url` - URL content extraction
+
+3. **System Server** (1 tool):
+   - `execute_command` - Run whitelisted system commands
+
+4. **RAG Server** (2 tools):
+   - `add_to_vector_store` - Add documents to vector DB
+   - `retrieve_from_vector_store` - Semantic search
+
+**Starting MCP Servers:**
+```bash
+npm run mcp-servers  # Starts all MCP servers in background
+```
+
+**Using MCP Tools:**
+```typescript
+// Call any MCP tool through the registry
+const result = await red.callMcpTool(
+  'store_message',
+  {
+    conversationId: 'conv_123',
+    role: 'user',
+    content: 'Hello!',
+    messageId: 'msg_456'
+  },
+  {
+    conversationId: 'conv_123',
+    generationId: 'gen_789',
+    messageId: 'msg_456'
+  }
+);
+```
 
 ### Stream Reconnection Architecture
 - **Decoupled Generation**: LLM generation runs independently of HTTP transport
 - **Redis Pub/Sub**: Real-time chunk publishing to `message:stream:{messageId}` channels
 - **Accumulated Content**: New subscribers instantly receive all previous chunks
 - **MessageQueue API**: `subscribeToMessage()` async generator for easy consumption
+- **1-hour TTL**: Transient state cleanup after completion
 
 ### Unified Streaming
 - **Consistent patterns**: Both modes go through the same graph execution
@@ -302,49 +511,53 @@ console.log(`Total duration: ${response.response_metadata.total_duration}ns`);
      │
      ▼
 ┌──────────┐
-│  Router  │  ──→ Analyzes query, decides: CHAT, SCRAPE_URL, or SEARCH
+│  Router  │  ──→ Analyzes query, decides: CHAT, WEB_SEARCH, SCRAPE_URL, or SYSTEM_COMMAND
 └────┬─────┘
      │
-     ├─────→ CHAT ────────┐
-     │                    │
-     ├─────→ SCRAPE_URL ──┤
-     │          ↓         │
-     │     ┌──────────┐   │
-     │     │ToolPicker│   │
-     │     └────┬─────┘   │
-     │          ↓         │
-     │     ┌──────────┐   │
-     └─────→│ToolNode │   │
-               └────┬─────┘
-                    ↓
-               ┌─────────┐
-               │ChatNode │  ──→ Generates final response with context
-               └────┬────┘
-                    │
-                    ▼
-               ┌─────────┐
-               │   End   │
-               └─────────┘
+     ├─────→ CHAT (responder) ─────┐
+     │                              │
+     ├─────→ WEB_SEARCH (search) ───┤
+     │                              │
+     ├─────→ SCRAPE_URL (scrape) ───┤
+     │                              │
+     └─────→ SYSTEM_COMMAND ────────┤
+              (command)             │
+                                    ▼
+                              ┌───────────┐
+                              │ Responder │  ──→ Generates final response with context
+                              └─────┬─────┘
+                                    │
+                                    ▼
+                              ┌─────────┐
+                              │   End   │
+                              └─────────┘
 ```
 
 **Flow:**
-1. **Router**: Classifies query intent (chat, scrape, search)
-2. **ToolPicker** (if needed): Selects and executes web search/scrape tools
-3. **ToolNode** (if needed): Processes tool results and extracts key info
-4. **ChatNode**: Generates response using conversation memory + tool results
-5. **Memory**: Auto-saves to MongoDB, updates Redis summaries, generates titles
+1. **Router**: Classifies query intent using structured output (CHAT, WEB_SEARCH, SCRAPE_URL, SYSTEM_COMMAND)
+2. **Tool Nodes** (if needed): Execute web search, URL scraping, or system commands via MCP servers
+3. **Responder**: Generates response using conversation context (from Context MCP) + tool results
+4. **Memory**: Auto-saves messages to MongoDB via Context MCP, updates Redis summaries, generates titles
+
+**MCP Integration:**
+- **Context Server**: Manages conversation history, summaries, and message storage
+- **Web Server**: Combines web search (Tavily) and URL scraping tools
+- **System Server**: Executes whitelisted system commands securely
+- **RAG Server**: Vector database operations for retrieval-augmented generation
 
 ---
 
 ## 📋 Examples
 
 See:
-- [`/examples/test-streaming.ts`](examples/test-streaming.ts) - Streaming examples with reconnection
-- [`/examples/test-router.ts`](examples/test-router.ts) - Router and tool usage examples
-- [`/examples/test-toolnode.ts`](examples/test-toolnode.ts) - Web search and scraping demos
 - [`/examples/server.ts`](examples/server.ts) - OpenAI-compatible API server
 - [`/examples/client.ts`](examples/client.ts) - Example API client in TypeScript
 - [`/examples/SERVER.md`](examples/SERVER.md) - API server documentation and deployment guide
+- [`/examples/test-rag.ts`](examples/test-rag.ts) - RAG (vector database) examples
+- [`/examples/test-mcp-client.ts`](examples/test-mcp-client.ts) - MCP client usage examples
+- [`/examples/test-mcp-registry.ts`](examples/test-mcp-registry.ts) - MCP registry examples
+- [`/examples/test-json-extractor.ts`](examples/test-json-extractor.ts) - JSON extraction utilities
+- [`/examples/test-tool-logging.ts`](examples/test-tool-logging.ts) - Tool execution logging demos
 
 ### Running the API Server
 
@@ -476,21 +689,45 @@ npx tsx examples/token-access.ts
 ai/
 ├── src/
 │   ├── index.ts           # Main Red class and exports
+│   ├── functions/
+│   │   ├── respond.ts     # Core response generation with streaming
+│   │   └── background/    # Background tasks (summarization, titles)
 │   ├── lib/
 │   │   ├── models.ts      # LLM model configurations
 │   │   ├── graphs/
-│   │   │   └── red.ts     # Main graph definition
-│   │   └── nodes/
-│   │       ├── chat.ts    # Chat processing node
-│   │       └── router.ts  # Routing logic node
+│   │   │   └── red.ts     # Main StateGraph definition
+│   │   ├── nodes/
+│   │   │   ├── router.ts  # Intelligent routing with structured output
+│   │   │   ├── responder.ts  # Final response generation
+│   │   │   ├── search.ts  # Web search node
+│   │   │   ├── scrape.ts  # URL scraping node
+│   │   │   └── command/   # System command execution
+│   │   ├── mcp/
+│   │   │   ├── client.ts  # MCP JSON-RPC client
+│   │   │   ├── server.ts  # MCP server base class
+│   │   │   ├── registry.ts # MCP server registry
+│   │   │   └── servers/   # MCP server implementations
+│   │   │       ├── context.ts  # Conversation context & history
+│   │   │       ├── rag.ts      # Vector database operations
+│   │   │       ├── web.ts      # Web search & scraping
+│   │   │       └── system.ts   # System command execution
+│   │   ├── memory/
+│   │   │   ├── memory.ts  # MemoryManager (Redis + MongoDB)
+│   │   │   ├── queue.ts   # MessageQueue for streaming
+│   │   │   ├── database.ts # MongoDB operations
+│   │   │   └── vectors.ts # Vector store manager
+│   │   ├── logs/
+│   │   │   ├── logger.ts  # Structured logging
+│   │   │   └── persistent-logger.ts # MongoDB-persisted logs
+│   │   └── utils/
+│   │       ├── thinking.ts # Extract/log thinking from models
+│   │       └── json-extractor.ts # Robust JSON parsing
+│   └── mcp-servers.ts     # MCP servers launcher
 ├── examples/
-│   ├── token-access.ts    # Usage examples
 │   ├── server.ts          # OpenAI-compatible API server
 │   ├── client.ts          # Example API client
-│   ├── test-api.sh        # API testing script
-│   ├── SERVER.md          # API server documentation
-│   └── API-STATUS.md      # Implementation status
-└── README.md              # Documentation
+│   └── test-*.ts          # Various test examples
+└── README.md              # This file
 ```
 
 ---

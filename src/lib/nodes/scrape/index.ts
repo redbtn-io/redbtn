@@ -1,18 +1,19 @@
 /**
  * URL Scraping Node
  * 
- * Fetches and extracts text content from a webpage with detailed progress events:
+ * Fetches and extracts text content from a webpage via MCP with detailed progress events:
  * 1. Validates the URL
- * 2. Fetches the HTML
- * 3. Parses and extracts clean text
- * 4. Returns content for chat node
+ * 2. Calls scrape_url MCP tool (Jina AI Reader)
+ * 3. Returns content for chat node
+ * 
+ * Note: This node now uses the MCP (Model Context Protocol) web server
+ * instead of direct scraping for better architecture and reusability.
  */
 
 import { SystemMessage } from '@langchain/core/messages';
 import type { Red } from '../../..';
 import { createIntegratedPublisher } from '../../events/integrated-publisher';
 import { validateUrl, ValidationError } from './validator';
-import { fetchAndParse } from './parser';
 
 interface ScrapeNodeState {
   query: { message: string };
@@ -43,7 +44,7 @@ export async function scrapeNode(state: ScrapeNodeState): Promise<Partial<any>> 
   if (redInstance?.messageQueue && messageId && conversationId) {
     publisher = createIntegratedPublisher(
       redInstance.messageQueue,
-      'web_search', // Using web_search type for now, could add 'scrape' to ToolType
+      'scrape', // Changed from 'web_search' to match frontend expectations
       'URL Scraper',
       messageId,
       conversationId
@@ -57,12 +58,13 @@ export async function scrapeNode(state: ScrapeNodeState): Promise<Partial<any>> 
     await redInstance.logger.log({
       level: 'info',
       category: 'tool',
-      message: `📄 Starting URL scrape`,
+      message: `📄 Starting URL scrape via MCP`,
       conversationId,
       generationId,
       metadata: { 
         toolName: 'scrape_url',
-        url: urlToScrape 
+        url: urlToScrape,
+        protocol: 'MCP/JSON-RPC 2.0'
       },
     });
 
@@ -95,9 +97,7 @@ export async function scrapeNode(state: ScrapeNodeState): Promise<Partial<any>> 
         });
 
         if (publisher) {
-          await publisher.publishError({
-            error: error.message,
-          });
+          await publisher.publishError(error.message);
         }
 
         return {
@@ -127,40 +127,56 @@ export async function scrapeNode(state: ScrapeNodeState): Promise<Partial<any>> 
     });
 
     // ==========================================
-    // STEP 3: Fetch Page
+    // STEP 3: Call MCP scrape_url Tool
     // ==========================================
     if (publisher) {
-      await publisher.publishProgress(`Fetching ${validatedUrl.hostname}...`, {
-        progress: 30,
+      await publisher.publishProgress(`Scraping ${validatedUrl.hostname} via MCP...`, {
+        progress: 40,
         data: { hostname: validatedUrl.hostname },
       });
     }
 
-    const parsed = await fetchAndParse(validatedUrl.toString());
-
-    await redInstance.logger.log({
-      level: 'success',
-      category: 'tool',
-      message: `✓ Page fetched: ${parsed.contentLength} characters`,
+    const scrapeResult = await redInstance.callMcpTool('scrape_url', {
+      url: validatedUrl.toString()
+    }, {
       conversationId,
       generationId,
-      metadata: { 
-        contentLength: parsed.contentLength,
-        title: parsed.title 
-      },
+      messageId
     });
 
-    // ==========================================
-    // STEP 4: Parse HTML
-    // ==========================================
-    if (publisher) {
-      await publisher.publishProgress('Extracting text content...', {
-        progress: 70,
-        data: { 
-          title: parsed.title,
-          contentLength: parsed.contentLength 
-        },
+    // Check for errors
+    if (scrapeResult.isError) {
+      throw new Error(scrapeResult.content[0]?.text || 'Scraping failed');
+    }
+
+    const scrapedContent = scrapeResult.content[0]?.text || '';
+
+    if (!scrapedContent || scrapedContent.includes('No content could be extracted')) {
+      await redInstance.logger.log({
+        level: 'warn',
+        category: 'tool',
+        message: `⚠️ No content extracted from URL`,
+        conversationId,
+        generationId,
       });
+
+      if (publisher) {
+        await publisher.publishComplete({
+          result: 'No content extracted',
+          metadata: { contentLength: 0 },
+        });
+      }
+
+      return {
+        messages: [
+          new SystemMessage(
+            `[INTERNAL CONTEXT]\n` +
+            `Could not extract content from ${validatedUrl.toString()}\n` +
+            `Inform the user.`
+          )
+        ],
+        nextGraph: 'chat',
+      };
     }
 
     const duration = Date.now() - startTime;
@@ -168,44 +184,83 @@ export async function scrapeNode(state: ScrapeNodeState): Promise<Partial<any>> 
     await redInstance.logger.log({
       level: 'success',
       category: 'tool',
-      message: `✓ URL scrape completed in ${(duration / 1000).toFixed(1)}s`,
+      message: `✓ URL scrape completed via MCP in ${(duration / 1000).toFixed(1)}s`,
       conversationId,
       generationId,
       metadata: { 
         duration,
         url: validatedUrl.toString(),
-        title: parsed.title,
-        textLength: parsed.text.length,
+        contentLength: scrapedContent.length,
+        protocol: 'MCP/JSON-RPC 2.0'
       },
     });
 
     if (publisher) {
       await publisher.publishComplete({
-        result: `Extracted ${parsed.text.length} characters from ${validatedUrl.hostname}`,
+        result: `Extracted ${scrapedContent.length} characters from ${validatedUrl.hostname}`,
         metadata: {
           duration,
           url: validatedUrl.toString(),
-          title: parsed.title,
-          contentLength: parsed.contentLength,
-          textLength: parsed.text.length,
+          contentLength: scrapedContent.length,
+          protocol: 'MCP',
         },
       });
     }
 
     // ==========================================
-    // STEP 5: Return Content for Chat
+    // STEP 4: Build Context with Scraped Content
     // ==========================================
-    const contextMessage = [
-      `[INTERNAL CONTEXT - User cannot see this]`,
-      `Content from ${validatedUrl.toString()}:`,
-      parsed.title ? `\nTitle: ${parsed.title}` : '',
-      `\n${parsed.text}`,
-      `\nUse this information to answer the user's query.`,
-    ].filter(Boolean).join('\n');
+    const messages: any[] = [];
+    
+    // Add system message
+    const systemMessage = `You are Red, an AI assistant developed by redbtn.io.
+Current date: ${new Date().toLocaleDateString()}
+
+CRITICAL RULES:
+1. Use the webpage content provided to answer the user's query
+2. Be direct, helpful, and conversational`;
+
+    messages.push({ role: 'system', content: systemMessage });
+    
+    // Load conversation context if we have one
+    if (conversationId) {
+      const contextResult = await redInstance.callMcpTool(
+        'get_context_history',
+        {
+          conversationId,
+          maxTokens: 20000, // Leave room for scraped content
+          includeSummary: true,
+          summaryType: 'trailing',
+          format: 'llm'
+        },
+        { conversationId, generationId, messageId }
+      );
+
+      if (!contextResult.isError && contextResult.content?.[0]?.text) {
+        const contextData = JSON.parse(contextResult.content[0].text);
+        const contextMessages = contextData.messages || [];
+        
+        // Filter out the current user message
+        const userQuery = state.query?.message || '';
+        const filteredMessages = contextMessages.filter((msg: any) => 
+          !(msg.role === 'user' && msg.content === userQuery)
+        );
+        
+        messages.push(...filteredMessages);
+      }
+    }
+    
+    // Add the user's query with scraped content in brackets
+    const userQuery = state.query?.message || '';
+    const userQueryWithContent = `${userQuery}\n\n[Webpage Content: ${scrapedContent}]`;
+    messages.push({
+      role: 'user',
+      content: userQueryWithContent
+    });
 
     return {
-      messages: [new SystemMessage(contextMessage)],
-      nextGraph: 'chat',
+      messages,
+      nextGraph: 'responder',
     };
 
   } catch (error) {
@@ -226,20 +281,21 @@ export async function scrapeNode(state: ScrapeNodeState): Promise<Partial<any>> 
     });
 
     if (publisher) {
-      await publisher.publishError({
-        error: errorMessage,
-      });
+      await publisher.publishError(errorMessage);
     }
 
     return {
       messages: [
-        new SystemMessage(
-          `[INTERNAL CONTEXT]\n` +
-          `URL scraping failed: ${errorMessage}\n` +
-          `Inform the user and offer to help in another way.`
-        )
+        {
+          role: 'system',
+          content: `You are Red, an AI assistant. URL scraping failed: ${errorMessage}. Inform the user and offer to help in another way.`
+        },
+        {
+          role: 'user',
+          content: state.query?.message || ''
+        }
       ],
-      nextGraph: 'chat',
+      nextGraph: 'responder',
     };
   }
 }

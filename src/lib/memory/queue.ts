@@ -81,7 +81,11 @@ export class MessageQueue {
       messageId,
       status: 'generating',
       content: '',
-      startedAt: Date.now()
+      startedAt: Date.now(),
+      currentStatus: {
+        action: 'initializing',
+        description: 'Starting generation'
+      }
     };
 
     const key = `${this.CONTENT_KEY_PREFIX}${messageId}`;
@@ -90,6 +94,12 @@ export class MessageQueue {
     // Add to conversation's generating messages index
     await this.redis.sadd(`${this.INDEX_KEY_PREFIX}${conversationId}`, messageId);
     await this.redis.expire(`${this.INDEX_KEY_PREFIX}${conversationId}`, this.STATE_TTL);
+
+    // Publish initial status event so frontend knows generation started
+    await this.redis.publish(
+      `${this.PUBSUB_PREFIX}${messageId}`,
+      JSON.stringify({ type: 'status', action: 'initializing', description: 'Starting generation' })
+    );
 
     console.log(`[MessageQueue] Started generation tracking: ${messageId}`);
   }

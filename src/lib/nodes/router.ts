@@ -1,6 +1,7 @@
 
 import { InvokeOptions, Red } from '../..';
 import { extractThinking, logThinking } from '../utils/thinking';
+import { extractJSONWithDetails } from '../utils/json-extractor';
 
 /**
  * JSON schema for routing decisions (structured output)
@@ -60,7 +61,7 @@ export const routerNode = async (state: any) => {
   const redInstance: Red = state.redInstance;
   const conversationId = state.options?.conversationId;
   const generationId = state.options?.generationId;
-  const messageId = (state.options as any)?.messageId;
+  const messageId = state.messageId; // Get from top-level state, not options
   
   // Publish routing status to frontend
   if (messageId) {
@@ -79,12 +80,32 @@ export const routerNode = async (state: any) => {
     conversationId,
   });
   
-  // Get executive summary for context (if exists)
+  // Get executive summary for context (if exists) via Context MCP
   let contextSummary = '';
   if (conversationId) {
-    const summary = await redInstance.memory.getExecutiveSummary(conversationId);
-    if (summary) {
-      contextSummary = `\n\nConversation Context: ${summary}`;
+    try {
+      const summaryResult = await redInstance.callMcpTool(
+        'get_summary',
+        {
+          conversationId,
+          summaryType: 'executive'
+        },
+        {
+          conversationId,
+          generationId,
+          messageId
+        }
+      );
+
+      if (!summaryResult.isError && summaryResult.content?.[0]?.text) {
+        const summaryData = JSON.parse(summaryResult.content[0].text);
+        const summary = summaryData.summary;
+        if (summary) {
+          contextSummary = `\n\nConversation Context: ${summary}`;
+        }
+      }
+    } catch (error) {
+      console.warn('[Router] Failed to get executive summary from Context MCP:', error);
     }
   }
   
@@ -97,8 +118,8 @@ export const routerNode = async (state: any) => {
     });
     
     // Force JSON output from Ollama models
-    const modelWithJsonFormat = redInstance.chatModel.bind({ 
-      format: "json" 
+    const modelWithJsonFormat = redInstance.workerModel.withStructuredOutput({
+      schema: routingDecisionSchema
     });
     
     const response = await modelWithJsonFormat.invoke([
@@ -110,17 +131,6 @@ TODAY'S DATE: ${currentDate}
 
 Your job is to analyze the user's message and determine which action to take.
 
-YOU MUST RESPOND WITH ONLY VALID JSON. No other text before or after the JSON.
-
-Required JSON format:
-{
-  "action": "WEB_SEARCH" | "SCRAPE_URL" | "SYSTEM_COMMAND" | "CHAT",
-  "reasoning": "brief explanation",
-  "searchQuery": "optional refined query for WEB_SEARCH",
-  "url": "optional URL for SCRAPE_URL",
-  "command": "optional command for SYSTEM_COMMAND"
-}
-
 Actions:
 - WEB_SEARCH: Use when the query needs current/recent information from the internet (news, weather, sports scores, stock prices, current events, or when user explicitly asks to search the web)
 - SCRAPE_URL: Use when the user provides a specific URL to read or analyze
@@ -131,9 +141,7 @@ Guidelines:
 - If the query mentions a specific URL (http://, https://), choose SCRAPE_URL
 - If the query is about recent events, breaking news, live data, choose WEB_SEARCH
 - If the query asks to execute/run something on the system, choose SYSTEM_COMMAND
-- When in doubt, choose CHAT
-
-RESPOND WITH ONLY THE JSON OBJECT, NOTHING ELSE.`
+- When in doubt, choose CHAT`
       },
       {
         role: 'user',
@@ -141,38 +149,163 @@ RESPOND WITH ONLY THE JSON OBJECT, NOTHING ELSE.`
       }
     ]);
     
-    // Parse the JSON response
+    // With structured output, response is already parsed
     let routingDecision: RoutingDecision;
-    try {
-      routingDecision = JSON.parse(response.content as string);
+    
+    // Check if response is already an object (structured output) or needs parsing
+    if (typeof response === 'object' && response !== null) {
+      // Check if it's in tool call format: {name, arguments}
+      if ('name' in response && 'arguments' in response) {
+        const toolCall = response as { name: string; arguments: any };
+        
+        // Extract the actual data from arguments
+        routingDecision = {
+          action: toolCall.name as RoutingDecision['action'],
+          reasoning: toolCall.arguments.reasoning || '',
+          searchQuery: toolCall.arguments.searchQuery || toolCall.arguments.query,
+          url: toolCall.arguments.url,
+          command: toolCall.arguments.command
+        };
+        
+        await redInstance.logger.log({
+          level: 'success',
+          category: 'router',
+          message: `<green>✓ Routing decision received (tool call format)</green>`,
+          generationId,
+          conversationId,
+          metadata: { 
+            decision: routingDecision,
+            method: 'tool_call_format',
+            rawToolCall: toolCall
+          },
+        });
+        
+      } else if ('action' in response) {
+        // Already structured - direct from withStructuredOutput
+        routingDecision = response as RoutingDecision;
+        
+        await redInstance.logger.log({
+          level: 'success',
+          category: 'router',
+          message: `<green>✓ Routing decision received (structured output)</green>`,
+          generationId,
+          conversationId,
+          metadata: { 
+            decision: routingDecision,
+            method: 'structured_output'
+          },
+        });
+        
+      } else {
+        // Unknown object format, try to extract
+        throw new Error(`Unknown response format: ${JSON.stringify(response)}`);
+      }
       
-      // Log successful parsing with full decision details
+    } else {
+      // Check if response has direct text content
+      // Check top-level: response/text/content/message
+      let directText = (response as any)?.response || 
+                       (response as any)?.text || 
+                       (response as any)?.content ||
+                       (response as any)?.message;
+      
+      // Check nested in 'response' property
+      if (!directText && (response as any)?.response && typeof (response as any).response === 'object') {
+        const resp = (response as any).response;
+        directText = resp.response || resp.text || resp.content || resp.message;
+      }
+      
+      // Check nested in 'arguments' property
+      if (!directText && (response as any)?.arguments) {
+        const args = (response as any).arguments;
+        directText = args.response || args.text || args.content || args.message;
+      }
+      
+      // Check nested in 'data' property
+      if (!directText && (response as any)?.data) {
+        const data = (response as any).data;
+        directText = data.response || data.text || data.content || data.message;
+      }
+      
+      if (typeof directText === 'string' && directText.trim().length > 0) {
+        // Response contains direct text - stream it and skip to responder
+        await redInstance.logger.log({
+          level: 'info',
+          category: 'router',
+          message: `<cyan>📋 Router received text response, passing through</cyan>`,
+          generationId,
+          conversationId,
+          metadata: { 
+            hasDirectText: true,
+            textLength: directText.length
+          },
+        });
+        
+        // Store the direct response in state so responder can stream it
+        return { 
+          nextGraph: 'responder',
+          directResponse: directText
+        };
+      }
+      
+      // Fallback: response has content property that needs extraction
+      const rawResponse = typeof response === 'string' ? response : (response as any)?.content || JSON.stringify(response);
+      
+      // Log the full raw response for debugging
       await redInstance.logger.log({
         level: 'info',
         category: 'router',
-        message: `<cyan>✓ Routing decision parsed successfully</cyan>`,
+        message: `<cyan>📋 Raw LLM response received</cyan>`,
         generationId,
         conversationId,
         metadata: { 
-          decision: routingDecision
+          rawResponse,
+          responseLength: rawResponse.length,
+          responseType: typeof response
         },
       });
       
-    } catch (parseError) {
-      // Log the full response if JSON parsing fails
-      await redInstance.logger.log({
-        level: 'error',
-        category: 'router',
-        message: `<red>✗ Failed to parse routing decision as JSON</red>`,
-        generationId,
-        conversationId,
-        metadata: { 
-          rawResponse: response.content,
-          parseError: parseError instanceof Error ? parseError.message : String(parseError)
-        },
-      });
+      // Try to extract JSON from the response
+      const extractionResult = extractJSONWithDetails<RoutingDecision>(
+        rawResponse,
+        { action: undefined, reasoning: undefined } // Expected shape
+      );
       
-      throw new Error(`Failed to parse routing response: ${response.content}`);
+      if (extractionResult.success && extractionResult.data) {
+        routingDecision = extractionResult.data;
+        
+        // Log successful extraction with details
+        await redInstance.logger.log({
+          level: 'success',
+          category: 'router',
+          message: `<green>✓ Routing decision extracted successfully</green> <dim>(strategy: ${extractionResult.strategy})</dim>`,
+          generationId,
+          conversationId,
+          metadata: { 
+            decision: routingDecision,
+            extractionStrategy: extractionResult.strategy,
+            extractedText: extractionResult.extractedText,
+            hadExtraText: extractionResult.extractedText !== rawResponse.trim()
+          },
+        });
+        
+      } else {
+        // Log failure with full details
+        await redInstance.logger.log({
+          level: 'error',
+          category: 'router',
+          message: `<red>✗ Failed to extract routing decision from response</red>`,
+          generationId,
+          conversationId,
+          metadata: { 
+            rawResponse,
+            extractionError: extractionResult.error,
+            attemptedStrategies: ['direct', 'braces', 'codeblock']
+          },
+        });
+        
+        throw new Error(`Failed to parse routing response: ${extractionResult.error}`);
+      }
     }
     
     // Log the reasoning and action details
@@ -308,11 +441,11 @@ RESPOND WITH ONLY THE JSON OBJECT, NOTHING ELSE.`
           conversationId,
           metadata: { 
             decision: 'CHAT', 
-            nextGraph: 'chat',
+            nextGraph: 'responder',
             reasoning: routingDecision.reasoning
           },
         });
-        return { nextGraph: 'chat' };
+        return { nextGraph: 'responder' };
       }
     }
     
