@@ -121,6 +121,22 @@ export class MemoryManager {
   async addMessage(conversationId: string, message: ConversationMessage): Promise<void> {
     const key = `conversations:${conversationId}:messages`;
     
+    // Check if this message already exists in Redis (deduplicate by messageId)
+    const existingMessages = await this.redis.lrange(key, 0, -1);
+    const messageExists = existingMessages.some((msgJson: string) => {
+      try {
+        const existingMsg = JSON.parse(msgJson);
+        return existingMsg.id === message.id;
+      } catch {
+        return false;
+      }
+    });
+    
+    if (messageExists) {
+      console.log(`[Memory] Message ${message.id} already exists in Redis cache for ${conversationId}, skipping duplicate`);
+      return;
+    }
+    
     // Store in MongoDB for persistence (non-blocking, ignore errors)
     getDatabase().storeMessage({
       messageId: message.id, // Include the original message ID

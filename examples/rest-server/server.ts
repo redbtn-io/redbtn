@@ -9,7 +9,7 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
-import { Red, RedConfig } from '../src/index';
+import { Red, RedConfig } from '@redbtn/ai';
 
 // Check if running in think mode (no HTTP server, just autonomous thinking)
 const THINK_MODE = process.env.THINK === 'true' || process.env.THINK === '1';
@@ -84,8 +84,9 @@ const config: RedConfig = {
   // Use the Redis URI scheme so ioredis connects correctly
   redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
   vectorDbUrl: process.env.VECTOR_DB_URL || "http://localhost:8200",
-  databaseUrl: process.env.DATABASE_URL || "http://localhost:5432",
-  defaultLlmUrl: process.env.LLM_URL || "http://localhost:11434",
+  databaseUrl: process.env.DATABASE_URL || "mongodb://localhost:27017/red-webapp",
+  chatLlmUrl: process.env.CHAT_LLM_URL || "http://localhost:11434",
+  workLlmUrl: process.env.WORK_LLM_URL || "http://localhost:11434",
 };
 
 let red: Red;

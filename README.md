@@ -549,43 +549,31 @@ const result = await red.callMcpTool(
 
 ## 📋 Examples
 
-See:
-- [`/examples/server.ts`](examples/server.ts) - OpenAI-compatible API server
-- [`/examples/client.ts`](examples/client.ts) - Example API client in TypeScript
-- [`/examples/SERVER.md`](examples/SERVER.md) - API server documentation and deployment guide
-- [`/examples/test-rag.ts`](examples/test-rag.ts) - RAG (vector database) examples
-- [`/examples/test-mcp-client.ts`](examples/test-mcp-client.ts) - MCP client usage examples
-- [`/examples/test-mcp-registry.ts`](examples/test-mcp-registry.ts) - MCP registry examples
-- [`/examples/test-json-extractor.ts`](examples/test-json-extractor.ts) - JSON extraction utilities
-- [`/examples/test-tool-logging.ts`](examples/test-tool-logging.ts) - Tool execution logging demos
+The `examples/` directory contains self-contained examples with their own dependencies:
 
-### Running the API Server
-
-Red AI can be run as an OpenAI-compatible API server, allowing integration with tools like OpenWebUI, Cursor, Continue, and any other OpenAI-compatible client:
+### 🤖 [Discord Bot](examples/discord)
+Full-featured Discord bot that responds when mentioned in channels.
+- Tag-based activation
+- Per-channel conversation management  
+- Multi-user context formatting
+- Streaming responses with typing indicators
 
 ```bash
-npm run server
+cd examples/discord && npm install && npm start
 ```
 
-Then test it:
+### 🌐 [REST API Server](examples/rest-server)
+OpenAI-compatible API server for Red AI.
+- Works with OpenWebUI, Cursor, Continue, etc.
+- Streaming and non-streaming modes
+- Bearer token authentication
+- Includes TypeScript client example
 
 ```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Red",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": false
-  }'
+cd examples/rest-server && npm install && npm start
 ```
 
-Or use the TypeScript client:
-
-```bash
-npx tsx examples/client.ts
-```
-
-See [`/examples/SERVER.md`](examples/SERVER.md) for complete documentation.
+See [examples/README.md](examples/README.md) for complete documentation.
 
 ---
 

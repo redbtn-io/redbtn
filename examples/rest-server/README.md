@@ -4,10 +4,17 @@ This example demonstrates how to run Red AI as an OpenAI-compatible API server. 
 
 ## Quick Start
 
-### 1. Start the server
+### 1. Install dependencies
 
 ```bash
-npm run server
+cd examples/rest-server
+npm install
+```
+
+### 2. Start the server
+
+```bash
+npm start
 ```
 
 The server will start on `http://localhost:3000` (configurable via `PORT` environment variable).
@@ -16,14 +23,24 @@ The server will start on `http://localhost:3000` (configurable via `PORT` enviro
 
 ### 2. Configure your LLM endpoint
 
-Set the `LLM_URL` environment variable to point to your Ollama instance:
+Create a `.env` file in the `examples/rest-server` directory:
 
 ```bash
-export LLM_URL=http://localhost:11434
-npm run server
-```
+# Redis, Vector DB, and MongoDB URLs
+REDIS_URL=redis://localhost:6379
+VECTOR_DB_URL=http://localhost:8200
+DATABASE_URL=mongodb://localhost:27017/red-webapp
 
-Or use the `.env` file approach for all configuration options.
+# LLM endpoints
+CHAT_LLM_URL=http://192.168.1.4:11434
+WORK_LLM_URL=http://192.168.1.3:11434
+
+# Optional: Override bearer token
+BEARER_TOKEN=your_custom_token_here
+
+# Optional: Change port (default: 3000)
+PORT=3000
+```
 
 ### 3. Get your Bearer token
 

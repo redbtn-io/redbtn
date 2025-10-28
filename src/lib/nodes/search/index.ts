@@ -144,11 +144,53 @@ export async function searchNode(state: SearchNodeState): Promise<Partial<any>> 
         });
       }
 
+      // Build proper context even when search fails
+      const messages: any[] = [];
+      
+      // Add system message
+      const systemMessage = `You are Red, an AI assistant developed by redbtn.io.
+Current date: ${new Date().toLocaleDateString()}
+
+The user asked about something but the search returned no results. Let them know you couldn't find information about their query.`;
+
+      messages.push({ role: 'system', content: systemMessage });
+      
+      // Load conversation context if we have one
+      if (conversationId) {
+        const contextResult = await redInstance.callMcpTool(
+          'get_context_history',
+          {
+            conversationId,
+            maxTokens: 30000,
+            includeSummary: true,
+            summaryType: 'trailing',
+            format: 'llm'
+          },
+          { conversationId, generationId, messageId }
+        );
+
+        if (!contextResult.isError && contextResult.content?.[0]?.text) {
+          const contextData = JSON.parse(contextResult.content[0].text);
+          const contextMessages = contextData.messages || [];
+          
+          // Filter out the current user message (will be re-added)
+          const filteredMessages = contextMessages.filter((msg: any) => 
+            !(msg.role === 'user' && msg.content === userQuery)
+          );
+          
+          messages.push(...filteredMessages);
+        }
+      }
+      
+      // Add user query with note about no results
+      messages.push({
+        role: 'user',
+        content: `${userQuery}\n\n[Note: Web search returned no results for this query]`
+      });
+
       return {
-        messages: [
-          new SystemMessage(`[INTERNAL CONTEXT]\nNo search results found for: ${optimizedQuery}`)
-        ],
-        nextGraph: 'chat',
+        messages,
+        nextGraph: 'responder',
       };
     }
 

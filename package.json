@@ -11,18 +11,14 @@
   ],
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "test:tools": "npx tsx examples/test-tools.ts",
-    "test:rag": "npx tsx examples/test-rag.ts",
     "mcp:start": "npx tsx src/mcp-servers.ts",
-    "mcp:test": "npx tsx examples/test-mcp-client.ts",
-    "mcp:test:registry": "npx tsx examples/test-mcp-registry.ts",
-    "dev:server": "npx tsx watch examples/server.ts",
-    "start:server": "npx tsx examples/server.ts",
-    "think": "THINK=true npx tsx examples/server.ts",
+    "dev:server": "cd examples/rest-server && npm run dev",
+    "start:server": "cd examples/rest-server && npm start",
     "build": "tsc",
     "pack": "npm run build && npm pack",
     "prepublishOnly": "npm run build",
-    "db:fix-messageids": "npx tsx scripts/fix-null-messageids.ts"
+    "db:fix-messageids": "npx tsx scripts/fix-null-messageids.ts",
+    "redis:cleanup-dupes": "npx tsx scripts/cleanup-redis-duplicates.ts"
   },
   "author": "",
   "license": "ISC",

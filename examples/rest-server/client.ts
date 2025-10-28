@@ -64,7 +64,7 @@ async function chatCompletion(
     throw new Error(`API error: ${response.status} ${response.statusText}`);
   }
 
-  return response.json();
+  return response.json() as Promise<ChatCompletionResponse>;
 }
 
 /**

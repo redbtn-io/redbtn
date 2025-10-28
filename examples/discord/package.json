@@ -1,0 +1,20 @@
+{
+  "name": "@redbtn/ai-discord-example",
+  "version": "1.0.0",
+  "description": "Discord bot example for Red AI",
+  "private": true,
+  "scripts": {
+    "start": "tsx discord-bot.ts",
+    "dev": "tsx watch discord-bot.ts"
+  },
+  "dependencies": {
+    "@redbtn/ai": "file:../../redbtn-ai-0.0.1.tgz",
+    "discord.js": "^14.16.3",
+    "dotenv": "^17.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.2"
+  }
+}
