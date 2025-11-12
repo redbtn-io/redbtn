@@ -61,7 +61,6 @@ export async function respond(
   });
   
   // Store user message via Context MCP
-  console.log(`[Respond] About to store user message - messageId:${userMessageId}`);
   await red.callMcpTool('store_message', {
     conversationId,
     role: 'user',
@@ -105,13 +104,69 @@ CRITICAL RULES:
     const result = await redGraph.invoke(initialState);
     const response = result.response;
     
+    // Retrieve tool executions from Redis state
+    let toolExecutions: any[] = [];
+    if (requestId) {
+      const messageState = await red.messageQueue.getMessageState(requestId);
+      if (messageState?.toolEvents) {
+        // Convert tool events to tool executions for storage
+        const toolMap = new Map<string, any>();
+        
+        for (const event of messageState.toolEvents) {
+          if (event.type === 'tool_start') {
+            toolMap.set(event.toolId, {
+              toolId: event.toolId,
+              toolType: event.toolType,
+              toolName: event.toolName,
+              status: 'running',
+              startTime: new Date(event.timestamp),
+              steps: [],
+              metadata: event.metadata || {}
+            });
+          } else if (event.type === 'tool_progress' && toolMap.has(event.toolId)) {
+            const tool = toolMap.get(event.toolId);
+            tool.steps.push({
+              step: event.step,
+              timestamp: new Date(event.timestamp),
+              progress: event.progress,
+              data: event.data
+            });
+            if (event.progress !== undefined) {
+              tool.progress = event.progress;
+            }
+            tool.currentStep = event.step;
+          } else if (event.type === 'tool_complete' && toolMap.has(event.toolId)) {
+            const tool = toolMap.get(event.toolId);
+            tool.status = 'completed';
+            tool.endTime = new Date(event.timestamp);
+            tool.duration = tool.endTime.getTime() - tool.startTime.getTime();
+            if (event.result !== undefined) {
+              tool.result = event.result;
+            }
+            if (event.metadata) {
+              tool.metadata = { ...tool.metadata, ...event.metadata };
+            }
+          } else if (event.type === 'tool_error' && toolMap.has(event.toolId)) {
+            const tool = toolMap.get(event.toolId);
+            tool.status = 'error';
+            tool.endTime = new Date(event.timestamp);
+            tool.duration = tool.endTime.getTime() - tool.startTime.getTime();
+            tool.error = typeof event.error === 'string' ? event.error : JSON.stringify(event.error);
+          }
+        }
+        
+        toolExecutions = Array.from(toolMap.values());
+        console.log(`[Respond] Collected ${toolExecutions.length} tool executions from generation state`);
+      }
+    }
+    
     // Store assistant response via Context MCP
     await red.callMcpTool('store_message', {
       conversationId,
       role: 'assistant',
       content: typeof response.content === 'string' ? response.content : JSON.stringify(response.content),
       messageId: assistantMessageId, // Use unique assistant message ID
-      toolExecutions: [] // TODO: Implement tool execution data collection
+      toolExecutions
     }, { conversationId, generationId, messageId: requestId });
     
     // Get message count for title generation via Context MCP
@@ -435,19 +490,71 @@ async function* streamThroughGraphWithMemory(
     }
     
     // Store assistant response via Context MCP (after streaming completes)
-    console.log(`[Respond] Streaming complete - fullContent length:${fullContent?.length}, assistantMessageId:${assistantMessageId}`);
     if (fullContent) {
-      console.log(`[Respond] About to store assistant message - messageId:${assistantMessageId}, content length:${fullContent.length}`);
+      // Retrieve tool executions from Redis state
+      let toolExecutions: any[] = [];
+      if (requestId) {
+        const messageState = await red.messageQueue.getMessageState(requestId);
+        if (messageState?.toolEvents) {
+          // Convert tool events to tool executions for storage
+          const toolMap = new Map<string, any>();
+          
+          for (const event of messageState.toolEvents) {
+            if (event.type === 'tool_start') {
+              toolMap.set(event.toolId, {
+                toolId: event.toolId,
+                toolType: event.toolType,
+                toolName: event.toolName,
+                status: 'running',
+                startTime: new Date(event.timestamp),
+                steps: [],
+                metadata: event.metadata || {}
+              });
+            } else if (event.type === 'tool_progress' && toolMap.has(event.toolId)) {
+              const tool = toolMap.get(event.toolId);
+              tool.steps.push({
+                step: event.step,
+                timestamp: new Date(event.timestamp),
+                progress: event.progress,
+                data: event.data
+              });
+              if (event.progress !== undefined) {
+                tool.progress = event.progress;
+              }
+              tool.currentStep = event.step;
+            } else if (event.type === 'tool_complete' && toolMap.has(event.toolId)) {
+              const tool = toolMap.get(event.toolId);
+              tool.status = 'completed';
+              tool.endTime = new Date(event.timestamp);
+              tool.duration = tool.endTime.getTime() - tool.startTime.getTime();
+              if (event.result !== undefined) {
+                tool.result = event.result;
+              }
+              if (event.metadata) {
+                tool.metadata = { ...tool.metadata, ...event.metadata };
+              }
+            } else if (event.type === 'tool_error' && toolMap.has(event.toolId)) {
+              const tool = toolMap.get(event.toolId);
+              tool.status = 'error';
+              tool.endTime = new Date(event.timestamp);
+              tool.duration = tool.endTime.getTime() - tool.startTime.getTime();
+              tool.error = typeof event.error === 'string' ? event.error : JSON.stringify(event.error);
+            }
+          }
+          
+          toolExecutions = Array.from(toolMap.values());
+          console.log(`[Respond] Collected ${toolExecutions.length} tool executions from generation state`);
+        }
+      }
+      
       // Store content via MCP for LLM context (already cleaned in streaming/non-streaming paths)
-      console.log(`[Respond] Calling red.callMcpTool('store_message'...)`);
-      const storeResult = await red.callMcpTool('store_message', {
+      await red.callMcpTool('store_message', {
         conversationId,
         role: 'assistant',
         content: fullContent,
         messageId: assistantMessageId, // Use unique assistant message ID
-        toolExecutions: [] // TODO: Implement tool execution data collection
+        toolExecutions
       }, { conversationId, generationId, messageId: requestId });
-      console.log(`[Respond] callMcpTool returned:`, storeResult?.isError ? 'ERROR' : 'SUCCESS');
       
       // Complete the generation
       await red.logger.completeGeneration(generationId, {

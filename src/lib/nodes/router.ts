@@ -2,45 +2,98 @@
 import { InvokeOptions, Red } from '../..';
 import { extractThinking, logThinking } from '../utils/thinking';
 import { extractJSONWithDetails } from '../utils/json-extractor';
+import { invokeWithRetry } from '../utils/retry';
+import { getNodeSystemPrefix } from '../utils/node-helpers';
 
 /**
  * JSON schema for routing decisions (structured output)
+ * Multi-path confidence scoring: evaluate all three options simultaneously
  */
 const routingDecisionSchema = {
   type: 'object',
   properties: {
-    action: {
-      type: 'string',
-      enum: ['WEB_SEARCH', 'SCRAPE_URL', 'SYSTEM_COMMAND', 'CHAT'],
-      description: 'The routing action to take based on the user query'
-    },
-    reasoning: {
-      type: 'string',
-      description: 'Brief explanation of why this action was chosen'
-    },
-    url: {
-      type: 'string',
-      description: 'The URL to scrape (only for SCRAPE_URL action)'
+    research: {
+      type: 'object',
+      properties: {
+        confidence: {
+          type: 'number',
+          minimum: 0,
+          maximum: 1,
+          description: 'Confidence 0-1 that this query needs web research/search'
+        },
+        reasoning: {
+          type: 'string',
+          description: 'Why research would or would not help answer this query'
+        },
+        query: {
+          type: 'string',
+          description: 'Optimized search query if research is needed. Include date context for time-sensitive queries (e.g., "Chiefs game November 9 2025" not "tonight")'
+        }
+      },
+      required: ['confidence', 'reasoning']
     },
     command: {
-      type: 'string',
-      description: 'The system command to execute (only for SYSTEM_COMMAND action)'
+      type: 'object',
+      properties: {
+        confidence: {
+          type: 'number',
+          minimum: 0,
+          maximum: 1,
+          description: 'Confidence 0-1 that this query needs command execution across various domains'
+        },
+        reasoning: {
+          type: 'string',
+          description: 'Why a command would or would not be appropriate'
+        },
+        domain: {
+          type: 'string',
+          enum: ['system', 'api', 'home'],
+          description: 'Command domain: system (file ops, shell commands), api (external services, webhooks), home (smart home, IoT devices)'
+        },
+        details: {
+          type: 'string',
+          description: 'Specific command details, parameters, or context needed'
+        }
+      },
+      required: ['confidence', 'reasoning']
     },
-    searchQuery: {
-      type: 'string',
-      description: 'Refined search query (only for WEB_SEARCH action)'
+    respond: {
+      type: 'object',
+      properties: {
+        confidence: {
+          type: 'number',
+          minimum: 0,
+          maximum: 1,
+          description: 'Confidence 0-1 that this can be answered directly using existing knowledge without external tools'
+        },
+        reasoning: {
+          type: 'string',
+          description: 'Why a direct response would or would not be sufficient'
+        }
+      },
+      required: ['confidence', 'reasoning']
     }
   },
-  required: ['action', 'reasoning'],
+  required: ['research', 'command', 'respond'],
   additionalProperties: false
 } as const;
 
 interface RoutingDecision {
-  action: 'WEB_SEARCH' | 'SCRAPE_URL' | 'SYSTEM_COMMAND' | 'CHAT';
-  reasoning: string;
-  url?: string;
-  command?: string;
-  searchQuery?: string;
+  research: {
+    confidence: number;
+    reasoning: string;
+    query?: string;
+  };
+  command: {
+    confidence: number;
+    reasoning: string;
+    domain?: 'system' | 'api' | 'home';
+    details?: string;
+  };
+  respond: {
+    confidence: number;
+    reasoning: string;
+  };
 }
 
 /**
@@ -49,19 +102,81 @@ interface RoutingDecision {
  * - web_search: Query needs current information from the internet
  * - scrape_url: User provided a specific URL to scrape
  * - system_command: User wants to execute a system command
- * - chat: Query can be answered directly without external tools
+ * - respond: Query can be answered directly without external tools
  * 
  * Uses structured outputs with Zod schema for reliable routing decisions.
  * 
  * @param state The current state of the graph.
  * @returns A partial state object indicating the next step.
  */
+
+/**
+ * Normalize and validate routing decision response
+ * Handles various quirky LLM output formats and fills in missing fields
+ */
+function normalizeRoutingDecision(raw: any): RoutingDecision {
+  // Step 1: Normalize keys to lowercase
+  const normalizeKeys = (obj: any): any => {
+    if (typeof obj !== 'object' || obj === null) return obj;
+    const result: any = {};
+    for (const key in obj) {
+      const lowerKey = key.toLowerCase();
+      result[lowerKey] = typeof obj[key] === 'object' && obj[key] !== null 
+        ? normalizeKeys(obj[key]) 
+        : obj[key];
+    }
+    return result;
+  };
+  
+  const normalized = normalizeKeys(raw);
+  
+  // Step 2: Extract/validate each path
+  const research = normalized.research || {};
+  const command = normalized.command || {};
+  const respond = normalized.respond || {};
+  
+  // Step 3: Build complete structure with defaults
+  const result: RoutingDecision = {
+    research: {
+      confidence: typeof research.confidence === 'number' ? research.confidence : 0,
+      reasoning: research.reasoning || 'No reasoning provided',
+      query: research.query || ''
+    },
+    command: {
+      confidence: typeof command.confidence === 'number' ? command.confidence : 0,
+      reasoning: command.reasoning || 'No reasoning provided',
+      domain: command.domain || '',
+      details: command.details || ''
+    },
+    respond: {
+      confidence: typeof respond.confidence === 'number' ? respond.confidence : 0,
+      reasoning: respond.reasoning || 'No reasoning provided'
+    }
+  };
+  
+  // Step 4: Validate and fix confidence scores
+  // If any confidence is missing/invalid, redistribute evenly
+  const allValid = [result.research.confidence, result.command.confidence, result.respond.confidence]
+    .every(c => typeof c === 'number' && c >= 0 && c <= 1);
+  
+  if (!allValid) {
+    // Set default: respond wins if we can't determine
+    result.research.confidence = 0.1;
+    result.command.confidence = 0.1;
+    result.respond.confidence = 0.8;
+  }
+  
+  return result;
+}
+
 export const routerNode = async (state: any) => {
   const query = state.messages[state.messages.length - 1]?.content || state.query?.message || '';
   const redInstance: Red = state.redInstance;
   const conversationId = state.options?.conversationId;
   const generationId = state.options?.generationId;
   const messageId = state.messageId; // Get from top-level state, not options
+  const currentNodeNumber = state.nodeNumber || 1; // Router is always node 1
+  const nextNodeNumber = currentNodeNumber + 1; // Next nodes will be node 2, 3, etc.
   
   // Publish routing status to frontend
   if (messageId) {
@@ -80,10 +195,50 @@ export const routerNode = async (state: any) => {
     conversationId,
   });
   
-  // Get executive summary for context (if exists) via Context MCP
+  // Load conversation context ONCE in router and pass to all other nodes
+  let conversationMessages: any[] = [];
   let contextSummary = '';
+  
   if (conversationId) {
     try {
+      // Get full conversation history
+      const contextResult = await redInstance.callMcpTool(
+        'get_context_history',
+        {
+          conversationId,
+          maxTokens: 30000,
+          includeSummary: true,
+          summaryType: 'trailing',
+          format: 'llm'
+        },
+        {
+          conversationId,
+          generationId,
+          messageId
+        }
+      );
+
+      if (!contextResult.isError && contextResult.content?.[0]?.text) {
+        const contextData = JSON.parse(contextResult.content[0].text);
+        const rawMessages = contextData.messages || [];
+        
+        // Deduplicate by CONTENT (not just ID, since duplicates have different IDs)
+        const seenContent = new Set<string>();
+        conversationMessages = rawMessages.filter((m: any) => {
+          const key = `${m.role}:${m.content}`;
+          if (seenContent.has(key)) {
+            return false; // Skip duplicate content
+          }
+          seenContent.add(key);
+          return true;
+        });
+        
+        if (rawMessages.length !== conversationMessages.length) {
+          console.warn('[Router] Removed', rawMessages.length - conversationMessages.length, 'duplicate messages (same content, different IDs)');
+        }
+      }
+      
+      // Also get executive summary for routing decision
       const summaryResult = await redInstance.callMcpTool(
         'get_summary',
         {
@@ -105,7 +260,7 @@ export const routerNode = async (state: any) => {
         }
       }
     } catch (error) {
-      console.warn('[Router] Failed to get executive summary from Context MCP:', error);
+      console.warn('[Router] Failed to load context from Context MCP:', error);
     }
   }
   
@@ -121,84 +276,104 @@ export const routerNode = async (state: any) => {
     const modelWithJsonFormat = redInstance.workerModel.withStructuredOutput({
       schema: routingDecisionSchema
     });
-    
-    const response = await modelWithJsonFormat.invoke([
+    const response = await invokeWithRetry(modelWithJsonFormat, [
       {
         role: 'system',
-        content: `You are a routing cognition node for an Artificial Intelligence named Red.
+        content: `${getNodeSystemPrefix(currentNodeNumber, 'Router')}
 
-TODAY'S DATE: ${currentDate}
+Your job is to analyze the user's message and evaluate ALL THREE routing options simultaneously with confidence scores AND reasoning.
 
-Your job is to analyze the user's message and determine which action to take.
+You must return for EACH of the three paths:
+- confidence: A score from 0.0 to 1.0
+- reasoning: A brief explanation (1-2 sentences) of WHY you gave that confidence score
 
-Actions:
-- WEB_SEARCH: Use when the query needs current/recent information from the internet (news, weather, sports scores, stock prices, current events, or when user explicitly asks to search the web)
-- SCRAPE_URL: Use when the user provides a specific URL to read or analyze
-- SYSTEM_COMMAND: Use when the user wants to execute a system command (list files, read files, run scripts, etc.)
-- CHAT: Use for everything else (greetings, questions answerable with general knowledge, conversations, explanations)
+1. RESEARCH (Web Search):
+   - High confidence (0.8-1.0): Current events, breaking news, sports scores, weather, stock prices, "search for X", time-sensitive data
+   - Medium confidence (0.5-0.7): Could benefit from recent info but not critical
+   - Low confidence (0.0-0.4): Historical facts, general knowledge, doesn't need web data
+   - MUST provide 'query' field with optimized search terms including dates for time-sensitive queries
+   - Example: "Did Chiefs win tonight?" → query: "Chiefs game score November 9 2025"
+   - reasoning example: "User is asking about today's sports game which requires real-time data I don't have"
 
-Guidelines:
-- If the query mentions a specific URL (http://, https://), choose SCRAPE_URL
-- If the query is about recent events, breaking news, live data, choose WEB_SEARCH
-- If the query asks to execute/run something on the system, choose SYSTEM_COMMAND
-- When in doubt, choose CHAT`
+2. COMMAND (System/API/Home):
+   - High confidence (0.8-1.0): Clear command intent - system operations, API calls, smart home control
+   - Medium confidence (0.5-0.7): Might need command execution or external integrations
+   - Low confidence (0.0-0.4): No command/action context
+   - If confidence > 0.5, must specify 'domain' (system/api/home) and 'details'
+   - Domains:
+     * system: File operations, shell commands, local system tasks
+     * api: External services, webhooks, third-party integrations
+     * home: Smart home devices, IoT control, home automation
+   - reasoning example: "No system commands or actions are being requested"
+
+3. RESPOND (Direct Answer):
+   - High confidence (0.8-1.0): Can answer directly using existing knowledge - greetings, explanations, factual questions, conceptual discussions
+   - Medium confidence (0.5-0.7): Could answer directly but might benefit from external data for accuracy or completeness
+   - Low confidence (0.0-0.4): Definitely needs external tools or current data
+   - reasoning example: "This is a conceptual question about established knowledge that doesn't require real-time data"
+
+CRITICAL ROUTING RULES:
+- If you DON'T have real-time/current data → research confidence MUST be HIGH (0.8+)
+- If query asks about "today", "tonight", "current", "latest" → research confidence MUST be HIGH (0.8+)
+- The path with HIGHEST confidence wins
+- In a tie: research > command > respond (priority order)
+- Be honest - all three scores should reflect actual confidence, they don't need to sum to 1.0
+- ALWAYS provide reasoning for each path - explain your confidence score`
       },
       {
         role: 'user',
         content: `${contextSummary ? `Conversation Context:\n${contextSummary}\n\n` : ''}User message: ${query}`
       }
-    ]);
+    ], { context: 'router decision' });
     
     // With structured output, response is already parsed
     let routingDecision: RoutingDecision;
     
     // Check if response is already an object (structured output) or needs parsing
     if (typeof response === 'object' && response !== null) {
-      // Check if it's in tool call format: {name, arguments}
-      if ('name' in response && 'arguments' in response) {
-        const toolCall = response as { name: string; arguments: any };
-        
-        // Extract the actual data from arguments
-        routingDecision = {
-          action: toolCall.name as RoutingDecision['action'],
-          reasoning: toolCall.arguments.reasoning || '',
-          searchQuery: toolCall.arguments.searchQuery || toolCall.arguments.query,
-          url: toolCall.arguments.url,
-          command: toolCall.arguments.command
-        };
-        
+      // Check if it's the new multi-path format (handle both lowercase and uppercase keys)
+      const hasLowercase = 'research' in response && 'command' in response && 'respond' in response;
+      const hasUppercase = 'RESEARCH' in response && 'COMMAND' in response && 'RESPOND' in response;
+      
+      if (hasLowercase || hasUppercase) {
+        // Log raw response for debugging
         await redInstance.logger.log({
-          level: 'success',
+          level: 'debug',
           category: 'router',
-          message: `<green>✓ Routing decision received (tool call format)</green>`,
+          message: `<cyan>📋 Raw routing response before normalization</cyan>`,
           generationId,
           conversationId,
           metadata: { 
-            decision: routingDecision,
-            method: 'tool_call_format',
-            rawToolCall: toolCall
+            rawResponse: response,
+            hasUppercase,
+            hasLowercase
           },
         });
         
-      } else if ('action' in response) {
-        // Already structured - direct from withStructuredOutput
-        routingDecision = response as RoutingDecision;
+        // Normalize and validate the response
+        routingDecision = normalizeRoutingDecision(response);
         
         await redInstance.logger.log({
           level: 'success',
           category: 'router',
-          message: `<green>✓ Routing decision received (structured output)</green>`,
+          message: `<green>✓ Multi-path routing decision received</green>`,
           generationId,
           conversationId,
           metadata: { 
             decision: routingDecision,
-            method: 'structured_output'
+            method: 'structured_output',
+            keysNormalized: hasUppercase,
+            scores: {
+              research: routingDecision.research.confidence,
+              command: routingDecision.command.confidence,
+              chat: routingDecision.respond.confidence
+            }
           },
         });
         
       } else {
         // Unknown object format, try to extract
-        throw new Error(`Unknown response format: ${JSON.stringify(response)}`);
+        throw new Error(`Unknown response format - expected research/command/respond structure: ${JSON.stringify(response)}`);
       }
       
     } else {
@@ -244,7 +419,9 @@ Guidelines:
         // Store the direct response in state so responder can stream it
         return { 
           nextGraph: 'responder',
-          directResponse: directText
+          directResponse: directText,
+          contextMessages: conversationMessages,
+          nodeNumber: nextNodeNumber
         };
       }
       
@@ -268,24 +445,28 @@ Guidelines:
       // Try to extract JSON from the response
       const extractionResult = extractJSONWithDetails<RoutingDecision>(
         rawResponse,
-        { action: undefined, reasoning: undefined } // Expected shape
+        { research: undefined, command: undefined, respond: undefined } // Expected shape
       );
       
       if (extractionResult.success && extractionResult.data) {
-        routingDecision = extractionResult.data;
+        // Normalize and validate the extracted data
+        routingDecision = normalizeRoutingDecision(extractionResult.data);
         
         // Log successful extraction with details
         await redInstance.logger.log({
           level: 'success',
           category: 'router',
-          message: `<green>✓ Routing decision extracted successfully</green> <dim>(strategy: ${extractionResult.strategy})</dim>`,
+          message: `<green>✓ Multi-path routing decision extracted</green> <dim>(strategy: ${extractionResult.strategy})</dim>`,
           generationId,
           conversationId,
           metadata: { 
             decision: routingDecision,
             extractionStrategy: extractionResult.strategy,
-            extractedText: extractionResult.extractedText,
-            hadExtraText: extractionResult.extractedText !== rawResponse.trim()
+            scores: {
+              research: routingDecision.research.confidence,
+              command: routingDecision.command.confidence,
+              chat: routingDecision.respond.confidence
+            }
           },
         });
         
@@ -308,146 +489,207 @@ Guidelines:
       }
     }
     
-    // Log the reasoning and action details
-    const optionalFields: string[] = [];
-    if (routingDecision.searchQuery) optionalFields.push(`searchQuery: ${routingDecision.searchQuery}`);
-    if (routingDecision.url) optionalFields.push(`url: ${routingDecision.url}`);
-    if (routingDecision.command) optionalFields.push(`command: ${routingDecision.command}`);
+    // Determine winner: Highest confidence wins, with tie-breaker: research > command > respond
+    const scores = [
+      { path: 'research', confidence: routingDecision.research.confidence, priority: 1 },
+      { path: 'command', confidence: routingDecision.command.confidence, priority: 2 },
+      { path: 'respond', confidence: routingDecision.respond.confidence, priority: 3 }
+    ];
     
+    // Sort by confidence (desc), then by priority (asc) for tie-breaking
+    scores.sort((a, b) => {
+      if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+      return a.priority - b.priority;
+    });
+    
+    const winner = scores[0];
+    const winnerPath = winner.path as 'research' | 'command' | 'respond';
+    
+    // Log all three scores with winner highlighted
     await redInstance.logger.log({
       level: 'info',
       category: 'router',
-      message: `<cyan>Decision:</cyan> <bold>${routingDecision.action}</bold> <dim>${optionalFields.length > 0 ? `(${optionalFields.join(', ')})` : ''}</dim>`,
+      message: `<cyan>Multi-Path Confidence Scores:</cyan>
+  🔍 Research: <${winner.path === 'research' ? 'bold green' : 'dim'}>${(routingDecision.research.confidence * 100).toFixed(0)}%</> ${winner.path === 'research' ? '<green>← WINNER</green>' : ''}
+     ${routingDecision.research.reasoning}
+  ⚡ Command: <${winner.path === 'command' ? 'bold green' : 'dim'}>${(routingDecision.command.confidence * 100).toFixed(0)}%</> ${winner.path === 'command' ? '<green>← WINNER</green>' : ''}
+     ${routingDecision.command.reasoning}
+  💬 Respond: <${winner.path === 'respond' ? 'bold green' : 'dim'}>${(routingDecision.respond.confidence * 100).toFixed(0)}%</> ${winner.path === 'respond' ? '<green>← WINNER</green>' : ''}
+     ${routingDecision.respond.reasoning}`,
       generationId,
       conversationId,
       metadata: {
-        action: routingDecision.action,
-        reasoning: routingDecision.reasoning,
-        ...(routingDecision.searchQuery && { searchQuery: routingDecision.searchQuery }),
-        ...(routingDecision.url && { url: routingDecision.url }),
-        ...(routingDecision.command && { command: routingDecision.command })
+        winner: winnerPath,
+        winnerConfidence: winner.confidence,
+        allScores: {
+          research: routingDecision.research.confidence,
+          command: routingDecision.command.confidence,
+          chat: routingDecision.respond.confidence
+        },
+        tieBreaker: scores[0].confidence === scores[1].confidence
       }
     });
     
-    // Log reasoning as "thinking" in the logging system
-    if (routingDecision.reasoning && generationId && conversationId) {
+    // Log all reasoning as thinking
+    if (generationId && conversationId) {
       await redInstance.logger.logThought({
-        content: routingDecision.reasoning,
+        content: `Router Multi-Path Analysis:\n\nResearch (${(routingDecision.research.confidence * 100).toFixed(0)}%): ${routingDecision.research.reasoning}\n\nCommand (${(routingDecision.command.confidence * 100).toFixed(0)}%): ${routingDecision.command.reasoning}\n\nRespond (${(routingDecision.respond.confidence * 100).toFixed(0)}%): ${routingDecision.respond.reasoning}\n\nDecision: ${winnerPath.toUpperCase()}`,
         source: 'router',
         generationId,
         conversationId,
       });
     }
     
-    // Route based on action
-    switch (routingDecision.action) {
-      case 'WEB_SEARCH': {
-        // Publish tool_status so frontend knows we're searching
-        if (messageId) {
-          await redInstance.messageQueue.publishToolStatus(messageId, {
-            status: '🔍 Searching the web...',
-            action: 'web_search'
-          });
-        }
-
+    // Route based on winner
+    if (winnerPath === 'research') {
+      const searchQuery = routingDecision.research.query || query;
+      
+      // Validate search query - if missing or too vague, fall back to respond
+      if (!searchQuery || searchQuery.trim().length < 3) {
         await redInstance.logger.log({
-          level: 'success',
+          level: 'warn',
           category: 'router',
-          message: `<green>→ Route:</green> <bold>WEB_SEARCH</bold> <dim>${routingDecision.searchQuery || ''}</dim>`,
+          message: `<yellow>⚠ Research won but query is missing/invalid, falling back to CHAT</yellow>`,
           generationId,
           conversationId,
-          metadata: { 
-            decision: 'WEB_SEARCH', 
-            nextGraph: 'search',
-            searchQuery: routingDecision.searchQuery,
-            reasoning: routingDecision.reasoning
-          },
+          metadata: {
+            providedQuery: searchQuery,
+            fallbackReason: 'invalid_query'
+          }
         });
-        return { 
-          nextGraph: 'search',
-          toolParam: routingDecision.searchQuery || query
-        };
-      }
-      
-      case 'SCRAPE_URL': {
-        const url = routingDecision.url || '';
         
-        // Publish tool status to frontend
-        if (messageId) {
-          await redInstance.messageQueue.publishToolStatus(messageId, {
-            status: '📄 Reading webpage...',
-            action: 'scrape_url'
-          });
-        }
-        
-        await redInstance.logger.log({
-          level: 'success',
-          category: 'router',
-          message: `<green>→ Route:</green> <bold>SCRAPE_URL</bold> <dim>${url}</dim>`,
-          generationId,
-          conversationId,
-          metadata: { 
-            decision: 'SCRAPE_URL', 
-            url, 
-            nextGraph: 'scrape',
-            reasoning: routingDecision.reasoning
-          },
-        });
-        return { nextGraph: 'scrape', toolParam: url };
-      }
-      
-      case 'SYSTEM_COMMAND': {
-        const command = routingDecision.command || '';
-        
-        // Publish tool status to frontend
-        if (messageId) {
-          await redInstance.messageQueue.publishToolStatus(messageId, {
-            status: '⚙️ Executing command...',
-            action: 'system_command'
-          });
-        }
-        
-        await redInstance.logger.log({
-          level: 'success',
-          category: 'router',
-          message: `<green>→ Route:</green> <bold>SYSTEM_COMMAND</bold> <dim>${command}</dim>`,
-          generationId,
-          conversationId,
-          metadata: { 
-            decision: 'SYSTEM_COMMAND', 
-            command, 
-            nextGraph: 'command',
-            reasoning: routingDecision.reasoning
-          },
-        });
-        return { nextGraph: 'command', toolParam: command };
-      }
-      
-      case 'CHAT':
-      default: {
-        // Publish chat status to frontend
         if (messageId) {
           await redInstance.messageQueue.publishStatus(messageId, {
             action: 'processing',
-            description: 'Generating response'
+            description: 'Generating response',
+            reasoning: `[Fallback] ${routingDecision.respond.reasoning}`,
+            confidence: routingDecision.respond.confidence
           });
         }
         
+        return { nextGraph: 'responder', contextMessages: conversationMessages, nodeNumber: nextNodeNumber };
+      }
+      
+      if (messageId) {
+        await redInstance.messageQueue.publishToolStatus(messageId, {
+          status: '🔍 Searching the web...',
+          action: 'web_search',
+          reasoning: routingDecision.research.reasoning,
+          confidence: routingDecision.research.confidence
+        });
+      }
+
+      await redInstance.logger.log({
+        level: 'success',
+        category: 'router',
+        message: `<green>→ Route:</green> <bold>RESEARCH</bold> <dim>${searchQuery}</dim>`,
+        generationId,
+        conversationId,
+        metadata: { 
+          decision: 'RESEARCH', 
+          nextGraph: 'search',
+          searchQuery,
+          reasoning: routingDecision.research.reasoning,
+          confidence: routingDecision.research.confidence
+        },
+      });
+      
+      return { 
+        nextGraph: 'search',
+        toolParam: searchQuery,
+        contextMessages: conversationMessages,
+        nodeNumber: nextNodeNumber
+      };
+    }
+    
+    if (winnerPath === 'command') {
+      const commandDomain = routingDecision.command.domain;
+      const commandDetails = routingDecision.command.details || '';
+      
+      if (!commandDomain || !commandDetails) {
         await redInstance.logger.log({
-          level: 'success',
+          level: 'warn',
           category: 'router',
-          message: `<green>→ Route:</green> <bold>CHAT</bold>`,
+          message: `<yellow>⚠ Command won but missing domain/details, falling back to CHAT</yellow>`,
           generationId,
           conversationId,
-          metadata: { 
-            decision: 'CHAT', 
-            nextGraph: 'responder',
-            reasoning: routingDecision.reasoning
-          },
+          metadata: {
+            providedDomain: commandDomain,
+            providedDetails: commandDetails
+          }
         });
-        return { nextGraph: 'responder' };
+        
+        if (messageId) {
+          await redInstance.messageQueue.publishStatus(messageId, {
+            action: 'processing',
+            description: 'Generating response',
+            reasoning: routingDecision.respond.reasoning,
+            confidence: routingDecision.respond.confidence
+          });
+        }
+        
+        return { nextGraph: 'responder', contextMessages: conversationMessages, nodeNumber: nextNodeNumber };
       }
+      
+      // Route to command node with domain and details
+      if (messageId) {
+        await redInstance.messageQueue.publishToolStatus(messageId, {
+          status: `⚡ Executing ${commandDomain} command...`,
+          action: 'command',
+          reasoning: routingDecision.command.reasoning,
+          confidence: routingDecision.command.confidence
+        });
+      }
+      
+      await redInstance.logger.log({
+        level: 'success',
+        category: 'router',
+        message: `<green>→ Route:</green> <bold>COMMAND</bold> <dim>[${commandDomain}] ${commandDetails}</dim>`,
+        generationId,
+        conversationId,
+        metadata: { 
+          decision: 'COMMAND',
+          domain: commandDomain,
+          details: commandDetails,
+          nextGraph: 'command',
+          reasoning: routingDecision.command.reasoning,
+          confidence: routingDecision.command.confidence
+        },
+      });
+      
+      return { 
+        nextGraph: 'command', 
+        toolParam: JSON.stringify({ domain: commandDomain, details: commandDetails }),
+        contextMessages: conversationMessages,
+        nodeNumber: nextNodeNumber
+      };
     }
+    
+    // Default: respond wins (or fallback)
+    if (messageId) {
+      await redInstance.messageQueue.publishStatus(messageId, {
+        action: 'processing',
+        description: 'Generating response',
+        reasoning: routingDecision.respond.reasoning,
+        confidence: routingDecision.respond.confidence
+      });
+    }
+    
+    await redInstance.logger.log({
+      level: 'success',
+      category: 'router',
+      message: `<green>→ Route:</green> <bold>CHAT</bold>`,
+      generationId,
+      conversationId,
+      metadata: { 
+        decision: 'RESPOND', 
+        nextGraph: 'responder',
+        reasoning: routingDecision.respond.reasoning,
+        confidence: routingDecision.respond.confidence
+      },
+    });
+    
+    return { nextGraph: 'responder', contextMessages: conversationMessages, nodeNumber: nextNodeNumber };
     
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -459,6 +701,6 @@ Guidelines:
       conversationId,
       metadata: { error: errorMessage },
     });
-    return { nextGraph: 'chat' };
+    return { nextGraph: 'responder', contextMessages: conversationMessages, nodeNumber: nextNodeNumber };
   }
 };

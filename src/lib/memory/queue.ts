@@ -18,6 +18,8 @@ export interface MessageGenerationState {
   currentStatus?: {
     action: string;
     description?: string;
+    reasoning?: string; // Router's reasoning for the action taken
+    confidence?: number; // Router's confidence score (0-1) for the decision
   };
   metadata?: {
     model?: string;
@@ -167,7 +169,7 @@ export class MessageQueue {
   /**
    * Publish tool status indicator (searching, scraping, etc.)
    */
-  async publishToolStatus(messageId: string, toolInfo: { status: string; action: string }): Promise<void> {
+  async publishToolStatus(messageId: string, toolInfo: { status: string; action: string; reasoning?: string; confidence?: number }): Promise<void> {
     console.log(`[MessageQueue] publishToolStatus called for ${messageId}:`, toolInfo);
     
     // Store in state so SSE connection can retrieve it
@@ -180,7 +182,9 @@ export class MessageQueue {
       
       state.currentStatus = {
         action: toolInfo.action,
-        description: toolInfo.status
+        description: toolInfo.status,
+        ...(toolInfo.reasoning && { reasoning: toolInfo.reasoning }),
+        ...(toolInfo.confidence !== undefined && { confidence: toolInfo.confidence })
       };
       
       await this.redis.setex(key, this.STATE_TTL, JSON.stringify(state));
@@ -189,7 +193,7 @@ export class MessageQueue {
       console.warn(`[MessageQueue] No state found for ${messageId}, cannot store tool status`);
     }
     
-    // Publish tool status event
+    // Publish tool status event (include reasoning if provided)
     await this.redis.publish(
       `${this.PUBSUB_PREFIX}${messageId}`,
       JSON.stringify({ type: 'tool_status', ...toolInfo })
@@ -201,7 +205,7 @@ export class MessageQueue {
   /**
    * Publish general status update (routing, thinking, processing, etc.)
    */
-  async publishStatus(messageId: string, status: { action: string; description?: string }): Promise<void> {
+  async publishStatus(messageId: string, status: { action: string; description?: string; reasoning?: string; confidence?: number }): Promise<void> {
     console.log(`[MessageQueue] Publishing status for ${messageId}:`, status.action);
     
     // Store in state so SSE connection can retrieve it

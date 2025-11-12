@@ -31,6 +31,7 @@ export class MemoryManager {
   private readonly MAX_CONTEXT_TOKENS = parseInt(process.env.MAX_CONTEXT_TOKENS || '30000');
   private readonly SUMMARY_CUSHION_TOKENS = parseInt(process.env.SUMMARY_CUSHION_TOKENS || '2000');
   private readonly REDIS_MESSAGE_LIMIT = 100; // Keep last 100 messages in Redis for hot context
+  private readonly MESSAGE_ID_INDEX_TTL = parseInt(process.env.CONVERSATION_MESSAGE_ID_TTL || (60 * 60 * 24 * 30).toString());
 
   constructor(redisUrl: string) {
     this.redisUrl = redisUrl;
@@ -120,10 +121,30 @@ export class MemoryManager {
    */
   async addMessage(conversationId: string, message: ConversationMessage): Promise<void> {
     const key = `conversations:${conversationId}:messages`;
-    
-    // Check if this message already exists in Redis (deduplicate by messageId)
+    const idIndexKey = `${key}:ids`;
+
+    // Ensure message has an ID before we attempt to index it
+    if (!message.id) {
+      message.id = `msg_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    }
+
+    // Atomic duplicate guard – only the first writer wins
+    let addedToIndex = 1;
+    try {
+      addedToIndex = await this.redis.sadd(idIndexKey, message.id);
+      await this.redis.expire(idIndexKey, this.MESSAGE_ID_INDEX_TTL);
+    } catch (error) {
+      console.warn('[Memory] Failed to update message id index:', error instanceof Error ? error.message : String(error));
+    }
+
+    if (addedToIndex === 0) {
+      console.log(`[Memory] Message ${message.id} already indexed for ${conversationId}, skipping duplicate`);
+      return;
+    }
+
+    // Secondary guard in case the ID index was flushed but the list already contains the message
     const existingMessages = await this.redis.lrange(key, 0, -1);
-    const messageExists = existingMessages.some((msgJson: string) => {
+    const alreadyInList = existingMessages.some((msgJson: string) => {
       try {
         const existingMsg = JSON.parse(msgJson);
         return existingMsg.id === message.id;
@@ -131,38 +152,44 @@ export class MemoryManager {
         return false;
       }
     });
-    
-    if (messageExists) {
+
+    if (alreadyInList) {
       console.log(`[Memory] Message ${message.id} already exists in Redis cache for ${conversationId}, skipping duplicate`);
       return;
     }
-    
-    // Store in MongoDB for persistence (non-blocking, ignore errors)
-    getDatabase().storeMessage({
-      messageId: message.id, // Include the original message ID
-      conversationId,
-      role: message.role,
-      content: message.content,
-      timestamp: new Date(message.timestamp),
-      toolExecutions: message.toolExecutions || [], // Include tool executions
-      metadata: {}
-    }).catch(err => {
-      console.warn('[Memory] Failed to save message to MongoDB:', err.message);
-    });
-    
-    // Add to Redis (hot cache)
-    await this.redis.rpush(key, JSON.stringify(message));
-    
-    // Trim Redis to keep only last 100 messages
-    const messageCount = await this.redis.llen(key);
-    if (messageCount > this.REDIS_MESSAGE_LIMIT) {
-      const trimCount = messageCount - this.REDIS_MESSAGE_LIMIT;
-      await this.redis.ltrim(key, trimCount, -1);
-      console.log(`[Memory] Trimmed ${trimCount} old messages from Redis cache for ${conversationId}`);
+
+    try {
+      // Store in MongoDB for persistence (non-blocking, ignore errors)
+      getDatabase().storeMessage({
+        messageId: message.id,
+        conversationId,
+        role: message.role,
+        content: message.content,
+        timestamp: new Date(message.timestamp),
+        toolExecutions: message.toolExecutions || [],
+        metadata: {}
+      }).catch(err => {
+        console.warn('[Memory] Failed to save message to MongoDB:', err.message);
+      });
+
+      // Add to Redis (hot cache)
+      await this.redis.rpush(key, JSON.stringify(message));
+
+      // Trim Redis to keep only last 100 messages
+      const messageCount = await this.redis.llen(key);
+      if (messageCount > this.REDIS_MESSAGE_LIMIT) {
+        const trimCount = messageCount - this.REDIS_MESSAGE_LIMIT;
+        await this.redis.ltrim(key, trimCount, -1);
+        console.log(`[Memory] Trimmed ${trimCount} old messages from Redis cache for ${conversationId}`);
+      }
+
+      // Update metadata
+      await this.updateMetadata(conversationId);
+    } catch (error) {
+      // Roll back index entry so a retry can succeed
+      await this.redis.srem(idIndexKey, message.id);
+      throw error;
     }
-    
-    // Update metadata
-    await this.updateMetadata(conversationId);
   }
 
   /**
@@ -195,7 +222,11 @@ export class MemoryManager {
             toolExecutions: msg.toolExecutions || [] // Include tool executions
           };
           pipeline.rpush(key, JSON.stringify(convMsg));
+          if (convMsg.id) {
+            pipeline.sadd(`${key}:ids`, convMsg.id);
+          }
         }
+        pipeline.expire(`${key}:ids`, this.MESSAGE_ID_INDEX_TTL);
         await pipeline.exec();
         
         console.log(`[Memory] Populated Redis cache with ${dbMessages.length} messages from MongoDB for ${conversationId}`);
@@ -363,9 +394,18 @@ export class MemoryManager {
     // Clear old messages and store only recent ones
     const messagesKey = `conversations:${conversationId}:messages`;
     await this.redis.del(messagesKey);
-    
-    for (const msg of messagesToKeep) {
-      await this.redis.rpush(messagesKey, JSON.stringify(msg));
+    await this.redis.del(`${messagesKey}:ids`);
+
+    if (messagesToKeep.length > 0) {
+      const pipeline = this.redis.pipeline();
+      for (const msg of messagesToKeep) {
+        pipeline.rpush(messagesKey, JSON.stringify(msg));
+        if (msg.id) {
+          pipeline.sadd(`${messagesKey}:ids`, msg.id);
+        }
+      }
+      pipeline.expire(`${messagesKey}:ids`, this.MESSAGE_ID_INDEX_TTL);
+      await pipeline.exec();
     }
     
     // Build summary content (include existing summary if present)
@@ -532,6 +572,7 @@ ${contentToSummarize}`;
    */
   async deleteConversation(conversationId: string): Promise<void> {
     await this.redis.del(`conversations:${conversationId}:messages`);
+    await this.redis.del(`conversations:${conversationId}:messages:ids`);
     await this.redis.del(`conversations:${conversationId}:summary:trailing`);
     await this.redis.del(`conversations:${conversationId}:summary:executive`);
     await this.redis.del(`conversations:${conversationId}:metadata`);

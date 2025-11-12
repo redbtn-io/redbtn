@@ -14,6 +14,7 @@ import { SystemMessage } from '@langchain/core/messages';
 import type { Red } from '../../..';
 import { createIntegratedPublisher } from '../../events/integrated-publisher';
 import { validateUrl, ValidationError } from './validator';
+import { getNodeSystemPrefix } from '../../utils/node-helpers';
 
 interface ScrapeNodeState {
   query: { message: string };
@@ -24,6 +25,8 @@ interface ScrapeNodeState {
   };
   messageId?: string;
   toolParam?: string; // URL to scrape
+  contextMessages?: any[]; // Pre-loaded context from router
+  nodeNumber?: number; // Current node position in graph
 }
 
 /**
@@ -35,6 +38,8 @@ export async function scrapeNode(state: ScrapeNodeState): Promise<Partial<any>> 
   const conversationId = state.options?.conversationId;
   const generationId = state.options?.generationId;
   const messageId = state.messageId;
+  const currentNodeNumber = state.nodeNumber || 2; // If not set, default to 2
+  const nextNodeNumber = currentNodeNumber + 1; // Responder will be next
   
   // Get URL from toolParam or extract from query
   const urlToScrape = state.toolParam || state.query?.message || '';
@@ -213,8 +218,7 @@ export async function scrapeNode(state: ScrapeNodeState): Promise<Partial<any>> 
     const messages: any[] = [];
     
     // Add system message
-    const systemMessage = `You are Red, an AI assistant developed by redbtn.io.
-Current date: ${new Date().toLocaleDateString()}
+    const systemMessage = `${getNodeSystemPrefix(currentNodeNumber, 'Scrape')}
 
 CRITICAL RULES:
 1. Use the webpage content provided to answer the user's query
@@ -222,32 +226,15 @@ CRITICAL RULES:
 
     messages.push({ role: 'system', content: systemMessage });
     
-    // Load conversation context if we have one
-    if (conversationId) {
-      const contextResult = await redInstance.callMcpTool(
-        'get_context_history',
-        {
-          conversationId,
-          maxTokens: 20000, // Leave room for scraped content
-          includeSummary: true,
-          summaryType: 'trailing',
-          format: 'llm'
-        },
-        { conversationId, generationId, messageId }
+    // Use pre-loaded context from router (no need to load again)
+    if (state.contextMessages && state.contextMessages.length > 0) {
+      // Filter out the current user message
+      const userQuery = state.query?.message || '';
+      const filteredMessages = state.contextMessages.filter((msg: any) => 
+        !(msg.role === 'user' && msg.content === userQuery)
       );
-
-      if (!contextResult.isError && contextResult.content?.[0]?.text) {
-        const contextData = JSON.parse(contextResult.content[0].text);
-        const contextMessages = contextData.messages || [];
-        
-        // Filter out the current user message
-        const userQuery = state.query?.message || '';
-        const filteredMessages = contextMessages.filter((msg: any) => 
-          !(msg.role === 'user' && msg.content === userQuery)
-        );
-        
-        messages.push(...filteredMessages);
-      }
+      
+      messages.push(...filteredMessages);
     }
     
     // Add the user's query with scraped content in brackets
@@ -261,6 +248,7 @@ CRITICAL RULES:
     return {
       messages,
       nextGraph: 'responder',
+      nodeNumber: nextNodeNumber
     };
 
   } catch (error) {
@@ -296,6 +284,7 @@ CRITICAL RULES:
         }
       ],
       nextGraph: 'responder',
+      nodeNumber: nextNodeNumber
     };
   }
 }

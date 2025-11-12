@@ -7,6 +7,7 @@ import { Redis } from 'ioredis';
 import { McpServer } from '../server';
 import { CallToolResult } from '../types';
 import { McpEventPublisher } from '../event-publisher';
+import { fetchAndParse } from '../../nodes/scrape/parser';
 
 export class WebServer extends McpServer {
   private googleApiKey: string;
@@ -39,7 +40,7 @@ export class WebServer extends McpServer {
           },
           count: {
             type: 'number',
-            description: 'Number of results to return (1-10, default: 5)'
+            description: 'Number of results to return (1-10, default: 10)'
           }
         },
         required: ['query']
@@ -49,7 +50,7 @@ export class WebServer extends McpServer {
     // Define scrape_url tool
     this.defineTool({
       name: 'scrape_url',
-      description: 'Scrape and extract clean text content from a URL. Returns the main content of the page without ads, navigation, or other clutter. Works with articles, documentation, blog posts, and most web pages.',
+      description: 'Scrape and extract clean text content from a URL using custom content extraction. Returns the main content of the page without ads, navigation, or other clutter. Works with articles, documentation, blog posts, and most web pages.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -97,7 +98,7 @@ export class WebServer extends McpServer {
     meta?: { conversationId?: string; generationId?: string; messageId?: string }
   ): Promise<CallToolResult> {
     const query = args.query as string;
-    const count = Math.min((args.count as number) || 5, 10);
+    const count = Math.min((args.count as number) || 10, 10); // Google API limit is 10
 
     // Create event publisher (use publishRedis for events)
     const publisher = new McpEventPublisher(this.publishRedis, 'web_search', 'Web Search', meta);
@@ -210,7 +211,7 @@ export class WebServer extends McpServer {
   }
 
   /**
-   * Scrape URL
+   * Scrape URL using custom parser
    */
   private async scrapeUrl(
     args: Record<string, unknown>,
@@ -239,32 +240,15 @@ export class WebServer extends McpServer {
     }
 
     try {
-      await publisher.publishProgress('Calling Jina AI Reader API...', { progress: 30 });
+      await publisher.publishProgress('Fetching page...', { progress: 30 });
       
-      // Use Jina AI Reader API
-      const jinaUrl = `https://r.jina.ai/${url}`;
-      const response = await fetch(jinaUrl, {
-        headers: {
-          'Accept': 'text/plain',
-          'X-Return-Format': 'markdown'
-        }
-      });
-
-      if (!response.ok) {
-        const error = `Jina API error: ${response.status} ${response.statusText}`;
-        await publisher.publishError(error);
-        await publisher.publishLog('error', `✗ ${error}`, { duration: publisher.getDuration() });
-        throw new Error(error);
-      }
-
-      await publisher.publishProgress('Processing content...', { progress: 70 });
-
-      const content = await response.text();
+      // Use custom parser
+      const parsed = await fetchAndParse(url);
       const duration = publisher.getDuration();
 
-      await publisher.publishLog('info', `✓ Received ${content.length} chars in ${duration}ms`);
+      await publisher.publishLog('info', `✓ Extracted ${parsed.contentLength} chars in ${duration}ms`);
 
-      if (!content || content.trim().length === 0) {
+      if (!parsed.text || parsed.text.trim().length === 0) {
         await publisher.publishComplete({ message: 'No content extracted' });
         await publisher.publishLog('warn', '⚠️ No content extracted');
         
@@ -276,19 +260,27 @@ export class WebServer extends McpServer {
         };
       }
 
-      // Add metadata
-      const result = `# Content from ${url}\n\n${content}`;
+      await publisher.publishProgress('Processing content...', { progress: 70 });
+
+      // Format result with title if available
+      let result = '';
+      if (parsed.title) {
+        result += `# ${parsed.title}\n\n`;
+      }
+      result += `Source: ${url}\n\n${parsed.text}`;
 
       await publisher.publishComplete({
-        contentLength: result.length
+        contentLength: result.length,
+        title: parsed.title
       }, {
         duration,
-        protocol: 'MCP'
+        protocol: 'Custom Parser'
       });
 
       await publisher.publishLog('success', `✓ Complete - ${result.length} chars`, {
         duration,
-        contentLength: result.length
+        contentLength: result.length,
+        title: parsed.title
       });
 
       return {

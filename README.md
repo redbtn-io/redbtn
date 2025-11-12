@@ -12,8 +12,12 @@
 - **Web Search & Scraping**: Built-in tools via MCP for real-time web search and content extraction
 - **Unified Streaming**: Seamless streaming and non-streaming modes with the same API
 - **Stream Reconnection**: Redis-backed message queue with pub/sub for reliable mobile streaming
+- **Network Resilience**: Automatic retry with exponential backoff for LLM calls and streaming
+- **Tool Execution Tracking**: Automatic collection and persistence of tool usage data
 - **Persistent Memory**: MongoDB for long-term message storage, Redis for hot state and summaries
+- **Vector RAG Support**: Qdrant integration for semantic search and document retrieval
 - **Comprehensive Logging**: MongoDB-persisted logs with categories, levels, and generation tracking
+- **Thinking Extraction**: Capture and store reasoning from DeepSeek-R1 and similar models
 - **Token Tracking**: Complete access to token usage and performance metrics
 - **Type-Safe**: Full TypeScript support with type guards
 - **Extensible**: Easy to add custom nodes, graphs, and MCP servers
@@ -26,21 +30,47 @@ npm install @redbtn/ai
 
 ## 🏁 Quick Start
 
+### Prerequisites
+Ensure these services are running:
+```bash
+# Redis
+redis-server
+
+# MongoDB
+mongod
+
+# Qdrant (for RAG)
+docker run -p 6333:6333 qdrant/qdrant
+
+# Ollama (for LLM)
+ollama serve
+```
+
+### Installation
+```bash
+npm install @redbtn/ai
+```
+
+### Basic Usage
+
 ```typescript
 import { Red, RedConfig } from '@redbtn/ai';
 
 // Configure your Red instance
 const config: RedConfig = {
   redisUrl: "redis://localhost:6379",
-  vectorDbUrl: "http://localhost:8200",
-  databaseUrl: "mongodb://localhost:27017/red-webapp",
-  chatLlmUrl: "http://192.168.1.4:11434",  // Primary chat model (Ollama)
-  workLlmUrl: "http://192.168.1.3:11434"   // Worker model for routing/tools
+  vectorDbUrl: "http://localhost:6333",
+  databaseUrl: "mongodb://localhost:27017/redbtn_ai",
+  chatLlmUrl: "http://localhost:11434",  // Primary chat model (Ollama)
+  workLlmUrl: "http://localhost:11434"   // Worker model for routing/tools
 };
 
 // Initialize and load
 const red = new Red(config);
 await red.load("my-node");
+
+// Start MCP servers (required for tools)
+// In separate terminal: npm run mcp:start
 
 // Get a response (non-streaming)
 const response = await red.respond(
@@ -53,17 +83,35 @@ console.log(response.usage_metadata);  // { input_tokens: 10, output_tokens: 5, 
 
 // Or stream the response
 const stream = await red.respond(
-  { message: 'Tell me a story' },
-  { stream: true, conversationId: 'conv_123' }
+  { message: 'Search for TypeScript tutorials' },
+  { stream: true, conversationId: 'conv_456' }
 );
 
 for await (const chunk of stream) {
-  if (typeof chunk === 'string') {
+  if (typeof chunk === 'object' && chunk._metadata) {
+    // First chunk with conversation ID
+    console.log('Conversation:', chunk.conversationId);
+  } else if (typeof chunk === 'string') {
     process.stdout.write(chunk);  // Real-time text
   } else {
-    console.log('Tokens:', chunk.usage_metadata);  // Final metadata
+    // Final AIMessage with metadata
+    console.log('\nTokens:', chunk.usage_metadata);
   }
 }
+
+// Graceful shutdown
+await red.shutdown();
+```
+
+### Testing Web Search
+```typescript
+// This will automatically trigger web search via MCP
+const response = await red.respond(
+  { message: 'What is the weather in San Francisco today?' }
+);
+
+console.log(response.content);
+// The router detects this needs web search and calls the web_search MCP tool
 ```
 
 ## 📚 Core Concepts
@@ -136,13 +184,31 @@ await red.messageQueue.startGeneration(conversationId, messageId);
 // Append content as it streams in
 await red.messageQueue.appendContent(messageId, chunk);
 
+// Publish status updates
+await red.messageQueue.publishStatus(messageId, 'processing', 'Analyzing query');
+
+// Publish tool events for tracking
+await red.messageQueue.publishToolEvent(messageId, {
+  type: 'tool_start',
+  toolId: 'tool_123',
+  toolType: 'web_search',
+  toolName: 'Web Search',
+  timestamp: Date.now()
+});
+
 // Complete the generation
 await red.messageQueue.completeGeneration(messageId, metadata);
 
 // Subscribe to a message stream (yields existing + new content)
 for await (const event of red.messageQueue.subscribeToMessage(messageId)) {
-  if (event.type === 'chunk') {
+  if (event.type === 'init') {
+    console.log('Existing content:', event.existingContent);
+  } else if (event.type === 'chunk') {
     console.log(event.content);
+  } else if (event.type === 'tool_event') {
+    console.log('Tool event:', event.event.type, event.event.toolName);
+  } else if (event.type === 'status') {
+    console.log('Status:', event.action, event.description);
   } else if (event.type === 'complete') {
     console.log('Done:', event.metadata);
   }
@@ -153,6 +219,8 @@ for await (const event of red.messageQueue.subscribeToMessage(messageId)) {
 - **Redis Pub/Sub**: Real-time chunk delivery to multiple subscribers
 - **Reconnection**: Clients can disconnect and reconnect to ongoing streams
 - **Accumulated Content**: New subscribers receive all previous chunks immediately
+- **Tool Event Tracking**: Stores tool execution events for reconnection support
+- **Status Broadcasting**: Real-time status updates (routing, searching, thinking, etc.)
 - **1-hour TTL**: Transient state cleanup after completion
 
 ### Logging System
@@ -162,11 +230,12 @@ Red AI includes a comprehensive MongoDB-persisted logging system:
 ```typescript
 // Log with context
 await red.logger.log({
-  level: 'info' | 'success' | 'warn' | 'error',
+  level: 'info' | 'success' | 'warn' | 'error' | 'debug' | 'trace',
   category: 'system' | 'router' | 'mcp' | 'memory' | 'responder' | 'tool',
   message: 'Operation completed',
   conversationId: 'conv_123',
   generationId: 'gen_456',
+  nodeId: 'node_abc',
   metadata: { key: 'value' }
 });
 
@@ -174,25 +243,44 @@ await red.logger.log({
 const genId = await red.logger.startGeneration(conversationId);
 await red.logger.completeGeneration(genId, {
   response: 'Hello!',
+  thinking: 'I analyzed the query...',
+  route: 'chat',
+  toolsUsed: [],
+  model: 'llama3.2',
   tokens: { input: 10, output: 5, total: 15 }
 });
 await red.logger.failGeneration(genId, 'Error message');
 
-// Log thinking/reasoning
+// Log thinking/reasoning (stored separately from messages)
 await red.logger.logThought({
   content: 'I should search the web for this',
-  source: 'router',
+  source: 'router' | 'chat' | 'toolPicker',
   conversationId: 'conv_123',
-  generationId: 'gen_456'
+  generationId: 'gen_456',
+  messageId: 'msg_789'
+});
+
+// Subscribe to real-time logs for a conversation
+for await (const log of red.logger.subscribeToConversation('conv_123')) {
+  console.log(`[${log.level}] ${log.message}`);
+}
+
+// Query logs from MongoDB
+const logs = await red.logger.getLogsForConversation('conv_123', {
+  limit: 100,
+  level: 'error',
+  category: 'tool'
 });
 ```
 
 **Features:**
-- MongoDB persistence with indexes on conversationId, generationId, category
-- Colored console output with log levels
-- Generation lifecycle tracking (start, complete, fail)
-- Thinking/reasoning capture from models
-- Structured metadata support
+- **MongoDB Persistence**: 6-month TTL with automatic cleanup
+- **Colored Console Output**: ANSI colors for different log levels
+- **Generation Tracking**: Complete lifecycle from start to completion/failure
+- **Thinking Storage**: Separate collection for DeepSeek-R1 reasoning chains
+- **Real-time Streaming**: Subscribe to logs via Redis pub/sub
+- **Structured Metadata**: Rich context with conversationId, generationId, nodeId
+- **Indexed Queries**: Fast lookups by conversation, generation, category, level
 
 ---
 
@@ -398,18 +486,51 @@ if (Symbol.asyncIterator in response) {
 
 ### Performance Metrics
 
-## Environment variables (.env)
+## Environment Variables
 
-This project supports loading environment variables from a `.env` file using `dotenv`. Create a `.env` file at the project root with values such as:
+Red AI uses environment variables for configuration. Create a `.env` file at the project root:
 
-```
-REDIS_URL=redis://192.168.1.10:6379
-LLM_URL=https://llm.redbtn.io
-BEARER_TOKEN=red_ai_sk_...
+```bash
+# Redis Configuration
+REDIS_URL=redis://localhost:6379
+
+# MongoDB Configuration
+MONGODB_URI=mongodb://localhost:27017/redbtn_ai
+
+# Vector Database (Qdrant)
+VECTOR_DB_URL=http://localhost:6333
+
+# LLM Endpoints (Ollama)
+CHAT_LLM_URL=http://localhost:11434  # Primary chat model
+WORK_LLM_URL=http://localhost:11434  # Worker model for routing/tools
+OLLAMA_MODEL=llama3.2                # Default model name
+
+# Web Search (Google Custom Search)
+GOOGLE_API_KEY=your_google_api_key
+GOOGLE_SEARCH_ENGINE_ID=your_search_engine_id
+
+# Optional: OpenAI/Gemini
+OPENAI_API_KEY=sk-...
+GOOGLE_API_KEY=AIza...
+
+# Server Configuration (for examples)
 PORT=3000
+BEARER_TOKEN=red_ai_sk_...
+
+# System Prompt Override (optional)
+SYSTEM_PROMPT="You are Red, an AI assistant..."
 ```
 
-The server and library load `.env` automatically at startup. Restart the server after changing `.env`.
+**Important Environment Variables:**
+
+- `REDIS_URL`: Required for message queue and hot memory cache
+- `MONGODB_URI`: Required for persistent storage (messages, logs, generations)
+- `VECTOR_DB_URL`: Required for RAG operations (Qdrant vector database)
+- `CHAT_LLM_URL`: Primary chat model endpoint
+- `WORK_LLM_URL`: Worker model for routing and tool execution
+- `GOOGLE_API_KEY` + `GOOGLE_SEARCH_ENGINE_ID`: Required for web search functionality
+
+The library automatically loads `.env` using `dotenv/config` at startup. Restart after changes.
 
 Calculate generation speed and analyze performance:
 
@@ -429,9 +550,25 @@ console.log(`Total duration: ${response.response_metadata.total_duration}ns`);
 ## 🏗️ Architecture
 
 ### Multi-Layer Memory System
-- **Redis (Hot)**: Active conversation state, summaries, generating message tracking
-- **MongoDB (Persistent)**: Complete message history, logs, generations - searchable, survives Redis flushes
-- **Executive Summaries**: Auto-generated after 3+ messages for quick context retrieval
+- **Redis (Hot Cache)**: 
+  - Last 100 messages per conversation (configurable limit)
+  - Active conversation state and summaries
+  - Message generation tracking (streaming state)
+  - Message ID index for duplicate detection (1-hour TTL)
+- **MongoDB (Persistent Storage)**: 
+  - Complete message history with tool execution data
+  - Logs with 6-month TTL and automatic cleanup
+  - Generation tracking (lifecycle, tokens, performance)
+  - Thinking/reasoning chains (stored separately)
+  - Conversation metadata (title, message count, tokens)
+- **Vector Database (Qdrant)**: 
+  - Semantic search for RAG operations
+  - Document chunking and embedding
+  - Collection management per conversation
+- **Executive Summaries**: 
+  - Auto-generated after 3+ messages
+  - Trailing summaries for trimmed context
+  - Token-aware context window management
 - **Context MCP Server**: Centralized conversation management with 7 tools
 
 ### MCP (Model Context Protocol) Architecture
@@ -446,28 +583,41 @@ Red AI uses MCP for modular, extensible tool management:
 **Available MCP Servers:**
 
 1. **Context Server** (7 tools):
-   - `get_messages` - Retrieve conversation messages
-   - `get_context_history` - Get formatted context for LLM
-   - `get_summary` - Retrieve conversation summary
-   - `store_message` - Save messages to MongoDB
-   - `get_conversation_metadata` - Get metadata (message count, tokens)
-   - `get_token_count` - Calculate token usage
-   - `list_conversations` - List all conversations
+   - `get_messages` - Retrieve conversation messages with tool execution data
+   - `get_context_history` - Get formatted context for LLM (manages token limits)
+   - `get_summary` - Retrieve executive/trailing conversation summaries
+   - `store_message` - Save messages to MongoDB with tool executions
+   - `get_conversation_metadata` - Get metadata (message count, tokens, etc.)
+   - `get_token_count` - Calculate token usage for text
+   - `list_conversations` - List all conversations with pagination
 
 2. **Web Server** (2 tools):
-   - `search_web` - Tavily web search
-   - `scrape_url` - URL content extraction
+   - `web_search` - Google Custom Search API integration
+   - `scrape_url` - URL content extraction with custom parser
 
 3. **System Server** (1 tool):
-   - `execute_command` - Run whitelisted system commands
+   - `execute_command` - Run whitelisted system commands (git, ls, etc.)
 
 4. **RAG Server** (2 tools):
-   - `add_to_vector_store` - Add documents to vector DB
-   - `retrieve_from_vector_store` - Semantic search
+   - `add_to_vector_store` - Add documents to Qdrant vector database
+   - `retrieve_from_vector_store` - Semantic search with configurable results
 
 **Starting MCP Servers:**
 ```bash
-npm run mcp-servers  # Starts all MCP servers in background
+npm run mcp:start  # Starts all MCP servers (context, web, system, rag)
+# Servers run in foreground - press Ctrl+C to stop
+# Or run in background: npm run mcp:start &
+```
+
+**Available Scripts:**
+```bash
+npm run build              # Compile TypeScript to dist/
+npm run pack               # Build and create .tgz package
+npm run mcp:start          # Start MCP servers
+npm run dev:server         # Start REST API server in dev mode
+npm run start:server       # Start REST API server
+npm run db:fix-messageids  # Fix null messageId values in MongoDB
+npm run redis:cleanup-dupes # Remove duplicate messages from Redis
 ```
 
 **Using MCP Tools:**
@@ -479,7 +629,8 @@ const result = await red.callMcpTool(
     conversationId: 'conv_123',
     role: 'user',
     content: 'Hello!',
-    messageId: 'msg_456'
+    messageId: 'msg_456',
+    toolExecutions: []  // Include tool execution data if available
   },
   {
     conversationId: 'conv_123',
@@ -487,20 +638,80 @@ const result = await red.callMcpTool(
     messageId: 'msg_456'
   }
 );
+
+// Result structure
+if (result.isError) {
+  console.error('Tool error:', result.content[0].text);
+} else {
+  const data = JSON.parse(result.content[0].text);
+  console.log('Success:', data);
+}
 ```
 
 ### Stream Reconnection Architecture
 - **Decoupled Generation**: LLM generation runs independently of HTTP transport
-- **Redis Pub/Sub**: Real-time chunk publishing to `message:stream:{messageId}` channels
+- **Redis Pub/Sub**: Real-time event publishing to `message:stream:{messageId}` channels
 - **Accumulated Content**: New subscribers instantly receive all previous chunks
-- **MessageQueue API**: `subscribeToMessage()` async generator for easy consumption
+- **Tool Event Persistence**: Tool execution events stored in generation state for reconnection
+- **Status Broadcasting**: Real-time status updates (initializing, routing, searching, thinking, streaming)
+- **MessageQueue API**: `subscribeToMessage()` async generator yielding init/chunk/status/tool_event/complete
 - **1-hour TTL**: Transient state cleanup after completion
+- **Mobile-Friendly**: Survives app switching and network interruptions
 
 ### Unified Streaming
 - **Consistent patterns**: Both modes go through the same graph execution
 - **Token-level streaming**: Real-time chunks during generation
 - **Complete metadata**: Full token counts and performance data at the end
+- **Tool Execution Tracking**: Tool events automatically converted to structured execution data
 - **Mobile-friendly**: Streams survive app switching and network interruptions
+
+### Tool Execution Storage
+Red AI automatically tracks and persists tool execution data:
+
+```typescript
+// Tool executions are automatically collected from Redis state
+// and stored with assistant messages in MongoDB
+
+// Structure stored in database:
+interface StoredToolExecution {
+  toolId: string;           // Unique ID for this execution
+  toolType: string;         // 'web_search', 'scrape_url', 'command', etc.
+  toolName: string;         // Human-readable name
+  status: 'running' | 'completed' | 'error';
+  startTime: Date;          // When tool started
+  endTime?: Date;           // When tool finished
+  duration?: number;        // Execution time in milliseconds
+  steps: Array<{            // Progress steps
+    step: string;
+    timestamp: Date;
+    progress?: number;
+    data?: any;
+  }>;
+  currentStep?: string;     // Current/last step
+  progress?: number;        // 0-100 progress indicator
+  result?: any;             // Tool result data
+  error?: string;           // Error message if failed
+  metadata?: Record<string, any>;  // Additional context
+}
+
+// Automatically retrieved when loading conversations
+const messages = await red.memory.getMessages('conv_123');
+messages.forEach(msg => {
+  if (msg.toolExecutions && msg.toolExecutions.length > 0) {
+    console.log(`Message ${msg.id} used ${msg.toolExecutions.length} tools`);
+    msg.toolExecutions.forEach(tool => {
+      console.log(`  - ${tool.toolName}: ${tool.status} (${tool.duration}ms)`);
+    });
+  }
+});
+```
+
+**Key Features:**
+- **Automatic Collection**: Tool events from Redis are converted to structured executions
+- **Persistent Storage**: Stored in MongoDB with each assistant message
+- **Full History**: Start/end times, duration, progress steps, results
+- **Error Tracking**: Captures failures with error messages
+- **Metadata Support**: Custom data for each tool and step
 
 ### Graph Structure
 
@@ -512,38 +723,62 @@ const result = await red.callMcpTool(
      ▼
 ┌──────────┐
 │  Router  │  ──→ Analyzes query, decides: CHAT, WEB_SEARCH, SCRAPE_URL, or SYSTEM_COMMAND
-└────┬─────┘
+└────┬─────┘      (Uses worker model with structured output)
      │
-     ├─────→ CHAT (responder) ─────┐
-     │                              │
-     ├─────→ WEB_SEARCH (search) ───┤
-     │                              │
-     ├─────→ SCRAPE_URL (scrape) ───┤
-     │                              │
-     └─────→ SYSTEM_COMMAND ────────┤
-              (command)             │
+     ├─────→ CHAT ──────────────────┐
+     │      (skip to responder)     │
+     │                               │
+     ├─────→ WEB_SEARCH ─────────────┤
+     │      (search node via MCP)   │
+     │                               │
+     ├─────→ SCRAPE_URL ─────────────┤
+     │      (scrape node via MCP)   │
+     │                               │
+     └─────→ SYSTEM_COMMAND ─────────┤
+            (command node via MCP)  │
                                     ▼
                               ┌───────────┐
-                              │ Responder │  ──→ Generates final response with context
-                              └─────┬─────┘
+                              │ Responder │  ──→ Generates response with context + tool results
+                              └─────┬─────┘      (Uses chat model, publishes thinking/chunks)
                                     │
                                     ▼
                               ┌─────────┐
-                              │   End   │
-                              └─────────┘
+                              │   End   │  ──→ Stores message, triggers background tasks
+                              └─────────┘      (Title gen, summarization, exec summary)
 ```
 
 **Flow:**
-1. **Router**: Classifies query intent using structured output (CHAT, WEB_SEARCH, SCRAPE_URL, SYSTEM_COMMAND)
-2. **Tool Nodes** (if needed): Execute web search, URL scraping, or system commands via MCP servers
-3. **Responder**: Generates response using conversation context (from Context MCP) + tool results
-4. **Memory**: Auto-saves messages to MongoDB via Context MCP, updates Redis summaries, generates titles
+1. **Router Node**: 
+   - Retrieves conversation history via Context MCP
+   - Uses worker model to classify query intent with structured output
+   - Publishes thinking/reasoning to Redis for storage
+   - Returns route decision: CHAT, WEB_SEARCH, SCRAPE_URL, or SYSTEM_COMMAND
+
+2. **Tool Nodes** (conditional):
+   - **Search Node**: Calls `web_search` MCP tool, publishes tool events (start/progress/complete)
+   - **Scrape Node**: Calls `scrape_url` MCP tool, extracts clean content
+   - **Command Node**: Calls `execute_command` MCP tool with security checks
+   - All tool events stored in Redis for reconnection and persistence
+
+3. **Responder Node**:
+   - Retrieves conversation context via Context MCP
+   - Includes tool results if available
+   - Uses chat model to generate response
+   - Publishes thinking (extracted from DeepSeek-R1 `<think>` tags)
+   - Streams chunks via Redis pub/sub
+   - Stores final message with tool execution data
+
+4. **Background Tasks** (non-blocking):
+   - Title generation after 2+ messages
+   - Trailing summary when context exceeds token limit
+   - Executive summary after 3+ messages
+   - Heartbeat registration for distributed nodes
 
 **MCP Integration:**
-- **Context Server**: Manages conversation history, summaries, and message storage
-- **Web Server**: Combines web search (Tavily) and URL scraping tools
-- **System Server**: Executes whitelisted system commands securely
-- **RAG Server**: Vector database operations for retrieval-augmented generation
+- **Context Server (7 tools)**: History, summaries, message storage, metadata, token counting
+- **Web Server (2 tools)**: Google Custom Search API, URL content scraping
+- **System Server (1 tool)**: Whitelisted command execution (git, ls, etc.)
+- **RAG Server (2 tools)**: Qdrant vector store operations for semantic search
 
 ---
 
@@ -577,7 +812,32 @@ See [examples/README.md](examples/README.md) for complete documentation.
 
 ---
 
-## 🚀 Deployment Options
+## � Recent Improvements
+
+### Tool Execution Persistence (Latest)
+- **Automatic Storage**: Tool executions are now automatically collected from Redis events and stored with messages
+- **Complete History**: Full execution data including start/end times, duration, progress steps, and results
+- **Reconnection Support**: Tool events persist in Redis state for stream reconnection
+- **Database Schema**: `StoredToolExecution` interface in MongoDB with all execution metadata
+
+### Network Resilience
+- **Automatic Retry**: LLM calls retry up to 3 times on network errors with exponential backoff
+- **Streaming Retry**: Responder streaming loop continues on transient failures
+- **Network Detection**: Distinguishes network errors from model errors for smart retry behavior
+
+### Message Deduplication
+- **Redis ID Index**: Messages indexed by ID with 1-hour TTL to prevent duplicates
+- **Atomic Operations**: Race-condition safe message storage across parallel MCP servers
+- **MongoDB Deduplication**: Unique messageId index with duplicate key error handling
+
+### Thinking Extraction (DeepSeek-R1 Support)
+- **Automatic Detection**: Extracts `<think>...</think>` tags from model responses
+- **Separate Storage**: Thinking stored in dedicated MongoDB collection, not in message content
+- **Source Tracking**: Captures thinking from router, responder, and tool picker nodes
+
+---
+
+## �🚀 Deployment Options
 
 Red AI supports **two deployment strategies** to give you maximum flexibility:
 
@@ -679,7 +939,7 @@ ai/
 │   ├── index.ts           # Main Red class and exports
 │   ├── functions/
 │   │   ├── respond.ts     # Core response generation with streaming
-│   │   └── background/    # Background tasks (summarization, titles)
+│   │   └── background/    # Background tasks (summarization, titles, heartbeat)
 │   ├── lib/
 │   │   ├── models.ts      # LLM model configurations
 │   │   ├── graphs/
@@ -687,34 +947,50 @@ ai/
 │   │   ├── nodes/
 │   │   │   ├── router.ts  # Intelligent routing with structured output
 │   │   │   ├── responder.ts  # Final response generation
-│   │   │   ├── search.ts  # Web search node
-│   │   │   ├── scrape.ts  # URL scraping node
-│   │   │   └── command/   # System command execution
+│   │   │   ├── search/    # Web search implementation
+│   │   │   ├── scrape/    # URL scraping implementation
+│   │   │   ├── command/   # System command execution
+│   │   │   └── rag/       # Vector store operations
 │   │   ├── mcp/
 │   │   │   ├── client.ts  # MCP JSON-RPC client
 │   │   │   ├── server.ts  # MCP server base class
 │   │   │   ├── registry.ts # MCP server registry
+│   │   │   ├── event-publisher.ts # Tool event publishing
 │   │   │   └── servers/   # MCP server implementations
-│   │   │       ├── context.ts  # Conversation context & history
-│   │   │       ├── rag.ts      # Vector database operations
-│   │   │       ├── web.ts      # Web search & scraping
-│   │   │       └── system.ts   # System command execution
+│   │   │       ├── context.ts  # Conversation context & history (7 tools)
+│   │   │       ├── rag.ts      # Vector database operations (2 tools)
+│   │   │       ├── web.ts      # Web search & scraping (2 tools)
+│   │   │       ├── system.ts   # System command execution (1 tool)
+│   │   │       ├── web-search.ts    # Standalone web search server
+│   │   │       ├── url-scraper.ts   # Standalone URL scraper server
+│   │   │       └── system-command.ts # Standalone command server
 │   │   ├── memory/
 │   │   │   ├── memory.ts  # MemoryManager (Redis + MongoDB)
-│   │   │   ├── queue.ts   # MessageQueue for streaming
-│   │   │   ├── database.ts # MongoDB operations
-│   │   │   └── vectors.ts # Vector store manager
+│   │   │   ├── queue.ts   # MessageQueue for streaming & reconnection
+│   │   │   ├── database.ts # MongoDB operations & tool execution storage
+│   │   │   └── vectors.ts # Vector store manager (Qdrant)
 │   │   ├── logs/
-│   │   │   ├── logger.ts  # Structured logging
-│   │   │   └── persistent-logger.ts # MongoDB-persisted logs
+│   │   │   ├── logger.ts  # Structured logging with colors
+│   │   │   ├── persistent-logger.ts # MongoDB-persisted logs
+│   │   │   ├── types.ts   # Log type definitions
+│   │   │   └── colors.ts  # Console color utilities
+│   │   ├── events/
+│   │   │   ├── integrated-publisher.ts # Tool event publishing bridge
+│   │   │   └── tool-events.ts # Tool event type definitions
 │   │   └── utils/
-│   │       ├── thinking.ts # Extract/log thinking from models
-│   │       └── json-extractor.ts # Robust JSON parsing
+│   │       ├── thinking.ts # Extract/log thinking from DeepSeek-R1
+│   │       ├── json-extractor.ts # Robust JSON parsing
+│   │       ├── tokenizer.ts # Token counting utilities
+│   │       └── retry.ts    # Network retry logic for LLM calls
 │   └── mcp-servers.ts     # MCP servers launcher
 ├── examples/
-│   ├── server.ts          # OpenAI-compatible API server
-│   ├── client.ts          # Example API client
-│   └── test-*.ts          # Various test examples
+│   ├── discord/           # Discord bot implementation
+│   │   ├── discord-bot.ts # Main bot with per-channel conversations
+│   │   └── package.json   # Discord-specific dependencies
+│   └── rest-server/       # OpenAI-compatible REST API
+│       ├── server.ts      # Express server with streaming support
+│       ├── client.ts      # Example TypeScript client
+│       └── package.json   # Server-specific dependencies
 └── README.md              # This file
 ```
 
@@ -738,11 +1014,67 @@ ISC License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
-## 🔗 Links
+## � Troubleshooting
+
+### MCP Tool Calls Failing
+```
+⚠️ MCP server registration failed
+Tool calls will fail. Make sure MCP servers are running: npm run mcp:start
+```
+
+**Solution**: Start MCP servers before initializing Red:
+```bash
+npm run mcp:start &
+# Then run your application
+```
+
+### Duplicate Messages in Redis
+If you see duplicate messages accumulating:
+```bash
+npm run redis:cleanup-dupes
+```
+
+### Missing Tool Executions After Reload
+If tool executions don't appear after page refresh:
+1. Check MongoDB for `toolExecutions` array in messages collection
+2. Verify Redis message queue has `toolEvents` in generation state
+3. Ensure frontend POST to `/tool-executions` endpoint succeeds
+
+### MongoDB Authentication Errors
+```
+Command find requires authentication
+```
+
+**Solution**: Update MongoDB URI with credentials:
+```bash
+MONGODB_URI=mongodb://username:password@localhost:27017/redbtn_ai?authSource=admin
+```
+
+### Network Timeout Errors
+If LLM calls timeout frequently, the retry logic will handle transient failures automatically. For persistent issues:
+1. Check LLM endpoint accessibility: `curl http://localhost:11434`
+2. Increase timeout in model config (default: 10000ms)
+3. Verify network connectivity between services
+
+### Redis Connection Issues
+```
+Error: Redis connection failed
+```
+
+**Solution**:
+1. Verify Redis is running: `redis-cli ping` should return `PONG`
+2. Check Redis URL in environment: `REDIS_URL=redis://localhost:6379`
+3. Ensure Redis accepts connections: Check `bind` setting in `redis.conf`
+
+---
+
+## �🔗 Links
 
 - **GitHub**: [redbtn-io/ai](https://github.com/redbtn-io/ai)
 - **LangChain**: [https://js.langchain.com](https://js.langchain.com)
 - **LangGraph**: [https://langchain-ai.github.io/langgraphjs](https://langchain-ai.github.io/langgraphjs)
+- **Qdrant**: [https://qdrant.tech](https://qdrant.tech)
+- **Model Context Protocol**: [https://modelcontextprotocol.io](https://modelcontextprotocol.io)
 
 ---
 

@@ -13,6 +13,7 @@
 import { SystemMessage } from '@langchain/core/messages';
 import type { Red } from '../../..';
 import { createIntegratedPublisher } from '../../events/integrated-publisher';
+import { getNodeSystemPrefix } from '../../utils/node-helpers';
 
 interface CommandNodeState {
   query: { message: string };
@@ -23,6 +24,8 @@ interface CommandNodeState {
   };
   messageId?: string;
   toolParam?: string; // Command to execute
+  contextMessages?: any[]; // Pre-loaded context from router
+  nodeNumber?: number; // Current node position in graph
 }
 
 /**
@@ -34,6 +37,8 @@ export async function commandNode(state: CommandNodeState): Promise<Partial<any>
   const conversationId = state.options?.conversationId;
   const generationId = state.options?.generationId;
   const messageId = state.messageId;
+  const currentNodeNumber = state.nodeNumber || 2; // If not set, default to 2
+  const nextNodeNumber = currentNodeNumber + 1; // Responder will be next
   
   // Get command from toolParam or query
   const command = state.toolParam || state.query?.message || '';
@@ -158,8 +163,7 @@ export async function commandNode(state: CommandNodeState): Promise<Partial<any>
     const messages: any[] = [];
     
     // Add system message
-    const systemMessage = `You are Red, an AI assistant developed by redbtn.io.
-Current date: ${new Date().toLocaleDateString()}
+    const systemMessage = `${getNodeSystemPrefix(currentNodeNumber, 'Command')}
 
 CRITICAL RULES:
 1. Use the command execution result to answer the user's query
@@ -167,32 +171,15 @@ CRITICAL RULES:
 
     messages.push({ role: 'system', content: systemMessage });
     
-    // Load conversation context if we have one
-    if (conversationId) {
-      const contextResult = await redInstance.callMcpTool(
-        'get_context_history',
-        {
-          conversationId,
-          maxTokens: 25000,
-          includeSummary: true,
-          summaryType: 'trailing',
-          format: 'llm'
-        },
-        { conversationId, generationId, messageId }
+    // Use pre-loaded context from router (no need to load again)
+    if (state.contextMessages && state.contextMessages.length > 0) {
+      // Filter out current user message
+      const userQuery = state.query?.message || command;
+      const filteredMessages = state.contextMessages.filter((msg: any) => 
+        !(msg.role === 'user' && msg.content === userQuery)
       );
-
-      if (!contextResult.isError && contextResult.content?.[0]?.text) {
-        const contextData = JSON.parse(contextResult.content[0].text);
-        const contextMessages = contextData.messages || [];
-        
-        // Filter out current user message
-        const userQuery = state.query?.message || command;
-        const filteredMessages = contextMessages.filter((msg: any) => 
-          !(msg.role === 'user' && msg.content === userQuery)
-        );
-        
-        messages.push(...filteredMessages);
-      }
+      
+      messages.push(...filteredMessages);
     }
     
     // Add user query with command result in brackets
@@ -206,6 +193,7 @@ CRITICAL RULES:
     return {
       messages,
       nextGraph: 'responder',
+      nodeNumber: nextNodeNumber
     };
 
   } catch (error) {
@@ -241,6 +229,7 @@ CRITICAL RULES:
         }
       ],
       nextGraph: 'responder',
+      nodeNumber: nextNodeNumber
     };
   }
 }

@@ -6,6 +6,7 @@ import type { Red } from '../../index';
 import type { ChatOllama } from '@langchain/ollama';
 import { extractThinking } from '../../lib/utils/thinking';
 import { getDatabase } from '../../lib/memory/database';
+import { invokeWithRetry } from '../../lib/utils/retry';
 
 /**
  * Generate a title for the conversation based on the first few messages
@@ -62,7 +63,9 @@ export async function generateTitleInBackground(
 ${conversationText}`;
 
     // Generate title using LLM
-    const response = await chatModel.invoke([{ role: 'user', content: titlePrompt }]);
+    const response = await invokeWithRetry(chatModel, [{ role: 'user', content: titlePrompt }], {
+      context: 'title generation',
+    });
     const rawContent = response.content as string;
     
     // Extract thinking (if present) and get cleaned content

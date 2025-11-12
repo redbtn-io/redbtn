@@ -5,6 +5,8 @@
 
 import type { Red } from '../../..';
 import { extractThinking } from '../../utils/thinking';
+import { invokeWithRetry } from '../../utils/retry';
+import { getNodeSystemPrefix } from '../../utils/node-helpers';
 
 /**
  * Optimize a natural language query into effective search terms
@@ -13,7 +15,8 @@ export async function optimizeSearchQuery(
   originalQuery: string,
   redInstance: Red,
   conversationId?: string,
-  generationId?: string
+  generationId?: string,
+  nodeNumber: number = 2
 ): Promise<{ optimizedQuery: string; thinking?: string }> {
   const currentDate = new Date().toLocaleDateString('en-US', { 
     weekday: 'long', 
@@ -22,11 +25,10 @@ export async function optimizeSearchQuery(
     day: 'numeric' 
   });
   
-  const response = await redInstance.chatModel.invoke([
+  const response = await invokeWithRetry(redInstance.chatModel, [
     {
       role: 'system',
-      content: `You are a search query optimizer for an AI assistant named Red.
-Today's date: ${currentDate}. 
+      content: `${getNodeSystemPrefix(nodeNumber, 'Search Query Optimizer')}
 
 Extract the key search terms from the user's prompt. Focus on:
 - Core concepts and keywords
@@ -40,7 +42,7 @@ Return ONLY the optimized search query, nothing else.`
       role: 'user',
       content: originalQuery
     }
-  ]);
+  ], { context: 'search query optimization' });
   
   const { thinking, cleanedContent } = extractThinking(response.content.toString());
   
@@ -68,7 +70,8 @@ export async function summarizeSearchResults(
   searchResults: string,
   redInstance: Red,
   conversationId?: string,
-  generationId?: string
+  generationId?: string,
+  nodeNumber: number = 2
 ): Promise<{ summary: string; thinking?: string }> {
   const currentDate = new Date().toLocaleDateString('en-US', { 
     weekday: 'long', 
@@ -77,16 +80,18 @@ export async function summarizeSearchResults(
     day: 'numeric' 
   });
   
-  const response = await redInstance.chatModel.invoke([
+  const response = await invokeWithRetry(redInstance.chatModel, [
     {
       role: 'system',
-      content: `Today's date: ${currentDate}. You are an information extraction expert. Extract key facts and data to answer the user's query accurately and concisely. IMPORTANT: Do NOT repeat or rephrase the query - only provide the facts and information.`
+      content: `${getNodeSystemPrefix(nodeNumber, 'Search Result Summarizer')}
+
+You are an information extraction expert. Extract key facts and data to answer the user's query accurately and concisely. IMPORTANT: Do NOT repeat or rephrase the query - only provide the facts and information.`
     },
     {
       role: 'user',
       content: `User Query: ${originalQuery}\n\nSearch Results:\n${searchResults}\n\nExtract and summarize the key information that answers this query. Start directly with the facts - do NOT repeat the query:`
     }
-  ]);
+  ], { context: 'search result summarization' });
 
   const { thinking, cleanedContent } = extractThinking(response.content.toString());
   
