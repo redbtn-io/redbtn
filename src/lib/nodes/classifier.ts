@@ -1,6 +1,7 @@
 import { ChatOpenAI } from '@langchain/openai';
 import { Red } from '../..';
 import { extractJSON } from '../utils/json-extractor';
+import { getNodeSystemPrefix } from '../utils/node-helpers';
 
 /**
  * Classifier Node - Fast local LLM for binary routing decision
@@ -46,9 +47,10 @@ export const classifierNode = async (state: any) => {
   await redInstance.logger.log({
     level: 'info',
     category: 'classifier',
-    message: `🤔 Classifying query: "${userQuery}"`,
+    message: `🤔 Classifier: Routing query...`,
     conversationId,
-    generationId
+    generationId,
+    metadata: { query: userQuery.substring(0, 100) }
   });
   
   // Build conversation context (last few messages for reference understanding)
@@ -67,17 +69,30 @@ export const classifierNode = async (state: any) => {
 ${contextSummary ? `Recent Context:\n${contextSummary}\n\n` : ''}User Query: ${userQuery}
 
 Classification Rules:
-- DIRECT: Pure knowledge questions, explanations, definitions, code examples, reasoning, calculations
-  Examples: "What is recursion?", "Explain async/await", "Write a bubble sort", "What's 25% of 80?"
-  
-- PLAN: Queries needing tools or multi-step actions
-  Examples: "Search for X", "Who won the game Monday?", "Run tests", "Check the weather"
-  
+
+DIRECT (can answer with knowledge alone):
+- Greetings and casual conversation: "hi", "hello", "hey", "how are you", "yo"
+- Knowledge questions you can answer: "what is X?", "explain Y", "how does Z work?"
+- Definitions, concepts, explanations from your training
+- Simple math and logic: "what's 5+5?", "which is larger?"
+- Code examples and technical explanations
+- General advice and recommendations
+- Answering questions about yourself
+
+PLAN (need external tools/data):
+- Explicit search requests: "search for X", "look up Y", "find Z"
+- Current/real-time information: "latest news", "today's weather", "current price"
+- Time-sensitive queries: "who won tonight?", "what happened today?"
+- External state: "check my calendar", "what's in my inbox"
+- Commands/actions: "turn on lights", "send message", "run script"
+- Multi-step workflows: "research X and summarize"
+- Questions about things after your knowledge cutoff
+
 IMPORTANT:
-- If uncertain, choose PLAN (conservative approach)
-- "Search for X" always needs PLAN
-- Time-sensitive info ("latest", "current", "today") needs PLAN
-- References to external state need PLAN
+- Default to DIRECT unless you genuinely need tools/external data
+- Only choose PLAN if you can't answer with your existing knowledge
+- "I don't know" is acceptable for DIRECT - you don't need planning for uncertainty
+- When uncertain about which to choose, ask yourself: "Do I need a tool to answer this?"
 
 Respond with JSON:
 {
@@ -90,8 +105,16 @@ Respond with JSON:
     // Use fast worker model for classification
     const model = redInstance.workerModel;
     
+    // Get node number from state or default to 1 (classifier is typically first after precheck)
+    const nodeNumber = state.nodeNumber || 1;
+    
+    const systemMessage = `${getNodeSystemPrefix(nodeNumber, 'Classifier')}
+
+You are a query classifier. Your job is to route queries to either DIRECT response or PLANNING.
+Respond only with valid JSON.`;
+    
     const response = await model.invoke([
-      { role: 'system', content: 'You are a query classifier. Respond only with valid JSON.' },
+      { role: 'system', content: systemMessage },
       { role: 'user', content: classificationPrompt }
     ]);
     
@@ -121,21 +144,15 @@ Respond with JSON:
       }
     });
     
-    // If confidence is too low, default to planning
-    if (decision.confidence < 0.5) {
+    // Log low confidence but still use the decision (LLM knows best)
+    if (decision.confidence < 0.6) {
       await redInstance.logger.log({
         level: 'warn',
         category: 'classifier',
-        message: `⚠️ Low confidence (${decision.confidence}), defaulting to PLAN`,
+        message: `⚠️ Low confidence (${decision.confidence}) but proceeding with: ${decision.decision.toUpperCase()}`,
         conversationId,
         generationId
       });
-      
-      return {
-        routerDecision: 'plan',
-        routerReason: `Low confidence: ${decision.reasoning}`,
-        routerConfidence: decision.confidence
-      };
     }
     
     return {

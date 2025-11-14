@@ -1,15 +1,17 @@
 import { Red } from '../..';
 
 /**
- * Fast Path Command Executor
+ * Fast Path Command Executor (PLACEHOLDER)
  * 
- * Executes pattern-matched commands directly without LLM intervention.
- * This is the ultra-fast path for unambiguous voice commands.
+ * This node will execute pattern-matched commands directly without LLM intervention.
+ * For now, it's a placeholder that logs the match and returns a simple response.
  * 
- * Flow:
+ * TODO: Implement actual command execution when precheck patterns are added.
+ * 
+ * Flow (future):
  * 1. Receive command details from precheck (tool, server, parameters)
  * 2. Call the MCP tool directly
- * 3. Return result for tiny confirmer
+ * 3. Return formatted response
  */
 
 export const fastpathExecutorNode = async (state: any) => {
@@ -17,146 +19,36 @@ export const fastpathExecutorNode = async (state: any) => {
   const conversationId = state.options?.conversationId;
   const generationId = state.options?.generationId;
   
+  const match = state.precheckMatch;
   const tool = state.fastpathTool;
   const server = state.fastpathServer;
   const parameters = state.fastpathParameters;
   
-  if (!tool || !server) {
-    await redInstance.logger.log({
-      level: 'error',
-      category: 'fastpath',
-      message: '❌ No tool/server specified for fast path execution',
-      conversationId,
-      generationId
-    });
-    
-    return {
-      fastpathSuccess: false,
-      fastpathError: 'Missing tool or server information'
-    };
-  }
-  
   await redInstance.logger.log({
     level: 'info',
     category: 'fastpath',
-    message: `⚡ Executing ${server}.${tool}`,
+    message: `⚡ FASTPATH (placeholder): Pattern matched but executor not implemented yet`,
     conversationId,
     generationId,
-    metadata: { tool, server, parameters }
+    metadata: { 
+      tool, 
+      server, 
+      parameters,
+      patternId: match?.pattern?.id 
+    }
   });
   
-  try {
-    // Call the MCP tool directly (registry will find the right server)
-    const result = await redInstance.mcpRegistry.callTool(
-      tool,
-      parameters,
-      { conversationId, generationId }
-    );
-    
-    // Parse result
-    const resultText = result.content[0]?.text || '';
-    let resultData: any;
-    
-    try {
-      resultData = JSON.parse(resultText);
-    } catch {
-      resultData = { success: true, message: resultText };
-    }
-    
-    await redInstance.logger.log({
-      level: 'info',
-      category: 'fastpath',
-      message: `✅ Command executed: ${resultData.message || 'Success'}`,
-      conversationId,
-      generationId,
-      metadata: { result: resultData }
-    });
-    
-    return {
-      fastpathSuccess: true,
-      fastpathResult: resultData,
-      fastpathMessage: resultData.message || resultText
-    };
-    
-  } catch (error) {
-    await redInstance.logger.log({
-      level: 'error',
-      category: 'fastpath',
-      message: `❌ Command execution failed: ${error}`,
-      conversationId,
-      generationId,
-      metadata: { error: String(error) }
-    });
-    
-    return {
-      fastpathSuccess: false,
-      fastpathError: String(error)
-    };
-  }
-};
-
-/**
- * Tiny Confirmer Node
- * 
- * Uses a tiny local model (or simple templates) to generate a brief
- * confirmation message for the user. Think "✓ Lights off" not a paragraph.
- * 
- * For now, we'll just use simple templates. Later we can add a tiny model.
- */
-
-export const tinyConfirmerNode = async (state: any) => {
-  const redInstance: Red = state.redInstance;
-  const conversationId = state.options?.conversationId;
-  const generationId = state.options?.generationId;
+  // Placeholder response
+  const placeholderResponse = `I detected a pattern match for "${match?.pattern?.description || 'unknown command'}", but the fastpath executor is not implemented yet. This feature is coming soon!`;
   
-  const success = state.fastpathSuccess;
-  const result = state.fastpathResult;
-  const error = state.fastpathError;
-  const parameters = state.fastpathParameters;
-  
-  let confirmationMessage: string;
-  
-  if (!success) {
-    // Error case
-    confirmationMessage = error
-      ? `Sorry, I couldn't complete that: ${error}`
-      : 'Sorry, something went wrong.';
-      
-    await redInstance.logger.log({
-      level: 'warn',
-      category: 'fastpath',
-      message: `⚠️ Command failed: ${confirmationMessage}`,
-      conversationId,
-      generationId
-    });
-    
-  } else {
-    // Success case - use result message or build one
-    if (result && result.message) {
-      confirmationMessage = `✓ ${result.message}`;
-    } else {
-      // Fallback: build simple confirmation from parameters
-      confirmationMessage = '✓ Done';
-    }
-    
-    await redInstance.logger.log({
-      level: 'info',
-      category: 'fastpath',
-      message: `✅ Confirmation: ${confirmationMessage}`,
-      conversationId,
-      generationId
-    });
-  }
-  
-  // Return as final message
+  // Return response that will be stored and sent to user
   return {
-    messages: [
-      ...state.messages,
-      {
-        role: 'assistant',
-        content: confirmationMessage
-      }
-    ],
+    response: {
+      role: 'assistant',
+      content: placeholderResponse
+    },
     fastpathComplete: true
   };
 };
+
+

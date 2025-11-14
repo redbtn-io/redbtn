@@ -201,10 +201,10 @@ export const precheckNode = async (state: any) => {
   await redInstance.logger.log({
     level: 'info',
     category: 'precheck',
-    message: `🔍 Precheck: "${userQuery}"`,
+    message: `🔍 Precheck: Checking for pattern matches...`,
     conversationId,
     generationId,
-    metadata: { query: userQuery }
+    metadata: { query: userQuery.substring(0, 100) }
   });
   
   // Load patterns (in production, cache these)

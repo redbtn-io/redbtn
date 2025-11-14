@@ -57,10 +57,20 @@ const RedGraphState = Annotation.Root({
   toolParam: Annotation<string | undefined>({
     reducer: (x: string | undefined, y: string | undefined) => y
   }),
-  // contextMessages holds the conversation history loaded once by router
+  // contextMessages holds the conversation history loaded once by context node
   contextMessages: Annotation<any[]>({
-    reducer: (x: any[], y: any[]) => y, // Replace (router loads it once)
+    reducer: (x: any[], y: any[]) => y,
     default: () => []
+  }),
+  // contextSummary stores the executive summary for quick prompting
+  contextSummary: Annotation<string>({
+    reducer: (x: string, y: string) => y,
+    default: () => ''
+  }),
+  // contextLoaded ensures the context node only runs once per invocation
+  contextLoaded: Annotation<boolean>({
+    reducer: (x: boolean, y: boolean) => y,
+    default: () => false
   }),
   // nodeNumber tracks current position in the graph (1st, 2nd, 3rd node, etc.)
   nodeNumber: Annotation<number>({
@@ -170,17 +180,30 @@ type RedGraphStateType = typeof RedGraphState.State;
 
 // Import new nodes
 import { precheckNode } from "../nodes/precheck";
+import { contextNode } from "../nodes/context";
 import { classifierNode } from "../nodes/classifier";
-import { fastpathExecutorNode, tinyConfirmerNode } from "../nodes/fastpath";
+import { fastpathExecutorNode } from "../nodes/fastpath";
 
-// THREE-TIER ARCHITECTURE GRAPH (new default)
-// Tier 0: Precheck (pattern matching) → fastpath or router
-// Tier 1: Classifier (fast LLM) → direct (responder) or plan (planner)
-// Tier 2: Planner (smart LLM) → multi-step execution
-const redGraphBuilderThreeTier = new StateGraph(RedGraphState)
+// ROUTER GRAPH WITH PRECHECK + CLASSIFIER (new default)
+// Flow: precheck → [fastpath_executor OR classifier] → [responder OR planner+executor loop]
+//
+// Step 1: Precheck (pattern matching)
+//   - Match → fastpath_executor (placeholder for now, will be implemented later)
+//   - No match → classifier
+//
+// Step 2: Classifier (fast LLM routing with bias toward planning)
+//   - Direct → responder (simple questions, greetings, knowledge queries)
+//   - Plan → planner (default, anything needing tools/multi-step)
+//
+// Step 3a: Responder path (direct answer)
+//   - Generate response → END
+//
+// Step 3b: Planner path (complex execution)
+//   - planner → executor → [search/scrape/command] → executor (loop) → responder → END
+const redGraphBuilderRouter = new StateGraph(RedGraphState)
   .addNode("precheck", precheckNode)
-  .addNode("fastpathExecutor", fastpathExecutorNode)
-  .addNode("tinyConfirmer", tinyConfirmerNode)
+  .addNode("fastpathExecutor", fastpathExecutorNode)  // Placeholder - to be implemented
+  .addNode("contextLoader", contextNode)
   .addNode("classifier", classifierNode)
   .addNode("planner", plannerNode)
   .addNode("executor", executorNode)
@@ -188,26 +211,32 @@ const redGraphBuilderThreeTier = new StateGraph(RedGraphState)
   .addNode("scrape", scrapeNode)
   .addNode("command", commandNode)
   .addNode("responder", responderNode)
-  // Start with precheck
+  
+  // START → precheck
   .addEdge("__start__", "precheck")
-  // After precheck: fastpath or classifier
+  
+  // PRECHECK → [fastpath_executor OR contextLoader]
   .addConditionalEdges(
     "precheck",
     (state: RedGraphStateType) => {
       if (state.precheckDecision === 'fastpath') {
         return 'fastpath';
       }
-      return 'classifier';
+      return 'context';
     },
     {
       "fastpath": "fastpathExecutor",
-      "classifier": "classifier"
+      "context": "contextLoader"
     }
   )
-  // Fastpath: execute → confirm → END
-  .addEdge("fastpathExecutor", "tinyConfirmer")
-  .addEdge("tinyConfirmer", END)
-  // After classifier: direct (responder) or plan (planner)
+
+  // CONTEXT LOADER → classifier (non-fastpath flow)
+  .addEdge("contextLoader", "classifier")
+  
+  // FASTPATH → END (placeholder, will be expanded later)
+  .addEdge("fastpathExecutor", END)
+  
+  // CLASSIFIER → [responder OR planner]
   .addConditionalEdges(
     "classifier",
     (state: RedGraphStateType) => {
@@ -221,19 +250,11 @@ const redGraphBuilderThreeTier = new StateGraph(RedGraphState)
       "planner": "planner"
     }
   )
-  // Planner → executor loop (existing planner architecture)
-  .addConditionalEdges(
-    "planner",
-    (state: RedGraphStateType) => {
-      if (state.requestReplan && state.replannedCount < 3) {
-        return "executor";
-      }
-      return "executor";
-    },
-    {
-      "executor": "executor"
-    }
-  )
+  
+  // PLANNER → executor (always)
+  .addEdge("planner", "executor")
+  
+  // EXECUTOR → [search/scrape/command/responder] based on current step
   .addConditionalEdges(
     "executor",
     (state: RedGraphStateType) => {
@@ -246,16 +267,20 @@ const redGraphBuilderThreeTier = new StateGraph(RedGraphState)
       "responder": "responder"
     }
   )
-  // After specialized nodes, continue execution or end
+  
+  // SEARCH → [search (loop) OR executor (next step) OR END]
   .addConditionalEdges(
     "search",
     (state: RedGraphStateType) => {
+      // Legacy router mode support (allows search to loop back to itself)
       if (state.nextGraph === 'search') {
         return 'search';
       }
+      // Check if we have more steps to execute
       if (state.executionPlan && state.currentStepIndex < state.executionPlan.steps.length) {
         return 'executor';
       }
+      // Plan complete
       return END;
     },
     {
@@ -264,6 +289,8 @@ const redGraphBuilderThreeTier = new StateGraph(RedGraphState)
       "__end__": END
     }
   )
+  
+  // SCRAPE → [executor (next step) OR END]
   .addConditionalEdges(
     "scrape",
     (state: RedGraphStateType) => {
@@ -277,6 +304,8 @@ const redGraphBuilderThreeTier = new StateGraph(RedGraphState)
       "__end__": END
     }
   )
+  
+  // COMMAND → [executor (next step) OR END]
   .addConditionalEdges(
     "command",
     (state: RedGraphStateType) => {
@@ -290,6 +319,8 @@ const redGraphBuilderThreeTier = new StateGraph(RedGraphState)
       "__end__": END
     }
   )
+  
+  // RESPONDER → [planner (replan) OR END]
   .addConditionalEdges(
     "responder",
     (state: RedGraphStateType) => {
@@ -307,13 +338,15 @@ const redGraphBuilderThreeTier = new StateGraph(RedGraphState)
 
 // PLANNER-BASED graph (kept for reference, but three-tier is now default)
 const redGraphBuilderWithPlanner = new StateGraph(RedGraphState)
+  .addNode("contextLoader", contextNode)
   .addNode("planner", plannerNode)      // Creates execution plan
   .addNode("executor", executorNode)    // Routes to appropriate step
   .addNode("search", searchNode)        // Web search node
   .addNode("scrape", scrapeNode)        // URL scraping node
   .addNode("command", commandNode)      // Command execution node
   .addNode("responder", responderNode)  // Final response generation node
-  .addEdge("__start__", "planner")      // Always start with planner
+  .addEdge("__start__", "contextLoader")
+  .addEdge("contextLoader", "planner")
   .addConditionalEdges(
     "planner",
     (state: RedGraphStateType) => {
@@ -411,12 +444,14 @@ const redGraphBuilderWithPlanner = new StateGraph(RedGraphState)
 
 // LEGACY: Create ROUTER-BASED graph (old architecture, kept for backwards compatibility)
 const redGraphBuilderWithRouter = new StateGraph(RedGraphState)
+  .addNode("contextLoader", contextNode)
   .addNode("router", routerNode)
   .addNode("search", searchNode)
   .addNode("scrape", scrapeNode)
   .addNode("command", commandNode)
   .addNode("responder", responderNode)
-  .addEdge("__start__", "router")
+  .addEdge("__start__", "contextLoader")
+  .addEdge("contextLoader", "router")
   .addConditionalEdges(
     "router",
     (state: RedGraphStateType) => {
@@ -448,11 +483,11 @@ const redGraphBuilderWithRouter = new StateGraph(RedGraphState)
   .addEdge("command", "responder")
   .addEdge("responder", END);
 
-// Export THREE-TIER graph as default
-export const redGraph = redGraphBuilderThreeTier.compile();
+// Export ROUTER graph with precheck+classifier as default
+export const redGraph = redGraphBuilderRouter.compile();
 
-// Export PLANNER-BASED graph for reference
+// Export PLANNER-BASED graph for reference (direct to planner, no classifier)
 export const redGraphPlanner = redGraphBuilderWithPlanner.compile();
 
-// Export ROUTER-BASED graph for backwards compatibility
+// Export LEGACY ROUTER-BASED graph for backwards compatibility (old single-step router)
 export const redGraphLegacy = redGraphBuilderWithRouter.compile();

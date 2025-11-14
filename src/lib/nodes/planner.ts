@@ -2,6 +2,7 @@
 import { Red } from '../..';
 import { invokeWithRetry } from '../utils/retry';
 import { getNodeSystemPrefix } from '../utils/node-helpers';
+import { extractJSON } from '../utils/json-extractor';
 
 /**
  * Execution plan step types
@@ -29,6 +30,89 @@ export interface PlanStep {
 export interface ExecutionPlan {
   reasoning: string;  // Overall strategy
   steps: PlanStep[];  // Ordered sequence of steps
+}
+
+function normalizeExecutionPlan(raw: any): ExecutionPlan | null {
+  if (!raw) return null;
+
+  let candidate: any = raw;
+
+  // Unwrap known wrappers
+  const unwrap = (value: any): any => {
+    if (!value || typeof value !== 'object') return value;
+    if ('plan' in value) return (value as any).plan;
+    if ('executionPlan' in value) return (value as any).executionPlan;
+    if ('data' in value) return (value as any).data;
+    if ('response' in value) return (value as any).response;
+    return value;
+  };
+
+  candidate = unwrap(candidate);
+
+  // Handle arrays (take first element)
+  if (Array.isArray(candidate)) {
+    candidate = candidate[0];
+  }
+
+  // Handle string response (extract JSON)
+  if (typeof candidate === 'string') {
+    const parsed = extractJSON(candidate);
+    if (!parsed) {
+      return null;
+    }
+    candidate = parsed;
+  }
+
+  candidate = unwrap(candidate);
+
+  if (!candidate || typeof candidate !== 'object') {
+    return null;
+  }
+
+  const rawSteps = (candidate as any).steps || (candidate as any).plan || (candidate as any).planSteps;
+  if (!Array.isArray(rawSteps)) {
+    return null;
+  }
+
+  const normalizeStepType = (value: string | undefined): StepType => {
+    const normalized = (value || '').toLowerCase();
+    if (normalized.includes('search')) return 'search';
+    if (normalized.includes('command') || normalized.includes('action')) return 'command';
+    return 'respond';
+  };
+
+  const steps: PlanStep[] = rawSteps
+    .map((step: any, index: number) => {
+      if (!step || typeof step !== 'object') {
+        return null;
+      }
+      const type = normalizeStepType(step.type || step.action || step.step);
+      const purpose = step.purpose || step.reason || step.description || `Step ${index + 1}`;
+      const normalizedStep: PlanStep = {
+        type,
+        purpose,
+      };
+      if (type === 'search') {
+        normalizedStep.searchQuery = step.searchQuery || step.query || step.prompt;
+      }
+      if (type === 'command') {
+        normalizedStep.domain = step.domain;
+        normalizedStep.commandDetails = step.commandDetails || step.details || step.command;
+      }
+      return normalizedStep;
+    })
+    .filter((step): step is PlanStep => step !== null);
+
+  if (!steps.length) {
+    return null;
+  }
+
+  const reasoning = (candidate as any).reasoning || (candidate as any).planReasoning || (candidate as any).strategy || 'No reasoning provided';
+
+  return {
+    reasoning,
+    steps
+  };
 }
 
 /**
@@ -133,70 +217,8 @@ export const plannerNode = async (state: any) => {
     conversationId,
   });
   
-  // Load conversation context
-  let conversationMessages: any[] = [];
-  let contextSummary = '';
-  
-  if (conversationId) {
-    try {
-      // Get full conversation history
-      const contextResult = await redInstance.callMcpTool(
-        'get_context_history',
-        {
-          conversationId,
-          maxTokens: 30000,
-          includeSummary: true,
-          summaryType: 'trailing',
-          format: 'llm'
-        },
-        {
-          conversationId,
-          generationId,
-          messageId
-        }
-      );
-
-      if (!contextResult.isError && contextResult.content?.[0]?.text) {
-        const contextData = JSON.parse(contextResult.content[0].text);
-        const rawMessages = contextData.messages || [];
-        
-        // Deduplicate by content
-        const seenContent = new Set<string>();
-        conversationMessages = rawMessages.filter((m: any) => {
-          const key = `${m.role}:${m.content}`;
-          if (seenContent.has(key)) {
-            return false;
-          }
-          seenContent.add(key);
-          return true;
-        });
-      }
-      
-      // Get executive summary
-      const summaryResult = await redInstance.callMcpTool(
-        'get_summary',
-        {
-          conversationId,
-          summaryType: 'executive'
-        },
-        {
-          conversationId,
-          generationId,
-          messageId
-        }
-      );
-
-      if (!summaryResult.isError && summaryResult.content?.[0]?.text) {
-        const summaryData = JSON.parse(summaryResult.content[0].text);
-        const summary = summaryData.summary;
-        if (summary) {
-          contextSummary = `\n\nConversation Context: ${summary}`;
-        }
-      }
-    } catch (error) {
-      console.warn('[Planner] Failed to load context from Context MCP:', error);
-    }
-  }
+  const contextSummary = state.contextSummary || '';
+  const contextPreface = contextSummary ? `Conversation Context:\n${contextSummary}\n\n` : '';
   
   try {
     const currentDate = new Date().toLocaleDateString('en-US', { 
@@ -218,11 +240,12 @@ Previous execution results are in the conversation history.
 Create a NEW plan that addresses the issue.`;
     }
     
-    const modelWithJsonFormat = redInstance.workerModel.withStructuredOutput({
+    // Use structured output to force valid planning JSON
+    const modelWithJson = redInstance.workerModel.withStructuredOutput({
       schema: planningDecisionSchema
     });
     
-    const response = await invokeWithRetry(modelWithJsonFormat, [
+    const response = await invokeWithRetry(modelWithJson, [
       {
         role: 'system',
         content: `${getNodeSystemPrefix(currentNodeNumber, 'Planner')}
@@ -276,18 +299,18 @@ CRITICAL: Every plan MUST end with a 'respond' step. This is not optional.`
       },
       {
         role: 'user',
-        content: `${contextSummary ? `Conversation Context:\n${contextSummary}\n\n` : ''}User query: ${query}`
+  content: `${contextPreface}User query: ${query}`
       }
     ], { context: 'planner decision' });
     
     // Parse and validate the plan
     let executionPlan: ExecutionPlan;
     
-    if (typeof response === 'object' && response !== null && 'steps' in response) {
-      executionPlan = response as ExecutionPlan;
-    } else {
+    const normalizedPlan = normalizeExecutionPlan(response);
+    if (!normalizedPlan) {
       throw new Error(`Invalid planning response format: ${JSON.stringify(response)}`);
     }
+    executionPlan = normalizedPlan;
     
     // Validate plan has steps
     if (!executionPlan.steps || executionPlan.steps.length === 0) {

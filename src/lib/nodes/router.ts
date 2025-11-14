@@ -195,74 +195,9 @@ export const routerNode = async (state: any) => {
     conversationId,
   });
   
-  // Load conversation context ONCE in router and pass to all other nodes
-  let conversationMessages: any[] = [];
-  let contextSummary = '';
-  
-  if (conversationId) {
-    try {
-      // Get full conversation history
-      const contextResult = await redInstance.callMcpTool(
-        'get_context_history',
-        {
-          conversationId,
-          maxTokens: 30000,
-          includeSummary: true,
-          summaryType: 'trailing',
-          format: 'llm'
-        },
-        {
-          conversationId,
-          generationId,
-          messageId
-        }
-      );
-
-      if (!contextResult.isError && contextResult.content?.[0]?.text) {
-        const contextData = JSON.parse(contextResult.content[0].text);
-        const rawMessages = contextData.messages || [];
-        
-        // Deduplicate by CONTENT (not just ID, since duplicates have different IDs)
-        const seenContent = new Set<string>();
-        conversationMessages = rawMessages.filter((m: any) => {
-          const key = `${m.role}:${m.content}`;
-          if (seenContent.has(key)) {
-            return false; // Skip duplicate content
-          }
-          seenContent.add(key);
-          return true;
-        });
-        
-        if (rawMessages.length !== conversationMessages.length) {
-          console.warn('[Router] Removed', rawMessages.length - conversationMessages.length, 'duplicate messages (same content, different IDs)');
-        }
-      }
-      
-      // Also get executive summary for routing decision
-      const summaryResult = await redInstance.callMcpTool(
-        'get_summary',
-        {
-          conversationId,
-          summaryType: 'executive'
-        },
-        {
-          conversationId,
-          generationId,
-          messageId
-        }
-      );
-
-      if (!summaryResult.isError && summaryResult.content?.[0]?.text) {
-        const summaryData = JSON.parse(summaryResult.content[0].text);
-        const summary = summaryData.summary;
-        if (summary) {
-          contextSummary = `\n\nConversation Context: ${summary}`;
-        }
-      }
-    } catch (error) {
-      console.warn('[Router] Failed to load context from Context MCP:', error);
-    }
-  }
+  const conversationMessages: any[] = state.contextMessages || [];
+  const contextSummary = state.contextSummary || '';
+  const contextPreface = contextSummary ? `Conversation Context:\n${contextSummary}\n\n` : '';
   
   try {
     const currentDate = new Date().toLocaleDateString('en-US', { 
@@ -322,7 +257,7 @@ CRITICAL ROUTING RULES:
       },
       {
         role: 'user',
-        content: `${contextSummary ? `Conversation Context:\n${contextSummary}\n\n` : ''}User message: ${query}`
+  content: `${contextPreface}User message: ${query}`
       }
     ], { context: 'router decision' });
     

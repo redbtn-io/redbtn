@@ -75,6 +75,7 @@ export async function respond(
     options: { ...options, conversationId, generationId }, // Add generationId to options
     redInstance: red, // Pass the entire instance into the graph
     messageId: requestId, // Add requestId to state for tool event publishing
+    messages: [{ role: 'user', content: query.message }], // Add initial message for precheck/classifier
   };
 
   // Inject a system message into the graph state for every respond() call.
