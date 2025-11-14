@@ -43,17 +43,19 @@ export async function commandNode(state: CommandNodeState): Promise<Partial<any>
   // Get command from toolParam or query
   const command = state.toolParam || state.query?.message || '';
 
-  // Create event publisher for real-time updates
+  // NOTE: Event publishing is now handled by the MCP registry wrapper
+  // No need for node-level event publishing anymore
   let publisher: any = null;
-  if (redInstance?.messageQueue && messageId && conversationId) {
-    publisher = createIntegratedPublisher(
-      redInstance.messageQueue,
-      'command', // Changed from 'code_execution' to match frontend expectations
-      'Command Execution',
-      messageId,
-      conversationId
-    );
-  }
+  // Disabled: registry publishes events automatically
+  // if (redInstance?.messageQueue && messageId && conversationId) {
+  //   publisher = createIntegratedPublisher(
+  //     redInstance.messageQueue,
+  //     'command',
+  //     'Command Execution',
+  //     messageId,
+  //     conversationId
+  //   );
+  // }
 
   try {
     // ==========================================

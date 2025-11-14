@@ -139,3 +139,23 @@ export interface ToolCallParams {
     messageId?: string;
   };
 }
+
+/**
+ * MCP Resource Definition
+ */
+export interface Resource {
+  uri: string;
+  name: string;
+  description?: string;
+  mimeType?: string;
+}
+
+/**
+ * Resource Contents
+ */
+export interface ResourceContents {
+  uri: string;
+  mimeType?: string;
+  text?: string;
+  blob?: string;
+}

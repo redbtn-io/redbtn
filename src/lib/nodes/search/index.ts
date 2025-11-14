@@ -50,17 +50,19 @@ export async function searchNode(state: SearchNodeState): Promise<Partial<any>> 
   
   const maxResults = 10; // Google API limit is 10 results per query
   
-  // Create event publisher for real-time updates
+  // NOTE: Event publishing is now handled by the MCP registry wrapper
+  // No need for node-level event publishing anymore
   let publisher: any = null;
-  if (redInstance?.messageQueue && messageId && conversationId) {
-    publisher = createIntegratedPublisher(
-      redInstance.messageQueue,
-      'search', // Changed from 'web_search' to match frontend expectations
-      'Web Search',
-      messageId,
-      conversationId
-    );
-  }
+  // Disabled: registry publishes events automatically
+  // if (redInstance?.messageQueue && messageId && conversationId) {
+  //   publisher = createIntegratedPublisher(
+  //     redInstance.messageQueue,
+  //     'search',
+  //     'Web Search',
+  //     messageId,
+  //     conversationId
+  //   );
+  // }
 
   // Check if we've hit the iteration limit
   if (currentIteration >= MAX_SEARCH_ITERATIONS) {

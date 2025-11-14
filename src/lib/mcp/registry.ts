@@ -3,45 +3,54 @@
  * Tracks available MCP servers and their capabilities
  */
 
-import { Redis } from 'ioredis';
-import { McpClient } from './client';
+import { McpClientSSE } from './client-sse';
 import { Tool } from './types';
+import { MessageQueue } from '../memory/queue';
 
 export interface ServerRegistration {
   name: string;
   version: string;
   tools: Tool[];
   capabilities: Record<string, unknown> | { tools?: { listChanged?: boolean } };
+  url: string;
+}
+
+export interface ServerConfig {
+  name: string;
+  url: string;  // e.g., 'http://localhost:3001/mcp'
 }
 
 /**
  * MCP Registry for discovering and managing server connections
  */
 export class McpRegistry {
-  private redis: Redis;
-  private clients: Map<string, McpClient> = new Map();
+  private clients: Map<string, McpClientSSE> = new Map();
   private servers: Map<string, ServerRegistration> = new Map();
+  private messageQueue?: MessageQueue;
 
-  constructor(redis: Redis) {
-    this.redis = redis;
+  constructor(messageQueue?: MessageQueue) {
+    // messageQueue is optional - if provided, enables tool event publishing
+    this.messageQueue = messageQueue;
   }
 
   /**
    * Register a server and connect to it
    */
-  async registerServer(serverName: string): Promise<void> {
-    if (this.clients.has(serverName)) {
-      console.log(`[Registry] Server ${serverName} already registered`);
+  async registerServer(config: ServerConfig): Promise<void> {
+    const { name, url } = config;
+    
+    if (this.clients.has(name)) {
+      console.log(`[Registry] Server ${name} already registered`);
       return;
     }
 
-    const client = new McpClient(this.redis.duplicate(), serverName);
+    const client = new McpClientSSE(url, name);
     
     try {
       // Connect and initialize
       await client.connect();
       const initResult = await client.initialize({
-        name: 'registry-client',
+        name: 'red-ai-client',
         version: '1.0.0'
       });
 
@@ -53,14 +62,17 @@ export class McpRegistry {
         name: initResult.serverInfo.name,
         version: initResult.serverInfo.version,
         tools: toolsList.tools,
-        capabilities: initResult.capabilities
+        capabilities: initResult.capabilities,
+        url
       };
 
-      this.clients.set(serverName, client);
-      this.servers.set(serverName, registration);
+      this.clients.set(name, client);
+      this.servers.set(name, registration);
+
+      console.log(`[Registry] Registered ${name} with ${toolsList.tools.length} tools`);
 
     } catch (error) {
-      console.error(`[Registry] Failed to register server ${serverName}:`, error);
+      console.error(`[Registry] Failed to register server ${name}:`, error);
       throw error;
     }
   }
@@ -81,7 +93,7 @@ export class McpRegistry {
   /**
    * Get client for a server
    */
-  getClient(serverName: string): McpClient | undefined {
+  getClient(serverName: string): McpClientSSE | undefined {
     return this.clients.get(serverName);
   }
 
@@ -97,6 +109,13 @@ export class McpRegistry {
    */
   getAllServers(): ServerRegistration[] {
     return Array.from(this.servers.values());
+  }
+
+  /**
+   * Get all server names
+   */
+  getAllServerNames(): string[] {
+    return Array.from(this.servers.keys());
   }
 
   /**
@@ -129,6 +148,8 @@ export class McpRegistry {
 
   /**
    * Call a tool (automatically finds the right server)
+   * Wraps tool execution with event publishing for frontend display
+   * (skips event publishing for infrastructure tools like context)
    */
   async callTool(
     toolName: string, 
@@ -148,9 +169,62 @@ export class McpRegistry {
       throw new Error(`Client not found for server: ${found.server}`);
     }
 
-    const result = await client.callTool(toolName, args, meta);
-    console.log(`[Registry] Tool ${toolName} returned, isError: ${result?.isError}`);
-    return result;
+    // Skip event publishing for infrastructure tools (context, rag storage)
+    const isInfrastructureTool = found.server === 'context' || 
+      (found.server === 'rag' && ['add_document', 'delete_documents'].includes(toolName));
+    
+    // Publish tool start event if messageId is provided and not infrastructure
+    const toolId = `${toolName}_${Date.now()}`;
+    if (meta?.messageId && this.messageQueue && !isInfrastructureTool) {
+      await this.messageQueue.publishToolEvent(meta.messageId, {
+        type: 'tool_start',
+        toolId,
+        toolType: toolName,
+        toolName,
+        timestamp: Date.now(),
+        metadata: meta
+      });
+    }
+
+    const startTime = Date.now();
+    try {
+      const result = await client.callTool(toolName, args, meta);
+      const duration = Date.now() - startTime;
+      
+      console.log(`[Registry] Tool ${toolName} returned in ${duration}ms, isError: ${result?.isError}`);
+      
+      // Publish tool complete event
+      if (meta?.messageId && this.messageQueue && !isInfrastructureTool) {
+        await this.messageQueue.publishToolEvent(meta.messageId, {
+          type: 'tool_complete',
+          toolId,
+          toolType: toolName,
+          toolName,
+          timestamp: Date.now(),
+          result: result,
+          metadata: { ...meta, duration }
+        });
+      }
+      
+      return result;
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      
+      // Publish tool error event
+      if (meta?.messageId && this.messageQueue && !isInfrastructureTool) {
+        await this.messageQueue.publishToolEvent(meta.messageId, {
+          type: 'tool_error',
+          toolId,
+          toolType: toolName,
+          toolName,
+          timestamp: Date.now(),
+          error: error instanceof Error ? error.message : String(error),
+          metadata: { ...meta, duration }
+        });
+      }
+      
+      throw error;
+    }
   }
 
   /**

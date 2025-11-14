@@ -86,6 +86,20 @@ export class McpClient {
   }
 
   /**
+   * List available resources
+   */
+  async listResources(): Promise<{ resources: Array<{ uri: string; name: string; description?: string; mimeType?: string }> }> {
+    return await this.sendRequest('resources/list');
+  }
+
+  /**
+   * Read a resource
+   */
+  async readResource(params: { uri: string }): Promise<{ contents: Array<{ uri: string; mimeType?: string; text?: string; blob?: string }> }> {
+    return await this.sendRequest('resources/read', params as unknown as Record<string, unknown>);
+  }
+
+  /**
    * Call a tool
    */
   async callTool(

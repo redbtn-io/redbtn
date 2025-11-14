@@ -624,6 +624,7 @@ export class ContextServer extends McpServer {
 
     await publisher.publishStart({ input: { conversationId, role } });
     console.log(`[Context MCP] storeMessage called - conversationId:${conversationId}, role:${role}, messageId:${messageId}, content length:${content?.length}`);
+    console.log(`[Context MCP] toolExecutions received:`, toolExecutions ? toolExecutions.length : 'undefined', toolExecutions ? JSON.stringify(toolExecutions).substring(0, 200) : '');
     await publisher.publishLog('info', `💾 Storing ${role} message in ${conversationId}`);
 
     try {

@@ -146,8 +146,8 @@ export class Red {
     // Initialize logger with MongoDB persistence
     this.logger = new PersistentLogger(redis, this.nodeId || 'default');
     
-    // Initialize MCP registry for tool servers
-    this.mcpRegistry = new McpRegistry(redis.duplicate());
+    // Initialize MCP registry for tool servers (pass messageQueue for event publishing)
+    this.mcpRegistry = new McpRegistry(this.messageQueue);
   }
 
   // --- Private Internal Methods ---
@@ -205,12 +205,12 @@ export class Red {
     this.baseState = { loadedAt: new Date(), nodeId: this.nodeId };
     this.isLoaded = true;
     
-    // Register MCP servers (web, system, rag, and context)
+    // Register MCP servers (SSE transport on different ports)
     try {
-      await this.mcpRegistry.registerServer('web');
-      await this.mcpRegistry.registerServer('system');
-      await this.mcpRegistry.registerServer('rag');
-      await this.mcpRegistry.registerServer('context');
+      await this.mcpRegistry.registerServer({ name: 'web', url: 'http://localhost:3001/mcp' });
+      await this.mcpRegistry.registerServer({ name: 'system', url: 'http://localhost:3002/mcp' });
+      await this.mcpRegistry.registerServer({ name: 'rag', url: 'http://localhost:3003/mcp' });
+      await this.mcpRegistry.registerServer({ name: 'context', url: 'http://localhost:3004/mcp' });
       const tools = this.mcpRegistry.getAllTools();
       process.stdout.write(`\r✓ Red AI initialized (${tools.length} MCP tools)\n`);
     } catch (error) {

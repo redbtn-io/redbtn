@@ -101,14 +101,211 @@ const RedGraphState = Annotation.Root({
   commandDetails: Annotation<string | undefined>({
     reducer: (x: string | undefined, y: string | undefined) => y,
     default: () => undefined
+  }),
+  // THREE-TIER ARCHITECTURE FIELDS
+  // Precheck (Tier 0: Pattern matching)
+  precheckDecision: Annotation<'fastpath' | 'router' | undefined>({
+    reducer: (x: any, y: any) => y,
+    default: () => undefined
+  }),
+  precheckMatch: Annotation<any | undefined>({
+    reducer: (x: any, y: any) => y,
+    default: () => undefined
+  }),
+  precheckReason: Annotation<string | undefined>({
+    reducer: (x: string | undefined, y: string | undefined) => y,
+    default: () => undefined
+  }),
+  // Fastpath execution
+  fastpathTool: Annotation<string | undefined>({
+    reducer: (x: string | undefined, y: string | undefined) => y,
+    default: () => undefined
+  }),
+  fastpathServer: Annotation<string | undefined>({
+    reducer: (x: string | undefined, y: string | undefined) => y,
+    default: () => undefined
+  }),
+  fastpathParameters: Annotation<Record<string, string> | undefined>({
+    reducer: (x: any, y: any) => y,
+    default: () => undefined
+  }),
+  fastpathSuccess: Annotation<boolean | undefined>({
+    reducer: (x: boolean | undefined, y: boolean | undefined) => y,
+    default: () => undefined
+  }),
+  fastpathResult: Annotation<any | undefined>({
+    reducer: (x: any, y: any) => y,
+    default: () => undefined
+  }),
+  fastpathError: Annotation<string | undefined>({
+    reducer: (x: string | undefined, y: string | undefined) => y,
+    default: () => undefined
+  }),
+  fastpathMessage: Annotation<string | undefined>({
+    reducer: (x: string | undefined, y: string | undefined) => y,
+    default: () => undefined
+  }),
+  fastpathComplete: Annotation<boolean | undefined>({
+    reducer: (x: boolean | undefined, y: boolean | undefined) => y,
+    default: () => undefined
+  }),
+  // Classifier (Tier 1: Fast LLM routing)
+  routerDecision: Annotation<'direct' | 'plan' | undefined>({
+    reducer: (x: any, y: any) => y,
+    default: () => undefined
+  }),
+  routerReason: Annotation<string | undefined>({
+    reducer: (x: string | undefined, y: string | undefined) => y,
+    default: () => undefined
+  }),
+  routerConfidence: Annotation<number | undefined>({
+    reducer: (x: number | undefined, y: number | undefined) => y,
+    default: () => undefined
   })
 });
 
 type RedGraphStateType = typeof RedGraphState.State;
 
-// --- Graph Definition ---
+// --- Graph Definitions ---
 
-// Create PLANNER-BASED graph (new architecture)
+// Import new nodes
+import { precheckNode } from "../nodes/precheck";
+import { classifierNode } from "../nodes/classifier";
+import { fastpathExecutorNode, tinyConfirmerNode } from "../nodes/fastpath";
+
+// THREE-TIER ARCHITECTURE GRAPH (new default)
+// Tier 0: Precheck (pattern matching) → fastpath or router
+// Tier 1: Classifier (fast LLM) → direct (responder) or plan (planner)
+// Tier 2: Planner (smart LLM) → multi-step execution
+const redGraphBuilderThreeTier = new StateGraph(RedGraphState)
+  .addNode("precheck", precheckNode)
+  .addNode("fastpathExecutor", fastpathExecutorNode)
+  .addNode("tinyConfirmer", tinyConfirmerNode)
+  .addNode("classifier", classifierNode)
+  .addNode("planner", plannerNode)
+  .addNode("executor", executorNode)
+  .addNode("search", searchNode)
+  .addNode("scrape", scrapeNode)
+  .addNode("command", commandNode)
+  .addNode("responder", responderNode)
+  // Start with precheck
+  .addEdge("__start__", "precheck")
+  // After precheck: fastpath or classifier
+  .addConditionalEdges(
+    "precheck",
+    (state: RedGraphStateType) => {
+      if (state.precheckDecision === 'fastpath') {
+        return 'fastpath';
+      }
+      return 'classifier';
+    },
+    {
+      "fastpath": "fastpathExecutor",
+      "classifier": "classifier"
+    }
+  )
+  // Fastpath: execute → confirm → END
+  .addEdge("fastpathExecutor", "tinyConfirmer")
+  .addEdge("tinyConfirmer", END)
+  // After classifier: direct (responder) or plan (planner)
+  .addConditionalEdges(
+    "classifier",
+    (state: RedGraphStateType) => {
+      if (state.routerDecision === 'direct') {
+        return 'responder';
+      }
+      return 'planner';
+    },
+    {
+      "responder": "responder",
+      "planner": "planner"
+    }
+  )
+  // Planner → executor loop (existing planner architecture)
+  .addConditionalEdges(
+    "planner",
+    (state: RedGraphStateType) => {
+      if (state.requestReplan && state.replannedCount < 3) {
+        return "executor";
+      }
+      return "executor";
+    },
+    {
+      "executor": "executor"
+    }
+  )
+  .addConditionalEdges(
+    "executor",
+    (state: RedGraphStateType) => {
+      return state.nextGraph || "responder";
+    },
+    {
+      "search": "search",
+      "scrape": "scrape",
+      "command": "command",
+      "responder": "responder"
+    }
+  )
+  // After specialized nodes, continue execution or end
+  .addConditionalEdges(
+    "search",
+    (state: RedGraphStateType) => {
+      if (state.nextGraph === 'search') {
+        return 'search';
+      }
+      if (state.executionPlan && state.currentStepIndex < state.executionPlan.steps.length) {
+        return 'executor';
+      }
+      return END;
+    },
+    {
+      "search": "search",
+      "executor": "executor",
+      "__end__": END
+    }
+  )
+  .addConditionalEdges(
+    "scrape",
+    (state: RedGraphStateType) => {
+      if (state.executionPlan && state.currentStepIndex < state.executionPlan.steps.length) {
+        return 'executor';
+      }
+      return END;
+    },
+    {
+      "executor": "executor",
+      "__end__": END
+    }
+  )
+  .addConditionalEdges(
+    "command",
+    (state: RedGraphStateType) => {
+      if (state.executionPlan && state.currentStepIndex < state.executionPlan.steps.length) {
+        return 'executor';
+      }
+      return END;
+    },
+    {
+      "executor": "executor",
+      "__end__": END
+    }
+  )
+  .addConditionalEdges(
+    "responder",
+    (state: RedGraphStateType) => {
+      // Check if responder requested replanning
+      if (state.requestReplan && state.replannedCount < 3) {
+        return 'planner';
+      }
+      return END;
+    },
+    {
+      "planner": "planner",
+      "__end__": END
+    }
+  );
+
+// PLANNER-BASED graph (kept for reference, but three-tier is now default)
 const redGraphBuilderWithPlanner = new StateGraph(RedGraphState)
   .addNode("planner", plannerNode)      // Creates execution plan
   .addNode("executor", executorNode)    // Routes to appropriate step
@@ -251,8 +448,11 @@ const redGraphBuilderWithRouter = new StateGraph(RedGraphState)
   .addEdge("command", "responder")
   .addEdge("responder", END);
 
-// Export PLANNER-BASED graph as default
-export const redGraph = redGraphBuilderWithPlanner.compile();
+// Export THREE-TIER graph as default
+export const redGraph = redGraphBuilderThreeTier.compile();
 
-// Export ROUTER-BASED graph for backwards compatibility (can be removed later)
+// Export PLANNER-BASED graph for reference
+export const redGraphPlanner = redGraphBuilderWithPlanner.compile();
+
+// Export ROUTER-BASED graph for backwards compatibility
 export const redGraphLegacy = redGraphBuilderWithRouter.compile();

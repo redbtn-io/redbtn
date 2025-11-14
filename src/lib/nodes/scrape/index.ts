@@ -44,17 +44,19 @@ export async function scrapeNode(state: ScrapeNodeState): Promise<Partial<any>> 
   // Get URL from toolParam or extract from query
   const urlToScrape = state.toolParam || state.query?.message || '';
 
-  // Create event publisher for real-time updates
+  // NOTE: Event publishing is now handled by the MCP registry wrapper
+  // No need for node-level event publishing anymore
   let publisher: any = null;
-  if (redInstance?.messageQueue && messageId && conversationId) {
-    publisher = createIntegratedPublisher(
-      redInstance.messageQueue,
-      'scrape', // Changed from 'web_search' to match frontend expectations
-      'URL Scraper',
-      messageId,
-      conversationId
-    );
-  }
+  // Disabled: registry publishes events automatically
+  // if (redInstance?.messageQueue && messageId && conversationId) {
+  //   publisher = createIntegratedPublisher(
+  //     redInstance.messageQueue,
+  //     'scrape',
+  //     'URL Scraper',
+  //     messageId,
+  //     conversationId
+  //   );
+  // }
 
   try {
     // ==========================================

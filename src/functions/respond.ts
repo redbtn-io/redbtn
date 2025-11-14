@@ -28,7 +28,8 @@ export async function respond(
   const requestId = (options as any).messageId;
   
   // Generate separate message IDs for user and assistant messages
-  const userMessageId = `msg_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  // Use provided userMessageId from frontend if available, otherwise generate one
+  const userMessageId = (options as any).userMessageId || `msg_${Date.now()}_${Math.random().toString(36).substring(7)}`;
   const assistantMessageId = `msg_${Date.now() + 1}_${Math.random().toString(36).substring(7)}`;
   
   console.log(`[Respond] Starting respond() - conversationId:${conversationId}, requestId:${requestId}, userMessageId:${userMessageId}, query:${query.message.substring(0, 50)}`);
@@ -495,6 +496,8 @@ async function* streamThroughGraphWithMemory(
       let toolExecutions: any[] = [];
       if (requestId) {
         const messageState = await red.messageQueue.getMessageState(requestId);
+        console.log(`[Respond] Message state for ${requestId}:`, messageState ? 'Found' : 'Not found');
+        console.log(`[Respond] Tool events in state:`, messageState?.toolEvents?.length || 0);
         if (messageState?.toolEvents) {
           // Convert tool events to tool executions for storage
           const toolMap = new Map<string, any>();
@@ -544,8 +547,14 @@ async function* streamThroughGraphWithMemory(
           
           toolExecutions = Array.from(toolMap.values());
           console.log(`[Respond] Collected ${toolExecutions.length} tool executions from generation state`);
+        } else {
+          console.log(`[Respond] No tool events found in message state`);
         }
+      } else {
+        console.log(`[Respond] No requestId provided, cannot retrieve tool executions`);
       }
+      
+      console.log(`[Respond] About to store message with ${toolExecutions.length} tool executions`);
       
       // Store content via MCP for LLM context (already cleaned in streaming/non-streaming paths)
       await red.callMcpTool('store_message', {

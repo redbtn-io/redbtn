@@ -159,8 +159,8 @@ export class MemoryManager {
     }
 
     try {
-      // Store in MongoDB for persistence (non-blocking, ignore errors)
-      getDatabase().storeMessage({
+      // Store in MongoDB for persistence (blocking to ensure consistency)
+      await getDatabase().storeMessage({
         messageId: message.id,
         conversationId,
         role: message.role,
@@ -169,7 +169,8 @@ export class MemoryManager {
         toolExecutions: message.toolExecutions || [],
         metadata: {}
       }).catch(err => {
-        console.warn('[Memory] Failed to save message to MongoDB:', err.message);
+        console.error('[Memory] Failed to save message to MongoDB:', err.message);
+        throw err; // Re-throw to trigger rollback
       });
 
       // Add to Redis (hot cache)
