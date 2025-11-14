@@ -29,7 +29,7 @@ export async function respond(
   
   // Generate separate message IDs for user and assistant messages
   // Use provided userMessageId from frontend if available, otherwise generate one
-  const userMessageId = (options as any).userMessageId || `msg_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  const userMessageId = options.userMessageId || `msg_${Date.now()}_${Math.random().toString(36).substring(7)}`;
   const assistantMessageId = `msg_${Date.now() + 1}_${Math.random().toString(36).substring(7)}`;
   
   console.log(`[Respond] Starting respond() - conversationId:${conversationId}, requestId:${requestId}, userMessageId:${userMessageId}, query:${query.message.substring(0, 50)}`);

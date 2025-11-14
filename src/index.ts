@@ -95,6 +95,7 @@ export interface InvokeOptions {
   conversationId?: string; // Optional conversation ID - will be auto-generated if not provided
   generationId?: string; // Optional generation ID - will be auto-generated if not provided
   messageId?: string; // Optional message ID for Redis pub/sub streaming
+  userMessageId?: string; // Optional user message ID from client request (stored in memory)
 }
 
 // --- The Red Library Class ---
