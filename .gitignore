@@ -10,6 +10,7 @@ yarn-error.log
 
 # Ignore .env file (if you have sensitive information)
 .env
+.env.local
 
 # Ignore dist
 dist/
