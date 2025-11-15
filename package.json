@@ -1,35 +1,48 @@
 {
   "name": "@redbtn/ai",
   "version": "0.0.1",
-  "description": "",
-  "author": "George Abreu Jr. <george@redbtn.io> (https://georgeanthony.net/)",
-  "license": "GPL-3.0-only",
+  "description": "Red AI Library - Graph-based AI agent built on LangChain and LangGraph",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "scripts": {
-    "prepare": "tsc -d"
-  },
   "files": [
-    "dist/",
-    "LICENSE",
+    "dist/**/*",
     "README.md",
-    "package.json"
+    "LICENSE"
   ],
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/redbtn-io/ai.git"
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "mcp:start": "npx tsx src/mcp-servers.ts",
+    "dev:server": "cd examples/rest-server && npm run dev",
+    "start:server": "cd examples/rest-server && npm start",
+    "build": "tsc",
+    "pack": "npm run build && npm pack",
+    "prepublishOnly": "npm run build",
+    "db:fix-messageids": "npx tsx scripts/fix-null-messageids.ts",
+    "redis:cleanup-dupes": "npx tsx scripts/cleanup-redis-duplicates.ts"
   },
-  "bugs": {
-    "url": "https://github.com/redbtn-io/ai/issues"
-  },
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "openai": "^4.67.3",
-    "wav": "^1.0.2",
-    "ws": "^8.18.0"
+    "@chroma-core/default-embed": "^0.1.8",
+    "@langchain/core": "^0.3.78",
+    "@langchain/google-genai": "^0.2.18",
+    "@langchain/langgraph": "^0.4.9",
+    "@langchain/ollama": "^0.2.4",
+    "@langchain/openai": "^0.6.13",
+    "@types/ioredis": "^4.28.10",
+    "chromadb": "^3.0.17",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "ioredis": "^5.8.0",
+    "mongodb": "^6.20.0",
+    "tiktoken": "^1.0.22",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^20.12.12",
-    "@types/ws": "^8.5.12",
-    "typescript": "^5.4.5"
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.5",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.2"
   }
 }

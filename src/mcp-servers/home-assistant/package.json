@@ -1,0 +1,21 @@
+{
+  "name": "@redbtn/mcp-home-assistant",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "MCP server for Home Assistant integration with pattern-based command detection",
+  "bin": {
+    "mcp-home-assistant": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "typescript": "^5.7.2"
+  }
+}

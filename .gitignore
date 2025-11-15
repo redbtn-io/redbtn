@@ -1,5 +1,6 @@
 # Ignore node_modules directory
 node_modules/
+test/
 
 # Ignore npm debug log
 npm-debug.log
@@ -10,6 +11,7 @@ yarn-error.log
 
 # Ignore .env file (if you have sensitive information)
 .env
+.env.local
 
 # Ignore dist
 dist/

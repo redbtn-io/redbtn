@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WORKSPACE_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
+CLEANUP_SCRIPT="$WORKSPACE_ROOT/scripts/pre-commit-cleanup.sh"
+
+if [ ! -x "$CLEANUP_SCRIPT" ]; then
+  printf 'Cleanup script not found at %s\n' "$CLEANUP_SCRIPT" >&2
+  exit 0
+fi
+
+"$CLEANUP_SCRIPT" "$PROJECT_ROOT"
