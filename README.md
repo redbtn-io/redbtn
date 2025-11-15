@@ -22,6 +22,34 @@
 - **Type-Safe**: Full TypeScript support with type guards
 - **Extensible**: Easy to add custom nodes, graphs, and MCP servers
 
+## 🧭 Workspace Layout
+
+Although this package can be published independently, it lives inside a two-project workspace:
+
+- `ai/` – this LangGraph-based library and its MCP server implementations
+- `webapp/` – the Next.js chat client and OpenAI-compatible API surface
+- `scripts/` – shared automation (most notably `pre-commit-cleanup.sh`)
+- `explanations/` – canonical home for every markdown file that **isn't** a README
+
+Keeping these directories organized ensures local work mirrors production deploys (Express/Stand-alone and Next.js serverless) and keeps the documentation policy enforceable.
+
+## 🧹 Documentation Hygiene & Git Hooks
+
+Every markdown file that is not a README belongs under `/explanations`. To keep that policy automatic, we share a cleanup script from the workspace root:
+
+```bash
+# From the workspace root
+./scripts/pre-commit-cleanup.sh ./ai
+```
+
+The script moves stray `.md` files, removes nested `explanations/` or `scripts/` folders inside `ai/`, and stages the results. Wire it into your local repo once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The pre-commit hook inside `ai/.githooks` simply shells out to the shared script with the current project root, so contributors on any OS get the same hygiene guarantees. If you need to run the cleanup manually (for CI or ad-hoc checks), call the script with the path to the project you want to sanitize.
+
 ## 📦 Installation
 
 ```bash
