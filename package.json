@@ -1,7 +1,7 @@
 {
-  "name": "@redbtn/ai",
-  "version": "0.0.1",
-  "description": "Red AI Library - Graph-based AI agent built on LangChain and LangGraph",
+  "name": "@redbtn/redbtn",
+  "version": "0.0.1-alpha",
+  "description": "Graph-based automation engine for building, running, and orchestrating dynamic workflows",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -10,39 +10,78 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest run --coverage",
     "mcp:start": "npx tsx src/mcp-servers.ts",
     "dev:server": "cd examples/rest-server && npm run dev",
     "start:server": "cd examples/rest-server && npm start",
     "build": "tsc",
     "pack": "npm run build && npm pack",
     "prepublishOnly": "npm run build",
-    "db:fix-messageids": "npx tsx scripts/fix-null-messageids.ts",
-    "redis:cleanup-dupes": "npx tsx scripts/cleanup-redis-duplicates.ts"
+    "db:seed-neurons": "npx tsx scripts/seed-default-neurons.ts",
+    "db:update-user-defaults": "npx tsx scripts/update-user-defaults.ts",
+    "db:seed-graphs": "npx tsx scripts/seed-default-graphs.ts",
+    "db:update-user-graphs": "npx tsx scripts/update-user-graph-defaults.ts",
+    "migrate-universal-nodes": "npx tsx src/scripts/migrate-universal-nodes.ts",
+    "verify-universal-nodes": "npx tsx src/scripts/verify-universal-nodes.ts",
+    "seed-default-graphs": "npx tsx src/scripts/seed-default-graphs.ts",
+    "lint": "eslint src --fix",
+    "lint:check": "eslint src",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "src/**/*.{ts,tsx}": [
+      "eslint --fix --max-warnings=100"
+    ]
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@chroma-core/default-embed": "^0.1.8",
-    "@langchain/core": "^0.3.78",
-    "@langchain/google-genai": "^0.2.18",
-    "@langchain/langgraph": "^0.4.9",
-    "@langchain/ollama": "^0.2.4",
-    "@langchain/openai": "^0.6.13",
-    "@types/ioredis": "^4.28.10",
-    "chromadb": "^3.0.17",
+    "@langchain/anthropic": "^1.2.3",
+    "@langchain/core": "^1.1.4",
+    "@langchain/google-genai": "^2.0.4",
+    "@langchain/langgraph": "^1.0.4",
+    "@langchain/ollama": "^1.0.3",
+    "@langchain/openai": "^1.1.3",
+    "chromadb": "^3.1.8",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
-    "express": "^5.1.0",
-    "ioredis": "^5.8.0",
-    "mongodb": "^6.20.0",
+    "express": "^5.2.1",
+    "fuse.js": "^7.1.0",
+    "ioredis": "^5.8.2",
+    "lru-cache": "^11.2.4",
+    "mammoth": "^1.11.0",
+    "mongodb": "^7.0.0",
+    "mongoose": "^9.0.1",
+    "pdf-parse": "^1.1.1",
+    "tesseract.js": "^7.0.0",
     "tiktoken": "^1.0.22",
-    "zod": "^3.25.76"
+    "word-extractor": "^1.0.4",
+    "xlsx": "^0.18.5",
+    "zod": "^4.1.13"
+  },
+  "peerDependencies": {
+    "@red/stream": ">=0.1.0",
+    "@redbtn/redlog": ">=0.1.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.2",
     "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.5",
-    "@types/node": "^24.5.2",
-    "typescript": "^5.9.2"
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.10.1",
+    "@types/pdf-parse": "^1.1.5",
+    "@typescript-eslint/eslint-plugin": "^8.53.0",
+    "@typescript-eslint/parser": "^8.53.0",
+    "@vitest/ui": "^4.0.15",
+    "eslint": "^9.39.2",
+    "eslint-plugin-unused-imports": "^4.3.0",
+    "happy-dom": "^20.0.11",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.53.0",
+    "vitest": "^4.0.15"
   }
 }
