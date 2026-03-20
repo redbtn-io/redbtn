@@ -169,7 +169,7 @@ const libraryWrite: NativeToolDefinition = {
       let chunkCount = 0;
       try {
         // Dynamic import to avoid hard dependency
-        const { VectorStoreManager } = require('../../vectorStore/VectorStoreManager');
+        const { VectorStoreManager } = require('../../memory/vectors');
         if (VectorStoreManager && library.vectorCollection) {
           const vsm = new VectorStoreManager();
           const chunks = vsm.chunkText(content, {
