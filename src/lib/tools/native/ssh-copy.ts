@@ -21,7 +21,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import mongoose from 'mongoose';
-import { GridFSBucket, ObjectId } from 'mongodb';
+
+// Use GridFSBucket and ObjectId from mongoose's bundled mongodb to avoid BSON version mismatch
+const { GridFSBucket } = mongoose.mongo;
+const ObjectId = mongoose.Types.ObjectId;
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
