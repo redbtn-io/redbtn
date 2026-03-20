@@ -146,4 +146,15 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register ssh_copy:', msg);
   }
+
+  try {
+    // Library Write — programmatic document ingestion into Knowledge Libraries
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const libraryWrite = require('./native/library-write.js');
+    registry.register('library_write', libraryWrite);
+    console.log('[NativeRegistry] Registered built-in tool: library_write');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register library_write:', msg);
+  }
 }
