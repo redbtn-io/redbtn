@@ -135,4 +135,15 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register invoke_function:', msg);
   }
+
+  try {
+    // SSH Copy — SFTP file transfer with Knowledge Library integration
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sshCopy = require('./native/ssh-copy.js');
+    registry.register('ssh_copy', sshCopy);
+    console.log('[NativeRegistry] Registered built-in tool: ssh_copy');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register ssh_copy:', msg);
+  }
 }
