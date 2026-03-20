@@ -1,0 +1,138 @@
+/**
+ * Native Tool Registry
+ *
+ * Native tools run in-process with direct access to the RunPublisher
+ * for real-time streaming. No MCP protocol overhead, no timeouts.
+ *
+ * The native path is checked BEFORE the MCP path in toolExecutor.
+ * Results are returned in MCP-compatible format so no special handling
+ * is required downstream.
+ */
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyObject = Record<string, any>;
+
+export interface NativeToolContext {
+  /** RunPublisher instance for streaming events — null if not in a run context */
+  publisher: AnyObject | null;
+  /** Current graph state */
+  state: AnyObject;
+  /** Current run ID */
+  runId: string | null;
+  /** Graph node ID that invoked the tool */
+  nodeId: string | null;
+  /** Unique tool execution ID — use with publisher.toolProgress(toolId, ...) */
+  toolId: string | null;
+  /** AbortSignal for cancellation support */
+  abortSignal: AbortSignal | null;
+}
+
+export interface NativeMcpResult {
+  content: Array<{ type: 'text'; text: string }>;
+  isError?: boolean;
+}
+
+export interface NativeToolDefinition {
+  /** Human-readable description shown in the UI */
+  description: string;
+  /** JSON Schema for input validation */
+  inputSchema: AnyObject;
+  /** Source server name for grouping in UI */
+  server?: string;
+  /** The actual tool implementation */
+  handler: (args: AnyObject, context: NativeToolContext) => Promise<NativeMcpResult>;
+}
+
+export interface NativeToolInfo {
+  name: string;
+  description: string;
+  inputSchema: AnyObject;
+  server: string;
+}
+
+export class NativeToolRegistry {
+  private tools: Map<string, NativeToolDefinition> = new Map();
+
+  /**
+   * Register a native tool definition.
+   * The name must match what graphs use in their toolName step config.
+   */
+  register(name: string, definition: NativeToolDefinition): void {
+    this.tools.set(name, definition);
+  }
+
+  has(name: string): boolean {
+    return this.tools.has(name);
+  }
+
+  get(name: string): NativeToolDefinition | undefined {
+    return this.tools.get(name);
+  }
+
+  /**
+   * List all registered native tools in MCP-compatible format.
+   */
+  listTools(): NativeToolInfo[] {
+    return Array.from(this.tools.entries()).map(([name, def]) => ({
+      name,
+      description: def.description,
+      inputSchema: def.inputSchema,
+      server: def.server || 'system',
+    }));
+  }
+
+  /**
+   * Invoke a native tool handler with the given args and context.
+   */
+  async callTool(name: string, args: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const tool = this.tools.get(name);
+    if (!tool) throw new Error(`Native tool not found: ${name}`);
+    return tool.handler(args, context);
+  }
+}
+
+// =============================================================================
+// Singleton
+// =============================================================================
+
+let _instance: NativeToolRegistry | null = null;
+
+/**
+ * Get the shared NativeToolRegistry singleton.
+ * Lazily registers all built-in native tools on first call.
+ */
+export function getNativeRegistry(): NativeToolRegistry {
+  if (!_instance) {
+    _instance = new NativeToolRegistry();
+    registerBuiltinTools(_instance);
+  }
+  return _instance;
+}
+
+/**
+ * Register all built-in native tools.
+ * Add new tools here as they are implemented.
+ */
+function registerBuiltinTools(registry: NativeToolRegistry): void {
+  try {
+    // SSH Shell — requires ssh2 package
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sshShell = require('./native/ssh-shell.js');
+    registry.register('ssh_shell', sshShell);
+    console.log('[NativeRegistry] Registered built-in tool: ssh_shell');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register ssh_shell:', msg);
+  }
+
+  try {
+    // Invoke Function — async RedRun function invocation with polling
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const invokeFunction = require('./native/invoke-function.js');
+    registry.register('invoke_function', invokeFunction);
+    console.log('[NativeRegistry] Registered built-in tool: invoke_function');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register invoke_function:', msg);
+  }
+}
