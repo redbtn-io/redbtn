@@ -21,6 +21,8 @@ export interface NativeToolContext {
   runId: string | null;
   /** Graph node ID that invoked the tool */
   nodeId: string | null;
+  /** Unique tool execution ID — use with publisher.toolProgress(toolId, ...) */
+  toolId: string | null;
   /** AbortSignal for cancellation support */
   abortSignal: AbortSignal | null;
 }
@@ -121,5 +123,16 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register ssh_shell:', msg);
+  }
+
+  try {
+    // Invoke Function — async RedRun function invocation with polling
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const invokeFunction = require('./native/invoke-function.js');
+    registry.register('invoke_function', invokeFunction);
+    console.log('[NativeRegistry] Registered built-in tool: invoke_function');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register invoke_function:', msg);
   }
 }
