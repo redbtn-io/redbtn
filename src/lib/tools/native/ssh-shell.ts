@@ -33,6 +33,7 @@ interface SshShellArgs {
   port?: number;
   user?: string;
   sshKeyPath?: string;
+  sshKey?: string;
   password?: string;
   command: string;
   workingDir?: string;
@@ -64,6 +65,10 @@ const sshShell: NativeToolDefinition = {
       sshKeyPath: {
         type: 'string',
         description: 'Path to SSH private key file on the worker machine. Supports ~ expansion.',
+      },
+      sshKey: {
+        type: 'string',
+        description: 'SSH private key content (PEM string). Use this instead of sshKeyPath when the key is stored in secrets.',
       },
       password: {
         type: 'string',
@@ -98,6 +103,7 @@ const sshShell: NativeToolDefinition = {
       port = 22,
       user = 'alpha',
       sshKeyPath,
+      sshKey,
       password,
       command,
       workingDir,
@@ -216,7 +222,11 @@ const sshShell: NativeToolDefinition = {
         keepaliveCountMax: 5,
       };
 
-      if (sshKeyPath) {
+      if (sshKey) {
+        // Key content passed directly (e.g. from secrets store)
+        connConfig.privateKey = Buffer.from(sshKey, 'utf8');
+        console.log(`[ssh_shell] Using key auth: inline key (${sshKey.length} chars)`);
+      } else if (sshKeyPath) {
         const expandedPath = sshKeyPath.replace(/^~/, os.homedir());
         try {
           connConfig.privateKey = fs.readFileSync(expandedPath);
