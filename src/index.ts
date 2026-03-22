@@ -18,6 +18,9 @@ import { createGeminiModel, createChatModel, createWorkerModel, createOpenAIMode
 import * as background from "./functions/background";
 import { respond as respondFunction } from "./functions/respond";
 import { McpRegistry } from "./lib/mcp/registry";
+import { GraphRegistry } from "./lib/graphs/GraphRegistry";
+import { NeuronRegistry } from "./lib/neurons/NeuronRegistry";
+import { createLogger } from "./lib/utils/logger";
 
 // Export database utilities for external use
 export { 
@@ -67,6 +70,10 @@ export {
   CallToolResult,
   ServerRegistration,
 } from "./lib/mcp";
+
+// Export graph execution
+export { run, isStreamingResult } from "./functions/run";
+export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } from "./functions/run";
 
 // --- Type Definitions ---
 
@@ -121,6 +128,9 @@ export class Red {
   public messageQueue!: MessageQueue;
   public logger!: PersistentLogger;
   public mcpRegistry!: McpRegistry;
+  public graphRegistry!: GraphRegistry;
+  public neuronRegistry!: NeuronRegistry;
+  public log: any;
   private redis!: any; // Redis client for heartbeat
 
   /**
@@ -149,6 +159,11 @@ export class Red {
     
     // Initialize MCP registry for tool servers (pass messageQueue for event publishing)
     this.mcpRegistry = new McpRegistry(this.messageQueue);
+
+    // Initialize graph and neuron registries for run() execution
+    this.graphRegistry = new GraphRegistry({ databaseUrl: config.databaseUrl });
+    this.neuronRegistry = new NeuronRegistry({ databaseUrl: config.databaseUrl });
+    this.log = createLogger('Red');
   }
 
   // --- Private Internal Methods ---
