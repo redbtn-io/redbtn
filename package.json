@@ -1,6 +1,6 @@
 {
   "name": "@redbtn/redbtn",
-  "version": "0.0.1-alpha",
+  "version": "0.0.2-alpha",
   "description": "Graph-based automation engine for building, running, and orchestrating dynamic workflows",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -63,10 +63,10 @@
     "zod": "^4.1.13"
   },
   "peerDependencies": {
-    "@red/stream": ">=0.1.0",
     "@redbtn/redlog": ">=0.1.0",
-    "mongoose": "^9.0.1",
-    "ioredis": "^5.8.2"
+    "@redbtn/redstream": "^0.1.2",
+    "ioredis": "^5.8.2",
+    "mongoose": "^9.0.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
