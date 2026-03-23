@@ -45,7 +45,7 @@ export { PersistentLogger } from "./lib/logs/persistent-logger";
 export { extractThinking, logThinking, extractAndLogThinking } from "./lib/utils/thinking";
 
 // Export RAG (Retrieval-Augmented Generation) components
-export { 
+export {
   VectorStoreManager,
   DocumentChunk,
   SearchResult,

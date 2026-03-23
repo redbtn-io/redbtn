@@ -127,8 +127,8 @@ export class VectorStoreManager {
    * @param embeddingModel Model name for embeddings (default: nomic-embed-text)
    */
   constructor(
-    chromaUrl: string = 'http://localhost:8024',
-    ollamaUrl: string = DEFAULT_OLLAMA_URL,
+    chromaUrl: string = process.env.CHROMA_URL || 'http://localhost:8024',
+    ollamaUrl: string = process.env.OLLAMA_URL || DEFAULT_OLLAMA_URL,
     embeddingModel: string = DEFAULT_EMBEDDING_MODEL
   ) {
     this.chromaUrl = chromaUrl;
