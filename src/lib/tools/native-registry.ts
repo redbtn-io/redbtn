@@ -201,4 +201,15 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register add_document:', msg);
   }
+
+  try {
+    // Fetch URL — HTTP requests with full REST support (GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fetchUrl = require('./native/fetch-url.js');
+    registry.register('fetch_url', fetchUrl);
+    console.log('[NativeRegistry] Registered built-in tool: fetch_url');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register fetch_url:', msg);
+  }
 }
