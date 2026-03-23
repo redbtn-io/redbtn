@@ -157,4 +157,48 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register library_write:', msg);
   }
+
+  try {
+    // Store Message — persist messages to Redis + MongoDB (ported from context-sse.ts)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const storeMessage = require('./native/store-message.js');
+    registry.register('store_message', storeMessage);
+    console.log('[NativeRegistry] Registered built-in tool: store_message');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register store_message:', msg);
+  }
+
+  try {
+    // Get Context — build formatted conversation context for LLM (ported from context-sse.ts)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getContext = require('./native/get-context.js');
+    registry.register('get_context_history', getContext);
+    console.log('[NativeRegistry] Registered built-in tool: get_context_history');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_context_history:', msg);
+  }
+
+  try {
+    // Search Documents — semantic vector search (ported from rag-sse.ts)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const searchDocuments = require('./native/search-documents.js');
+    registry.register('search_documents', searchDocuments);
+    console.log('[NativeRegistry] Registered built-in tool: search_documents');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register search_documents:', msg);
+  }
+
+  try {
+    // Add Document — chunk, embed, store in ChromaDB (ported from rag-sse.ts)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const addDocument = require('./native/add-document.js');
+    registry.register('add_document', addDocument);
+    console.log('[NativeRegistry] Registered built-in tool: add_document');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register add_document:', msg);
+  }
 }
