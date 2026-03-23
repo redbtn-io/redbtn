@@ -171,15 +171,17 @@ const libraryWrite: NativeToolDefinition = {
         // Dynamic import to avoid hard dependency
         const { VectorStoreManager } = require('../../memory/vectors');
         if (VectorStoreManager && library.vectorCollection) {
-          const vsm = new VectorStoreManager();
-          const chunks = vsm.chunkText(content, {
+          const chromaUrl = process.env.CHROMA_URL || 'http://localhost:8024';
+          const vsm = new VectorStoreManager(chromaUrl);
+          const chunks = await vsm.chunkText(content, {
             chunkSize: library.chunkSize || 2000,
             chunkOverlap: library.chunkOverlap || 200,
           });
 
           if (chunks.length > 0) {
             await vsm.addDocuments(library.vectorCollection, chunks.map((chunk: string, i: number) => ({
-              content: chunk,
+              id: `${documentId}_chunk_${i}`,
+              text: chunk,
               metadata: {
                 documentId,
                 libraryId,

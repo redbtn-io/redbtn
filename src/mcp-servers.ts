@@ -22,14 +22,7 @@ async function main() {
     console.log('[MCP Launcher] ✓ Web server started on http://localhost:3001/mcp');
 
     // System Server (port 3002)
-    const systemServer = new SystemServerSSE('system', '1.0.0', 3002, {
-      allowedCommands: [
-        'ls', 'cat', 'pwd', 'echo', 'date', 'whoami',
-        'find', 'grep', 'head', 'tail', 'wc', 'df', 'du',
-        'git', 'npm', 'node', 'python'
-      ],
-      workingDirectory: process.cwd()
-    });
+    const systemServer = new SystemServerSSE('system', '1.0.0', 3002);
     await systemServer.start();
     servers.push(systemServer);
     console.log('[MCP Launcher] ✓ System server started on http://localhost:3002/mcp');
