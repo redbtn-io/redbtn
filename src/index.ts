@@ -131,7 +131,7 @@ export class Red {
   public graphRegistry!: GraphRegistry;
   public neuronRegistry!: NeuronRegistry;
   public log: any;
-  private redis!: any; // Redis client for heartbeat
+  public redis!: any; // Redis client for heartbeat and run execution
 
   /**
    * Constructs a new instance of the Red AI engine.

@@ -1,4 +1,6 @@
 import { MongoClient, Db, Collection, ObjectId, Document, Filter, UpdateFilter, FindOptions } from 'mongodb';
+// FindOptions is not generic in MongoDB driver v7+, so we use a plain type alias
+type FindOptionsCompat = FindOptions;
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -377,7 +379,7 @@ class DatabaseManager {
   async find<T extends Document>(
     collectionName: string,
     filter: Filter<T> = {},
-    options?: FindOptions<T>
+    options?: FindOptionsCompat
   ): Promise<T[]> {
     await this.ensureConnected();
     const col = await this.collection<T>(collectionName);
