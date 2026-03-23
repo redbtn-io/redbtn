@@ -2,14 +2,15 @@
  * invoke_function — native tool for calling RedRun cloud functions
  *
  * Submits a job in async mode (?sync=false), then polls the execution
- * endpoint until it completes. Each individual HTTP request is short,
- * avoiding Cloudflare's ~100s proxy timeout while supporting long-running
- * functions (SSH+Claude can take 5+ minutes).
+ * endpoint until it completes. Also streams function logs in real-time
+ * by polling the execution logs endpoint and forwarding output chunks
+ * via RunPublisher.toolProgress().
  */
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry.js';
 
-const POLL_INTERVAL = 10_000; // 10 seconds
+const POLL_INTERVAL = 5_000; // 5 seconds (was 10s — faster for streaming)
+const LOG_POLL_INTERVAL = 2_000; // 2 seconds for log streaming
 const DEFAULT_MAX_WAIT = 900_000; // 15 minutes
 
 const definition: NativeToolDefinition = {
@@ -94,93 +95,152 @@ const definition: NativeToolDefinition = {
       await pub.toolProgress(toolId, `Job submitted: ${executionId}`, { progress: 10, data: { executionId, functionName } });
     }
 
-    // ── Step 2: Poll for completion ──
+    // ── Step 2: Poll for completion + stream logs ──
     const pollEndpoint = `${baseUrl}${pollUrl || `/api/executions/${executionId}`}`;
+    const logsEndpoint = `${baseUrl}/api/executions/${executionId}/logs`;
     const startTime = Date.now();
     let lastStatus = 'queued';
+    let lastLogIndex = 0; // Track how many logs we've already forwarded
 
-    while (Date.now() - startTime < maxWait) {
-      // Check abort signal
-      if (context.abortSignal?.aborted) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ error: 'Aborted', executionId }) }],
-          isError: true,
-        };
-      }
+    // Start log streaming in parallel with status polling
+    let logPollTimer: ReturnType<typeof setInterval> | null = null;
+    let done = false;
 
-      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-
+    const streamLogs = async () => {
       try {
-        const pollRes = await fetch(pollEndpoint, {
+        const logRes = await fetch(logsEndpoint, {
           headers,
-          signal: AbortSignal.timeout(30_000), // 30s timeout per poll request
+          signal: AbortSignal.timeout(10_000),
         });
-        if (!pollRes.ok) {
-          const errBody = await pollRes.text().catch(() => '');
-          console.warn(`[invoke_function] Poll returned ${pollRes.status}: ${errBody.substring(0, 200)}`);
-          continue;
-        }
+        if (!logRes.ok) return;
 
-        const execution = await pollRes.json() as {
-          status: string;
-          result?: unknown;
-          error?: string;
-          durationMs?: number;
+        const logData = await logRes.json() as {
+          logs?: Array<{ level: string; message: string; timestamp: string }>;
         };
 
-        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        const allLogs = logData.logs || [];
+        // Only process new logs since last check
+        const newLogs = allLogs.slice(lastLogIndex);
+        if (newLogs.length === 0) return;
 
-        if (execution.status !== lastStatus) {
-          lastStatus = execution.status;
-          console.log(`[invoke_function] ${executionId} status: ${execution.status} (${elapsed}s)`);
-        }
+        lastLogIndex = allLogs.length;
 
-        if (pub?.toolProgress && toolId) {
-          await pub.toolProgress(
-            toolId,
-            `${functionName}: ${execution.status} (${elapsed}s)`,
-            { progress: Math.min(90, 10 + (elapsed / (maxWait / 1000)) * 80), data: { executionId, status: execution.status, elapsed } },
-          );
-        }
+        for (const log of newLogs) {
+          if (pub?.toolProgress && toolId) {
+            // Check if this is an output chunk from ssh-claude
+            const isOutputChunk = log.message?.startsWith('[OUTPUT] ');
+            const message = isOutputChunk ? log.message.slice(9) : log.message;
 
-        if (execution.status === 'success' || execution.status === 'completed') {
-          console.log(`[invoke_function] ${executionId} completed in ${elapsed}s`);
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify(execution.result ?? execution),
-            }],
-          };
-        }
-
-        if (execution.status === 'failure' || execution.status === 'error' || execution.status === 'timeout') {
-          return {
-            content: [{
-              type: 'text',
-              text: JSON.stringify({
-                error: execution.error || `Function ${execution.status}`,
+            await pub.toolProgress(toolId, message, {
+              data: {
                 executionId,
-                durationMs: execution.durationMs,
-              }),
-            }],
+                functionName,
+                logLevel: log.level,
+                isOutputChunk,
+                timestamp: log.timestamp,
+              },
+            });
+          }
+        }
+      } catch {
+        // Swallow log poll errors — don't interrupt main polling
+      }
+    };
+
+    // Poll logs every LOG_POLL_INTERVAL
+    logPollTimer = setInterval(() => { if (!done) streamLogs(); }, LOG_POLL_INTERVAL);
+    // Also do an initial log fetch after a short delay
+    setTimeout(() => { if (!done) streamLogs(); }, 1000);
+
+    try {
+      while (Date.now() - startTime < maxWait) {
+        // Check abort signal
+        if (context.abortSignal?.aborted) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: 'Aborted', executionId }) }],
             isError: true,
           };
         }
 
-        // Still running — continue polling
-      } catch (pollErr) {
-        console.warn(`[invoke_function] Poll error:`, pollErr instanceof Error ? pollErr.message : pollErr);
-        // Network blip — keep trying
-      }
-    }
+        await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
 
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ error: `Timed out after ${maxWait}ms`, executionId }),
-      }],
-      isError: true,
-    };
+        try {
+          const pollRes = await fetch(pollEndpoint, {
+            headers,
+            signal: AbortSignal.timeout(30_000),
+          });
+          if (!pollRes.ok) {
+            const errBody = await pollRes.text().catch(() => '');
+            console.warn(`[invoke_function] Poll returned ${pollRes.status}: ${errBody.substring(0, 200)}`);
+            continue;
+          }
+
+          const execution = await pollRes.json() as {
+            status: string;
+            result?: unknown;
+            error?: string;
+            durationMs?: number;
+          };
+
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+
+          if (execution.status !== lastStatus) {
+            lastStatus = execution.status;
+            console.log(`[invoke_function] ${executionId} status: ${execution.status} (${elapsed}s)`);
+          }
+
+          if (pub?.toolProgress && toolId) {
+            await pub.toolProgress(
+              toolId,
+              `${functionName}: ${execution.status} (${elapsed}s)`,
+              { progress: Math.min(90, 10 + (elapsed / (maxWait / 1000)) * 80), data: { executionId, status: execution.status, elapsed } },
+            );
+          }
+
+          if (execution.status === 'success' || execution.status === 'completed') {
+            console.log(`[invoke_function] ${executionId} completed in ${elapsed}s`);
+            // Final log fetch to get any remaining output
+            await streamLogs();
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify(execution.result ?? execution),
+              }],
+            };
+          }
+
+          if (execution.status === 'failure' || execution.status === 'error' || execution.status === 'timeout') {
+            await streamLogs(); // Get final logs
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  error: execution.error || `Function ${execution.status}`,
+                  executionId,
+                  durationMs: execution.durationMs,
+                }),
+              }],
+              isError: true,
+            };
+          }
+
+          // Still running — continue polling
+        } catch (pollErr) {
+          console.warn(`[invoke_function] Poll error:`, pollErr instanceof Error ? pollErr.message : pollErr);
+        }
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ error: `Timed out after ${maxWait}ms`, executionId }),
+        }],
+        isError: true,
+      };
+    } finally {
+      done = true;
+      if (logPollTimer) clearInterval(logPollTimer);
+    }
   },
 };
 
