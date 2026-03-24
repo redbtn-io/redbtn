@@ -78,6 +78,10 @@ export { universalNodeRegistry } from "../dist/lib/registry/UniversalNodeRegistr
 export { run, isStreamingResult } from "./functions/run";
 export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } from "./functions/run";
 
+// Export run utilities (used by SSE stream endpoints)
+export { RunKeys } from "./lib/run/types";
+export { getRunState, getActiveRunForConversation } from "./lib/run/run-publisher";
+
 // --- Type Definitions ---
 
 /**
