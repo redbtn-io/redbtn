@@ -71,6 +71,9 @@ export {
   ServerRegistration,
 } from "./lib/mcp";
 
+// Export registries
+export { universalNodeRegistry } from "../dist/lib/registry/UniversalNodeRegistry";
+
 // Export graph execution
 export { run, isStreamingResult } from "./functions/run";
 export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } from "./functions/run";
