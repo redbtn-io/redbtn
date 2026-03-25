@@ -291,6 +291,16 @@ const sshShell: NativeToolDefinition = {
                 console.warn('[ssh_shell] Failed to publish stdout chunk:', msg);
               }
             }
+
+            // Parser/streaming callback
+            if (context.onChunk) {
+              try {
+                context.onChunk(chunk, 'stdout');
+              } catch (cbErr: unknown) {
+                const msg = cbErr instanceof Error ? cbErr.message : String(cbErr);
+                console.warn('[ssh_shell] onChunk callback error (stdout):', msg);
+              }
+            }
           });
 
           stream.stderr.on('data', (data: Buffer) => {
@@ -311,6 +321,16 @@ const sshShell: NativeToolDefinition = {
               } catch (pubErr: unknown) {
                 const msg = pubErr instanceof Error ? pubErr.message : String(pubErr);
                 console.warn('[ssh_shell] Failed to publish stderr chunk:', msg);
+              }
+            }
+
+            // Parser/streaming callback
+            if (context.onChunk) {
+              try {
+                context.onChunk(chunk, 'stderr');
+              } catch (cbErr: unknown) {
+                const msg = cbErr instanceof Error ? cbErr.message : String(cbErr);
+                console.warn('[ssh_shell] onChunk callback error (stderr):', msg);
               }
             }
           });

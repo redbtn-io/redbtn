@@ -12,6 +12,8 @@ import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '.
 const POLL_INTERVAL = 5_000; // 5 seconds (was 10s — faster for streaming)
 const LOG_POLL_INTERVAL = 2_000; // 2 seconds for log streaming
 const DEFAULT_MAX_WAIT = 900_000; // 15 minutes
+const SUBMIT_RETRIES = 3;
+const SUBMIT_BACKOFF = [2_000, 5_000, 10_000]; // 2s, 5s, 10s
 
 const definition: NativeToolDefinition = {
   description: 'Invoke a RedRun cloud function asynchronously. Submits the job, polls for completion, and returns the result.',
@@ -65,21 +67,48 @@ const definition: NativeToolDefinition = {
       await pub.toolProgress(toolId, `Submitting ${functionName} job...`, { progress: 5 });
     }
 
-    const submitRes = await fetch(submitUrl, {
-      method: 'POST',
-      headers,
-      body: bodyStr,
-    });
+    let submitData: { executionId: string; pollUrl: string } | null = null;
+    for (let attempt = 0; attempt <= SUBMIT_RETRIES; attempt++) {
+      try {
+        const submitRes = await fetch(submitUrl, {
+          method: 'POST',
+          headers,
+          body: bodyStr,
+          signal: AbortSignal.timeout(30_000),
+        });
 
-    if (!submitRes.ok) {
-      const errText = await submitRes.text();
+        if (submitRes.ok) {
+          submitData = await submitRes.json() as { executionId: string; pollUrl: string };
+          break;
+        }
+
+        const errText = await submitRes.text();
+        if (submitRes.status >= 400 && submitRes.status < 500) {
+          // Client error — don't retry
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: `Submit failed (${submitRes.status})`, details: errText.substring(0, 500) }) }],
+            isError: true,
+          };
+        }
+
+        // Server error — retry with backoff
+        console.warn(`[invoke_function] Submit returned ${submitRes.status}, retrying (${attempt + 1}/${SUBMIT_RETRIES}): ${errText.substring(0, 100)}`);
+      } catch (fetchErr: any) {
+        console.warn(`[invoke_function] Submit error (${attempt + 1}/${SUBMIT_RETRIES}): ${fetchErr.message}`);
+      }
+
+      if (attempt < SUBMIT_RETRIES) {
+        await new Promise(r => setTimeout(r, SUBMIT_BACKOFF[attempt] || 10_000));
+      }
+    }
+
+    if (!submitData) {
       return {
-        content: [{ type: 'text', text: JSON.stringify({ error: `Submit failed (${submitRes.status})`, details: errText.substring(0, 500) }) }],
+        content: [{ type: 'text', text: JSON.stringify({ error: `Submit failed after ${SUBMIT_RETRIES} retries` }) }],
         isError: true,
       };
     }
 
-    const submitData = await submitRes.json() as { executionId: string; pollUrl: string };
     const { executionId, pollUrl } = submitData;
 
     if (!executionId) {

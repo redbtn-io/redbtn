@@ -25,6 +25,8 @@ export interface NativeToolContext {
   toolId: string | null;
   /** AbortSignal for cancellation support */
   abortSignal: AbortSignal | null;
+  /** Callback for real-time chunk interception (used by stream parsers) */
+  onChunk?: (chunk: string, stream: 'stdout' | 'stderr') => void;
 }
 
 export interface NativeMcpResult {
@@ -211,5 +213,16 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register fetch_url:', msg);
+  }
+
+  try {
+    // Push Message — send messages to conversation streams in real-time
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pushMessage = require('./native/push-message.js');
+    registry.register('push_message', pushMessage);
+    console.log('[NativeRegistry] Registered built-in tool: push_message');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register push_message:', msg);
   }
 }

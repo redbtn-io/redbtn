@@ -272,6 +272,32 @@ export class NeuronRegistry {
     }
   }
 
+  async subscribeToInvalidations(redisUrl: string): Promise<void> {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const Redis = require('ioredis');
+      const sub = new Redis(redisUrl, { maxRetriesPerRequest: null, enableReadyCheck: false });
+      sub.on('error', (err: Error) => {
+        console.error('[NeuronRegistry] Redis sub error:', err.message);
+      });
+      await sub.subscribe('neuron:invalidate');
+      sub.on('message', (_channel: string, message: string) => {
+        // Support plain neuronId or JSON { neuronId, userId }
+        let neuronId = message;
+        try { const parsed = JSON.parse(message); neuronId = parsed.neuronId || message; } catch {}
+        for (const key of this.configCache.keys()) {
+          if (key === neuronId || key.endsWith(':' + neuronId)) {
+            this.configCache.delete(key);
+          }
+        }
+        log.info(`Cache invalidated via pub/sub for neuron: ${neuronId}`);
+      });
+      log.info('Subscribed to neuron:invalidate channel');
+    } catch (err) {
+      console.error('[NeuronRegistry] Failed to subscribe to invalidations:', err);
+    }
+  }
+
   async shutdown(): Promise<void> {
     await this.db.close();
     this.configCache.clear();

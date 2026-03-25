@@ -71,9 +71,20 @@ export {
   ServerRegistration,
 } from "./lib/mcp";
 
+// Export registries
+export { universalNodeRegistry } from "../dist/lib/registry/UniversalNodeRegistry";
+
 // Export graph execution
 export { run, isStreamingResult } from "./functions/run";
 export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } from "./functions/run";
+
+// Export run utilities (used by SSE stream endpoints)
+export { RunKeys } from "./lib/run/types";
+export { getRunState, getActiveRunForConversation } from "./lib/run/run-publisher";
+
+// Export conversation streaming
+export { ConversationPublisher, createConversationPublisher, ConversationKeys } from './lib/conversation';
+export type { ConversationEvent } from './lib/conversation';
 
 // --- Type Definitions ---
 
