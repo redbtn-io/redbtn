@@ -25,6 +25,8 @@ export interface NativeToolContext {
   toolId: string | null;
   /** AbortSignal for cancellation support */
   abortSignal: AbortSignal | null;
+  /** Callback for real-time chunk interception (used by stream parsers) */
+  onChunk?: (chunk: string, stream: 'stdout' | 'stderr') => void;
 }
 
 export interface NativeMcpResult {
