@@ -82,6 +82,10 @@ export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } fro
 export { RunKeys } from "./lib/run/types";
 export { getRunState, getActiveRunForConversation } from "./lib/run/run-publisher";
 
+// Export conversation streaming
+export { ConversationPublisher, createConversationPublisher, ConversationKeys } from './lib/conversation';
+export type { ConversationEvent } from './lib/conversation';
+
 // --- Type Definitions ---
 
 /**

@@ -212,4 +212,15 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register fetch_url:', msg);
   }
+
+  try {
+    // Push Message — send messages to conversation streams in real-time
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pushMessage = require('./native/push-message.js');
+    registry.register('push_message', pushMessage);
+    console.log('[NativeRegistry] Registered built-in tool: push_message');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register push_message:', msg);
+  }
 }
