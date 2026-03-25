@@ -77,7 +77,18 @@ export class McpClientSSE {
   async callTool(
     name: string,
     args: Record<string, unknown>,
-    meta?: { conversationId?: string; generationId?: string; messageId?: string }
+    meta?: {
+      conversationId?: string;
+      generationId?: string;
+      messageId?: string;
+      credentials?: {
+        type: string;
+        headers: Record<string, string>;
+        providerId: string;
+        connectionId: string;
+        accountInfo?: { email?: string; name?: string; externalId?: string };
+      };
+    }
   ): Promise<CallToolResult> {
     return await this.sendRequest<CallToolResult>('tools/call', {
       name,
