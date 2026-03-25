@@ -53,23 +53,46 @@ const fetchUrlTool: NativeToolDefinition = {
     publisher?.emit('log', `fetch_url ${method} ${url}`);
 
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeout);
-
       const fetchHeaders: Record<string, string> = { ...headers };
       if (body && !fetchHeaders['Content-Type'] && !fetchHeaders['content-type']) {
         fetchHeaders['Content-Type'] = 'application/json';
       }
 
-      const response = await fetch(url, {
-        method,
-        headers: fetchHeaders,
-        body: method !== 'GET' && method !== 'HEAD' ? (body || undefined) : undefined,
-        signal: controller.signal,
-        redirect: followRedirects ? 'follow' : 'manual',
-      });
+      const MAX_RETRIES = 2;
+      const BACKOFF = [2_000, 5_000];
+      let response: Response | null = null;
 
-      clearTimeout(timer);
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
+
+        try {
+          response = await fetch(url, {
+            method,
+            headers: fetchHeaders,
+            body: method !== 'GET' && method !== 'HEAD' ? (body || undefined) : undefined,
+            signal: controller.signal,
+            redirect: followRedirects ? 'follow' : 'manual',
+          });
+          clearTimeout(timer);
+
+          // Don't retry on success or client errors (4xx)
+          if (response.ok || (response.status >= 400 && response.status < 500)) break;
+
+          // Server error (5xx) — retry
+          if (attempt < MAX_RETRIES) {
+            publisher?.emit('log', `fetch_url ${method} ${url} → ${response.status}, retrying (${attempt + 1}/${MAX_RETRIES})`);
+            await new Promise(r => setTimeout(r, BACKOFF[attempt] || 5_000));
+          }
+        } catch (retryErr: any) {
+          clearTimeout(timer);
+          if (retryErr.name === 'AbortError' || attempt >= MAX_RETRIES) throw retryErr;
+          publisher?.emit('log', `fetch_url ${method} ${url} → error, retrying (${attempt + 1}/${MAX_RETRIES}): ${retryErr.message}`);
+          await new Promise(r => setTimeout(r, BACKOFF[attempt] || 5_000));
+        }
+      }
+
+      if (!response) throw new Error('No response after retries');
 
       // Collect response headers
       const responseHeaders: Record<string, string> = {};
