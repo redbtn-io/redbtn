@@ -152,9 +152,20 @@ export class McpRegistry {
    * (skips event publishing for infrastructure tools like context)
    */
   async callTool(
-    toolName: string, 
+    toolName: string,
     args: Record<string, unknown>,
-    meta?: { conversationId?: string; generationId?: string; messageId?: string }
+    meta?: {
+      conversationId?: string;
+      generationId?: string;
+      messageId?: string;
+      credentials?: {
+        type: string;
+        headers: Record<string, string>;
+        providerId: string;
+        connectionId: string;
+        accountInfo?: { email?: string; name?: string; externalId?: string };
+      };
+    }
   ): Promise<any> {
     const found = this.findTool(toolName);
     

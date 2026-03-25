@@ -386,7 +386,9 @@ async function executeStreaming(
       if (event.event === 'on_chain_end' && event.name === 'LangGraph') {
         const graphOutput = event.data?.output;
         const responseContent = graphOutput?.data?.response?.content || graphOutput?.data?.response;
-        if (responseContent && typeof responseContent === 'string' && !fullContent) {
+        // Also check if content was already streamed by the tool parser (via runPublisher.chunk)
+        const alreadyStreamed = publisher.getCachedState()?.output?.content;
+        if (responseContent && typeof responseContent === 'string' && !fullContent && !alreadyStreamed) {
           const { thinking, cleanedContent } = extractThinkingFromContent(responseContent);
           if (thinking) {
             thinkingBuffer = thinking;
@@ -409,15 +411,19 @@ async function executeStreaming(
         await publisher.chunk(char);
       }
     }
-    await publisher.complete({ content: fullContent, thinking: thinkingBuffer, data: initialState.data || {} });
+    // Use tool-parser-streamed content/thinking if local buffers are empty
+    const cachedState = publisher.getCachedState();
+    const finalContent = fullContent || cachedState?.output?.content || '';
+    const finalThinking = thinkingBuffer || cachedState?.output?.thinking || '';
+    await publisher.complete({ content: finalContent, thinking: finalThinking, data: initialState.data || {} });
     const state = await publisher.getState();
     return {
       runId,
       graphId: state?.graphId || '',
       graphName: state?.graphName || '',
       status: 'completed',
-      content: fullContent,
-      thinking: thinkingBuffer,
+      content: finalContent,
+      thinking: finalThinking,
       data: initialState.data || {},
       metadata: {
         startedAt: state?.startedAt || Date.now(),
