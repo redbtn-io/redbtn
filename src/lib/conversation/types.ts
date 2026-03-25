@@ -40,6 +40,8 @@ export interface ConversationMessageChunkEvent {
   type: 'message_chunk';
   messageId: string;
   content: string;
+  /** When true, this chunk is thinking/reasoning text (shown in collapsible bubble) */
+  thinking?: boolean;
   timestamp: number;
 }
 

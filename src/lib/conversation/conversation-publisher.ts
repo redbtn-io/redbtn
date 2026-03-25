@@ -84,11 +84,12 @@ export class ConversationPublisher {
   }
 
   /** Stream a chunk of content to an active message */
-  async streamChunk(messageId: string, content: string): Promise<void> {
+  async streamChunk(messageId: string, content: string, thinking?: boolean): Promise<void> {
     await this.publish({
       type: 'message_chunk',
       messageId,
       content,
+      thinking: thinking || false,
       timestamp: Date.now(),
     });
   }
