@@ -27,6 +27,18 @@ export interface NativeToolContext {
   abortSignal: AbortSignal | null;
   /** Callback for real-time chunk interception (used by stream parsers) */
   onChunk?: (chunk: string, stream: 'stdout' | 'stderr') => void;
+  /**
+   * Resolved connection credentials from UserConnection.
+   * Present when the tool step config specifies connectionId or providerId.
+   * Contains auth headers and raw credentials for authenticated API calls.
+   */
+  credentials?: {
+    type: 'api_key' | 'bearer' | 'basic' | 'custom';
+    headers: Record<string, string>;
+    providerId: string;
+    connectionId: string;
+    accountInfo?: { email?: string; name?: string; externalId?: string };
+  } | null;
 }
 
 export interface NativeMcpResult {
