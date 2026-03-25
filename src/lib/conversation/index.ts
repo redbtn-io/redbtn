@@ -9,4 +9,10 @@ export type {
   ConversationMessageStoredEvent,
   ConversationTypingEvent,
   ConversationStatusEvent,
+  ConversationRunStartEvent,
+  ConversationThinkingChunkEvent,
+  ConversationContentChunkEvent,
+  ConversationToolEvent,
+  ConversationRunCompleteEvent,
+  ConversationRunErrorEvent,
 } from './types';

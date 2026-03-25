@@ -104,6 +104,88 @@ export class ConversationPublisher {
     });
   }
 
+  // ── Run-aware streaming methods ──
+  // Used by RunPublisher to forward events to the conversation stream.
+
+  /** Signal a run has started in this conversation */
+  async publishRunStart(runId: string, messageId: string, graphId: string, graphName: string): Promise<void> {
+    await this.publish({
+      type: 'run_start',
+      runId,
+      messageId,
+      graphId,
+      graphName,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Stream a thinking/reasoning chunk from a run */
+  async streamThinking(runId: string, messageId: string, content: string): Promise<void> {
+    await this.publish({
+      type: 'thinking_chunk',
+      runId,
+      messageId,
+      content,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Stream a content chunk from a run */
+  async streamContent(runId: string, messageId: string, content: string): Promise<void> {
+    await this.publish({
+      type: 'content_chunk',
+      runId,
+      messageId,
+      content,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Publish a tool event from a run */
+  async publishToolEvent(runId: string, event: {
+    type: 'tool_start' | 'tool_progress' | 'tool_complete' | 'tool_error';
+    toolId: string;
+    toolName: string;
+    toolType: string;
+    input?: unknown;
+    step?: string;
+    progress?: number;
+    data?: Record<string, unknown>;
+    result?: unknown;
+    metadata?: Record<string, unknown>;
+    error?: string;
+    timestamp: number;
+  }): Promise<void> {
+    await this.publish({
+      type: 'tool_event',
+      runId,
+      event,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Signal a run has completed in this conversation */
+  async publishRunComplete(runId: string, messageId: string, finalContent?: string): Promise<void> {
+    await this.publish({
+      type: 'run_complete',
+      runId,
+      messageId,
+      finalContent,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Signal a run has failed in this conversation */
+  async publishRunError(runId: string, messageId: string, error: string): Promise<void> {
+    await this.publish({
+      type: 'run_error',
+      runId,
+      messageId,
+      error,
+      timestamp: Date.now(),
+    });
+  }
+
   /** Show/hide typing indicator */
   async setTyping(isTyping: boolean, sourceRunId?: string): Promise<void> {
     await this.publish({

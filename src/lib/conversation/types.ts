@@ -72,6 +72,71 @@ export interface ConversationStatusEvent {
   timestamp: number;
 }
 
+// ── Run-aware conversation events ──
+// These are published by RunPublisher when a run has a conversationId.
+// They allow the chat UI to group thinking/tools/content into unified run bubbles.
+
+export interface ConversationRunStartEvent {
+  type: 'run_start';
+  runId: string;
+  messageId: string;
+  graphId: string;
+  graphName: string;
+  timestamp: number;
+}
+
+export interface ConversationThinkingChunkEvent {
+  type: 'thinking_chunk';
+  runId: string;
+  messageId: string;
+  content: string;
+  timestamp: number;
+}
+
+export interface ConversationContentChunkEvent {
+  type: 'content_chunk';
+  runId: string;
+  messageId: string;
+  content: string;
+  timestamp: number;
+}
+
+export interface ConversationToolEvent {
+  type: 'tool_event';
+  runId: string;
+  event: {
+    type: 'tool_start' | 'tool_progress' | 'tool_complete' | 'tool_error';
+    toolId: string;
+    toolName: string;
+    toolType: string;
+    input?: unknown;
+    step?: string;
+    progress?: number;
+    data?: Record<string, unknown>;
+    result?: unknown;
+    metadata?: Record<string, unknown>;
+    error?: string;
+    timestamp: number;
+  };
+  timestamp: number;
+}
+
+export interface ConversationRunCompleteEvent {
+  type: 'run_complete';
+  runId: string;
+  messageId: string;
+  finalContent?: string;
+  timestamp: number;
+}
+
+export interface ConversationRunErrorEvent {
+  type: 'run_error';
+  runId: string;
+  messageId: string;
+  error: string;
+  timestamp: number;
+}
+
 export type ConversationEvent =
   | ConversationMessageEvent
   | ConversationMessageStartEvent
@@ -79,4 +144,10 @@ export type ConversationEvent =
   | ConversationMessageCompleteEvent
   | ConversationMessageStoredEvent
   | ConversationTypingEvent
-  | ConversationStatusEvent;
+  | ConversationStatusEvent
+  | ConversationRunStartEvent
+  | ConversationThinkingChunkEvent
+  | ConversationContentChunkEvent
+  | ConversationToolEvent
+  | ConversationRunCompleteEvent
+  | ConversationRunErrorEvent;

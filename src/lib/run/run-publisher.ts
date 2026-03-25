@@ -27,6 +27,7 @@ import {
   createToolExecution,
 } from './types';
 import type { RedLog } from '@redbtn/redlog';
+import { ConversationPublisher, createConversationPublisher } from '../conversation';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -70,6 +71,10 @@ export class RunPublisher {
   private readonly redlog?: RedLog;
   private state: RunState | null = null;
   private initialized = false;
+  /** ConversationPublisher for forwarding events to the chat UI */
+  private convPublisher: ConversationPublisher | null = null;
+  /** Message ID used for conversation stream (stable across run lifetime) */
+  private convMessageId: string | null = null;
 
   constructor(options: RunPublisherOptions) {
     this.redis = options.redis;
@@ -145,6 +150,20 @@ export class RunPublisher {
     await this.saveState();
     if (conversationId) {
       await this.redis.set(RunKeys.conversationRun(conversationId), this.runId, 'EX', this.stateTtl);
+      // Create ConversationPublisher for forwarding events to the chat UI
+      try {
+        this.convPublisher = createConversationPublisher({
+          redis: this.redis,
+          conversationId,
+          userId: this.userId,
+        });
+        this.convMessageId = `msg_run_${this.runId}`;
+        await this.convPublisher.publishRunStart(this.runId, this.convMessageId, graphId, graphName);
+        if (DEBUG) console.log(`[RunPublisher] Conversation forwarding enabled for ${conversationId}`);
+      } catch (err) {
+        console.warn('[RunPublisher] Failed to create conversation publisher:', err);
+        this.convPublisher = null;
+      }
     }
     await this.publish({
       type: 'run_start',
@@ -174,6 +193,18 @@ export class RunPublisher {
     if (this.state!.conversationId) {
       await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
     }
+    // Forward to conversation stream
+    if (this.convPublisher && this.convMessageId) {
+      try {
+        await this.convPublisher.publishRunComplete(
+          this.runId,
+          this.convMessageId,
+          this.state!.output.content || undefined,
+        );
+      } catch (err) {
+        if (DEBUG) console.warn('[RunPublisher] Conv forward run_complete failed:', err);
+      }
+    }
     await this.publish({
       type: 'run_complete',
       metadata: this.state!.metadata,
@@ -200,6 +231,14 @@ export class RunPublisher {
     await this.saveState();
     if (this.state!.conversationId) {
       await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
+    }
+    // Forward to conversation stream
+    if (this.convPublisher && this.convMessageId) {
+      try {
+        await this.convPublisher.publishRunError(this.runId, this.convMessageId, error);
+      } catch (err) {
+        if (DEBUG) console.warn('[RunPublisher] Conv forward run_error failed:', err);
+      }
     }
     await this.publish({ type: 'run_error', error, timestamp: Date.now() });
     await this.persistLog({
@@ -376,12 +415,24 @@ export class RunPublisher {
     this.ensureInitialized();
     this.state!.output.content += content;
     await this.publish({ type: 'chunk', content, timestamp: Date.now() });
+    // Forward to conversation stream
+    if (this.convPublisher && this.convMessageId) {
+      this.convPublisher.streamContent(this.runId, this.convMessageId, content).catch((err) => {
+        if (DEBUG) console.warn('[RunPublisher] Conv forward content_chunk failed:', err);
+      });
+    }
   }
 
   async thinkingChunk(content: string): Promise<void> {
     this.ensureInitialized();
     this.state!.output.thinking += content;
     await this.publish({ type: 'chunk', content, thinking: true, timestamp: Date.now() });
+    // Forward to conversation stream
+    if (this.convPublisher && this.convMessageId) {
+      this.convPublisher.streamThinking(this.runId, this.convMessageId, content).catch((err) => {
+        if (DEBUG) console.warn('[RunPublisher] Conv forward thinking_chunk failed:', err);
+      });
+    }
   }
 
   async thinkingComplete(): Promise<void> {
@@ -404,7 +455,14 @@ export class RunPublisher {
     const tool = createToolExecution({ toolId, toolName, toolType });
     this.state!.tools.push(tool);
     await this.saveState();
-    await this.publish({ type: 'tool_start', toolId, toolName, toolType, input: options?.input, timestamp: Date.now() });
+    const ts = Date.now();
+    await this.publish({ type: 'tool_start', toolId, toolName, toolType, input: options?.input, timestamp: ts });
+    // Forward to conversation stream
+    if (this.convPublisher) {
+      this.convPublisher.publishToolEvent(this.runId, {
+        type: 'tool_start', toolId, toolName, toolType, input: options?.input, timestamp: ts,
+      }).catch(() => {});
+    }
     await this.persistLog({
       level: 'info',
       category: 'tool',
@@ -424,7 +482,15 @@ export class RunPublisher {
       tool.steps.push({ name: step, timestamp: Date.now(), progress: options?.progress, data: options?.data });
     }
     await this.saveState();
-    await this.publish({ type: 'tool_progress', toolId, step, progress: options?.progress, data: options?.data, timestamp: Date.now() });
+    const ts = Date.now();
+    await this.publish({ type: 'tool_progress', toolId, step, progress: options?.progress, data: options?.data, timestamp: ts });
+    // Forward to conversation stream
+    if (this.convPublisher) {
+      this.convPublisher.publishToolEvent(this.runId, {
+        type: 'tool_progress', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
+        step, progress: options?.progress, data: options?.data, timestamp: ts,
+      }).catch(() => {});
+    }
     await this.persistLog({
       level: 'info',
       category: 'tool',
@@ -443,7 +509,15 @@ export class RunPublisher {
       tool.result = result;
     }
     await this.saveState();
-    await this.publish({ type: 'tool_complete', toolId, result, metadata, timestamp: Date.now() });
+    const ts = Date.now();
+    await this.publish({ type: 'tool_complete', toolId, result, metadata, timestamp: ts });
+    // Forward to conversation stream
+    if (this.convPublisher) {
+      this.convPublisher.publishToolEvent(this.runId, {
+        type: 'tool_complete', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
+        result, metadata, timestamp: ts,
+      }).catch(() => {});
+    }
     await this.persistLog({
       level: 'info',
       category: 'tool',
@@ -461,7 +535,15 @@ export class RunPublisher {
       tool.error = error;
     }
     await this.saveState();
-    await this.publish({ type: 'tool_error', toolId, error, timestamp: Date.now() });
+    const ts = Date.now();
+    await this.publish({ type: 'tool_error', toolId, error, timestamp: ts });
+    // Forward to conversation stream
+    if (this.convPublisher) {
+      this.convPublisher.publishToolEvent(this.runId, {
+        type: 'tool_error', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
+        error, timestamp: ts,
+      }).catch(() => {});
+    }
     await this.persistLog({
       level: 'error',
       category: 'tool',
