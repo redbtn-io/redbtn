@@ -12,6 +12,7 @@ import type { TransformStepConfig } from './types';
 import type { ConditionalStepConfig } from './types';
 import type { LoopStepConfig } from './types';
 import type { ConnectionStepConfig } from './types';
+import { resolveValue } from './templateRenderer';
 
 // These imports resolve from the dist/ directory at runtime — they are
 // hand-maintained modules that have no source counterpart in src/.
@@ -102,17 +103,13 @@ export async function executeStep(step: UniversalStep, state: any): Promise<Part
 }
 
 function evaluateStepCondition(condition: string, state: any): boolean {
-    const trimmed = condition.trim();
-    if (trimmed.startsWith('{{') && trimmed.endsWith('}}')) {
-        const expression = trimmed.slice(2, -2).trim();
-        try {
-            const evalFunc = new Function('state', `return ${expression}`);
-            return Boolean(evalFunc(state));
-        } catch (error) {
-            console.error('[StepExecutor] Failed to evaluate condition:', expression, error);
-            return false;
-        }
+    try {
+        // resolveValue handles {{...}} pure expressions with type preservation,
+        // mixed strings via renderTemplate, and plain strings as-is.
+        const result = resolveValue(condition, state);
+        return Boolean(result);
+    } catch (error) {
+        console.error('[StepExecutor] Failed to evaluate condition:', condition, error);
+        return false;
     }
-    // If not a JS expression, assume false for safety (or implement simple comparison if needed)
-    return false;
 }

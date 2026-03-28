@@ -4,7 +4,7 @@
  * Executes data transformations on arrays and objects.
  * Supports map, filter, and select operations with template rendering.
  */
-import { renderTemplate } from '../templateRenderer';
+import { renderTemplate, resolveValue } from '../templateRenderer';
 import { extractJSON } from '../../../utils/json-extractor';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { getGlobalStateClient } = require('../../../globalState') as { getGlobalStateClient: (opts?: any) => any };
@@ -370,38 +370,19 @@ function executeSetOperation(config: TransformStepConfig, state: any): any {
     if (config.value === undefined) {
         throw new Error('Set operation requires value expression');
     }
-    // If value is a boolean, number, or null, return it directly without string conversion
-    if (typeof config.value === 'boolean' || typeof config.value === 'number' || config.value === null) {
-        if (DEBUG)
-            console.log('[SetOperation] Returning primitive value:', config.value);
-        return config.value;
-    }
-    const valueStr = String(config.value);
     if (DEBUG)
-        console.log('[SetOperation] Processing value:', valueStr);
-    // If it's a template expression, evaluate it as JavaScript
-    if (valueStr.startsWith('{{') && valueStr.endsWith('}}')) {
-        const expression = valueStr.slice(2, -2).trim(); // Remove '{{' and '}}', trim to avoid ASI after 'return'
+        console.log('[SetOperation] Processing value:', config.value);
+    // Delegate entirely to resolveValue — it handles primitives, pure expressions,
+    // and mixed strings with type preservation.
+    try {
+        const result = resolveValue(config.value, state);
         if (DEBUG)
-            console.log('[SetOperation] Evaluating expression:', expression);
-        try {
-            // Create a function that evaluates the expression with state in scope
-            // The expression can be simple property access or complex JavaScript
-            // Note: .trim() above prevents ASI from inserting semicolon after 'return\n'
-            const evalFunc = new Function('state', `return (${expression})`);
-            const result = evalFunc(state);
-            if (DEBUG)
-                console.log('[SetOperation] Evaluation result:', typeof result);
-            return result;
-        } catch (error) {
-            console.error('[SetOperation] Evaluation failed:', error);
-            throw new Error(`Failed to evaluate expression: ${expression} - ${error instanceof Error ? error.message : String(error)}`);
-        }
+            console.log('[SetOperation] Result type:', typeof result);
+        return result;
+    } catch (error) {
+        console.error('[SetOperation] Evaluation failed:', error);
+        throw new Error(`Failed to evaluate set value: ${config.value} - ${error instanceof Error ? error.message : String(error)}`);
     }
-    // Otherwise try template rendering for simple substitutions
-    if (DEBUG)
-        console.log('[SetOperation] Using template rendering');
-    return renderTemplate(valueStr, state);
 }
 
 /**
@@ -645,15 +626,13 @@ async function executeSetGlobalOperation(config: TransformStepConfig, inputData:
     if (!config.key) {
         throw new Error('set-global operation requires key');
     }
-    // Render templates in namespace and key
-    const namespace = typeof config.namespace === 'string' ? renderTemplate(config.namespace, state) : config.namespace;
-    const key = typeof config.key === 'string' ? renderTemplate(config.key, state) : config.key;
-    // Get value from inputData, config.value, or render as template
+    // Resolve templates in namespace and key (type-preserving)
+    const namespace = resolveValue(config.namespace, state);
+    const key = resolveValue(config.key, state);
+    // Get value from inputData, config.value, or resolve as template (type-preserving)
     let valueToSet: any = inputData;
     if (valueToSet === undefined && config.value !== undefined) {
-        valueToSet = typeof config.value === 'string'
-            ? renderTemplate(config.value, state)
-            : config.value;
+        valueToSet = resolveValue(config.value, state);
     }
     if (valueToSet === undefined) {
         console.warn(`[SetGlobalOperation] No value to set for ${namespace}.${key}`);
@@ -701,9 +680,9 @@ async function executeGetGlobalOperation(config: TransformStepConfig, state: any
     if (!config.key) {
         throw new Error('get-global operation requires key');
     }
-    // Render templates in namespace and key
-    const namespace = typeof config.namespace === 'string' ? renderTemplate(config.namespace, state) : config.namespace;
-    const key = typeof config.key === 'string' ? renderTemplate(config.key, state) : config.key;
+    // Resolve templates in namespace and key (type-preserving)
+    const namespace = resolveValue(config.namespace, state);
+    const key = resolveValue(config.key, state);
     const client = getGlobalStateClient({
         userId: state.data?.userId || state.userId,
         workflowId: state.data?.graphId || state.graphId,
@@ -732,15 +711,8 @@ function executeIncrementOperation(config: TransformStepConfig, inputData: any, 
     // Get the amount to increment by (default 1)
     let incrementBy = 1;
     if (config.value !== undefined) {
-        if (typeof config.value === 'number') {
-            incrementBy = config.value;
-        } else if (typeof config.value === 'string') {
-            // Try to parse or render template
-            const rendered = config.value.includes('{{')
-                ? renderTemplate(config.value, state)
-                : config.value;
-            incrementBy = Number(rendered) || 1;
-        }
+        const resolved = resolveValue(config.value, state);
+        incrementBy = Number(resolved) || 1;
     }
     // Get current value (default 0)
     const currentValue = typeof inputData === 'number' ? inputData : 0;
@@ -766,15 +738,8 @@ function executeDecrementOperation(config: TransformStepConfig, inputData: any, 
     // Get the amount to decrement by (default 1)
     let decrementBy = 1;
     if (config.value !== undefined) {
-        if (typeof config.value === 'number') {
-            decrementBy = config.value;
-        } else if (typeof config.value === 'string') {
-            // Try to parse or render template
-            const rendered = config.value.includes('{{')
-                ? renderTemplate(config.value, state)
-                : config.value;
-            decrementBy = Number(rendered) || 1;
-        }
+        const resolved = resolveValue(config.value, state);
+        decrementBy = Number(resolved) || 1;
     }
     // Get current value (default 0)
     const currentValue = typeof inputData === 'number' ? inputData : 0;
