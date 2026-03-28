@@ -64,8 +64,31 @@ export function compileGraphFromConfig(config: GraphConfig): CompiledGraph {
   // Step 2: Create StateGraph builder with RedGraphState annotations
   const builder = new StateGraph(RedGraphState);
 
-  // Step 3: Add all nodes to the graph
+  // Step 2.5: Detect nodes that will be wrapped into subgraph chains
+  // These nodes should NOT be added to the main builder (they'll be in subgraphs)
+  const subgraphNodes = new Set<string>();
+  const joinEdge = config.edges.find(e => e.join);
+  const joinTargets = new Set<string>(joinEdge?.join || []);
+  for (const edge of config.edges) {
+    if (edge.parallel) {
+      for (const target of edge.parallel) {
+        const chain = traceChain(target, config.edges, joinTargets);
+        if (chain.length > 1) {
+          // All nodes in this chain will be in a subgraph, skip them in main builder
+          for (const nodeId of chain) {
+            subgraphNodes.add(nodeId);
+          }
+        }
+      }
+    }
+  }
+
+  // Step 3: Add all nodes to the graph (except those going into subgraphs)
   for (const node of config.nodes) {
+    if (subgraphNodes.has(node.id)) {
+      console.log(`[GraphCompiler]   Skipping node: ${node.id} (will be in subgraph chain)`);
+      continue;
+    }
     console.log(`[GraphCompiler]   Adding node: ${node.id} (nodeId: ${node.config?.nodeId || node.id})`);
     const wrappedFn = createConfigurableNode(node.id, (node.config as Record<string, unknown>) || {});
     builder.addNode(node.id, wrappedFn);
@@ -79,7 +102,19 @@ export function compileGraphFromConfig(config: GraphConfig): CompiledGraph {
   }
 
   // Step 4: Add all edges (simple, conditional, parallel fan-out, and join fan-in)
+  // Skip edges that connect nodes within subgraph chains (those are handled internally)
   for (const edge of config.edges) {
+    // Skip edges between subgraph nodes (they're wired inside the subgraph)
+    if (edge.from && edge.to && subgraphNodes.has(edge.from) && subgraphNodes.has(edge.to)) {
+      console.log(`[GraphCompiler]   Skipping edge: ${edge.from} → ${edge.to} (internal to subgraph chain)`);
+      continue;
+    }
+    // Skip edges FROM subgraph nodes that aren't the chain entry (handled by subgraph)
+    if (edge.from && subgraphNodes.has(edge.from) && !edge.parallel) {
+      console.log(`[GraphCompiler]   Skipping edge from subgraph node: ${edge.from} → ${edge.to}`);
+      continue;
+    }
+
     if (edge.join) {
       // Fan-in: wait for all listed sources before proceeding
       addJoinEdge(builder, edge);
@@ -260,18 +295,118 @@ function validateGraphConfig(config: GraphConfig): void {
 }
 
 /**
+ * Detect sequential chains within parallel branches.
+ *
+ * When a parallel target has sequential edges (A → B → C) before the join,
+ * those nodes form a chain that must execute within a single LangGraph superstep.
+ * This function traces the chain from a starting node following simple edges
+ * until it reaches a node that has no outgoing simple edge or reaches a join target.
+ *
+ * @returns Array of node IDs in the chain (including the start node)
+ */
+function traceChain(startNodeId: string, edges: GraphEdgeConfig[], joinTargets: Set<string>): string[] {
+  const chain: string[] = [startNodeId];
+  let current = startNodeId;
+
+  while (true) {
+    // Find a simple edge from current (not parallel, not conditional, not join)
+    const nextEdge = edges.find(e =>
+      e.from === current && e.to && !e.parallel && !e.condition && !e.targets && !e.join
+    );
+    if (!nextEdge || !nextEdge.to) break;
+
+    const next = nextEdge.to;
+    // Stop if we've reached __end__ or a join target (the join handles this node)
+    if (next === '__end__' || next === END) break;
+    // Don't follow into the join target itself
+    if (joinTargets.has(next)) break;
+
+    chain.push(next);
+    current = next;
+  }
+
+  return chain;
+}
+
+/**
  * Adds a parallel fan-out edge to the graph builder.
  * Fires all listed target nodes concurrently using LangGraph's conditional edge
- * with an array return value (NamedBarrierValue send pattern).
+ * with an array return value.
+ *
+ * When a parallel target has sequential successors (e.g., scanner → analyst),
+ * the chain is automatically wrapped as a compiled subgraph so LangGraph treats
+ * it as a single node in the superstep. This prevents the superstep-blocking
+ * deadlock where a long-running parallel node (e.g., a typing loop) prevents
+ * the next superstep from starting.
  */
-function addFanOutEdge(builder: any, edge: GraphEdgeConfig, _config: GraphConfig): void {
+function addFanOutEdge(builder: any, edge: GraphEdgeConfig, config: GraphConfig): void {
   const targets = edge.parallel!;
-  console.log(`[GraphCompiler]   Adding parallel fan-out: ${edge.from} → [${targets.join(', ')}]`);
 
-  // Use addConditionalEdges with array return for parallel execution.
-  // LangGraph treats an array return as "run all these nodes in the same superstep".
+  // Find the join edge that corresponds to this fan-out
+  const joinEdge = config.edges.find(e => e.join);
+  const joinTargets = new Set<string>(joinEdge?.join || []);
+
+  // For each parallel target, detect if it has a sequential chain
+  const actualTargets: string[] = [];
+  const chainsWrapped: string[] = [];
+
+  for (const target of targets) {
+    const chain = traceChain(target, config.edges, joinTargets);
+
+    if (chain.length === 1) {
+      // Single node — use as-is
+      actualTargets.push(target);
+    } else {
+      // Multi-node chain — wrap as subgraph
+      const chainId = `__chain_${target}`;
+      console.log(`[GraphCompiler]   Wrapping chain as subgraph: ${chainId} = [${chain.join(' → ')}]`);
+
+      // Build a subgraph for this chain
+      const subBuilder = new StateGraph(RedGraphState);
+      for (const nodeId of chain) {
+        const nodeConfig = config.nodes.find(n => n.id === nodeId);
+        if (nodeConfig) {
+          const wrappedFn = createConfigurableNode(nodeId, (nodeConfig.config as Record<string, unknown>) || {});
+          subBuilder.addNode(nodeId, wrappedFn);
+        }
+      }
+
+      // Add sequential edges within the subgraph
+      (subBuilder as any).addEdge('__start__', chain[0]);
+      for (let i = 0; i < chain.length - 1; i++) {
+        (subBuilder as any).addEdge(chain[i], chain[i + 1]);
+      }
+      (subBuilder as any).addEdge(chain[chain.length - 1], '__end__');
+
+      const subgraph = subBuilder.compile();
+
+      // Replace the chain's first node with the subgraph in the main builder
+      // Remove the original nodes from the main builder (they're in the subgraph now)
+      // We need to add the subgraph as a new node
+      builder.addNode(chainId, subgraph);
+      actualTargets.push(chainId);
+      chainsWrapped.push(chainId);
+
+      // Update the join edge to reference the chain wrapper instead of the last node in the chain
+      if (joinEdge?.join) {
+        const lastInChain = chain[chain.length - 1];
+        const joinIdx = joinEdge.join.indexOf(lastInChain);
+        if (joinIdx !== -1) {
+          joinEdge.join[joinIdx] = chainId;
+        }
+        // Also check if the first node was in the join
+        const firstIdx = joinEdge.join.indexOf(chain[0]);
+        if (firstIdx !== -1 && firstIdx !== joinIdx) {
+          joinEdge.join[firstIdx] = chainId;
+        }
+      }
+    }
+  }
+
+  console.log(`[GraphCompiler]   Adding parallel fan-out: ${edge.from} → [${actualTargets.join(', ')}]${chainsWrapped.length > 0 ? ` (${chainsWrapped.length} chain(s) wrapped)` : ''}`);
+
   const targetMap: Record<string, string> = {};
-  for (const nodeId of targets) {
+  for (const nodeId of actualTargets) {
     targetMap[nodeId] = nodeId;
   }
   targetMap['error_handler'] = 'error_handler';
@@ -280,7 +415,7 @@ function addFanOutEdge(builder: any, edge: GraphEdgeConfig, _config: GraphConfig
     if (state.data?.nextGraph === 'error_handler') {
       return 'error_handler';
     }
-    return targets;
+    return actualTargets;
   }, targetMap);
 }
 
