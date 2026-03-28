@@ -6,7 +6,7 @@
  * All nodes run through universalNode — config is loaded from MongoDB by nodeId.
  */
 
-import { StateGraph, END } from '@langchain/langgraph';
+import { StateGraph, END, Send } from '@langchain/langgraph';
 import { GraphConfig, GraphEdgeConfig, CompiledGraph } from '../types/graph';
 
 // These imports resolve from the dist/ directory at runtime — they are
@@ -268,20 +268,13 @@ function addFanOutEdge(builder: any, edge: GraphEdgeConfig, _config: GraphConfig
   const targets = edge.parallel!;
   console.log(`[GraphCompiler]   Adding parallel fan-out: ${edge.from} → [${targets.join(', ')}]`);
 
-  // Build pathMap — each target maps to itself, plus error handler
-  const targetMap: Record<string, string> = {};
-  for (const nodeId of targets) {
-    targetMap[nodeId] = nodeId;
-  }
-  targetMap['error_handler'] = 'error_handler';
-
   builder.addConditionalEdges(edge.from, (state: any) => {
     if (state.data?.nextGraph === 'error_handler') {
-      return 'error_handler';
+      return new Send('error_handler', state);
     }
-    // Return array — LangGraph fires all targets in parallel
-    return targets;
-  }, targetMap);
+    // Return Send objects for true parallel execution
+    return targets.map((nodeId: string) => new Send(nodeId, state));
+  });
 }
 
 /**
