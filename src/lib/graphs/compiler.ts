@@ -316,12 +316,12 @@ function traceChain(startNodeId: string, edges: GraphEdgeConfig[], joinTargets: 
     if (!nextEdge || !nextEdge.to) break;
 
     const next = nextEdge.to;
-    // Stop if we've reached __end__ or a join target (the join handles this node)
+    // Stop if we've reached __end__
     if (next === '__end__' || next === END) break;
-    // Don't follow into the join target itself
-    if (joinTargets.has(next)) break;
 
     chain.push(next);
+    // Stop after adding a join target — it's the last node in this chain
+    if (joinTargets.has(next)) break;
     current = next;
   }
 
