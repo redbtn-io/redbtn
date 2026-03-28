@@ -645,6 +645,9 @@ async function executeSetGlobalOperation(config: TransformStepConfig, inputData:
     if (!config.key) {
         throw new Error('set-global operation requires key');
     }
+    // Render templates in namespace and key
+    const namespace = typeof config.namespace === 'string' ? renderTemplate(config.namespace, state) : config.namespace;
+    const key = typeof config.key === 'string' ? renderTemplate(config.key, state) : config.key;
     // Get value from inputData, config.value, or render as template
     let valueToSet: any = inputData;
     if (valueToSet === undefined && config.value !== undefined) {
@@ -653,23 +656,23 @@ async function executeSetGlobalOperation(config: TransformStepConfig, inputData:
             : config.value;
     }
     if (valueToSet === undefined) {
-        console.warn(`[SetGlobalOperation] No value to set for ${config.namespace}.${config.key}`);
+        console.warn(`[SetGlobalOperation] No value to set for ${namespace}.${key}`);
         return { _globalStateSet: false };
     }
     const client = getGlobalStateClient({
         userId: state.data?.userId || state.userId,
         workflowId: state.data?.graphId || state.graphId,
     });
-    const success = await client.setValue(config.namespace, config.key, valueToSet, {
+    const success = await client.setValue(namespace, key, valueToSet, {
         description: config.description,
         ttlSeconds: config.ttlSeconds,
     });
     if (DEBUG)
-        console.log(`[SetGlobalOperation] Set ${config.namespace}.${config.key}`);
+        console.log(`[SetGlobalOperation] Set ${namespace}.${key}`);
     // Return metadata about the operation
     return {
         _globalStateSet: success,
-        _globalStateKey: `${config.namespace}.${config.key}`,
+        _globalStateKey: `${namespace}.${key}`,
     };
 }
 
@@ -698,13 +701,16 @@ async function executeGetGlobalOperation(config: TransformStepConfig, state: any
     if (!config.key) {
         throw new Error('get-global operation requires key');
     }
+    // Render templates in namespace and key
+    const namespace = typeof config.namespace === 'string' ? renderTemplate(config.namespace, state) : config.namespace;
+    const key = typeof config.key === 'string' ? renderTemplate(config.key, state) : config.key;
     const client = getGlobalStateClient({
         userId: state.data?.userId || state.userId,
         workflowId: state.data?.graphId || state.graphId,
     });
-    const value = await client.getValue(config.namespace, config.key);
+    const value = await client.getValue(namespace, key);
     if (DEBUG)
-        console.log(`[GetGlobalOperation] Got ${config.namespace}.${config.key}`);
+        console.log(`[GetGlobalOperation] Got ${namespace}.${key}`);
     // Return the value to be stored in outputField
     return value;
 }
