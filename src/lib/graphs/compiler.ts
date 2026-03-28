@@ -268,13 +268,20 @@ function addFanOutEdge(builder: any, edge: GraphEdgeConfig, _config: GraphConfig
   const targets = edge.parallel!;
   console.log(`[GraphCompiler]   Adding parallel fan-out: ${edge.from} → [${targets.join(', ')}]`);
 
+  // Use addConditionalEdges with array return for parallel execution.
+  // LangGraph treats an array return as "run all these nodes in the same superstep".
+  const targetMap: Record<string, string> = {};
+  for (const nodeId of targets) {
+    targetMap[nodeId] = nodeId;
+  }
+  targetMap['error_handler'] = 'error_handler';
+
   builder.addConditionalEdges(edge.from, (state: any) => {
     if (state.data?.nextGraph === 'error_handler') {
-      return new Send('error_handler', state);
+      return 'error_handler';
     }
-    // Return Send objects for true parallel execution
-    return targets.map((nodeId: string) => new Send(nodeId, state));
-  });
+    return targets;
+  }, targetMap);
 }
 
 /**
