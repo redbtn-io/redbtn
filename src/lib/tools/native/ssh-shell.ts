@@ -180,6 +180,7 @@ const sshShell: NativeToolDefinition = {
 
         const success = exitCode === 0;
         console.log(`[ssh_shell] Completed in ${duration}ms. exitCode=${exitCode}, stdout=${stdout.length}B, stderr=${stderr.length}B`);
+        if (stderr.length > 0) console.log(`[ssh_shell] stderr: ${stderr.substring(0, 500)}`);
 
         resolve({
           content: [{
