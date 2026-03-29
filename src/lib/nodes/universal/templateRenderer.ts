@@ -130,7 +130,6 @@ export function renderParameters(parameters: Record<string, any>, state: any): R
         } else {
             // Use resolveValue for everything — handles primitives, templates, IIFEs, mixed strings
             const resolved = resolveValue(value, state);
-            }
             rendered[key] = resolved;
         }
     }
