@@ -150,6 +150,11 @@ const sshShell: NativeToolDefinition = {
           timeoutTimer = null;
         }
 
+        if (statusInterval) {
+          clearInterval(statusInterval);
+          statusInterval = null;
+        }
+
         try { conn.end(); } catch (_) { /* ignore */ }
 
         const duration = Date.now() - startTime;
@@ -242,6 +247,9 @@ const sshShell: NativeToolDefinition = {
         console.warn('[ssh_shell] No auth method provided — connection may fail');
       }
 
+      // Periodic status publisher — keeps client informed during long SSH runs
+      let statusInterval: NodeJS.Timeout | null = null;
+
       conn.on('ready', () => {
         console.log(`[ssh_shell] SSH connection established to ${user}@${host}:${port}`);
 
@@ -262,6 +270,23 @@ const sshShell: NativeToolDefinition = {
             const msg = pubErr instanceof Error ? pubErr.message : String(pubErr);
             console.warn('[ssh_shell] Failed to publish tool_start:', msg);
           }
+
+          // Publish periodic status updates every 15 seconds so the UI shows activity
+          statusInterval = setInterval(() => {
+            if (settled) {
+              if (statusInterval) clearInterval(statusInterval);
+              return;
+            }
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            try {
+              (publisher as AnyObject).publish({
+                type: 'status',
+                action: 'running_command',
+                description: `SSH command running (${elapsed}s, ${stdout.length + stderr.length} bytes)`,
+                timestamp: Date.now(),
+              });
+            } catch (_) { /* ignore */ }
+          }, 15000);
         }
 
         conn.exec(fullCommand, { pty: false }, (err, stream) => {

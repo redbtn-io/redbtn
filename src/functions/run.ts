@@ -351,6 +351,7 @@ async function executeStreaming(
   let thinkingBuffer = '';
   let inThinkingTag = false;
   let pendingBuffer = '';
+  let graphOutputData: Record<string, unknown> | null = null;
   try {
     const streamConfig = { version: 'v1' as const, configurable: { thread_id: runId } };
     const stream = compiledGraph.graph.streamEvents(initialState, streamConfig);
@@ -385,7 +386,20 @@ async function executeStreaming(
       }
       if (event.event === 'on_chain_end' && event.name === 'LangGraph') {
         const graphOutput = event.data?.output;
-        const responseContent = graphOutput?.data?.response?.content || graphOutput?.data?.response;
+        // Capture graph output data for the final result
+        if (graphOutput?.data) {
+          graphOutputData = graphOutput.data;
+        }
+
+        // Try multiple response content locations used by different graph types:
+        // - data.response (standard graphs with responder node)
+        // - data.response.content (wrapped response object)
+        // - data.finding.naturalResponse (claude-assistant workflow graphs)
+        const responseContent =
+          graphOutput?.data?.response?.content ||
+          graphOutput?.data?.response ||
+          graphOutput?.data?.finding?.naturalResponse;
+
         // Also check if content was already streamed by the tool parser (via runPublisher.chunk)
         const alreadyStreamed = publisher.getCachedState()?.output?.content;
         if (responseContent && typeof responseContent === 'string' && !fullContent && !alreadyStreamed) {
@@ -415,7 +429,9 @@ async function executeStreaming(
     const cachedState = publisher.getCachedState();
     const finalContent = fullContent || cachedState?.output?.content || '';
     const finalThinking = thinkingBuffer || cachedState?.output?.thinking || '';
-    await publisher.complete({ content: finalContent, thinking: finalThinking, data: initialState.data || {} });
+    // Use graph output data if available, fall back to initial state data
+    const finalData = graphOutputData || initialState.data || {};
+    await publisher.complete({ content: finalContent, thinking: finalThinking, data: finalData });
     const state = await publisher.getState();
     return {
       runId,
@@ -424,7 +440,7 @@ async function executeStreaming(
       status: 'completed',
       content: finalContent,
       thinking: finalThinking,
-      data: initialState.data || {},
+      data: finalData,
       metadata: {
         startedAt: state?.startedAt || Date.now(),
         completedAt: state?.completedAt || Date.now(),
