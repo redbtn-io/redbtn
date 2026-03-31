@@ -133,6 +133,7 @@ export class NeuronRegistry {
       role: doc.role,
       tier: doc.tier,
       userId: doc.userId,
+      audioOptimized: (doc as any).audioOptimized ?? false,
     };
     this.configCache.set(cacheKey, config);
     return config;

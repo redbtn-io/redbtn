@@ -33,6 +33,8 @@ export interface NeuronConfig {
   role: NeuronRole;
   tier: number;
   userId?: string;
+  /** When true, the worker generates TTS audio server-side during streaming */
+  audioOptimized?: boolean;
 }
 
 /**
@@ -65,4 +67,6 @@ export interface NeuronDocument {
   updatedAt: Date;
   usageCount?: number;
   lastUsedAt?: Date;
+  /** When true, the worker generates TTS audio server-side during streaming */
+  audioOptimized?: boolean;
 }

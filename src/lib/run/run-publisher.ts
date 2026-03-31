@@ -442,6 +442,22 @@ export class RunPublisher {
   }
 
   // ===========================================================================
+  // Audio Streaming (Server-side TTS)
+  // ===========================================================================
+
+  async publishAudioChunk(audioBase64: string, index: number, isFinal: boolean): Promise<void> {
+    this.ensureInitialized();
+    await this.publish({
+      type: 'audio_chunk' as any,
+      audio: audioBase64,
+      index,
+      isFinal,
+      format: 'mp3',
+      timestamp: Date.now(),
+    });
+  }
+
+  // ===========================================================================
   // Tool Events
   // ===========================================================================
 
