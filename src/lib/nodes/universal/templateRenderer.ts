@@ -120,71 +120,17 @@ export function renderTemplate(template: string, state: any): string {
  */
 export function renderParameters(parameters: Record<string, any>, state: any): Record<string, any> {
     const rendered: Record<string, any> = {};
-    // Handle undefined or null parameters
     if (!parameters || typeof parameters !== 'object') {
         return rendered;
     }
     for (const [key, value] of Object.entries(parameters)) {
-        // Try to parse JSON strings for body/payload fields
-        let processValue = value;
-        if (typeof value === 'string' && (key === 'body' || key === 'payload' || key === 'data')) {
-            // Check if it looks like JSON
-            const trimmed = value.trim();
-            if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-                try {
-                    processValue = JSON.parse(value);
-                } catch {
-                    // Not valid JSON, keep as string
-                    processValue = value;
-                }
-            }
-        }
-        if (typeof processValue === 'string' && (processValue.includes('{{state.') || processValue.includes('{{parameters.'))) {
-            // Check if this is a pure parameter reference that should preserve type
-            const paramMatch = processValue.match(/^\{\{parameters\.(\w+)\}\}$/);
-            if (paramMatch && state.parameters) {
-                const paramName = paramMatch[1];
-                const resolved = state.parameters[paramName];
-                if (resolved !== undefined) {
-                    // Multi-pass: if the resolved value is itself a template string, resolve it
-                    if (typeof resolved === 'string' && (resolved.includes('{{state.') || resolved.includes('{{parameters.'))) {
-                        // Check for pure state ref (type-preserving)
-                        const innerStateMatch = resolved.match(/^\{\{state\.(.+)\}\}$/);
-                        if (innerStateMatch) {
-                            const innerResolved = getNestedProperty(state, innerStateMatch[1]);
-                            if (innerResolved !== undefined) {
-                                rendered[key] = innerResolved;
-                                continue;
-                            }
-                        }
-                        // Complex template — string render
-                        rendered[key] = renderTemplate(resolved, state);
-                        continue;
-                    }
-                    // Preserve original type (number, boolean, etc.)
-                    rendered[key] = resolved;
-                    continue;
-                }
-            }
-            // Check if this is a pure state reference that should preserve type
-            // Preserves primitives, objects, and arrays (for MCP tool params that accept complex types)
-            const stateMatch = processValue.match(/^\{\{state\.(.+)\}\}$/);
-            if (stateMatch) {
-                const path = stateMatch[1];
-                const resolved = getNestedProperty(state, path);
-                if (resolved !== undefined) {
-                    rendered[key] = resolved;
-                    continue;
-                }
-            }
-            // For complex templates or strings, use string rendering
-            rendered[key] = renderTemplate(processValue, state);
-        } else if (typeof processValue === 'object' && processValue !== null && !Array.isArray(processValue)) {
+        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
             // Recursively render nested objects
-            rendered[key] = renderParameters(processValue, state);
+            rendered[key] = renderParameters(value, state);
         } else {
-            // Keep non-string values as-is
-            rendered[key] = processValue;
+            // Use resolveValue for everything — handles primitives, templates, IIFEs, mixed strings
+            const resolved = resolveValue(value, state);
+            rendered[key] = resolved;
         }
     }
     return rendered;

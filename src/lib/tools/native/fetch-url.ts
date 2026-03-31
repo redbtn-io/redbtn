@@ -149,3 +149,4 @@ const fetchUrlTool: NativeToolDefinition = {
 };
 
 export default fetchUrlTool;
+module.exports = fetchUrlTool;

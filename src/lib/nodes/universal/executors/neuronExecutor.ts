@@ -15,6 +15,7 @@
 import type { NeuronStepConfig } from '../types';
 import { renderTemplate, getNestedProperty } from '../templateRenderer';
 import { executeWithErrorHandling } from './errorHandler';
+import { AudioStreamPipeline } from '../../../tts/audio-stream';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -460,6 +461,29 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
 
       console.log(`[NeuronExecutor] Stream started after ${Date.now() - streamStartTime}ms`);
 
+      // -----------------------------------------------------------------------
+      // Server-side TTS: Set up AudioStreamPipeline if the neuron is audio-optimized
+      // -----------------------------------------------------------------------
+      let audioPipeline: AudioStreamPipeline | null = null;
+      if (streamToUser && state.runPublisher) {
+        try {
+          const neuronConfig = await neuronRegistry.getConfig(neuronId, userId);
+          if (neuronConfig.audioOptimized) {
+            audioPipeline = new AudioStreamPipeline({
+              publisher: state.runPublisher,
+              ttsOptions: {
+                voice: (state.data?.ttsVoice as string) || undefined,
+                speed: (state.data?.ttsSpeed as number) || undefined,
+              },
+            });
+            console.log('[NeuronExecutor] TTS audio pipeline enabled for audio-optimized neuron:', neuronId);
+          }
+        } catch (ttsSetupErr) {
+          // Don't block execution if TTS setup fails
+          console.warn('[NeuronExecutor] TTS setup failed, continuing without audio:', ttsSetupErr instanceof Error ? ttsSetupErr.message : ttsSetupErr);
+        }
+      }
+
       response = '';
       let chunkCount = 0;
 
@@ -537,6 +561,11 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
             response += chunk.content;
             // Note: Whether chunks reach the user is decided by respond.ts
             // based on state._currentStepStreamToUser flag
+
+            // Feed text to TTS pipeline (non-blocking, runs synthesis in parallel)
+            if (audioPipeline) {
+              audioPipeline.push(chunk.content);
+            }
           }
         }
       } catch (streamErr) {
@@ -548,12 +577,26 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
         if (asyncIter.return) {
           try { await asyncIter.return(); } catch (_) { /* ignore close errors */ }
         }
+        // Best-effort flush of any pending TTS audio on error
+        if (audioPipeline) {
+          try { await audioPipeline.flush(); } catch (_) { /* ignore */ }
+        }
         throw streamErr;
       }
 
       console.log(
         `[NeuronExecutor] Stream complete: ${chunkCount} chunks, ${response.length} chars, ${Date.now() - streamStartTime}ms`
       );
+
+      // Flush TTS pipeline — waits for all pending synthesis to complete and publish
+      if (audioPipeline) {
+        try {
+          await audioPipeline.flush();
+          console.log(`[NeuronExecutor] TTS pipeline flushed: ${audioPipeline.audioChunkCount} audio chunks published`);
+        } catch (ttsFlushErr) {
+          console.warn('[NeuronExecutor] TTS pipeline flush failed:', ttsFlushErr instanceof Error ? ttsFlushErr.message : ttsFlushErr);
+        }
+      }
     }
 
     // Clear the flag after streaming completes

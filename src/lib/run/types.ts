@@ -267,6 +267,21 @@ export interface ToolErrorEvent extends BaseEvent {
 }
 
 /**
+ * Audio chunk event (server-side TTS)
+ */
+export interface AudioChunkEvent extends BaseEvent {
+  type: 'audio_chunk';
+  /** Base64-encoded audio data */
+  audio: string;
+  /** Sequential chunk index */
+  index: number;
+  /** Whether this is the final audio chunk for the response */
+  isFinal: boolean;
+  /** Audio format (e.g., 'mp3') */
+  format: string;
+}
+
+/**
  * Reconnection replay event
  */
 export interface InitEvent extends BaseEvent {
@@ -295,6 +310,7 @@ export type RunEvent =
   | ToolProgressEvent
   | ToolCompleteEvent
   | ToolErrorEvent
+  | AudioChunkEvent
   | InitEvent;
 
 /**

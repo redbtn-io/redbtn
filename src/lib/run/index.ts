@@ -39,6 +39,7 @@ export {
   type ToolProgressEvent,
   type ToolCompleteEvent,
   type ToolErrorEvent,
+  type AudioChunkEvent,
   type InitEvent,
   RunKeys,
   RunConfig,
