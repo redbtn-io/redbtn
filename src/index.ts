@@ -80,7 +80,12 @@ export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } fro
 
 // Export run utilities (used by SSE stream endpoints)
 export { RunKeys } from "./lib/run/types";
+export type { AudioChunkEvent } from "./lib/run/types";
 export { getRunState, getActiveRunForConversation } from "./lib/run/run-publisher";
+
+// Export TTS utilities
+export { TtsChunker, findBreakPoint, synthesize, isTtsAvailable, AudioStreamPipeline } from './lib/tts';
+export type { SynthesizeOptions, AudioStreamPipelineOptions } from './lib/tts';
 
 // Export conversation streaming
 export { ConversationPublisher, createConversationPublisher, ConversationKeys } from './lib/conversation';
