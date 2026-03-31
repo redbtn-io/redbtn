@@ -198,6 +198,11 @@ export class GraphRegistry {
         for (const key of this.compiledCache.keys()) {
           if (key.endsWith(':' + graphId)) {
             this.compiledCache.delete(key);
+            cleared++;
+          }
+        }
+        for (const key of this.configCache.keys()) {
+          if (key.endsWith(':' + graphId)) {
             this.configCache.delete(key);
             cleared++;
           }
@@ -223,6 +228,11 @@ export class GraphRegistry {
         for (const key of this.compiledCache.keys()) {
           if (key.endsWith(':' + graphId)) {
             this.compiledCache.delete(key);
+            cleared++;
+          }
+        }
+        for (const key of this.configCache.keys()) {
+          if (key.endsWith(':' + graphId)) {
             this.configCache.delete(key);
             cleared++;
           }

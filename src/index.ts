@@ -360,9 +360,9 @@ export class Red {
    * @returns The tool execution result
    */
   public async callMcpTool(
-    toolName: string, 
+    toolName: string,
     args: Record<string, unknown>,
-    context?: { conversationId?: string; generationId?: string; messageId?: string }
+    context?: { conversationId?: string; generationId?: string; messageId?: string; credentials?: any }
   ): Promise<any> {
     const startTime = Date.now();
     
@@ -384,7 +384,8 @@ export class Red {
       const result = await this.mcpRegistry.callTool(toolName, args, {
         conversationId: context?.conversationId,
         generationId: context?.generationId,
-        messageId: context?.messageId
+        messageId: context?.messageId,
+        credentials: context?.credentials,
       });
       const duration = Date.now() - startTime;
 

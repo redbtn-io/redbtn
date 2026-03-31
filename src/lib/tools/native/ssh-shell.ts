@@ -18,12 +18,11 @@ import * as fs from 'fs';
 import * as os from 'os';
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 
-// Maximum bytes kept in the final return value (100KB)
-const MAX_RETURN_BYTES = 100 * 1024;
-// Maximum bytes kept in stderr in the return value (10KB)
-const MAX_STDERR_BYTES = 10 * 1024;
-// Maximum bytes to accumulate in memory (5MB rolling buffer)
-const MAX_BUFFER_BYTES = 5 * 1024 * 1024;
+// No limits — Claude sessions can produce large outputs and we need
+// the full stream-json including the final result event
+const MAX_RETURN_BYTES = Infinity;
+const MAX_STDERR_BYTES = Infinity;
+const MAX_BUFFER_BYTES = Infinity;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;

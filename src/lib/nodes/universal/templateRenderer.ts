@@ -120,71 +120,17 @@ export function renderTemplate(template: string, state: any): string {
  */
 export function renderParameters(parameters: Record<string, any>, state: any): Record<string, any> {
     const rendered: Record<string, any> = {};
-    // Handle undefined or null parameters
     if (!parameters || typeof parameters !== 'object') {
         return rendered;
     }
     for (const [key, value] of Object.entries(parameters)) {
-        // Try to parse JSON strings for body/payload fields
-        let processValue = value;
-        if (typeof value === 'string' && (key === 'body' || key === 'payload' || key === 'data')) {
-            // Check if it looks like JSON
-            const trimmed = value.trim();
-            if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-                try {
-                    processValue = JSON.parse(value);
-                } catch {
-                    // Not valid JSON, keep as string
-                    processValue = value;
-                }
-            }
-        }
-        if (typeof processValue === 'string' && (processValue.includes('{{state.') || processValue.includes('{{parameters.'))) {
-            // Check if this is a pure parameter reference that should preserve type
-            const paramMatch = processValue.match(/^\{\{parameters\.(\w+)\}\}$/);
-            if (paramMatch && state.parameters) {
-                const paramName = paramMatch[1];
-                const resolved = state.parameters[paramName];
-                if (resolved !== undefined) {
-                    // Multi-pass: if the resolved value is itself a template string, resolve it
-                    if (typeof resolved === 'string' && (resolved.includes('{{state.') || resolved.includes('{{parameters.'))) {
-                        // Check for pure state ref (type-preserving)
-                        const innerStateMatch = resolved.match(/^\{\{state\.(.+)\}\}$/);
-                        if (innerStateMatch) {
-                            const innerResolved = getNestedProperty(state, innerStateMatch[1]);
-                            if (innerResolved !== undefined) {
-                                rendered[key] = innerResolved;
-                                continue;
-                            }
-                        }
-                        // Complex template — string render
-                        rendered[key] = renderTemplate(resolved, state);
-                        continue;
-                    }
-                    // Preserve original type (number, boolean, etc.)
-                    rendered[key] = resolved;
-                    continue;
-                }
-            }
-            // Check if this is a pure state reference that should preserve type
-            // Preserves primitives, objects, and arrays (for MCP tool params that accept complex types)
-            const stateMatch = processValue.match(/^\{\{state\.(.+)\}\}$/);
-            if (stateMatch) {
-                const path = stateMatch[1];
-                const resolved = getNestedProperty(state, path);
-                if (resolved !== undefined) {
-                    rendered[key] = resolved;
-                    continue;
-                }
-            }
-            // For complex templates or strings, use string rendering
-            rendered[key] = renderTemplate(processValue, state);
-        } else if (typeof processValue === 'object' && processValue !== null && !Array.isArray(processValue)) {
+        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
             // Recursively render nested objects
-            rendered[key] = renderParameters(processValue, state);
+            rendered[key] = renderParameters(value, state);
         } else {
-            // Keep non-string values as-is
-            rendered[key] = processValue;
+            // Use resolveValue for everything — handles primitives, templates, IIFEs, mixed strings
+            const resolved = resolveValue(value, state);
+            rendered[key] = resolved;
         }
     }
     return rendered;
@@ -211,6 +157,100 @@ export function getNestedProperty(obj: any, path: string): any {
     return path.split('.').reduce((current, key) => {
         return current?.[key];
     }, obj);
+}
+
+/**
+ * Unified value resolver — the single entry point for all template evaluation.
+ *
+ * Rules (applied in order):
+ * 1. Non-string values are returned as-is (preserves boolean, number, null, object).
+ * 2. Pure template expressions (exactly `{{...}}` with nothing outside):
+ *    a. Try simple path resolution first (state.xxx, parameters.xxx).
+ *    b. If that returns undefined OR the expression is complex (operators, ternary,
+ *       function calls, array indexing, etc.), evaluate via `new Function` with
+ *       `state` in scope — this preserves the actual JS type of the result.
+ * 3. Mixed template strings (contain `{{...}}` but also surrounding text) fall back
+ *    to `renderTemplate`, which always returns a string.
+ * 4. Strings with no template markers are returned as-is.
+ *
+ * Examples:
+ *   resolveValue('{{true}}', state)                                  → true  (boolean)
+ *   resolveValue('{{false}}', state)                                 → false (boolean)
+ *   resolveValue('{{42}}', state)                                    → 42    (number)
+ *   resolveValue('{{state.data.triggerType}}', state)                → actual value (preserves type)
+ *   resolveValue('{{parameters.ns}}', state)                         → actual value (preserves type)
+ *   resolveValue('{{state.x === "y" ? true : false}}', state)        → boolean
+ *   resolveValue('{{state.plan.steps[state.idx || 0]}}', state)      → object/undefined
+ *   resolveValue('hello {{state.name}}', state)                      → 'hello Alice' (string)
+ *   resolveValue(42, state)                                          → 42    (non-string passthrough)
+ *   resolveValue(true, state)                                        → true  (non-string passthrough)
+ *
+ * @param value - The value to resolve. May be any type.
+ * @param state - Current graph state (includes `parameters` sub-object).
+ * @returns Resolved value, type-preserving for pure expressions.
+ */
+export function resolveValue(value: any, state: any): any {
+    // Rule 1: non-strings pass through unchanged
+    if (typeof value !== 'string') {
+        return value;
+    }
+
+    const trimmed = value.trim();
+
+    // Rule 2: pure template expression — starts with {{ and ends with }}
+    // with no other text outside the braces
+    if (trimmed.startsWith('{{') && trimmed.endsWith('}}')) {
+        const expression = trimmed.slice(2, -2).trim();
+
+        // Detect simple path expressions: `state.a.b.c` or `parameters.a.b.c`
+        // A "simple path" contains only word chars, dots, and no operators/parens/brackets/spaces
+        const isSimplePath = /^(state|parameters)(\.\w+)+$/.test(expression);
+
+        if (isSimplePath) {
+            if (expression.startsWith('parameters.')) {
+                const path = expression.slice('parameters.'.length);
+                const resolved = getNestedProperty(state.parameters || {}, path);
+                if (resolved !== undefined) {
+                    return resolved;
+                }
+                // Fall through to new Function evaluation if not found
+            } else {
+                // state.xxx
+                const path = expression.slice('state.'.length);
+                const resolved = getNestedProperty(state, path);
+                if (resolved !== undefined) {
+                    return resolved;
+                }
+                // Try data. fallback (migration support)
+                if (!path.startsWith('data.')) {
+                    const dataValue = getNestedProperty(state, `data.${path}`);
+                    if (dataValue !== undefined) {
+                        return dataValue;
+                    }
+                }
+                // Fall through to new Function evaluation if not found
+            }
+        }
+
+        // Complex expression (or simple path that returned undefined) — evaluate via new Function
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+            const evalFunc = new Function('state', `return (${expression})`);
+            return evalFunc(state);
+        } catch (error) {
+            console.error('[TemplateRenderer] resolveValue: failed to evaluate expression:', expression, error);
+            // Return the original string on error so callers see something useful
+            return value;
+        }
+    }
+
+    // Rule 3: mixed template string (has {{ but not pure) — string interpolation only
+    if (value.includes('{{')) {
+        return renderTemplate(value, state);
+    }
+
+    // Rule 4: no templates — return as-is
+    return value;
 }
 
 /**
