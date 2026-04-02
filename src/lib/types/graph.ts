@@ -117,9 +117,7 @@ export interface GraphConfig {
   graphId: string;
   /** Owner user ID: "system" for defaults, user ID for custom graphs */
   userId: string;
-  /** Graph type: 'responsive' requires input message, 'workflow' can run without input */
-  graphType?: 'responsive' | 'workflow';
-  /** Input schema for workflows (defines expected input structure) */
+  /** Input schema (defines expected input structure) */
   inputSchema?: Record<string, any>;
   /** Default input values (for scheduled/automated workflows) */
   defaultInput?: Record<string, any>;
