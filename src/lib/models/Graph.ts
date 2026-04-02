@@ -73,12 +73,6 @@ const sharePermissionSchema = new Schema({
 const graphSchema = new Schema({
   graphId: { type: String, required: true },
   userId: { type: String, required: true, index: true, default: 'system' },
-  graphType: {
-    type: String,
-    enum: ['agent', 'workflow'],
-    default: 'agent',
-    index: true,
-  },
   inputSchema: { type: Schema.Types.Mixed, default: null },
   defaultInput: { type: Schema.Types.Mixed, default: null },
   outputConfig: {
