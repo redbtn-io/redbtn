@@ -73,7 +73,7 @@ export {
 } from "./lib/mcp";
 
 // Export registries
-export { universalNodeRegistry } from "../dist/lib/registry/UniversalNodeRegistry";
+export { universalNodeRegistry, getUniversalNode, getUniversalNodeRaw } from "./lib/registry/UniversalNodeRegistry";
 
 // Export graph execution
 export { run, isStreamingResult } from "./functions/run";
