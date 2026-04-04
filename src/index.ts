@@ -14,20 +14,21 @@ import { redGraph } from "./lib/graphs/red";
 import { MemoryManager } from "./lib/memory/memory";
 import { MessageQueue } from "./lib/memory/queue";
 import { PersistentLogger } from "./lib/logs/persistent-logger";
-import { createGeminiModel, createChatModel, createWorkerModel, createOpenAIModel } from "./lib/models";
+import { createGeminiModel, createOpenAIModel } from "./lib/models";
 import * as background from "./functions/background";
 import { respond as respondFunction } from "./functions/respond";
 import { McpRegistry } from "./lib/mcp/registry";
 import { GraphRegistry } from "./lib/graphs/GraphRegistry";
 import { NeuronRegistry } from "./lib/neurons/NeuronRegistry";
 import { createLogger } from "./lib/utils/logger";
+import { RedLog } from "@redbtn/redlog";
 
 // Export database utilities for external use
-export { 
-  getDatabase, 
+export {
+  getDatabase,
   resetDatabase,
-  DatabaseManager, 
-  StoredMessage, 
+  DatabaseManager,
+  StoredMessage,
   Conversation,
   StoredLog,
   Generation,
@@ -54,7 +55,7 @@ export {
   CollectionStats
 } from "./lib/memory/vectors";
 
-export { 
+export {
   addToVectorStoreNode,
   retrieveFromVectorStoreNode
 } from "./lib/nodes/rag";
@@ -101,9 +102,11 @@ export interface RedConfig {
   redisUrl: string; // URL for connecting to the Redis instance, global state store
   vectorDbUrl: string; // URL for connecting to the vector database, short to medium term memory
   databaseUrl: string; // URL for connecting to the traditional database, long term memory
-  chatLlmUrl: string; // URL for the chat LLM (e.g., Ollama on 192.168.1.4:11434)
-  workLlmUrl: string; // URL for the worker LLM (e.g., Ollama on 192.168.1.3:11434)
   llmEndpoints?: { [agentName: string]: string }; // Map of named agents to specific LLM endpoint URLs
+  /** @deprecated LLM endpoints are now configured via neuron configs in MongoDB. Use neuronRegistry instead. */
+  chatLlmUrl?: string;
+  /** @deprecated LLM endpoints are now configured via neuron configs in MongoDB. Use neuronRegistry instead. */
+  workLlmUrl?: string;
 }
 
 /**
@@ -137,13 +140,24 @@ export class Red {
   private heartbeatInterval?: NodeJS.Timeout;
 
   // Properties to hold the configured model instances
-  public chatModel!: ChatOllama; // Primary chat interaction model
-  public workerModel!: ChatOllama; // Background tasks and tool execution model
+  /**
+   * @deprecated Use neuronRegistry.getModel() instead.
+   * LLM endpoints are now configured via neuron configs in MongoDB.
+   * This property is no longer initialized -- accessing it will throw at runtime.
+   */
+  public chatModel!: ChatOllama;
+  /**
+   * @deprecated Use neuronRegistry.getModel() instead.
+   * LLM endpoints are now configured via neuron configs in MongoDB.
+   * This property is no longer initialized -- accessing it will throw at runtime.
+   */
+  public workerModel!: ChatOllama;
   public openAIModel?: ChatOpenAI;
   public geminiModel?: ChatGoogleGenerativeAI;
   public memory!: MemoryManager;
   public messageQueue!: MessageQueue;
   public logger!: PersistentLogger;
+  public redlog!: RedLog;
   public mcpRegistry!: McpRegistry;
   public graphRegistry!: GraphRegistry;
   public neuronRegistry!: NeuronRegistry;
@@ -157,23 +171,33 @@ export class Red {
   constructor(config: RedConfig) {
     this.config = config;
 
-    // Initialize the model instances
-    this.chatModel = createChatModel(config);
-    this.workerModel = createWorkerModel(config);
+    // Initialize optional model instances (OpenAI, Gemini)
+    // Note: chatModel and workerModel are deprecated. The neuron system in MongoDB
+    // is now the source of truth for LLM endpoints. Use neuronRegistry.getModel() instead.
+    // These properties are intentionally left uninitialized.
     this.openAIModel = createOpenAIModel();
     this.geminiModel = createGeminiModel();
-    
+
     // Initialize memory manager
     this.memory = new MemoryManager(config.redisUrl);
-    
+
     // Initialize message queue with same Redis connection
     const redis = new (require('ioredis'))(config.redisUrl);
     this.redis = redis;
     this.messageQueue = new MessageQueue(redis);
-    
+
     // Initialize logger with MongoDB persistence
     this.logger = new PersistentLogger(redis, this.nodeId || 'default');
-    
+
+    // Initialize RedLog for structured logging via @redbtn/redlog (used by RunPublisher)
+    this.redlog = RedLog.create({
+      redisUrl: config.redisUrl,
+      mongoUri: config.databaseUrl,
+      prefix: 'redlog',
+      namespace: 'run',
+      console: false,
+    });
+
     // Initialize MCP registry for tool servers (pass messageQueue for event publishing)
     this.mcpRegistry = new McpRegistry(this.messageQueue);
 
@@ -198,16 +222,16 @@ export class Red {
     if (!this.isLoaded) {
       throw new Error("Red instance is not loaded. Please call load() before invoking a graph.");
     }
-    
+
     // TODO: Implement the actual LangGraph execution logic.
     // This function will select a graph from a library based on `graphName`,
     // merge the `baseState` and `localState`, and execute the graph.
-    
-    const result = { 
+
+    const result = {
       output: `Output from ${graphName}`,
       timestamp: new Date().toISOString()
     };
-    
+
     return result;
   }
 
@@ -231,13 +255,13 @@ export class Red {
     }
 
     process.stdout.write(`\rLoading node: ${this.nodeId}...`);
-    
+
     // TODO: Implement the actual state fetching logic from Redis using `this.config.redisUrl`.
     // The `nodeId` can be used to fetch a specific state for recovery or distributed operation.
-    
+
     this.baseState = { loadedAt: new Date(), nodeId: this.nodeId };
     this.isLoaded = true;
-    
+
     // Register MCP servers (SSE transport on different ports)
     try {
       await this.mcpRegistry.registerServer({ name: 'web', url: 'http://localhost:3001/mcp' });
@@ -250,7 +274,7 @@ export class Red {
       console.warn('⚠️ MCP server registration failed:', error);
       console.warn('  Tool calls will fail. Make sure MCP servers are running: npm run mcp:start');
     }
-    
+
     // Start heartbeat to register node as active
     this.heartbeatInterval = background.startHeartbeat(this.nodeId, this.redis);
   }
@@ -262,7 +286,7 @@ export class Red {
   public async getActiveNodes(): Promise<string[]> {
     return background.getActiveNodes(this.redis);
   }
-  
+
   /**
    * Starts the autonomous, continuous "thinking" loop. The loop runs internally
    * until `stopThinking()` is called.
@@ -279,10 +303,10 @@ export class Red {
 
     do {
       await this._invoke('cognitionGraph', { cycleType: 'autonomous' });
-      
+
       // Delay between cycles to prevent runaway processes and manage resource usage.
       await new Promise(resolve => setTimeout(resolve, 2000)); // 2-second delay
-      
+
     } while (this.isThinking);
   }
 
@@ -301,14 +325,14 @@ export class Red {
    */
   public async shutdown(): Promise<void> {
     console.log(`[Red] Shutting down node: ${this.nodeId}...`);
-    
+
     // Stop thinking if active
     this.stopThinking();
-    
+
     // Stop heartbeat
     await background.stopHeartbeat(this.nodeId, this.redis, this.heartbeatInterval);
     this.heartbeatInterval = undefined;
-    
+
     // Disconnect from MCP servers
     try {
       await this.mcpRegistry.disconnectAll();
@@ -316,12 +340,12 @@ export class Red {
     } catch (error) {
       console.warn('[Red] Error disconnecting MCP clients:', error);
     }
-    
+
     // Close Redis connection
     if (this.redis) {
       await this.redis.quit();
     }
-    
+
     this.isLoaded = false;
     console.log('[Red] Shutdown complete');
   }
@@ -371,7 +395,7 @@ export class Red {
     context?: { conversationId?: string; generationId?: string; messageId?: string; credentials?: any }
   ): Promise<any> {
     const startTime = Date.now();
-    
+
     // Log tool call start
     await this.logger.log({
       level: 'info',
@@ -399,7 +423,7 @@ export class Red {
       await this.logger.log({
         level: result.isError ? 'warn' : 'success',
         category: 'mcp',
-        message: result.isError 
+        message: result.isError
           ? `⚠️ MCP Tool Error: ${toolName} (${duration}ms)`
           : `✓ MCP Tool Complete: ${toolName} (${duration}ms)`,
         conversationId: context?.conversationId,
@@ -443,7 +467,7 @@ export class Red {
    */
   private sanitizeArgsForLogging(args: Record<string, unknown>): Record<string, unknown> {
     const sanitized: Record<string, unknown> = {};
-    
+
     for (const [key, value] of Object.entries(args)) {
       if (typeof value === 'string') {
         // Truncate long strings
@@ -452,7 +476,7 @@ export class Red {
         sanitized[key] = value;
       }
     }
-    
+
     return sanitized;
   }
 

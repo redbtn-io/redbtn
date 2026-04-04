@@ -119,7 +119,8 @@ export const addToVectorStoreNode = async (
     // Initialize vector store manager
     const vectorStore = new VectorStoreManager(
       redInstance?.config?.vectorDbUrl || process.env.CHROMA_URL || 'http://localhost:8024',
-      redInstance?.config?.chatLlmUrl || process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
+      // TODO: Move embedding endpoint to a dedicated config field or neuron config
+      process.env.OLLAMA_BASE_URL || 'http://localhost:11434'
     );
 
     // Health check

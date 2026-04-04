@@ -530,7 +530,7 @@ export async function run(
   if (!lock) throw new Error(`[run] Conversation ${lockKey} already has an active run`);
   console.log(`[run] Acquired lock for conversation ${lockKey}`);
 
-  const publisher = createRunPublisher({ redis, runId, userId, log: red.log });
+  const publisher = createRunPublisher({ redis, runId, userId, log: red.redlog });
 
   console.log(`[run] ${new Date().toISOString()} Calling publisher.init() for run ${runId}`);
   await publisher.init(actualGraphId, graphName, input, options.conversationId);

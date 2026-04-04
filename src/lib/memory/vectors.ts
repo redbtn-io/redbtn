@@ -35,7 +35,9 @@ const DEFAULT_CHUNK_OVERLAP = 200;
 const DEFAULT_EMBEDDING_MODEL = 'nomic-embed-text';
 
 /**
- * Default Ollama base URL for embeddings
+ * Default Ollama base URL for embeddings.
+ * TODO: Move embedding endpoint configuration to a dedicated config field or neuron system
+ * instead of relying on OLLAMA_URL / OLLAMA_BASE_URL env vars.
  */
 const DEFAULT_OLLAMA_URL = 'http://localhost:11434';
 
