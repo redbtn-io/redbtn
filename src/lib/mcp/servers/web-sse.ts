@@ -5,7 +5,6 @@
 
 import { McpServerSSE } from '../server-sse';
 import { CallToolResult } from '../types';
-import { McpEventPublisher } from '../event-publisher';
 import { fetchAndParse } from '../../nodes/scrape/parser';
 
 export class WebServerSSE extends McpServerSSE {

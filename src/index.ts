@@ -21,6 +21,7 @@ import { McpRegistry } from "./lib/mcp/registry";
 import { GraphRegistry } from "./lib/graphs/GraphRegistry";
 import { NeuronRegistry } from "./lib/neurons/NeuronRegistry";
 import { createLogger } from "./lib/utils/logger";
+import { RedLog } from "@redbtn/redlog";
 
 // Export database utilities for external use
 export {
@@ -156,6 +157,7 @@ export class Red {
   public memory!: MemoryManager;
   public messageQueue!: MessageQueue;
   public logger!: PersistentLogger;
+  public redlog!: RedLog;
   public mcpRegistry!: McpRegistry;
   public graphRegistry!: GraphRegistry;
   public neuronRegistry!: NeuronRegistry;
@@ -186,6 +188,15 @@ export class Red {
 
     // Initialize logger with MongoDB persistence
     this.logger = new PersistentLogger(redis, this.nodeId || 'default');
+
+    // Initialize RedLog for structured logging via @redbtn/redlog (used by RunPublisher)
+    this.redlog = RedLog.create({
+      redisUrl: config.redisUrl,
+      mongoUri: config.databaseUrl,
+      prefix: 'redlog',
+      namespace: 'run',
+      console: false,
+    });
 
     // Initialize MCP registry for tool servers (pass messageQueue for event publishing)
     this.mcpRegistry = new McpRegistry(this.messageQueue);
