@@ -532,8 +532,12 @@ export async function run(
 
   const publisher = createRunPublisher({ redis, runId, userId, log: red.redlog });
 
+  // W-3: extract triggerType from the already-enriched input so that publisher.init()
+  // can guarantee it ends up in this.state.input._trigger even for direct run() callers.
+  const triggerType = (input as Record<string, any>)?._trigger?.type as string | undefined;
+
   console.log(`[run] ${new Date().toISOString()} Calling publisher.init() for run ${runId}`);
-  await publisher.init(actualGraphId, graphName, input, options.conversationId);
+  await publisher.init(actualGraphId, graphName, input, options.conversationId, triggerType);
   console.log(`[run] ${new Date().toISOString()} publisher.init() complete for run ${runId}`);
 
   // Check for existing checkpoint (crash recovery)

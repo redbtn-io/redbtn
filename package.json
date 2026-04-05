@@ -1,6 +1,6 @@
 {
   "name": "@redbtn/redbtn",
-  "version": "0.0.35-alpha",
+  "version": "0.0.50-alpha",
   "description": "Graph-based automation engine for building, running, and orchestrating dynamic workflows",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -17,7 +17,7 @@
     "mcp:start": "npx tsx src/mcp-servers.ts",
     "dev:server": "cd examples/rest-server && npm run dev",
     "start:server": "cd examples/rest-server && npm start",
-    "build": "tsc && cp src/lib/graphs/conditionEvaluator.js src/lib/graphs/conditionEvaluator.d.ts src/lib/graphs/state.js src/lib/graphs/state.d.ts dist/lib/graphs/ && mkdir -p dist/lib/registry && printf '\"use strict\";\\nObject.defineProperty(exports, \"__esModule\", { value: true });\\nexports.universalNodeRegistry = {};\\n' > dist/lib/registry/UniversalNodeRegistry.js && printf 'export declare const universalNodeRegistry: any;\\n' > dist/lib/registry/UniversalNodeRegistry.d.ts",
+    "build": "tsc && cp src/lib/graphs/conditionEvaluator.js src/lib/graphs/conditionEvaluator.d.ts src/lib/graphs/state.js src/lib/graphs/state.d.ts dist/lib/graphs/",
     "pack": "npm run build && npm pack",
     "prepublishOnly": "npm run build",
     "db:seed-neurons": "npx tsx scripts/seed-default-neurons.ts",

@@ -290,6 +290,41 @@ export interface InitEvent extends BaseEvent {
 }
 
 /**
+ * Media kind for attachment events
+ */
+export type AttachmentKind = 'image' | 'video' | 'audio' | 'document' | 'file';
+
+/**
+ * Attachment event — a file/image/video has been produced or received during a run.
+ *
+ * Consumers should prefer `url` for display/download. `base64` is only present
+ * when the attachment is small and inline delivery is preferred (e.g. generated images).
+ * `fileId` references the GridFS ObjectId in the `attachments` bucket when the file
+ * has been persisted to the webapp's attachment store.
+ */
+export interface AttachmentEvent extends BaseEvent {
+  type: 'attachment';
+  /** Stable identifier for this attachment (nanoid, assigned by publisher or upload API) */
+  attachmentId: string;
+  /** Media category */
+  kind: AttachmentKind;
+  /** MIME type (e.g. 'image/png', 'video/mp4', 'application/pdf') */
+  mimeType: string;
+  /** Original filename */
+  filename: string;
+  /** File size in bytes */
+  size: number;
+  /** GridFS ObjectId string — present when persisted to the attachment store */
+  fileId?: string;
+  /** Publicly or privately accessible download URL */
+  url?: string;
+  /** Base64-encoded file data — present for small inline attachments */
+  base64?: string;
+  /** Optional human-readable caption */
+  caption?: string;
+}
+
+/**
  * Union of all run events
  */
 export type RunEvent =
@@ -311,7 +346,8 @@ export type RunEvent =
   | ToolCompleteEvent
   | ToolErrorEvent
   | AudioChunkEvent
-  | InitEvent;
+  | InitEvent
+  | AttachmentEvent;
 
 /**
  * Event type discriminator

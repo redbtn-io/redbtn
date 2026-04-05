@@ -41,6 +41,8 @@ export {
   type ToolErrorEvent,
   type AudioChunkEvent,
   type InitEvent,
+  type AttachmentEvent,
+  type AttachmentKind,
   RunKeys,
   RunConfig,
   createInitialRunState,
@@ -55,6 +57,7 @@ export {
   createRunPublisher,
   getRunState,
   getActiveRunForConversation,
+  ARCHIVE_QUEUE_NAMES,
 } from './run-publisher';
 
 export {
@@ -67,3 +70,22 @@ export {
   isConversationLocked,
   isGraphLocked,
 } from './run-lock';
+
+export {
+  type TriggerType,
+  type TriggerSource,
+  type TriggerMetadata,
+  type Trigger,
+  type TriggeredRun,
+  type EnrichedInput,
+  type EnrichmentResult,
+  type AutomationTriggeredBy,
+  type AttachmentRef,
+  LEGACY_TRIGGER_MAP,
+  toTriggerType,
+} from './trigger-types';
+
+export {
+  enrichInput,
+  type EnrichInputOptions,
+} from './enrich-input';

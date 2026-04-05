@@ -185,6 +185,12 @@ const sshShell: NativeToolDefinition = {
         const success = exitCode === 0;
         console.log(`[ssh_shell] Completed in ${duration}ms. exitCode=${exitCode}, stdout=${stdout.length}B, stderr=${stderr.length}B`);
         if (stderr.length > 0) console.log(`[ssh_shell] stderr: ${stderr.substring(0, 500)}`);
+        // When the remote command fails, surface the output so diagnostics are
+        // not lost. With 2>&1 redirection, error messages end up in stdout.
+        if (!success) {
+          const stdoutPreview = stdout.length > 1000 ? stdout.substring(0, 1000) + '...[truncated]' : stdout;
+          console.error(`[ssh_shell] Non-zero exit (${exitCode}). stdout: ${stdoutPreview}`);
+        }
 
         resolve({
           content: [{
