@@ -56,7 +56,11 @@ export class ParserExecutor {
         this._disabled = false;
         this._maxErrors = 5;
         this._executeTool = executeTool || null;
+        this._processingChain = Promise.resolve();
     }
+
+    /** Serialized processing chain — ensures concurrent processChunk calls are queued. */
+    private _processingChain!: Promise<void>;
 
     /** Inject context into the parser state (e.g. channelId, triggerType). */
     setContext(ctx: Record<string, any>): void {
@@ -66,8 +70,26 @@ export class ParserExecutor {
     /**
      * Process a raw chunk from tool output.
      * Returns array of parsed content strings (may be 0, 1, or many).
+     *
+     * Calls are serialized via an internal promise chain — this is critical
+     * for parsers with awaited tool steps (e.g. Discord sends). Without
+     * serialization, concurrent invocations would interleave their mutations
+     * to _parserState and cause duplicate messages, lost captured IDs, etc.
      */
     async processChunk(rawChunk: string, streamType?: string): Promise<any[]> {
+        // Queue on the processing chain — each call waits for the previous
+        const prev = this._processingChain;
+        let resolveNext!: () => void;
+        this._processingChain = new Promise<void>((resolve) => { resolveNext = resolve; });
+        await prev;
+        try {
+            return await this._processChunkInternal(rawChunk, streamType);
+        } finally {
+            resolveNext();
+        }
+    }
+
+    private async _processChunkInternal(rawChunk: string, _streamType?: string): Promise<any[]> {
         if (this._disabled) {
             // Passthrough mode after too many errors
             return rawChunk ? [rawChunk] : [];
@@ -125,8 +147,21 @@ export class ParserExecutor {
 
     /**
      * Flush any remaining buffer content (end of stream).
+     * Serialized on the same chain as processChunk.
      */
     async flush(): Promise<any> {
+        const prev = this._processingChain;
+        let resolveNext!: () => void;
+        this._processingChain = new Promise<void>((resolve) => { resolveNext = resolve; });
+        await prev;
+        try {
+            return await this._flushInternal();
+        } finally {
+            resolveNext();
+        }
+    }
+
+    private async _flushInternal(): Promise<any> {
         if (!this._buffer || this._disabled) {
             const remaining = this._buffer;
             this._buffer = '';
