@@ -9,10 +9,31 @@
  * - Redis list: conversation:events:{conversationId} (for replay)
  *
  * Messages can optionally be persisted to MongoDB via the conversation model.
+ *
+ * Archive side-channel:
+ * - After every publish(), enqueues a BullMQ job to `conversation-archive` queue
+ *   (unless ARCHIVE_QUEUE_DISABLED=true). Each job has a dedup ID of
+ *   `{conversationId}:{seq}`. Attachment events have their base64 payload stripped
+ *   before enqueueing — only the reference (fileId/url) is archived.
  */
 
 import type Redis from 'ioredis';
 import { ConversationKeys, ConversationConfig, type ConversationEvent } from './types';
+
+// ---------------------------------------------------------------------------
+// Module-level singleton BullMQ Queue instances (C-1 fix)
+// One Queue per (name, prefix) pair — shared across all ConversationPublisher instances.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { Queue: _BullQueue } = require('bullmq');
+const _archiveQueues = new Map<string, InstanceType<typeof _BullQueue>>();
+
+function getArchiveQueue(name: string, redis: unknown, prefix: string): InstanceType<typeof _BullQueue> {
+  const key = `${prefix}:${name}`;
+  if (!_archiveQueues.has(key)) {
+    _archiveQueues.set(key, new _BullQueue(name, { connection: redis, prefix }));
+  }
+  return _archiveQueues.get(key)!;
+}
 
 export interface ConversationPublisherOptions {
   redis: Redis;
@@ -186,6 +207,43 @@ export class ConversationPublisher {
     });
   }
 
+  /**
+   * Publish an attachment event to the conversation stream.
+   * Called by RunPublisher when a file is produced or received during a run.
+   * The chat UI uses this to render inline previews without polling.
+   */
+  async publishAttachment(runId: string, event: {
+    type: 'attachment';
+    attachmentId: string;
+    kind: 'image' | 'video' | 'audio' | 'document' | 'file';
+    mimeType: string;
+    filename: string;
+    size: number;
+    fileId?: string;
+    url?: string;
+    base64?: string;
+    caption?: string;
+    timestamp: number;
+  }, messageId?: string): Promise<void> {
+    await this.publish({
+      type: 'attachment',
+      runId,
+      // W-4: include messageId so the archiver can associate this attachment
+      // with the correct in-flight message instead of silently dropping it.
+      ...(messageId ? { messageId } : {}),
+      attachmentId: event.attachmentId,
+      kind: event.kind,
+      mimeType: event.mimeType,
+      filename: event.filename,
+      size: event.size,
+      fileId: event.fileId,
+      url: event.url,
+      base64: event.base64,
+      caption: event.caption,
+      timestamp: event.timestamp,
+    });
+  }
+
   /** Show/hide typing indicator */
   async setTyping(isTyping: boolean, sourceRunId?: string): Promise<void> {
     await this.publish({
@@ -215,6 +273,51 @@ export class ConversationPublisher {
     // Store in list for replay on reconnection
     await this.redis.rpush(this.eventsKey, json);
     await this.redis.expire(this.eventsKey, this.ttl);
+    // Fire-and-forget archive job -- non-blocking, non-fatal
+    this._enqueueArchive(event).catch(() => {});
+  }
+
+  /**
+   * Enqueue a conversation archive job.
+   *
+   * No-op when ARCHIVE_QUEUE_DISABLED=true (for local dev without the
+   * webapp archiver running). Attachment events have their base64 payload
+   * stripped -- only the reference (fileId/url) is archived.
+   */
+  private async _enqueueArchive(event: ConversationEvent): Promise<void> {
+    if (process.env.ARCHIVE_QUEUE_DISABLED === 'true') return;
+    try {
+      const seqKey = `archive:seq:conv:${this.conversationId}`;
+      const seq = await this.redis.incr(seqKey);
+      // Expire the seq counter after the events TTL
+      if (seq === 1) {
+        await this.redis.expire(seqKey, this.ttl);
+      }
+      // Strip base64 from attachment events -- archive references only
+      let archiveEvent: Record<string, unknown> = event as unknown as Record<string, unknown>;
+      if ((event as any).type === 'attachment' && (archiveEvent as any).base64) {
+        const { base64: _stripped, ...rest } = archiveEvent;
+        archiveEvent = { ...rest, base64Stripped: true };
+      }
+      const jobData = {
+        type: 'conversation',
+        conversationId: this.conversationId,
+        userId: this.userId,
+        seq,
+        event: archiveEvent,
+        timestamp: Date.now(),
+      };
+      // Use module-level singleton Queue to avoid per-event connection churn (C-1).
+      const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
+      const queue = getArchiveQueue('conversation-archive', this.redis, prefix);
+      await queue.add('archive', jobData, {
+        jobId: `${this.conversationId}:${seq}`,
+        removeOnComplete: { age: 3600, count: 500 },
+        removeOnFail: { age: 86400 },
+      });
+    } catch (_err) {
+      // Silently swallow -- archiving is a side-channel, never fatal
+    }
   }
 
   private async persistMessage(params: {

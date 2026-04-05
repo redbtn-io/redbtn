@@ -56,7 +56,11 @@ export class ParserExecutor {
         this._disabled = false;
         this._maxErrors = 5;
         this._executeTool = executeTool || null;
+        this._processingChain = Promise.resolve();
     }
+
+    /** Serialized processing chain — ensures concurrent processChunk calls are queued. */
+    private _processingChain!: Promise<void>;
 
     /** Inject context into the parser state (e.g. channelId, triggerType). */
     setContext(ctx: Record<string, any>): void {
@@ -66,8 +70,26 @@ export class ParserExecutor {
     /**
      * Process a raw chunk from tool output.
      * Returns array of parsed content strings (may be 0, 1, or many).
+     *
+     * Calls are serialized via an internal promise chain — this is critical
+     * for parsers with awaited tool steps (e.g. Discord sends). Without
+     * serialization, concurrent invocations would interleave their mutations
+     * to _parserState and cause duplicate messages, lost captured IDs, etc.
      */
     async processChunk(rawChunk: string, streamType?: string): Promise<any[]> {
+        // Queue on the processing chain — each call waits for the previous
+        const prev = this._processingChain;
+        let resolveNext!: () => void;
+        this._processingChain = new Promise<void>((resolve) => { resolveNext = resolve; });
+        await prev;
+        try {
+            return await this._processChunkInternal(rawChunk, streamType);
+        } finally {
+            resolveNext();
+        }
+    }
+
+    private async _processChunkInternal(rawChunk: string, _streamType?: string): Promise<any[]> {
         if (this._disabled) {
             // Passthrough mode after too many errors
             return rawChunk ? [rawChunk] : [];
@@ -125,8 +147,21 @@ export class ParserExecutor {
 
     /**
      * Flush any remaining buffer content (end of stream).
+     * Serialized on the same chain as processChunk.
      */
     async flush(): Promise<any> {
+        const prev = this._processingChain;
+        let resolveNext!: () => void;
+        this._processingChain = new Promise<void>((resolve) => { resolveNext = resolve; });
+        await prev;
+        try {
+            return await this._flushInternal();
+        } finally {
+            resolveNext();
+        }
+    }
+
+    private async _flushInternal(): Promise<any> {
         if (!this._buffer || this._disabled) {
             const remaining = this._buffer;
             this._buffer = '';
@@ -161,11 +196,37 @@ export class ParserExecutor {
             // Execute each step in sequence
             for (const step of this.steps) {
                 if (step.type === 'transform') {
+                    // Check condition if present (transform steps can have conditions too)
+                    const tCondition = (step as any).condition;
+                    if (tCondition) {
+                        const { resolveValue } = require('../templateRenderer');
+                        try {
+                            const ok = Boolean(resolveValue(tCondition, state));
+                            if (!ok) continue;
+                        } catch {
+                            continue;
+                        }
+                    }
                     const { executeTransform } = require('./transformExecutor');
                     const result = await executeTransform(step.config, state);
-                    // Merge result into state
+                    // Merge result into state — with special handling for nested
+                    // paths like `_parserState.X` that should be written into the
+                    // actual _parserState object (transformExecutor returns these
+                    // as flat keys with dots in the name).
                     if (result && typeof result === 'object') {
-                        Object.assign(state, result);
+                        for (const [key, value] of Object.entries(result)) {
+                            if (key.startsWith('_parserState.')) {
+                                const path = key.substring('_parserState.'.length).split('.');
+                                let cur: any = this._parserState;
+                                for (let i = 0; i < path.length - 1; i++) {
+                                    if (cur[path[i]] == null || typeof cur[path[i]] !== 'object') cur[path[i]] = {};
+                                    cur = cur[path[i]];
+                                }
+                                cur[path[path.length - 1]] = value;
+                            } else {
+                                state[key] = value;
+                            }
+                        }
                     }
                 } else if (step.type === 'conditional') {
                     const { executeConditional } = require('./conditionalExecutor');
@@ -174,25 +235,63 @@ export class ParserExecutor {
                         Object.assign(state, result);
                     }
                 } else if (step.type === 'tool' && this._executeTool) {
+                    const { resolveValue, renderTemplate } = require('../templateRenderer');
                     // Check condition if present
                     const condition = (step as any).condition;
                     if (condition) {
-                        const { evaluateCondition } = require('../../../graphs/conditionEvaluator');
-                        if (!evaluateCondition(condition, state)) continue;
+                        try {
+                            const ok = Boolean(resolveValue(condition, state));
+                            if (!ok) continue;
+                        } catch (condErr: any) {
+                            console.warn(`[ParserExecutor] Condition eval error: ${condErr.message}`);
+                            continue;
+                        }
                     }
                     // Render parameters from state
-                    const { renderTemplate } = require('../templateRenderer');
                     const toolConfig = (step as any).config || {};
                     const toolName = renderTemplate(toolConfig.toolName || '', state);
                     const rawParams = toolConfig.parameters || {};
                     const rendered: Record<string, any> = {};
                     for (const [k, v] of Object.entries(rawParams)) {
-                        rendered[k] = typeof v === 'string' ? renderTemplate(v, state) : v;
+                        rendered[k] = typeof v === 'string' ? resolveValue(v, state) : v;
                     }
-                    // Fire-and-forget — don't block the parser
-                    this._executeTool(toolName, rendered).catch((err: any) => {
-                        console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
-                    });
+                    // Log the tool call for diagnostics (parser tool steps don't
+                    // show up in the ToolExecutor's normal logging path).
+                    console.log(`[ParserExecutor] tool step: ${toolName} params=${JSON.stringify(rendered).substring(0, 400)}`);
+                    // If outputField is specified, await the result and store it in _parserState.
+                    // Otherwise fire-and-forget (doesn't block parser processing).
+                    const outputField = toolConfig.outputField;
+                    if (outputField) {
+                        try {
+                            const result = await this._executeTool(toolName, rendered);
+                            // Unwrap common result shapes: MCP { content: [{text: jsonStr}] } or plain
+                            let extracted: any = result;
+                            if (result && typeof result === 'object' && Array.isArray((result as any).content)) {
+                                const textBlock = (result as any).content.find((b: any) => b?.type === 'text');
+                                if (textBlock?.text) {
+                                    try { extracted = JSON.parse(textBlock.text); } catch { extracted = textBlock.text; }
+                                }
+                            }
+                            // Store at the path in _parserState
+                            const setPath = (obj: any, path: string, val: any) => {
+                                const keys = path.split('.');
+                                let cur = obj;
+                                for (let i = 0; i < keys.length - 1; i++) {
+                                    if (cur[keys[i]] == null || typeof cur[keys[i]] !== 'object') cur[keys[i]] = {};
+                                    cur = cur[keys[i]];
+                                }
+                                cur[keys[keys.length - 1]] = val;
+                            };
+                            setPath(this._parserState, outputField, extracted);
+                            console.log(`[ParserExecutor] tool step ${toolName} → ${outputField}: ${JSON.stringify(extracted).substring(0, 200)}`);
+                        } catch (err: any) {
+                            console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
+                        }
+                    } else {
+                        this._executeTool(toolName, rendered).catch((err: any) => {
+                            console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
+                        });
+                    }
                 }
             }
 

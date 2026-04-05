@@ -10,6 +10,12 @@
  * - Handle client ready signaling for streaming
  * - Provide state access and subscription methods
  *
+ * Archive side-channel:
+ * - After every publish(), enqueues a BullMQ job to `run-archive` queue
+ *   (unless ARCHIVE_QUEUE_DISABLED=true). Each job has a dedup ID of
+ *   `{runId}:{seq}` where seq is an atomic Redis INCR counter.
+ *   Audio chunks are stripped of base64 payload before enqueueing.
+ *
  * @module lib/run/run-publisher
  */
 import type { Redis } from 'ioredis';
@@ -20,6 +26,7 @@ import {
   type RunOutput,
   type TokenMetadata,
   type ToolExecution,
+  type AttachmentKind,
   RunKeys,
   RunConfig,
   createInitialRunState,
@@ -31,6 +38,22 @@ import { ConversationPublisher, createConversationPublisher } from '../conversat
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
+
+// ---------------------------------------------------------------------------
+// Module-level singleton BullMQ Queue instances
+// One Queue per (name, prefix) pair — shared across all RunPublisher instances.
+// Creating a Queue per event causes connection churn (C-1 fix).
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { Queue: _BullQueue } = require('bullmq');
+const _archiveQueues = new Map<string, InstanceType<typeof _BullQueue>>();
+
+function getArchiveQueue(name: string, redis: unknown, prefix: string): InstanceType<typeof _BullQueue> {
+  const key = `${prefix}:${name}`;
+  if (!_archiveQueues.has(key)) {
+    _archiveQueues.set(key, new _BullQueue(name, { connection: redis, prefix }));
+  }
+  return _archiveQueues.get(key)!;
+}
 
 /**
  * Options for RunPublisher constructor
@@ -135,16 +158,25 @@ export class RunPublisher {
     graphName: string,
     input: Record<string, unknown>,
     conversationId?: string,
+    triggerType?: string,
   ): Promise<void> {
     if (this.initialized) {
       throw new Error(`RunPublisher already initialized for run ${this.runId}`);
+    }
+    // W-3: If the caller supplies triggerType explicitly (e.g. from enrichInput's
+    // resolved trigger.type), inject it into the input snapshot stored in state so
+    // that _enqueueArchive can always read it from this.state.input._trigger.type —
+    // even when run() is called directly without going through enrichInput().
+    let resolvedInput = input;
+    if (triggerType && !(input as Record<string, any>)._trigger) {
+      resolvedInput = { ...input, _trigger: { type: triggerType } };
     }
     this.state = createInitialRunState({
       runId: this.runId,
       userId: this.userId,
       graphId,
       graphName,
-      input,
+      input: resolvedInput,
       conversationId,
     });
     await this.saveState();
@@ -458,6 +490,59 @@ export class RunPublisher {
   }
 
   // ===========================================================================
+  // Attachment Events
+  // ===========================================================================
+
+  /**
+   * Publish an attachment event to the run stream and (if conversationId is set)
+   * to the conversation stream so that the chat UI can render the file inline.
+   *
+   * Call this after the file has been stored (GridFS / external URL is known).
+   * `fileId` and `url` are both optional — pass whichever is available.
+   */
+  async attachment(params: {
+    attachmentId: string;
+    kind: AttachmentKind;
+    mimeType: string;
+    filename: string;
+    size: number;
+    fileId?: string;
+    url?: string;
+    base64?: string;
+    caption?: string;
+  }): Promise<void> {
+    this.ensureInitialized();
+    const event = {
+      type: 'attachment' as const,
+      ...params,
+      timestamp: Date.now(),
+    };
+    await this.publish(event);
+    // Forward to conversation stream so the UI receives it without polling.
+    // Pass convMessageId so the archiver can persist this attachment to the
+    // correct in-flight message (W-4 fix).
+    if (this.convPublisher) {
+      this.convPublisher.publishAttachment(this.runId, event, this.convMessageId ?? undefined).catch((err) => {
+        if (DEBUG) console.warn('[RunPublisher] Conv forward attachment failed:', err);
+      });
+    }
+    await this.persistLog({
+      level: 'info',
+      category: 'attachment',
+      message: `Attachment: ${params.filename} (${params.kind})`,
+      metadata: {
+        attachmentId: params.attachmentId,
+        kind: params.kind,
+        mimeType: params.mimeType,
+        filename: params.filename,
+        size: params.size,
+        fileId: params.fileId,
+        url: params.url,
+      },
+    });
+  }
+
+  // ===========================================================================
   // Tool Events
   // ===========================================================================
 
@@ -534,11 +619,16 @@ export class RunPublisher {
         result, metadata, timestamp: ts,
       }).catch(() => {});
     }
+    // Extract a useful preview of the tool result for persistent logging.
+    // For structured results (ssh_shell, invoke_function, etc.) we include
+    // stdout/stderr/exitCode so command failures are diagnosable from logs.
+    const resultPreview = summarizeToolResult(result);
+    const logLevel = resultPreview.isFailure ? 'warn' : 'info';
     await this.persistLog({
-      level: 'info',
+      level: logLevel,
       category: 'tool',
-      message: `Tool completed: ${tool?.toolName ?? toolId}`,
-      metadata: { toolId, toolName: tool?.toolName, duration: tool?.duration, ...metadata },
+      message: `Tool completed: ${tool?.toolName ?? toolId}${resultPreview.isFailure ? ' (non-zero exit)' : ''}`,
+      metadata: { toolId, toolName: tool?.toolName, duration: tool?.duration, ...resultPreview.meta, ...metadata },
     });
   }
 
@@ -640,6 +730,57 @@ export class RunPublisher {
     const eventsKey = RunKeys.events(this.runId);
     const pub = new StreamPublisher({ redis: this.redis, channel, eventsKey, ttl: this.stateTtl });
     await pub.publish(event as any);
+    // Fire-and-forget archive job — non-blocking, non-fatal
+    this._enqueueArchive(event).catch(() => {});
+  }
+
+  /**
+   * Enqueue an archive job for this run event.
+   *
+   * No-op when ARCHIVE_QUEUE_DISABLED=true (for local dev without the
+   * webapp archiver running). Audio events have their base64 payload stripped
+   * before enqueueing — only metadata is archived by default.
+   */
+  private async _enqueueArchive(event: RunEvent): Promise<void> {
+    if (process.env.ARCHIVE_QUEUE_DISABLED === 'true') return;
+    try {
+      const seqKey = `archive:seq:run:${this.runId}`;
+      const seq = await this.redis.incr(seqKey);
+      // Expire the seq counter after the run state TTL so it doesn't accumulate
+      if (seq === 1) {
+        await this.redis.expire(seqKey, this.stateTtl);
+      }
+      // Strip base64 audio payload — archive metadata only by default
+      let archiveEvent: Record<string, unknown> = event as unknown as Record<string, unknown>;
+      if ((event as any).type === 'audio_chunk') {
+        const { audio: _stripped, ...rest } = archiveEvent;
+        archiveEvent = { ...rest, audioStripped: true };
+      }
+      // W-3: include triggerType so the archiver can correctly categorise the run.
+      // _trigger is injected into the input by enrichInput() in the worker processor.
+      const triggerType = (this.state?.input as Record<string, any>)?._trigger?.type as string | undefined;
+      const jobData = {
+        type: 'run',
+        runId: this.runId,
+        userId: this.userId,
+        graphId: this.state?.graphId,
+        conversationId: this.state?.conversationId,
+        triggerType,
+        seq,
+        event: archiveEvent,
+        timestamp: Date.now(),
+      };
+      // Use module-level singleton Queue to avoid per-event connection churn (C-1).
+      const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
+      const queue = getArchiveQueue('run-archive', this.redis, prefix);
+      await queue.add('archive', jobData, {
+        jobId: `${this.runId}:${seq}`,
+        removeOnComplete: { age: 3600, count: 500 },
+        removeOnFail: { age: 86400 },
+      });
+    } catch (err) {
+      if (DEBUG) console.error('[RunPublisher] _enqueueArchive error:', err);
+    }
   }
 
   async getEvents(): Promise<RunEvent[]> {
@@ -685,6 +826,59 @@ export function createRunPublisher(options: RunPublisherOptions): RunPublisher {
   return new RunPublisher(options);
 }
 
+/**
+ * Extract a useful, size-limited preview of a tool result for log metadata.
+ * Understands MCP-style content arrays and common structured shapes
+ * (ssh_shell, invoke_function) so command failures are diagnosable from logs.
+ */
+function summarizeToolResult(result: unknown): { meta: Record<string, unknown>; isFailure: boolean } {
+  if (result == null) return { meta: {}, isFailure: false };
+  const MAX_PREVIEW = 500;
+  const trunc = (s: string) => (s.length > MAX_PREVIEW ? s.substring(0, MAX_PREVIEW) + '...[truncated]' : s);
+
+  // Unwrap MCP content format: { content: [{ type:"text", text: "..." }] }
+  let payload: any = result;
+  if (payload && typeof payload === 'object' && Array.isArray((payload as any).content)) {
+    const textBlock = (payload as any).content.find((b: any) => b?.type === 'text' && typeof b.text === 'string');
+    if (textBlock) {
+      try { payload = JSON.parse(textBlock.text); } catch { payload = textBlock.text; }
+    }
+  }
+
+  // String result — just preview it
+  if (typeof payload === 'string') {
+    return { meta: { resultPreview: trunc(payload) }, isFailure: false };
+  }
+
+  if (typeof payload !== 'object') {
+    return { meta: { result: payload }, isFailure: false };
+  }
+
+  const obj = payload as Record<string, any>;
+  const meta: Record<string, unknown> = {};
+  let isFailure = false;
+
+  if ('exitCode' in obj) {
+    meta.exitCode = obj.exitCode;
+    if (typeof obj.exitCode === 'number' && obj.exitCode !== 0) isFailure = true;
+  }
+  if ('success' in obj && obj.success === false) isFailure = true;
+  if ('error' in obj && obj.error) {
+    meta.error = typeof obj.error === 'string' ? trunc(obj.error) : obj.error;
+    isFailure = true;
+  }
+  if (typeof obj.stdout === 'string') meta.stdoutPreview = trunc(obj.stdout);
+  if (typeof obj.stderr === 'string' && obj.stderr.length > 0) meta.stderrPreview = trunc(obj.stderr);
+  if (typeof obj.durationMs === 'number') meta.toolDurationMs = obj.durationMs;
+  if (typeof obj.status === 'number') meta.httpStatus = obj.status;
+
+  // Nothing extracted → include a small JSON preview
+  if (Object.keys(meta).length === 0) {
+    try { meta.resultPreview = trunc(JSON.stringify(obj)); } catch { /* ignore */ }
+  }
+  return { meta, isFailure };
+}
+
 export async function getActiveRunForConversation(redis: Redis, conversationId: string): Promise<string | null> {
   const runId = await redis.get(RunKeys.conversationRun(conversationId));
   if (!runId) return null;
@@ -706,3 +900,17 @@ export async function getRunState(redis: Redis, runId: string): Promise<RunState
   if (!stateJson) return null;
   return JSON.parse(stateJson);
 }
+
+// =============================================================================
+// Archive Queue Helper
+// =============================================================================
+
+/**
+ * Queue names used by the stream archiver system.
+ * Import this in the webapp to create the consumer workers on the same queues
+ * that RunPublisher and ConversationPublisher enqueue into.
+ */
+export const ARCHIVE_QUEUE_NAMES = {
+  RUN: 'run-archive',
+  CONVERSATION: 'conversation-archive',
+} as const;

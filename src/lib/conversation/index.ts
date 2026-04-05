@@ -15,4 +15,5 @@ export type {
   ConversationToolEvent,
   ConversationRunCompleteEvent,
   ConversationRunErrorEvent,
+  ConversationAttachmentEvent,
 } from './types';

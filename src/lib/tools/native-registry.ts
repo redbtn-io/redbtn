@@ -237,4 +237,15 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register push_message:', msg);
   }
+
+  try {
+    // Upload Attachment — upload files to the attachment store and publish to run stream
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const uploadAttachment = require('./native/upload-attachment.js');
+    registry.register('upload_attachment', uploadAttachment);
+    console.log('[NativeRegistry] Registered built-in tool: upload_attachment');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register upload_attachment:', msg);
+  }
 }
