@@ -242,7 +242,8 @@ export class ParserExecutor {
                         try {
                             const ok = Boolean(resolveValue(condition, state));
                             if (!ok) continue;
-                        } catch {
+                        } catch (condErr: any) {
+                            console.warn(`[ParserExecutor] Condition eval error: ${condErr.message}`);
                             continue;
                         }
                     }
@@ -254,6 +255,9 @@ export class ParserExecutor {
                     for (const [k, v] of Object.entries(rawParams)) {
                         rendered[k] = typeof v === 'string' ? resolveValue(v, state) : v;
                     }
+                    // Log the tool call for diagnostics (parser tool steps don't
+                    // show up in the ToolExecutor's normal logging path).
+                    console.log(`[ParserExecutor] tool step: ${toolName} params=${JSON.stringify(rendered).substring(0, 400)}`);
                     // If outputField is specified, await the result and store it in _parserState.
                     // Otherwise fire-and-forget (doesn't block parser processing).
                     const outputField = toolConfig.outputField;
@@ -279,6 +283,7 @@ export class ParserExecutor {
                                 cur[keys[keys.length - 1]] = val;
                             };
                             setPath(this._parserState, outputField, extracted);
+                            console.log(`[ParserExecutor] tool step ${toolName} → ${outputField}: ${JSON.stringify(extracted).substring(0, 200)}`);
                         } catch (err: any) {
                             console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
                         }
