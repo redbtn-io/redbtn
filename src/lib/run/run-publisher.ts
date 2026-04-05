@@ -10,6 +10,12 @@
  * - Handle client ready signaling for streaming
  * - Provide state access and subscription methods
  *
+ * Archive side-channel:
+ * - After every publish(), enqueues a BullMQ job to `run-archive` queue
+ *   (unless ARCHIVE_QUEUE_DISABLED=true). Each job has a dedup ID of
+ *   `{runId}:{seq}` where seq is an atomic Redis INCR counter.
+ *   Audio chunks are stripped of base64 payload before enqueueing.
+ *
  * @module lib/run/run-publisher
  */
 import type { Redis } from 'ioredis';
@@ -20,6 +26,7 @@ import {
   type RunOutput,
   type TokenMetadata,
   type ToolExecution,
+  type AttachmentKind,
   RunKeys,
   RunConfig,
   createInitialRunState,
@@ -458,6 +465,57 @@ export class RunPublisher {
   }
 
   // ===========================================================================
+  // Attachment Events
+  // ===========================================================================
+
+  /**
+   * Publish an attachment event to the run stream and (if conversationId is set)
+   * to the conversation stream so that the chat UI can render the file inline.
+   *
+   * Call this after the file has been stored (GridFS / external URL is known).
+   * `fileId` and `url` are both optional — pass whichever is available.
+   */
+  async attachment(params: {
+    attachmentId: string;
+    kind: AttachmentKind;
+    mimeType: string;
+    filename: string;
+    size: number;
+    fileId?: string;
+    url?: string;
+    base64?: string;
+    caption?: string;
+  }): Promise<void> {
+    this.ensureInitialized();
+    const event = {
+      type: 'attachment' as const,
+      ...params,
+      timestamp: Date.now(),
+    };
+    await this.publish(event);
+    // Forward to conversation stream so the UI receives it without polling
+    if (this.convPublisher) {
+      this.convPublisher.publishAttachment(this.runId, event).catch((err) => {
+        if (DEBUG) console.warn('[RunPublisher] Conv forward attachment failed:', err);
+      });
+    }
+    await this.persistLog({
+      level: 'info',
+      category: 'attachment',
+      message: `Attachment: ${params.filename} (${params.kind})`,
+      metadata: {
+        attachmentId: params.attachmentId,
+        kind: params.kind,
+        mimeType: params.mimeType,
+        filename: params.filename,
+        size: params.size,
+        fileId: params.fileId,
+        url: params.url,
+      },
+    });
+  }
+
+  // ===========================================================================
   // Tool Events
   // ===========================================================================
 
@@ -645,6 +703,61 @@ export class RunPublisher {
     const eventsKey = RunKeys.events(this.runId);
     const pub = new StreamPublisher({ redis: this.redis, channel, eventsKey, ttl: this.stateTtl });
     await pub.publish(event as any);
+    // Fire-and-forget archive job — non-blocking, non-fatal
+    this._enqueueArchive(event).catch(() => {});
+  }
+
+  /**
+   * Enqueue an archive job for this run event.
+   *
+   * No-op when ARCHIVE_QUEUE_DISABLED=true (for local dev without the
+   * webapp archiver running). Audio events have their base64 payload stripped
+   * before enqueueing — only metadata is archived by default.
+   */
+  private async _enqueueArchive(event: RunEvent): Promise<void> {
+    if (process.env.ARCHIVE_QUEUE_DISABLED === 'true') return;
+    try {
+      const seqKey = `archive:seq:run:${this.runId}`;
+      const seq = await this.redis.incr(seqKey);
+      // Expire the seq counter after the run state TTL so it doesn't accumulate
+      if (seq === 1) {
+        await this.redis.expire(seqKey, this.stateTtl);
+      }
+      // Strip base64 audio payload — archive metadata only by default
+      let archiveEvent: Record<string, unknown> = event as unknown as Record<string, unknown>;
+      if ((event as any).type === 'audio_chunk') {
+        const { audio: _stripped, ...rest } = archiveEvent;
+        archiveEvent = { ...rest, audioStripped: true };
+      }
+      const jobData = {
+        type: 'run',
+        runId: this.runId,
+        userId: this.userId,
+        graphId: this.state?.graphId,
+        conversationId: this.state?.conversationId,
+        seq,
+        event: archiveEvent,
+        timestamp: Date.now(),
+      };
+      // Use inline require to avoid circular imports and keep this module
+      // working in both the worker (where the archiver queue is NOT consuming)
+      // and the webapp (where it IS consuming).
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { Queue } = require('bullmq');
+      const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
+      const queue = new Queue('run-archive', {
+        connection: this.redis,
+        prefix,
+      });
+      await queue.add('archive', jobData, {
+        jobId: `${this.runId}:${seq}`,
+        removeOnComplete: { age: 3600, count: 500 },
+        removeOnFail: { age: 86400 },
+      });
+      await queue.close();
+    } catch (err) {
+      if (DEBUG) console.error('[RunPublisher] _enqueueArchive error:', err);
+    }
   }
 
   async getEvents(): Promise<RunEvent[]> {
@@ -764,3 +877,17 @@ export async function getRunState(redis: Redis, runId: string): Promise<RunState
   if (!stateJson) return null;
   return JSON.parse(stateJson);
 }
+
+// =============================================================================
+// Archive Queue Helper
+// =============================================================================
+
+/**
+ * Queue names used by the stream archiver system.
+ * Import this in the webapp to create the consumer workers on the same queues
+ * that RunPublisher and ConversationPublisher enqueue into.
+ */
+export const ARCHIVE_QUEUE_NAMES = {
+  RUN: 'run-archive',
+  CONVERSATION: 'conversation-archive',
+} as const;

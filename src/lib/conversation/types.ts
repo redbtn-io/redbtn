@@ -137,6 +137,25 @@ export interface ConversationRunErrorEvent {
   timestamp: number;
 }
 
+/**
+ * Attachment event forwarded from RunPublisher when a file is produced or received.
+ * The chat UI uses this to render inline image/video/document previews.
+ */
+export interface ConversationAttachmentEvent {
+  type: 'attachment';
+  runId: string;
+  attachmentId: string;
+  kind: 'image' | 'video' | 'audio' | 'document' | 'file';
+  mimeType: string;
+  filename: string;
+  size: number;
+  fileId?: string;
+  url?: string;
+  base64?: string;
+  caption?: string;
+  timestamp: number;
+}
+
 export type ConversationEvent =
   | ConversationMessageEvent
   | ConversationMessageStartEvent
@@ -150,4 +169,5 @@ export type ConversationEvent =
   | ConversationContentChunkEvent
   | ConversationToolEvent
   | ConversationRunCompleteEvent
-  | ConversationRunErrorEvent;
+  | ConversationRunErrorEvent
+  | ConversationAttachmentEvent;

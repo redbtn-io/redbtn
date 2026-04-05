@@ -51,6 +51,28 @@ export interface TriggerSource {
 }
 
 /**
+ * A lightweight reference to an attachment sent alongside a trigger.
+ *
+ * These refs are normalized by edge adapters (Discord bot, email receiver, etc.)
+ * before the payload reaches the platform. The attachment may later be persisted
+ * to the webapp attachment store (GridFS) by the upload-attachment native tool.
+ */
+export interface AttachmentRef {
+  /** Media category */
+  kind: 'image' | 'video' | 'audio' | 'document' | 'file';
+  /** MIME type (e.g. 'image/jpeg') */
+  mimeType: string;
+  /** Original filename */
+  filename: string;
+  /** File size in bytes (may be 0 when unknown) */
+  size: number;
+  /** Source URL (e.g. Discord CDN) — may require auth headers to fetch */
+  url?: string;
+  /** Base64-encoded data — present for small inline attachments */
+  base64?: string;
+}
+
+/**
  * Trigger-specific metadata that varies by trigger type.
  *
  * Common examples:
@@ -60,8 +82,14 @@ export interface TriggerSource {
  *   cron    → { cronExpression: '0 * * * *', scheduleMode: 'cron' | 'interval' }
  *   email   → { from: '...', subject: '...', to: '...' }
  *   api     → { clientId: '...', oauthScopes: [...] }
+ *
+ * The `attachments` field is populated by edge adapters when the trigger
+ * carries files (Discord image uploads, email attachments, etc.).
  */
-export type TriggerMetadata = Record<string, unknown>;
+export interface TriggerMetadata extends Record<string, unknown> {
+  /** Normalized attachments carried with this trigger */
+  attachments?: AttachmentRef[];
+}
 
 /**
  * Full trigger descriptor attached to every TriggeredRun.
