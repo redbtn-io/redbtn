@@ -20,6 +20,21 @@
 import type Redis from 'ioredis';
 import { ConversationKeys, ConversationConfig, type ConversationEvent } from './types';
 
+// ---------------------------------------------------------------------------
+// Module-level singleton BullMQ Queue instances (C-1 fix)
+// One Queue per (name, prefix) pair — shared across all ConversationPublisher instances.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { Queue: _BullQueue } = require('bullmq');
+const _archiveQueues = new Map<string, InstanceType<typeof _BullQueue>>();
+
+function getArchiveQueue(name: string, redis: unknown, prefix: string): InstanceType<typeof _BullQueue> {
+  const key = `${prefix}:${name}`;
+  if (!_archiveQueues.has(key)) {
+    _archiveQueues.set(key, new _BullQueue(name, { connection: redis, prefix }));
+  }
+  return _archiveQueues.get(key)!;
+}
+
 export interface ConversationPublisherOptions {
   redis: Redis;
   conversationId: string;
@@ -209,10 +224,13 @@ export class ConversationPublisher {
     base64?: string;
     caption?: string;
     timestamp: number;
-  }): Promise<void> {
+  }, messageId?: string): Promise<void> {
     await this.publish({
       type: 'attachment',
       runId,
+      // W-4: include messageId so the archiver can associate this attachment
+      // with the correct in-flight message instead of silently dropping it.
+      ...(messageId ? { messageId } : {}),
       attachmentId: event.attachmentId,
       kind: event.kind,
       mimeType: event.mimeType,
@@ -289,19 +307,14 @@ export class ConversationPublisher {
         event: archiveEvent,
         timestamp: Date.now(),
       };
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { Queue } = require('bullmq');
+      // Use module-level singleton Queue to avoid per-event connection churn (C-1).
       const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
-      const queue = new Queue('conversation-archive', {
-        connection: this.redis,
-        prefix,
-      });
+      const queue = getArchiveQueue('conversation-archive', this.redis, prefix);
       await queue.add('archive', jobData, {
         jobId: `${this.conversationId}:${seq}`,
         removeOnComplete: { age: 3600, count: 500 },
         removeOnFail: { age: 86400 },
       });
-      await queue.close();
     } catch (_err) {
       // Silently swallow -- archiving is a side-channel, never fatal
     }

@@ -140,10 +140,15 @@ export interface ConversationRunErrorEvent {
 /**
  * Attachment event forwarded from RunPublisher when a file is produced or received.
  * The chat UI uses this to render inline image/video/document previews.
+ *
+ * `messageId` ties the attachment to the in-flight assistant message so the
+ * conversation archiver can persist it to the correct messages array entry (W-4).
  */
 export interface ConversationAttachmentEvent {
   type: 'attachment';
   runId: string;
+  /** The in-flight assistant message this attachment belongs to */
+  messageId?: string;
   attachmentId: string;
   kind: 'image' | 'video' | 'audio' | 'document' | 'file';
   mimeType: string;

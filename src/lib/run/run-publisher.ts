@@ -39,6 +39,22 @@ import { ConversationPublisher, createConversationPublisher } from '../conversat
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
 
+// ---------------------------------------------------------------------------
+// Module-level singleton BullMQ Queue instances
+// One Queue per (name, prefix) pair — shared across all RunPublisher instances.
+// Creating a Queue per event causes connection churn (C-1 fix).
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { Queue: _BullQueue } = require('bullmq');
+const _archiveQueues = new Map<string, InstanceType<typeof _BullQueue>>();
+
+function getArchiveQueue(name: string, redis: unknown, prefix: string): InstanceType<typeof _BullQueue> {
+  const key = `${prefix}:${name}`;
+  if (!_archiveQueues.has(key)) {
+    _archiveQueues.set(key, new _BullQueue(name, { connection: redis, prefix }));
+  }
+  return _archiveQueues.get(key)!;
+}
+
 /**
  * Options for RunPublisher constructor
  */
@@ -493,9 +509,11 @@ export class RunPublisher {
       timestamp: Date.now(),
     };
     await this.publish(event);
-    // Forward to conversation stream so the UI receives it without polling
+    // Forward to conversation stream so the UI receives it without polling.
+    // Pass convMessageId so the archiver can persist this attachment to the
+    // correct in-flight message (W-4 fix).
     if (this.convPublisher) {
-      this.convPublisher.publishAttachment(this.runId, event).catch((err) => {
+      this.convPublisher.publishAttachment(this.runId, event, this.convMessageId ?? undefined).catch((err) => {
         if (DEBUG) console.warn('[RunPublisher] Conv forward attachment failed:', err);
       });
     }
@@ -729,32 +747,28 @@ export class RunPublisher {
         const { audio: _stripped, ...rest } = archiveEvent;
         archiveEvent = { ...rest, audioStripped: true };
       }
+      // W-3: include triggerType so the archiver can correctly categorise the run.
+      // _trigger is injected into the input by enrichInput() in the worker processor.
+      const triggerType = (this.state?.input as Record<string, any>)?._trigger?.type as string | undefined;
       const jobData = {
         type: 'run',
         runId: this.runId,
         userId: this.userId,
         graphId: this.state?.graphId,
         conversationId: this.state?.conversationId,
+        triggerType,
         seq,
         event: archiveEvent,
         timestamp: Date.now(),
       };
-      // Use inline require to avoid circular imports and keep this module
-      // working in both the worker (where the archiver queue is NOT consuming)
-      // and the webapp (where it IS consuming).
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { Queue } = require('bullmq');
+      // Use module-level singleton Queue to avoid per-event connection churn (C-1).
       const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
-      const queue = new Queue('run-archive', {
-        connection: this.redis,
-        prefix,
-      });
+      const queue = getArchiveQueue('run-archive', this.redis, prefix);
       await queue.add('archive', jobData, {
         jobId: `${this.runId}:${seq}`,
         removeOnComplete: { age: 3600, count: 500 },
         removeOnFail: { age: 86400 },
       });
-      await queue.close();
     } catch (err) {
       if (DEBUG) console.error('[RunPublisher] _enqueueArchive error:', err);
     }
