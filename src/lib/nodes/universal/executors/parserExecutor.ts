@@ -1,8 +1,11 @@
 /**
  * ParserExecutor -- processes streaming chunks through parser node steps.
  *
- * Handles buffering (line/chunk/json modes), executes transform/conditional
+ * Handles buffering (line/chunk/json modes), executes transform/conditional/tool
  * steps per-unit, and returns parsed content for conversation streaming.
+ *
+ * Tool steps enable side-effects (e.g. send-discord) directly from the parser.
+ * The caller provides an `executeTool` callback that handles the actual invocation.
  *
  * Error-isolated: parser failures never crash the tool execution.
  */
@@ -15,6 +18,15 @@ interface ParserConfig {
     skipEmpty?: boolean;
 }
 
+/**
+ * Callback for executing tool steps within the parser.
+ * Fire-and-forget: the parser doesn't wait for results.
+ */
+export type ParserToolExecutor = (
+    toolName: string,
+    parameters: Record<string, any>,
+) => Promise<any>;
+
 export class ParserExecutor {
     private steps: UniversalStep[];
     private inputField: string;
@@ -26,8 +38,13 @@ export class ParserExecutor {
     private _consecutiveErrors: number;
     private _disabled: boolean;
     private _maxErrors: number;
+    private _executeTool: ParserToolExecutor | null;
 
-    constructor(parserNodeConfig: NodeConfig, parserConfig?: ParserConfig) {
+    constructor(
+        parserNodeConfig: NodeConfig,
+        parserConfig?: ParserConfig,
+        executeTool?: ParserToolExecutor,
+    ) {
         this.steps = parserNodeConfig.steps || [];
         this.inputField = (parserConfig && parserConfig.inputField) || 'chunk';
         this.outputField = (parserConfig && parserConfig.outputField) || 'parsedContent';
@@ -38,6 +55,12 @@ export class ParserExecutor {
         this._consecutiveErrors = 0;
         this._disabled = false;
         this._maxErrors = 5;
+        this._executeTool = executeTool || null;
+    }
+
+    /** Inject context into the parser state (e.g. channelId, triggerType). */
+    setContext(ctx: Record<string, any>): void {
+        this._parserState._context = { ...this._parserState._context, ...ctx };
     }
 
     /**
@@ -150,8 +173,27 @@ export class ParserExecutor {
                     if (result && typeof result === 'object') {
                         Object.assign(state, result);
                     }
+                } else if (step.type === 'tool' && this._executeTool) {
+                    // Check condition if present
+                    const condition = (step as any).condition;
+                    if (condition) {
+                        const { evaluateCondition } = require('../../../graphs/conditionEvaluator');
+                        if (!evaluateCondition(condition, state)) continue;
+                    }
+                    // Render parameters from state
+                    const { renderTemplate } = require('../templateRenderer');
+                    const toolConfig = (step as any).config || {};
+                    const toolName = renderTemplate(toolConfig.toolName || '', state);
+                    const rawParams = toolConfig.parameters || {};
+                    const rendered: Record<string, any> = {};
+                    for (const [k, v] of Object.entries(rawParams)) {
+                        rendered[k] = typeof v === 'string' ? renderTemplate(v, state) : v;
+                    }
+                    // Fire-and-forget — don't block the parser
+                    this._executeTool(toolName, rendered).catch((err: any) => {
+                        console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
+                    });
                 }
-                // Other step types (neuron, tool, loop) not supported in parsers
             }
 
             // Extract output
