@@ -193,10 +193,39 @@ export class ParserExecutor {
                     for (const [k, v] of Object.entries(rawParams)) {
                         rendered[k] = typeof v === 'string' ? resolveValue(v, state) : v;
                     }
-                    // Fire-and-forget — don't block the parser
-                    this._executeTool(toolName, rendered).catch((err: any) => {
-                        console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
-                    });
+                    // If outputField is specified, await the result and store it in _parserState.
+                    // Otherwise fire-and-forget (doesn't block parser processing).
+                    const outputField = toolConfig.outputField;
+                    if (outputField) {
+                        try {
+                            const result = await this._executeTool(toolName, rendered);
+                            // Unwrap common result shapes: MCP { content: [{text: jsonStr}] } or plain
+                            let extracted: any = result;
+                            if (result && typeof result === 'object' && Array.isArray((result as any).content)) {
+                                const textBlock = (result as any).content.find((b: any) => b?.type === 'text');
+                                if (textBlock?.text) {
+                                    try { extracted = JSON.parse(textBlock.text); } catch { extracted = textBlock.text; }
+                                }
+                            }
+                            // Store at the path in _parserState
+                            const setPath = (obj: any, path: string, val: any) => {
+                                const keys = path.split('.');
+                                let cur = obj;
+                                for (let i = 0; i < keys.length - 1; i++) {
+                                    if (cur[keys[i]] == null || typeof cur[keys[i]] !== 'object') cur[keys[i]] = {};
+                                    cur = cur[keys[i]];
+                                }
+                                cur[keys[keys.length - 1]] = val;
+                            };
+                            setPath(this._parserState, outputField, extracted);
+                        } catch (err: any) {
+                            console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
+                        }
+                    } else {
+                        this._executeTool(toolName, rendered).catch((err: any) => {
+                            console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
+                        });
+                    }
                 }
             }
 

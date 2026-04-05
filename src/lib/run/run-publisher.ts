@@ -534,11 +534,16 @@ export class RunPublisher {
         result, metadata, timestamp: ts,
       }).catch(() => {});
     }
+    // Extract a useful preview of the tool result for persistent logging.
+    // For structured results (ssh_shell, invoke_function, etc.) we include
+    // stdout/stderr/exitCode so command failures are diagnosable from logs.
+    const resultPreview = summarizeToolResult(result);
+    const logLevel = resultPreview.isFailure ? 'warn' : 'info';
     await this.persistLog({
-      level: 'info',
+      level: logLevel,
       category: 'tool',
-      message: `Tool completed: ${tool?.toolName ?? toolId}`,
-      metadata: { toolId, toolName: tool?.toolName, duration: tool?.duration, ...metadata },
+      message: `Tool completed: ${tool?.toolName ?? toolId}${resultPreview.isFailure ? ' (non-zero exit)' : ''}`,
+      metadata: { toolId, toolName: tool?.toolName, duration: tool?.duration, ...resultPreview.meta, ...metadata },
     });
   }
 
@@ -683,6 +688,59 @@ export class RunPublisher {
 
 export function createRunPublisher(options: RunPublisherOptions): RunPublisher {
   return new RunPublisher(options);
+}
+
+/**
+ * Extract a useful, size-limited preview of a tool result for log metadata.
+ * Understands MCP-style content arrays and common structured shapes
+ * (ssh_shell, invoke_function) so command failures are diagnosable from logs.
+ */
+function summarizeToolResult(result: unknown): { meta: Record<string, unknown>; isFailure: boolean } {
+  if (result == null) return { meta: {}, isFailure: false };
+  const MAX_PREVIEW = 500;
+  const trunc = (s: string) => (s.length > MAX_PREVIEW ? s.substring(0, MAX_PREVIEW) + '...[truncated]' : s);
+
+  // Unwrap MCP content format: { content: [{ type:"text", text: "..." }] }
+  let payload: any = result;
+  if (payload && typeof payload === 'object' && Array.isArray((payload as any).content)) {
+    const textBlock = (payload as any).content.find((b: any) => b?.type === 'text' && typeof b.text === 'string');
+    if (textBlock) {
+      try { payload = JSON.parse(textBlock.text); } catch { payload = textBlock.text; }
+    }
+  }
+
+  // String result — just preview it
+  if (typeof payload === 'string') {
+    return { meta: { resultPreview: trunc(payload) }, isFailure: false };
+  }
+
+  if (typeof payload !== 'object') {
+    return { meta: { result: payload }, isFailure: false };
+  }
+
+  const obj = payload as Record<string, any>;
+  const meta: Record<string, unknown> = {};
+  let isFailure = false;
+
+  if ('exitCode' in obj) {
+    meta.exitCode = obj.exitCode;
+    if (typeof obj.exitCode === 'number' && obj.exitCode !== 0) isFailure = true;
+  }
+  if ('success' in obj && obj.success === false) isFailure = true;
+  if ('error' in obj && obj.error) {
+    meta.error = typeof obj.error === 'string' ? trunc(obj.error) : obj.error;
+    isFailure = true;
+  }
+  if (typeof obj.stdout === 'string') meta.stdoutPreview = trunc(obj.stdout);
+  if (typeof obj.stderr === 'string' && obj.stderr.length > 0) meta.stderrPreview = trunc(obj.stderr);
+  if (typeof obj.durationMs === 'number') meta.toolDurationMs = obj.durationMs;
+  if (typeof obj.status === 'number') meta.httpStatus = obj.status;
+
+  // Nothing extracted → include a small JSON preview
+  if (Object.keys(meta).length === 0) {
+    try { meta.resultPreview = trunc(JSON.stringify(obj)); } catch { /* ignore */ }
+  }
+  return { meta, isFailure };
 }
 
 export async function getActiveRunForConversation(redis: Redis, conversationId: string): Promise<string | null> {
