@@ -165,8 +165,30 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
             const registry = getParserRegistry();
             const parserDef = await registry.getParser((config as any).streamParser);
             if (parserDef) {
-                parserExecutor = new ParserExecutor(parserDef.config, parserDef.parserConfig);
-                console.log(`[ToolExecutor] Stream parser "${(config as any).streamParser}" loaded for ${config.toolName}`);
+                // Build tool executor callback for parser tool steps (e.g. send-discord)
+                const nativeReg = getNativeRegistry();
+                const parserToolExecutor = async (toolName: string, params: Record<string, any>) => {
+                    if (nativeReg.has(toolName)) {
+                        const tool = nativeReg.get(toolName);
+                        return tool.handler(params, {});
+                    }
+                    // Fall back to MCP
+                    const mcpClient = state.mcpClient;
+                    if (mcpClient) {
+                        return mcpClient.callTool(toolName, params);
+                    }
+                    throw new Error(`Tool "${toolName}" not available in parser context`);
+                };
+                parserExecutor = new ParserExecutor(parserDef.config, parserDef.parserConfig, parserToolExecutor);
+                // Inject context from graph state so parser steps can reference channelId, triggerType, etc.
+                const inputData = state.data?.input || state.input || {};
+                parserExecutor.setContext({
+                    channelId: inputData.channelId,
+                    triggerType: state.data?.triggerType || inputData.type,
+                    messageId: inputData.messageId,
+                    replyToMessageId: state.data?.replyToMessageId || inputData.messageId,
+                });
+                console.log(`[ToolExecutor] Stream parser "${(config as any).streamParser}" loaded for ${config.toolName} (tool steps enabled)`);
             } else {
                 console.warn(`[ToolExecutor] Stream parser "${(config as any).streamParser}" not found, using passthrough`);
             }
