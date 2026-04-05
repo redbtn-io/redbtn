@@ -84,6 +84,20 @@ export { RunKeys } from "./lib/run/types";
 export type { AudioChunkEvent } from "./lib/run/types";
 export { getRunState, getActiveRunForConversation } from "./lib/run/run-publisher";
 
+// Export unified run trigger types and enrichment pipeline (Phase 1)
+export type {
+  TriggerType,
+  TriggerSource,
+  TriggerMetadata,
+  Trigger,
+  TriggeredRun,
+  EnrichedInput,
+  EnrichmentResult,
+  AutomationTriggeredBy,
+  EnrichInputOptions,
+} from "./lib/run";
+export { LEGACY_TRIGGER_MAP, toTriggerType, enrichInput } from "./lib/run";
+
 // Export TTS / Voice utilities
 export { TtsChunker, findBreakPoint, synthesize, isTtsAvailable, AudioStreamPipeline } from './lib/tts';
 export { transcribe, isSttAvailable, VoiceClient } from './lib/tts';

@@ -67,3 +67,21 @@ export {
   isConversationLocked,
   isGraphLocked,
 } from './run-lock';
+
+export {
+  type TriggerType,
+  type TriggerSource,
+  type TriggerMetadata,
+  type Trigger,
+  type TriggeredRun,
+  type EnrichedInput,
+  type EnrichmentResult,
+  type AutomationTriggeredBy,
+  LEGACY_TRIGGER_MAP,
+  toTriggerType,
+} from './trigger-types';
+
+export {
+  enrichInput,
+  type EnrichInputOptions,
+} from './enrich-input';
