@@ -161,11 +161,37 @@ export class ParserExecutor {
             // Execute each step in sequence
             for (const step of this.steps) {
                 if (step.type === 'transform') {
+                    // Check condition if present (transform steps can have conditions too)
+                    const tCondition = (step as any).condition;
+                    if (tCondition) {
+                        const { resolveValue } = require('../templateRenderer');
+                        try {
+                            const ok = Boolean(resolveValue(tCondition, state));
+                            if (!ok) continue;
+                        } catch {
+                            continue;
+                        }
+                    }
                     const { executeTransform } = require('./transformExecutor');
                     const result = await executeTransform(step.config, state);
-                    // Merge result into state
+                    // Merge result into state — with special handling for nested
+                    // paths like `_parserState.X` that should be written into the
+                    // actual _parserState object (transformExecutor returns these
+                    // as flat keys with dots in the name).
                     if (result && typeof result === 'object') {
-                        Object.assign(state, result);
+                        for (const [key, value] of Object.entries(result)) {
+                            if (key.startsWith('_parserState.')) {
+                                const path = key.substring('_parserState.'.length).split('.');
+                                let cur: any = this._parserState;
+                                for (let i = 0; i < path.length - 1; i++) {
+                                    if (cur[path[i]] == null || typeof cur[path[i]] !== 'object') cur[path[i]] = {};
+                                    cur = cur[path[i]];
+                                }
+                                cur[path[path.length - 1]] = value;
+                            } else {
+                                state[key] = value;
+                            }
+                        }
                     }
                 } else if (step.type === 'conditional') {
                     const { executeConditional } = require('./conditionalExecutor');
