@@ -174,20 +174,24 @@ export class ParserExecutor {
                         Object.assign(state, result);
                     }
                 } else if (step.type === 'tool' && this._executeTool) {
+                    const { resolveValue, renderTemplate } = require('../templateRenderer');
                     // Check condition if present
                     const condition = (step as any).condition;
                     if (condition) {
-                        const { evaluateCondition } = require('../../../graphs/conditionEvaluator');
-                        if (!evaluateCondition(condition, state)) continue;
+                        try {
+                            const ok = Boolean(resolveValue(condition, state));
+                            if (!ok) continue;
+                        } catch {
+                            continue;
+                        }
                     }
                     // Render parameters from state
-                    const { renderTemplate } = require('../templateRenderer');
                     const toolConfig = (step as any).config || {};
                     const toolName = renderTemplate(toolConfig.toolName || '', state);
                     const rawParams = toolConfig.parameters || {};
                     const rendered: Record<string, any> = {};
                     for (const [k, v] of Object.entries(rawParams)) {
-                        rendered[k] = typeof v === 'string' ? renderTemplate(v, state) : v;
+                        rendered[k] = typeof v === 'string' ? resolveValue(v, state) : v;
                     }
                     // Fire-and-forget — don't block the parser
                     this._executeTool(toolName, rendered).catch((err: any) => {
