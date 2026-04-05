@@ -1,8 +1,26 @@
 import Redis from 'ioredis';
 
 /**
+ * @deprecated MessageQueue is a legacy system from the pre-unified-trigger era.
+ *
+ * Redis key patterns owned by this class:
+ *   - message:generating:{messageId}   — generation state blob
+ *   - message:stream:{messageId}        — pub/sub channel for SSE chunks
+ *   - stream:ready:{messageId}          — readiness handshake
+ *   - conversation:generating:{convId}  — set of active messageIds per conversation
+ *
+ * These patterns are NO LONGER WRITTEN TO by the production run() path (v0.0.51-alpha+).
+ * New code uses RunPublisher and the run:{runId} Redis key family.
+ *
+ * This class is retained because the following webapp endpoints still read from it
+ * as a legacy fallback:
+ *   - GET /api/v1/conversations/:id/status       → getGeneratingMessages()
+ *   - GET /api/v1/conversations/:id/active-generation → getGeneratingMessages()
+ *
+ * Do not add new callers. Migrate those endpoints to use getActiveRunForConversation()
+ * + getRunState() from RunPublisher before removing this class.
+ *
  * Message Queue - Manages in-progress message generation state in Redis
- * Allows reconnecting to ongoing generations and tracking completion status
  */
 
 export interface MessageGenerationState {

@@ -10,13 +10,11 @@ import { ChatOllama } from "@langchain/ollama";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 
-import { redGraph } from "./lib/graphs/red";
 import { MemoryManager } from "./lib/memory/memory";
 import { MessageQueue } from "./lib/memory/queue";
 import { PersistentLogger } from "./lib/logs/persistent-logger";
 import { createGeminiModel, createOpenAIModel } from "./lib/models";
 import * as background from "./functions/background";
-import { respond as respondFunction } from "./functions/respond";
 import { McpRegistry } from "./lib/mcp/registry";
 import { GraphRegistry } from "./lib/graphs/GraphRegistry";
 import { NeuronRegistry } from "./lib/neurons/NeuronRegistry";
@@ -36,6 +34,10 @@ export {
 } from "./lib/memory/database";
 
 // Export message queue for background processing
+// @deprecated MessageQueue and its Redis key patterns (message:generating:*, message:stream:*,
+// stream:ready:*, conversation:generating:*) are legacy. New code uses RunPublisher.
+// MessageQueue is kept for webapp compatibility (getGeneratingMessages is still called by
+// GET /api/v1/conversations/:id/status and /active-generation routes).
 export { MessageQueue, MessageGenerationState } from "./lib/memory/queue";
 
 // Export logging system
@@ -366,15 +368,15 @@ export class Red {
   }
 
   /**
-   * Handles a direct, on-demand request from a user-facing application.
-   * Automatically manages conversation history, memory, and summarization.
-   * @param query The user's input or request data (must have a 'message' property)
-   * @param options Metadata about the source of the request and conversation settings
-   * @returns For non-streaming: the full AIMessage object with content, tokens, metadata, and conversationId.
-   *          For streaming: an async generator that yields metadata first (with conversationId), then string chunks, then finally the full AIMessage.
+   * @deprecated Red.respond() was removed in v0.0.51-alpha.
+   * Migrate to run() from '@redbtn/redbtn'.
+   * See src/functions/respond.ts for the full migration guide.
    */
-  public async respond(query: { message: string }, options: InvokeOptions = {}): Promise<any | AsyncGenerator<string | any, void, unknown>> {
-    return respondFunction(this, query, options);
+  public respond(_query?: unknown, _options?: unknown): never {
+    throw new Error(
+      '[redbtn] Red.respond() was removed in v0.0.51-alpha. ' +
+      'Migrate to run() — see src/functions/respond.ts for migration guide.'
+    );
   }
 
   /**

@@ -503,7 +503,9 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
         }
 
         // Get metadata for tool execution
-        // Note: messageId is in state.data.messageId (set by respond.ts initialState)
+        // Note: messageId in meta is set by legacy respond() callers only.
+        // In the run() path, state.messageId is undefined and MCP registry event
+        // publishing is skipped. Tool events are published via RunPublisher instead.
         const meta: Record<string, any> = {
             conversationId: state.options?.conversationId || state.data?.options?.conversationId,
             generationId: state.options?.generationId || state.data?.options?.generationId,
