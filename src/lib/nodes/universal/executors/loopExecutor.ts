@@ -189,7 +189,8 @@ export async function executeLoop(config: LoopStepConfig, state: any): Promise<P
     }
     // Build result object - ONLY include data fields that changed during loop
     // Do NOT spread entire loopState (contains infrastructure like mcpClient, logger, etc.)
-    const infrastructureKeys = ['mcpClient', 'logger', 'neuronRegistry', 'memory', 'messageQueue',
+    const infrastructureKeys = ['mcpClient', 'logger', 'neuronRegistry', 'memory',
+        // 'messageQueue' removed in v0.0.51-alpha — no longer in graph state
         'userId', 'accountTier', 'options', 'query', 'data']; // IMPORTANT: Don't return 'data' directly - it overwrites parent state!
     const result: Record<string, any> = {
         loopIterations: iteration,

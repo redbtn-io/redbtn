@@ -1,8 +1,9 @@
 /**
  * RunPublisher
  *
- * Unified publisher for run state and events. Replaces the fragmented
- * MessageQueue + GraphEventPublisher + McpEventPublisher system.
+ * Unified publisher for run state and events. Replaced the fragmented
+ * legacy MessageQueue + GraphEventPublisher + McpEventPublisher system
+ * (all three removed in v0.0.51-alpha).
  *
  * Key responsibilities:
  * - Maintain run state in Redis (run:{runId})

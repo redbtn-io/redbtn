@@ -12,7 +12,6 @@
 
 import { SystemMessage } from '@langchain/core/messages';
 import type { Red } from '../../..';
-import { createIntegratedPublisher } from '../../events/integrated-publisher';
 import { invokeWithRetry } from '../../utils/retry';
 import { getNodeSystemPrefix } from '../../utils/node-helpers';
 
