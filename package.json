@@ -1,6 +1,6 @@
 {
   "name": "@redbtn/redbtn",
-  "version": "0.0.37-alpha",
+  "version": "0.0.38-alpha",
   "description": "Graph-based automation engine for building, running, and orchestrating dynamic workflows",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
