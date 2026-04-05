@@ -45,6 +45,7 @@ interface AutomationDoc {
 /** Minimal conversation document shape */
 interface ConversationDoc {
   graphInputs?: Record<string, unknown>;
+  configOverrides?: Record<string, unknown>;
   graphId?: string;
 }
 
@@ -244,9 +245,14 @@ async function loadAutomationDoc(
 async function loadConversationEnrichment(
   conversationId: string,
   graphId: string | undefined,
-): Promise<{ graphInputs: Record<string, unknown>; schemaDefaults: Record<string, unknown> }> {
+): Promise<{
+  graphInputs: Record<string, unknown>;
+  schemaDefaults: Record<string, unknown>;
+  configOverrides: Record<string, unknown>;
+}> {
   const graphInputs: Record<string, unknown> = {};
   const schemaDefaults: Record<string, unknown> = {};
+  const configOverrides: Record<string, unknown> = {};
 
   try {
     const mongoose = (await import('mongoose')).default;
@@ -257,6 +263,9 @@ async function loadConversationEnrichment(
       const conv = await ConvModel.findById(new MongooseObjectId(conversationId)).lean() as ConversationDoc | null;
       if (conv?.graphInputs && typeof conv.graphInputs === 'object') {
         Object.assign(graphInputs, conv.graphInputs);
+      }
+      if (conv?.configOverrides && typeof conv.configOverrides === 'object') {
+        Object.assign(configOverrides, conv.configOverrides);
       }
     }
   } catch (err) {
@@ -286,7 +295,7 @@ async function loadConversationEnrichment(
     }
   }
 
-  return { graphInputs, schemaDefaults };
+  return { graphInputs, schemaDefaults, configOverrides };
 }
 
 // =============================================================================
@@ -458,12 +467,17 @@ export async function enrichInput(options: EnrichInputOptions): Promise<Enrichme
     }
   }
 
-  // ── Step 2: Load conversation graphInputs + schema defaults ─────────────────
+  // ── Step 2: Load conversation graphInputs + schema defaults + configOverrides ─
+  let conversationConfigOverrides: Record<string, unknown> = {};
   if (conversationId) {
-    const { graphInputs, schemaDefaults } = await loadConversationEnrichment(conversationId, graphId);
+    const { graphInputs, schemaDefaults, configOverrides: convOverrides } =
+      await loadConversationEnrichment(conversationId, graphId);
 
     // Merge order: schemaDefaults < graphInputs < raw input
     input = { ...schemaDefaults, ...graphInputs, ...input };
+
+    // Capture conversation-level overrides for later injection
+    conversationConfigOverrides = convOverrides;
   }
 
   // ── Step 3: Inject webhook/event-specific data (passed as part of input) ───
@@ -494,11 +508,15 @@ export async function enrichInput(options: EnrichInputOptions): Promise<Enrichme
     enriched._state = resolvedState;
   }
 
-  // _configOverrides — merge automation overrides (automation wins over nothing;
-  // future: conversation-level overrides would be merged here too)
+  // _configOverrides — merge automation + conversation overrides.
+  // Priority: automation.configOverrides < conversation.configOverrides
+  // (conversation-level overrides take precedence over automation defaults).
   const configOverrides: Record<string, unknown> = {};
   if (automationDoc?.configOverrides && typeof automationDoc.configOverrides === 'object') {
     Object.assign(configOverrides, automationDoc.configOverrides);
+  }
+  if (Object.keys(conversationConfigOverrides).length > 0) {
+    Object.assign(configOverrides, conversationConfigOverrides);
   }
   if (Object.keys(configOverrides).length > 0) {
     enriched._configOverrides = configOverrides;
