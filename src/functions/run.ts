@@ -218,7 +218,10 @@ CRITICAL RULES:
   return {
     neuronRegistry: red.neuronRegistry,
     memory: red.memory,
-    messageQueue: red.messageQueue,
+    // messageQueue is intentionally omitted here — legacy legacy graph nodes (router.ts,
+    // planner.ts, responder.ts) that called messageQueue.publishStatus() used the old redGraph
+    // path, which was removed in v0.0.51-alpha alongside Red.respond(). New graph execution
+    // uses RunPublisher for all SSE events.
     mcpClient: {
       callTool: (toolName: string, args: unknown, meta?: unknown) =>
         red.callMcpTool(toolName, args as Record<string, unknown>, meta as Record<string, unknown>),

@@ -17,9 +17,8 @@ exports.RedGraphState = langgraph_1.Annotation.Root({
     memory: (0, langgraph_1.Annotation)({
         reducer: (x, y) => y
     }),
-    messageQueue: (0, langgraph_1.Annotation)({
-        reducer: (x, y) => y
-    }),
+    // messageQueue removed in v0.0.51-alpha — legacy respond() path deleted.
+    // RunPublisher (state.runPublisher) is the unified event publishing mechanism.
     logger: (0, langgraph_1.Annotation)({
         reducer: (x, y) => y
     }),

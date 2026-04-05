@@ -356,8 +356,8 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // Check if this step should stream to user
     const streamToUser = config.stream === true;
 
-    // Set flag in state so LangGraph/respond.ts can access it
-    // This allows respond.ts to filter which streaming events reach the client
+    // Set flag in state so the streaming execution path (run.ts) can filter
+    // which LLM streaming events are forwarded to the client via RunPublisher.
     state._currentStepStreamToUser = streamToUser;
 
     // Structured output doesn't support streaming - use invoke instead
@@ -559,8 +559,8 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
 
           if (chunk.content) {
             response += chunk.content;
-            // Note: Whether chunks reach the user is decided by respond.ts
-            // based on state._currentStepStreamToUser flag
+            // Note: Whether chunks reach the user is decided by the streaming
+            // execution path (run.ts) based on state._currentStepStreamToUser flag
 
             // Feed text to TTS pipeline (non-blocking, runs synthesis in parallel)
             if (audioPipeline) {

@@ -216,7 +216,7 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
 
         try {
             // Set current step index in state
-            // This allows respond.ts to know which step is currently executing
+            // Used by streaming execution path to track which step is executing
             state._currentStepIndex = i;
 
             // Execute step with current accumulated state

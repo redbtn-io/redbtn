@@ -14,7 +14,8 @@ export * from './servers/web-sse';
 export * from './servers/system-sse';
 export * from './servers/rag-sse';
 export * from './servers/context-sse';
-export * from './event-publisher';
+// event-publisher (McpEventPublisher / tool:event:* Redis key) removed in v0.0.51-alpha.
+// McpEventPublisher was never instantiated; RunPublisher handles all tool events now.
 
 // Legacy exports for backward compatibility
 export { WebServerSSE as WebServer } from './servers/web-sse';

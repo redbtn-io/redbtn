@@ -6,7 +6,6 @@ export declare const RedGraphState: import("@langchain/langgraph").AnnotationRoo
     neuronRegistry: import("@langchain/langgraph").BinaryOperatorAggregate<any, any>;
     mcpClient: import("@langchain/langgraph").BinaryOperatorAggregate<any, any>;
     memory: import("@langchain/langgraph").BinaryOperatorAggregate<any, any>;
-    messageQueue: import("@langchain/langgraph").BinaryOperatorAggregate<any, any>;
     logger: import("@langchain/langgraph").BinaryOperatorAggregate<any, any>;
     runPublisher: import("@langchain/langgraph").BinaryOperatorAggregate<any, any>;
     graphPublisher: import("@langchain/langgraph").BinaryOperatorAggregate<any, any>;
