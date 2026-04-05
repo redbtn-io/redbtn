@@ -158,16 +158,25 @@ export class RunPublisher {
     graphName: string,
     input: Record<string, unknown>,
     conversationId?: string,
+    triggerType?: string,
   ): Promise<void> {
     if (this.initialized) {
       throw new Error(`RunPublisher already initialized for run ${this.runId}`);
+    }
+    // W-3: If the caller supplies triggerType explicitly (e.g. from enrichInput's
+    // resolved trigger.type), inject it into the input snapshot stored in state so
+    // that _enqueueArchive can always read it from this.state.input._trigger.type —
+    // even when run() is called directly without going through enrichInput().
+    let resolvedInput = input;
+    if (triggerType && !(input as Record<string, any>)._trigger) {
+      resolvedInput = { ...input, _trigger: { type: triggerType } };
     }
     this.state = createInitialRunState({
       runId: this.runId,
       userId: this.userId,
       graphId,
       graphName,
-      input,
+      input: resolvedInput,
       conversationId,
     });
     await this.saveState();
