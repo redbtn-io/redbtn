@@ -169,12 +169,9 @@ function replaceStateRefs(
  */
 async function getAutomationModel(): Promise<import('mongoose').Model<any>> {
   const mongoose = (await import('mongoose')).default;
-  try {
-    return mongoose.model('Automation');
-  } catch {
-    const s = new mongoose.Schema({}, { collection: 'automations', strict: false });
-    return mongoose.model('Automation', s);
-  }
+  if (mongoose.models['Automation']) return mongoose.models['Automation'];
+  const s = new mongoose.Schema({}, { collection: 'automations', strict: false });
+  return mongoose.model('Automation', s);
 }
 
 /**
@@ -182,12 +179,9 @@ async function getAutomationModel(): Promise<import('mongoose').Model<any>> {
  */
 async function getConversationModel(): Promise<import('mongoose').Model<any>> {
   const mongoose = (await import('mongoose')).default;
-  try {
-    return mongoose.model('Conversation');
-  } catch {
-    const s = new mongoose.Schema({}, { collection: 'user_conversations', strict: false });
-    return mongoose.model('Conversation', s);
-  }
+  if (mongoose.models['Conversation']) return mongoose.models['Conversation'];
+  const s = new mongoose.Schema({}, { collection: 'user_conversations', strict: false });
+  return mongoose.model('Conversation', s);
 }
 
 /**
@@ -196,29 +190,26 @@ async function getConversationModel(): Promise<import('mongoose').Model<any>> {
  */
 async function getGlobalStateModel(): Promise<import('mongoose').Model<any>> {
   const mongoose = (await import('mongoose')).default;
-  try {
-    return mongoose.model('GlobalStateNamespace');
-  } catch {
-    const stateSchema = new mongoose.Schema({}, {
-      collection: 'globalstatenamespaces',
-      strict: false,
-    });
-    stateSchema.statics.getValue = async function (
-      uid: string,
-      ns: string,
-      k: string,
-    ): Promise<unknown> {
-      const doc = await this.findOne(
-        { userId: uid, namespace: ns },
-        { entries: { $elemMatch: { key: k } } },
-      ).lean() as any;
-      if (!doc?.entries?.length) return undefined;
-      const entry = doc.entries[0];
-      if (entry.expiresAt && new Date(entry.expiresAt) < new Date()) return undefined;
-      return entry.value;
-    };
-    return mongoose.model('GlobalStateNamespace', stateSchema);
-  }
+  if (mongoose.models['GlobalStateNamespace']) return mongoose.models['GlobalStateNamespace'];
+  const stateSchema = new mongoose.Schema({}, {
+    collection: 'globalstatenamespaces',
+    strict: false,
+  });
+  stateSchema.statics.getValue = async function (
+    uid: string,
+    ns: string,
+    k: string,
+  ): Promise<unknown> {
+    const doc = await this.findOne(
+      { userId: uid, namespace: ns },
+      { entries: { $elemMatch: { key: k } } },
+    ).lean() as any;
+    if (!doc?.entries?.length) return undefined;
+    const entry = doc.entries[0];
+    if (entry.expiresAt && new Date(entry.expiresAt) < new Date()) return undefined;
+    return entry.value;
+  };
+  return mongoose.model('GlobalStateNamespace', stateSchema);
 }
 
 // =============================================================================
