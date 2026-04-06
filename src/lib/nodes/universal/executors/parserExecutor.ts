@@ -116,6 +116,8 @@ export class ParserExecutor {
         // For type: 'websocket'
         // (no extra fields — placeholder only)
         // For type: 'subgraph'
+        // When true: run in background, don't block the parser, publish result to stream:result:{sessionId}
+        fireAndForget?: boolean;
         // Maps tool names → graph invocation config
         graphMapping?: Record<string, {
             graphId: string;
@@ -668,34 +670,61 @@ export class ParserExecutor {
             return;
         }
 
-        console.log(`[ParserExecutor] subgraph output "${label}": dispatching tool "${toolName}" → graph "${resolvedGraphId}"`);
+        console.log(`[ParserExecutor] subgraph output "${label}": dispatching tool "${toolName}" → graph "${resolvedGraphId}"${output.fireAndForget ? ' (fire-and-forget)' : ''}`);
+
+        // Build the common execution helper (shared by both sync and async paths)
+        const { executeGraph } = require('./graphExecutor');
+        const stepConfig = {
+            graphId: resolvedGraphId,
+            outputField: '_subgraphOutput',
+            configOverrides: mappedEntry?.configOverrides,
+            inputMapping: mappedEntry?.inputMapping,
+        };
+
+        const parentState = ps._parentState || {};
+        const fakeState: Record<string, any> = {
+            ...parentState,
+            _graphRegistry: this._graphRegistry,
+            _subgraphDepth: parentState._subgraphDepth ?? 0,
+        };
+
+        const runtimeOverrides = {
+            input: toolArgs,
+        };
+
+        // Helper: publish result to stream:result:{sessionId} so the session
+        // manager can feed it back to the realtime provider as context text.
+        const publishStreamResult = (subgraphOutput: unknown): void => {
+            const ctx = this._parserState._context || {};
+            const sessionId: string | undefined = ctx.sessionId;
+            const redis: any | undefined = ctx.redis;
+            if (redis && sessionId) {
+                const { StreamSessionKeys } = require('../../../streams/types');
+                redis.publish(
+                    StreamSessionKeys.result(sessionId),
+                    JSON.stringify({ toolName, result: subgraphOutput }),
+                ).catch(() => {});
+            }
+        };
+
+        if (output.fireAndForget) {
+            // Don't await — run in background and publish result when done.
+            // Clear the pending tool call immediately so the parser can continue.
+            this._parserState._pendingToolCall = undefined;
+
+            executeGraph(stepConfig, fakeState, runtimeOverrides)
+                .then((result: Record<string, any>) => {
+                    const subgraphOutput = result['_subgraphOutput'];
+                    console.log(`[ParserExecutor] subgraph output "${label}": async graph "${resolvedGraphId}" completed`);
+                    publishStreamResult(subgraphOutput);
+                })
+                .catch((err: any) => {
+                    console.error(`[ParserExecutor] subgraph output "${label}" — async graph "${resolvedGraphId}" failed:`, err.message);
+                });
+            return;
+        }
 
         try {
-            // Build a minimal GraphStepConfig for executeGraph
-            const { executeGraph } = require('./graphExecutor');
-            const stepConfig = {
-                graphId: resolvedGraphId,
-                outputField: '_subgraphOutput',
-                configOverrides: mappedEntry?.configOverrides,
-                inputMapping: mappedEntry?.inputMapping,
-            };
-
-            // Build a fake parent state with the registry + infrastructure forwarded
-            // from parser context. The _parserState._parentState field may hold the
-            // real graph state if set by toolExecutor.
-            const parentState = ps._parentState || {};
-            const fakeState: Record<string, any> = {
-                ...parentState,
-                _graphRegistry: this._graphRegistry,
-                _subgraphDepth: parentState._subgraphDepth ?? 0,
-            };
-
-            // runtimeOverrides: pass tool args as input overrides so the subgraph
-            // can access them as {{state.data.input.X}}
-            const runtimeOverrides = {
-                input: toolArgs,
-            };
-
             const result = await executeGraph(stepConfig, fakeState, runtimeOverrides);
             const subgraphOutput = result['_subgraphOutput'];
 
@@ -710,6 +739,9 @@ export class ParserExecutor {
                     returnTo: output.returnTo,
                 };
             }
+
+            // Publish to stream result channel if sessionId is in context
+            publishStreamResult(subgraphOutput);
 
             // Clear the pending tool call
             this._parserState._pendingToolCall = undefined;

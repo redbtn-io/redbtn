@@ -111,6 +111,26 @@ export type { SynthesizeOptions, AudioStreamPipelineOptions, TranscribeOptions, 
 export { ConversationPublisher, createConversationPublisher, ConversationKeys } from './lib/conversation';
 export type { ConversationEvent, ConversationAttachmentEvent } from './lib/conversation';
 
+// Export stream session pub/sub
+export { StreamEventPublisher, createStreamEventPublisher, StreamSessionKeys, StreamSessionConfig } from './lib/streams';
+export type {
+  StreamEvent,
+  StreamEventType,
+  StreamEventPublisherOptions,
+  StreamSessionState,
+  StreamSessionStartEvent,
+  StreamSessionReadyEvent,
+  StreamSessionEndEvent,
+  StreamSessionErrorEvent,
+  StreamAudioInEvent,
+  StreamAudioOutEvent,
+  StreamTextInEvent,
+  StreamTextOutEvent,
+  StreamToolCallEvent,
+  StreamToolResultEvent,
+  StreamSubgraphResultEvent,
+} from './lib/streams';
+
 // --- Type Definitions ---
 
 /**
