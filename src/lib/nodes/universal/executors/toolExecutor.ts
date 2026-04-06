@@ -180,11 +180,16 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     throw new Error(`Tool "${toolName}" not available in parser context`);
                 };
                 parserExecutor = new ParserExecutor(parserDef.config, parserDef.parserConfig, parserToolExecutor);
-                // Inject context from graph state so parser steps can reference channelId, triggerType, etc.
+                // Inject context from graph state so parser steps can reference channelId, platform, etc.
                 const inputData = state.data?.input || state.input || {};
+                const triggerSource = (inputData as any)._trigger?.source;
                 parserExecutor.setContext({
                     channelId: inputData.channelId,
-                    triggerType: state.data?.triggerType || inputData.type,
+                    // platform: canonical free-form string ('discord', 'telegram', 'email', etc.)
+                    // Falls back to legacy inputData.type for backward compat with old webhook payloads.
+                    platform: triggerSource?.platform || state.data?.platform || (inputData as any).type,
+                    // Keep triggerType for backward compat — deprecated, use platform instead.
+                    triggerType: state.data?.triggerType || (inputData as any).type,
                     messageId: inputData.messageId,
                     replyToMessageId: state.data?.replyToMessageId || inputData.messageId,
                 });

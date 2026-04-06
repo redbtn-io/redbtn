@@ -16,34 +16,36 @@
 // =============================================================================
 
 /**
- * All first-class trigger sources understood by the platform.
+ * The three canonical trigger classifications understood by the platform.
  *
- * - chat       → user typed a message in the redbtn chat UI or REST client
- * - webhook    → external HTTP POST to /api/v1/webhooks/[automationId]
- * - cron       → scheduler fired a repeatable BullMQ job
- * - email      → email forwarding service POSTed to the webhook endpoint
- * - discord    → Discord bot routed a message (was previously ad-hoc payload.type)
- * - api        → direct POST to /api/v1/chat/completions with source=api
- * - scheduled  → one-shot delayed job (nextRunAt override on an automation)
+ * - chat    → user typed a message in the redbtn chat UI or a REST client
+ * - webhook → ALL external HTTP triggers: discord bots, email forwarding,
+ *             telegram, slack, CI pipelines, monitoring tools, etc.
+ *             Platform-specific info is carried in trigger.source.platform
+ *             and trigger.metadata (channelId, guildId, emailFrom, etc.).
+ * - cron    → scheduler fired a repeatable BullMQ job (also covers
+ *             one-shot delayed/interval runs)
+ *
+ * Legacy values ('email', 'discord', 'api', 'scheduled') are normalised to
+ * one of these three by toTriggerType().
  */
-export type TriggerType =
-  | 'chat'
-  | 'webhook'
-  | 'cron'
-  | 'email'
-  | 'discord'
-  | 'api'
-  | 'scheduled';
+export type TriggerType = 'chat' | 'webhook' | 'cron';
 
 /**
  * Source details captured at the edge (API route / bot adapter).
  * All fields are optional — capture what is available.
  */
 export interface TriggerSource {
+  /**
+   * Originating platform for webhook triggers — free-form string so new
+   * platforms (telegram, slack, sms, etc.) work without code changes.
+   * Examples: 'discord', 'telegram', 'email', 'slack', 'github'.
+   */
+  platform?: string;
   /** Originating application / adapter */
   application?: string;
   /** Device form-factor (for chat triggers) */
-  device?: 'phone' | 'speaker' | 'web' | 'api';
+  device?: string;
   /** Raw User-Agent header */
   userAgent?: string;
   /** Caller IP (first value of X-Forwarded-For) */
@@ -77,11 +79,13 @@ export interface AttachmentRef {
  *
  * Common examples:
  *   chat    → { conversationSource: 'terminal' | 'chat' }
- *   webhook → { contentType: 'application/json', ip: '...' }
- *   discord → { channelId: '...', guildId: '...', authorId: '...' }
+ *   webhook → { contentType: 'application/json', channelId: '...', guildId: '...' }
  *   cron    → { cronExpression: '0 * * * *', scheduleMode: 'cron' | 'interval' }
- *   email   → { from: '...', subject: '...', to: '...' }
- *   api     → { clientId: '...', oauthScopes: [...] }
+ *
+ * Platform-specific fields (all optional):
+ *   Discord → { channelId, messageId, guildId }
+ *   Email   → { emailFrom, emailSubject, emailTo }
+ *   Slack   → { channelId, workspaceId }
  *
  * The `attachments` field is populated by edge adapters when the trigger
  * carries files (Discord image uploads, email attachments, etc.).
@@ -89,6 +93,16 @@ export interface AttachmentRef {
 export interface TriggerMetadata extends Record<string, unknown> {
   /** Normalized attachments carried with this trigger */
   attachments?: AttachmentRef[];
+  /** Discord / Slack channel ID */
+  channelId?: string;
+  /** Discord / Slack message ID (for reply threading) */
+  messageId?: string;
+  /** Discord guild / server ID */
+  guildId?: string;
+  /** Email sender address */
+  emailFrom?: string;
+  /** Email subject */
+  emailSubject?: string;
 }
 
 /**
@@ -252,19 +266,38 @@ export interface EnrichmentResult {
 /** @deprecated Use TriggerType instead */
 export type AutomationTriggeredBy = 'manual' | 'cron' | 'webhook' | 'event' | 'email';
 
-/** Map from legacy AutomationTriggeredBy values to TriggerType */
-export const LEGACY_TRIGGER_MAP: Record<AutomationTriggeredBy, TriggerType> = {
-  manual:  'api',
-  cron:    'cron',
-  webhook: 'webhook',
-  event:   'webhook',
-  email:   'email',
+/**
+ * Map from legacy AutomationTriggeredBy values to the 3-value TriggerType.
+ * 'email' and 'event' → 'webhook' (platform info moves to trigger.source.platform).
+ * 'manual' → 'chat' (direct/interactive invocation).
+ */
+export const LEGACY_TRIGGER_MAP: Record<string, TriggerType> = {
+  // Legacy AutomationTriggeredBy values
+  manual:    'chat',
+  cron:      'cron',
+  webhook:   'webhook',
+  event:     'webhook',
+  email:     'webhook',
+  // Old 7-value TriggerType literals
+  chat:      'chat',
+  discord:   'webhook',
+  api:       'chat',
+  scheduled: 'cron',
 } as const;
 
 /**
- * Convert a legacy automation triggeredBy string to the canonical TriggerType.
+ * Convert any legacy trigger string to the canonical 3-value TriggerType.
+ *
+ * Maps:
+ *   'discord'   → 'webhook'  (platform = 'discord' in trigger.source)
+ *   'email'     → 'webhook'  (platform = 'email'   in trigger.source)
+ *   'api'       → 'chat'
+ *   'manual'    → 'chat'
+ *   'scheduled' → 'cron'
+ *   'event'     → 'webhook'
+ *
  * Falls back to 'webhook' for unknown values.
  */
 export function toTriggerType(legacy: string): TriggerType {
-  return (LEGACY_TRIGGER_MAP as Record<string, TriggerType>)[legacy] ?? 'webhook';
+  return LEGACY_TRIGGER_MAP[legacy] ?? 'webhook';
 }
