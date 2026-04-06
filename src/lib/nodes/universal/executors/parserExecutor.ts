@@ -83,12 +83,22 @@ export class ParserExecutor {
      */
     private _outputs: Array<{
         id?: string;
-        type: 'http' | 'conversation' | 'runStream';
+        type: 'http' | 'conversation' | 'runStream' | 'tts_http';
         condition?: Record<string, unknown>;
         sentenceSplit?: boolean;
+        // For type: 'http'
         endpoint?: string;
         headers?: Record<string, string>;
         body?: Record<string, string>;
+        // For type: 'tts_http' — chains TTS + delivery per sentence
+        ttsEndpoint?: string;
+        ttsHeaders?: Record<string, string>;
+        ttsVoice?: string;
+        ttsModel?: string;
+        ttsResponsePath?: string;
+        deliveryEndpoint?: string;
+        deliveryHeaders?: Record<string, string>;
+        deliveryBody?: Record<string, string>;
     }>;
 
     /** Inject context into the parser state (e.g. channelId, triggerType). */
@@ -183,6 +193,8 @@ export class ParserExecutor {
 
             if (output.type === 'http') {
                 await this._flushHttpOutput(output, ps, ctx);
+            } else if (output.type === 'tts_http') {
+                await this._flushTtsHttpOutput(output, ps, ctx);
             }
             // Future: conversation, runStream types
         }
@@ -241,6 +253,117 @@ export class ParserExecutor {
                     body: JSON.stringify(renderedBody),
                 }).catch(() => {});
             } catch { /* ignore */ }
+        }
+    }
+
+    /**
+     * TTS + delivery output: for each sentence, call a TTS API to get audio,
+     * then forward the audio to a delivery endpoint. All in TypeScript — no
+     * config template eval with large base64 strings.
+     */
+    private async _flushTtsHttpOutput(
+        output: Record<string, any>,
+        ps: Record<string, any>,
+        ctx: Record<string, any>,
+    ): Promise<void> {
+        const { ttsEndpoint, ttsHeaders, ttsVoice, ttsModel, ttsResponsePath,
+                deliveryEndpoint, deliveryHeaders, deliveryBody, sentenceSplit } = output;
+        if (!ttsEndpoint || !deliveryEndpoint) return;
+
+        // Split sentences (same logic as _flushHttpOutput)
+        let chunks: string[];
+        if (sentenceSplit !== false) {
+            const boundaries = /(?<=[.!?])\s+|(?<=\.)\n|(?<=!)\n|(?<=\?)\n|(?<=—)\s+|(?<=:)\n|\n\n/;
+            const sentences = ps._textBuffer.split(boundaries).filter((s: string) => s && s.trim().length > 2);
+            if (sentences.length === 0) return;
+            const endsClean = /[.!?—]\s*$/.test(ps._textBuffer.trimEnd()) || ps._textBuffer.endsWith('\n\n');
+            chunks = endsClean ? sentences : sentences.slice(0, -1);
+            const remainder = endsClean ? '' : sentences[sentences.length - 1];
+            if (chunks.length === 0) return;
+            ps._textBuffer = remainder;
+        } else {
+            chunks = [ps._textBuffer];
+            ps._textBuffer = '';
+        }
+
+        ps._shouldSendText = false;
+        const label = output.id || 'tts_http';
+        const voice = ttsVoice || 'Kore';
+        const model = ttsModel || 'gemini-2.5-flash-preview-tts';
+
+        for (const chunk of chunks) {
+            const text = chunk.trim();
+            if (!text) continue;
+            console.log(`[ParserExecutor] TTS(${label}): "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}" (${text.length} chars)`);
+
+            try {
+                // Step 1: Call TTS API
+                const ttsBody = {
+                    contents: [{ parts: [{ text: `Say naturally: ${text}` }] }],
+                    generationConfig: {
+                        responseModalities: ['AUDIO'],
+                        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+                    },
+                };
+
+                const ttsStart = Date.now();
+                const ttsResp = await fetch(ttsEndpoint, {
+                    method: 'POST',
+                    headers: ttsHeaders || { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(ttsBody),
+                });
+
+                if (!ttsResp.ok) {
+                    const errText = await ttsResp.text().catch(() => '');
+                    console.error(`[ParserExecutor] TTS(${label}) failed: ${ttsResp.status} ${errText.substring(0, 200)}`);
+                    continue;
+                }
+
+                const ttsData = await ttsResp.json() as any;
+                const ttsDuration = Date.now() - ttsStart;
+
+                // Step 2: Extract audio from response via path
+                let audioData: string | undefined;
+                try {
+                    // Navigate the response path: candidates[0].content.parts[0].inlineData.data
+                    audioData = ttsData?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+                } catch {
+                    console.error(`[ParserExecutor] TTS(${label}) audio extraction failed`);
+                    continue;
+                }
+
+                if (!audioData) {
+                    console.error(`[ParserExecutor] TTS(${label}) no audio data in response`);
+                    continue;
+                }
+
+                console.log(`[ParserExecutor] TTS(${label}): got ${audioData.length} base64 chars in ${ttsDuration}ms`);
+
+                // Step 3: Forward audio to delivery endpoint
+                const renderedDelivery: Record<string, unknown> = {};
+                if (deliveryBody && typeof deliveryBody === 'object') {
+                    for (const [k, v] of Object.entries(deliveryBody as Record<string, string>)) {
+                        if (v === '{{audio}}') renderedDelivery[k] = audioData;
+                        else if (typeof v === 'string' && v.startsWith('{{context.') && v.endsWith('}}')) {
+                            renderedDelivery[k] = ctx[v.slice(10, -2)] ?? '';
+                        } else {
+                            renderedDelivery[k] = v;
+                        }
+                    }
+                }
+
+                fetch(deliveryEndpoint, {
+                    method: 'POST',
+                    headers: deliveryHeaders || { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(renderedDelivery),
+                }).catch((err) => {
+                    console.error(`[ParserExecutor] TTS(${label}) delivery failed:`, err.message);
+                });
+
+                console.log(`[ParserExecutor] TTS(${label}): audio sent to delivery endpoint`);
+            } catch (err: any) {
+                console.error(`[ParserExecutor] TTS(${label}) error:`, err.message);
+            }
         }
     }
 
