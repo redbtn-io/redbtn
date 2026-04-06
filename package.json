@@ -1,6 +1,6 @@
 {
   "name": "@redbtn/redbtn",
-  "version": "0.0.53-alpha",
+  "version": "0.0.55-alpha",
   "description": "Graph-based automation engine for building, running, and orchestrating dynamic workflows",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -15,8 +15,6 @@
     "test:ui": "vitest --ui",
     "test:coverage": "vitest run --coverage",
     "mcp:start": "npx tsx src/mcp-servers.ts",
-    "dev:server": "cd examples/rest-server && npm run dev",
-    "start:server": "cd examples/rest-server && npm start",
     "build": "tsc && cp src/lib/graphs/conditionEvaluator.js src/lib/graphs/conditionEvaluator.d.ts src/lib/graphs/state.js src/lib/graphs/state.d.ts dist/lib/graphs/",
     "pack": "npm run build && npm pack",
     "prepublishOnly": "npm run build",
