@@ -198,6 +198,8 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     voiceChannelId: (inputData as any).voiceChannelId || null,
                     guildId: (inputData as any).guildId || null,
                     botWorkspaceId: (inputData as any).botWorkspaceId || null,
+                    // RunPublisher for conversation output type
+                    runPublisher: runPublisher || null,
                 });
                 console.log(`[ToolExecutor] Stream parser "${(config as any).streamParser}" loaded for ${config.toolName} (tool steps enabled)`);
             } else {

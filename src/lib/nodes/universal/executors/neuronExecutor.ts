@@ -635,6 +635,8 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
               voiceChannelId: inputData.voiceChannelId || null,
               guildId: inputData.guildId || state.data?.input?.guildId || null,
               botWorkspaceId: inputData.botWorkspaceId || null,
+              // RunPublisher for conversation output type
+              runPublisher: state.runPublisher || null,
             });
             console.log(`[NeuronExecutor] Stream parser "${streamParserName}" loaded (outputs enabled)`);
           }

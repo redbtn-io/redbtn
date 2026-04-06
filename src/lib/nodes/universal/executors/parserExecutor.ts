@@ -75,18 +75,22 @@ export class ParserExecutor {
      *
      * Each output fires independently when its condition matches.
      * Types:
-     *   - http: POST to an endpoint with body template
+     *   - http:         POST to an endpoint with body template
+     *   - tts_http:     TTS synthesis + delivery chained per sentence
      *   - conversation: publish to conversation stream via RunPublisher
-     *   - runStream: publish to run stream (for archivers/UI)
+     *   - websocket:    placeholder (not yet implemented)
+     *   - email:        fire-and-forget POST to an email service endpoint
+     *   - storage:      POST content to a storage endpoint (GridFS, S3, etc.)
+     *   - pubsub:       POST to a relay that publishes to a Redis channel
      *
      * All matching outputs fire in parallel per chunk.
      */
     private _outputs: Array<{
         id?: string;
-        type: 'http' | 'conversation' | 'runStream' | 'tts_http';
+        type: 'http' | 'tts_http' | 'conversation' | 'websocket' | 'email' | 'storage' | 'pubsub';
         condition?: Record<string, unknown>;
         sentenceSplit?: boolean;
-        // For type: 'http'
+        // For type: 'http' | 'email' | 'storage' | 'pubsub'
         endpoint?: string;
         headers?: Record<string, string>;
         body?: Record<string, string>;
@@ -99,11 +103,29 @@ export class ParserExecutor {
         deliveryEndpoint?: string;
         deliveryHeaders?: Record<string, string>;
         deliveryBody?: Record<string, string>;
+        // For type: 'email'
+        to?: string;
+        subject?: string;
+        bodyField?: string;
+        // For type: 'storage'
+        filenameTemplate?: string;
+        mimeType?: string;
+        // For type: 'pubsub'
+        channel?: string;
+        // For type: 'websocket'
+        // (no extra fields — placeholder only)
     }>;
 
-    /** Inject context into the parser state (e.g. channelId, triggerType). */
+    /** RunPublisher instance injected via setContext({ runPublisher }). */
+    private _runPublisher: any | null = null;
+
+    /** Inject context into the parser state (e.g. channelId, triggerType, runPublisher). */
     setContext(ctx: Record<string, any>): void {
-        this._parserState._context = { ...this._parserState._context, ...ctx };
+        if (ctx.runPublisher !== undefined) {
+            this._runPublisher = ctx.runPublisher;
+        }
+        const { runPublisher: _rp, ...rest } = ctx;
+        this._parserState._context = { ...this._parserState._context, ...rest };
     }
 
     /**
@@ -150,12 +172,22 @@ export class ParserExecutor {
                         }
                         if (!matches) continue;
                     }
+                    const flushPs = { ...this._parserState, _textBuffer: this._parserState._pendingText };
+                    const flushCtx = this._parserState._context || {};
                     if (output.type === 'http') {
-                        await this._flushHttpOutput(
-                            output,
-                            { ...this._parserState, _textBuffer: this._parserState._pendingText },
-                            this._parserState._context || {},
-                        );
+                        await this._flushHttpOutput(output, flushPs, flushCtx);
+                    } else if (output.type === 'tts_http') {
+                        await this._flushTtsHttpOutput(output, flushPs, flushCtx);
+                    } else if (output.type === 'conversation') {
+                        await this._flushConversationOutput(output, flushPs, flushCtx);
+                    } else if (output.type === 'email') {
+                        await this._flushEmailOutput(output, flushPs, flushCtx);
+                    } else if (output.type === 'storage') {
+                        await this._flushStorageOutput(output, flushPs, flushCtx);
+                    } else if (output.type === 'pubsub') {
+                        await this._flushPubsubOutput(output, flushPs, flushCtx);
+                    } else if (output.type === 'websocket') {
+                        console.log(`[ParserExecutor] WebSocket output "${output.id || 'websocket'}" not yet implemented`);
                     }
                 }
             }
@@ -195,8 +227,17 @@ export class ParserExecutor {
                 await this._flushHttpOutput(output, ps, ctx);
             } else if (output.type === 'tts_http') {
                 await this._flushTtsHttpOutput(output, ps, ctx);
+            } else if (output.type === 'conversation') {
+                await this._flushConversationOutput(output, ps, ctx);
+            } else if (output.type === 'email') {
+                await this._flushEmailOutput(output, ps, ctx);
+            } else if (output.type === 'storage') {
+                await this._flushStorageOutput(output, ps, ctx);
+            } else if (output.type === 'pubsub') {
+                await this._flushPubsubOutput(output, ps, ctx);
+            } else if (output.type === 'websocket') {
+                console.log(`[ParserExecutor] WebSocket output "${output.id || 'websocket'}" not yet implemented`);
             }
-            // Future: conversation, runStream types
         }
     }
 
@@ -403,6 +444,231 @@ export class ParserExecutor {
             } catch (err: any) {
                 console.error(`[ParserExecutor] TTS(${label}) delivery failed:`, err.message);
             }
+        }
+    }
+
+    /**
+     * Conversation output: publish text chunks to the conversation stream
+     * via the RunPublisher injected through setContext({ runPublisher }).
+     *
+     * Sentence splitting is off by default for conversation output
+     * (the RunPublisher handles its own chunking). Set sentenceSplit: true
+     * in the output config to split into sentences before publishing.
+     */
+    private async _flushConversationOutput(
+        output: Record<string, any>,
+        ps: Record<string, any>,
+        _ctx: Record<string, any>,
+    ): Promise<void> {
+        if (!this._runPublisher) {
+            console.warn(`[ParserExecutor] conversation output "${output.id || 'conversation'}" — no RunPublisher available (pass runPublisher via setContext)`);
+            return;
+        }
+        if (!ps._textBuffer || ps._textBuffer.length === 0) return;
+
+        const label = output.id || 'conversation';
+        let chunks: string[];
+
+        if (output.sentenceSplit === true) {
+            const boundaries = /(?<=[.!?])\s+|(?<=\.)\n|(?<=!)\n|(?<=\?)\n|(?<=—)\s+|(?<=:)\n|\n\n/;
+            const sentences = ps._textBuffer.split(boundaries).filter((s: string) => s && s.trim().length > 2);
+            if (sentences.length === 0) return;
+            const endsClean = /[.!?—]\s*$/.test(ps._textBuffer.trimEnd()) || ps._textBuffer.endsWith('\n\n');
+            chunks = endsClean ? sentences : sentences.slice(0, -1);
+            const remainder = endsClean ? '' : sentences[sentences.length - 1];
+            if (chunks.length === 0) return;
+            ps._textBuffer = remainder;
+        } else {
+            chunks = [ps._textBuffer];
+            ps._textBuffer = '';
+        }
+
+        for (const chunk of chunks) {
+            const text = chunk.trim();
+            if (!text) continue;
+            console.log(`[ParserExecutor] Output(${label}): "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}" (${text.length} chars) → conversation`);
+            try {
+                await this._runPublisher.chunk(text);
+            } catch (err: any) {
+                console.warn(`[ParserExecutor] conversation output "${label}" chunk failed:`, err.message);
+            }
+        }
+    }
+
+    /**
+     * Email output: fire-and-forget POST to an email service endpoint.
+     * Uses email-specific fields (to, subject) alongside the text body.
+     * The email service handles actual delivery.
+     */
+    private async _flushEmailOutput(
+        output: Record<string, any>,
+        ps: Record<string, any>,
+        ctx: Record<string, any>,
+    ): Promise<void> {
+        const { endpoint, headers, sentenceSplit, to, subject, bodyField } = output;
+        if (!endpoint) return;
+        if (!ps._textBuffer || ps._textBuffer.length === 0) return;
+
+        // Email bodies should be full paragraphs — sentenceSplit defaults to false
+        let chunks: string[];
+        if (sentenceSplit === true) {
+            const boundaries = /(?<=[.!?])\s+|(?<=\.)\n|(?<=!)\n|(?<=\?)\n|(?<=—)\s+|(?<=:)\n|\n\n/;
+            const sentences = ps._textBuffer.split(boundaries).filter((s: string) => s && s.trim().length > 2);
+            if (sentences.length === 0) return;
+            const endsClean = /[.!?—]\s*$/.test(ps._textBuffer.trimEnd()) || ps._textBuffer.endsWith('\n\n');
+            chunks = endsClean ? sentences : sentences.slice(0, -1);
+            const remainder = endsClean ? '' : sentences[sentences.length - 1];
+            if (chunks.length === 0) return;
+            ps._textBuffer = remainder;
+        } else {
+            chunks = [ps._textBuffer];
+            ps._textBuffer = '';
+        }
+
+        const label = output.id || 'email';
+
+        const renderStr = (tpl: string | undefined): string => {
+            if (!tpl) return '';
+            if (tpl.startsWith('{{context.') && tpl.endsWith('}}')) return ctx[tpl.slice(10, -2)] ?? '';
+            return tpl;
+        };
+
+        for (const chunk of chunks) {
+            const text = chunk.trim();
+            if (!text) continue;
+            console.log(`[ParserExecutor] Output(${label}): email to="${renderStr(to)}" subject="${renderStr(subject)}" (${text.length} chars)`);
+            try {
+                const emailBody: Record<string, unknown> = {
+                    to: renderStr(to),
+                    subject: renderStr(subject),
+                    [bodyField || 'text']: text,
+                };
+                fetch(endpoint, {
+                    method: 'POST',
+                    headers: headers || { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(emailBody),
+                }).catch(() => {});
+            } catch { /* ignore */ }
+        }
+    }
+
+    /**
+     * Storage output: POST content to a storage endpoint (GridFS, S3, etc.)
+     * and log the returned URL. Useful for persisting generated audio as
+     * shareable files.
+     */
+    private async _flushStorageOutput(
+        output: Record<string, any>,
+        ps: Record<string, any>,
+        ctx: Record<string, any>,
+    ): Promise<void> {
+        const { endpoint, headers, filenameTemplate, mimeType } = output;
+        if (!endpoint) return;
+        if (!ps._textBuffer || ps._textBuffer.length === 0) return;
+
+        const text = ps._textBuffer;
+        ps._textBuffer = '';
+
+        const label = output.id || 'storage';
+
+        const renderFilename = (tpl: string | undefined): string => {
+            if (!tpl) return `parser-output-${Date.now()}`;
+            return tpl.replace(/\{\{timestamp\}\}/g, String(Date.now()))
+                      .replace(/\{\{context\.(\w+)\}\}/g, (_: string, k: string) => ctx[k] ?? '');
+        };
+
+        const filename = renderFilename(filenameTemplate);
+        console.log(`[ParserExecutor] Output(${label}): storage upload "${filename}" mimeType="${mimeType || 'text/plain'}" (${text.length} chars)`);
+
+        try {
+            const storageBody: Record<string, unknown> = {
+                filename,
+                mimeType: mimeType || 'text/plain',
+                content: text,
+            };
+            const resp = await fetch(endpoint, {
+                method: 'POST',
+                headers: headers || { 'Content-Type': 'application/json' },
+                body: JSON.stringify(storageBody),
+            });
+            if (resp.ok) {
+                const result = await resp.json().catch(() => ({})) as any;
+                const url = result?.url || result?.fileUrl || result?.id || '(no url returned)';
+                console.log(`[ParserExecutor] Output(${label}): stored at ${url}`);
+            } else {
+                console.warn(`[ParserExecutor] Output(${label}): storage upload failed ${resp.status}`);
+            }
+        } catch (err: any) {
+            console.warn(`[ParserExecutor] Output(${label}): storage upload error:`, err.message);
+        }
+    }
+
+    /**
+     * Pub/sub output: POST to a relay endpoint that publishes to a Redis channel.
+     * Semantically equivalent to http but with channel-oriented body construction.
+     * Uses the same fire-and-forget pattern as the http output.
+     */
+    private async _flushPubsubOutput(
+        output: Record<string, any>,
+        ps: Record<string, any>,
+        ctx: Record<string, any>,
+    ): Promise<void> {
+        const { endpoint, headers, body: bodyTemplate, channel, sentenceSplit } = output;
+        if (!endpoint) return;
+        if (!ps._textBuffer || ps._textBuffer.length === 0) return;
+
+        let chunks: string[];
+        if (sentenceSplit === true) {
+            const boundaries = /(?<=[.!?])\s+|(?<=\.)\n|(?<=!)\n|(?<=\?)\n|(?<=—)\s+|(?<=:)\n|\n\n/;
+            const sentences = ps._textBuffer.split(boundaries).filter((s: string) => s && s.trim().length > 2);
+            if (sentences.length === 0) return;
+            const endsClean = /[.!?—]\s*$/.test(ps._textBuffer.trimEnd()) || ps._textBuffer.endsWith('\n\n');
+            chunks = endsClean ? sentences : sentences.slice(0, -1);
+            const remainder = endsClean ? '' : sentences[sentences.length - 1];
+            if (chunks.length === 0) return;
+            ps._textBuffer = remainder;
+        } else {
+            chunks = [ps._textBuffer];
+            ps._textBuffer = '';
+        }
+
+        const label = output.id || 'pubsub';
+
+        const resolveChannel = (tpl: string | undefined): string => {
+            if (!tpl) return '';
+            if (tpl.startsWith('{{context.') && tpl.endsWith('}}')) return ctx[tpl.slice(10, -2)] ?? '';
+            return tpl;
+        };
+
+        const resolvedChannel = resolveChannel(channel);
+
+        for (const chunk of chunks) {
+            const text = chunk.trim();
+            if (!text) continue;
+            console.log(`[ParserExecutor] Output(${label}): pubsub channel="${resolvedChannel}" (${text.length} chars)`);
+            try {
+                const renderedBody: Record<string, unknown> = {};
+                if (bodyTemplate && typeof bodyTemplate === 'object') {
+                    for (const [k, v] of Object.entries(bodyTemplate as Record<string, string>)) {
+                        if (v === '{{text}}') renderedBody[k] = text;
+                        else if (v === '{{channel}}') renderedBody[k] = resolvedChannel;
+                        else if (typeof v === 'string' && v.startsWith('{{context.') && v.endsWith('}}')) {
+                            renderedBody[k] = ctx[v.slice(10, -2)] ?? '';
+                        } else {
+                            renderedBody[k] = v;
+                        }
+                    }
+                } else {
+                    // Default pubsub body when no template specified
+                    renderedBody.channel = resolvedChannel;
+                    renderedBody.message = text;
+                }
+                fetch(endpoint, {
+                    method: 'POST',
+                    headers: headers || { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(renderedBody),
+                }).catch(() => {});
+            } catch { /* ignore */ }
         }
     }
 
