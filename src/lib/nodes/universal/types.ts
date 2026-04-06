@@ -85,6 +85,49 @@ export interface NeuronStepConfig {
      */
     stream?: boolean;
     /**
+     * Enable multimodal content parts in the user message.
+     *
+     * When true (or when audioInput/imageInput is true), the executor will
+     * inspect state for audio/image data and build a multimodal HumanMessage
+     * before calling the LLM.
+     *
+     * @default false
+     */
+    multimodal?: boolean;
+    /**
+     * Accept audio data from state.data.input.audioData (base64 WAV).
+     *
+     * When enabled, looks for audioData + audioMimeType in state.data.input
+     * and prepends a media content part to the user message before sending
+     * to the model. Requires a multimodal-capable model (e.g. Gemini).
+     *
+     * @default false
+     */
+    audioInput?: boolean;
+    /**
+     * Accept image attachments from state.data.input.attachments or
+     * state.data._trigger.metadata.attachments.
+     *
+     * When enabled, images found in the attachments array are appended as
+     * image_url content parts to the user message.
+     *
+     * @default false
+     */
+    imageInput?: boolean;
+    /**
+     * Request audio output from the model.
+     *
+     * NOTE: Audio output requires model-level support (e.g. Gemini Live API)
+     * which is not yet available in @langchain/google-genai v2.x.
+     * This flag is reserved for future use — currently a no-op.
+     *
+     * When audio IS returned, the raw bytes are stored in state.data._audioOutput
+     * as { data: base64, mimeType: string }.
+     *
+     * @default false
+     */
+    audioOutput?: boolean;
+    /**
      * JSON Schema for structured output.
      *
      * When provided, uses LangChain's `.withStructuredOutput()` to force the model

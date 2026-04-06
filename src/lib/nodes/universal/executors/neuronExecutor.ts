@@ -19,6 +19,7 @@ import { AudioStreamPipeline } from '../../../tts/audio-stream';
 import { ParserExecutor, type ParserToolExecutor } from './parserExecutor';
 import { getParserRegistry } from './parserRegistry';
 import { getNativeRegistry } from '../../../tools/native-registry';
+import { HumanMessage } from '@langchain/core/messages';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -115,6 +116,89 @@ function resolveConfigValue(value: any, state: any): any {
 
   // Not a template or couldn't resolve - return as-is
   return value;
+}
+
+/**
+ * Attachment reference shape (mirrors the Discord bot payload + trigger metadata)
+ */
+interface AttachmentRef {
+  kind?: 'image' | 'video' | 'audio' | 'document' | 'file';
+  mimeType?: string;
+  url?: string;
+  filename?: string;
+  size?: number;
+}
+
+/**
+ * Build a multimodal HumanMessage that may include audio and/or image content parts.
+ *
+ * Audio: pulled from state.data.input.audioData (base64 WAV from Discord raw audio mode)
+ * Images: pulled from state.data.input.attachments or state.data._trigger.metadata.attachments
+ *
+ * Returns null when no multimodal content is found so the caller can fall back
+ * to a plain string message.
+ *
+ * @langchain/google-genai v2.1.26 supports:
+ *   { type: "media", mimeType: "audio/wav", data: base64 }  -> inlineData
+ *   { type: "image_url", image_url: { url: "https://..." } } -> fileData / inlineData
+ */
+function buildMultimodalMessage(
+  config: NeuronStepConfig,
+  textContent: string,
+  state: any
+): HumanMessage | null {
+  const wantsAudio = config.audioInput || config.multimodal;
+  const wantsImages = config.imageInput || config.multimodal;
+
+  if (!wantsAudio && !wantsImages) return null;
+
+  const input = state.data?.input || {};
+  const triggerAttachments: AttachmentRef[] =
+    state.data?._trigger?.metadata?.attachments || input.attachments || [];
+
+  const contentParts: any[] = [];
+  let hasMultimodal = false;
+
+  // --- Audio input ---
+  if (wantsAudio && input.audioData) {
+    const mimeType: string = input.audioMimeType || 'audio/wav';
+    contentParts.push({
+      type: 'media',
+      mimeType,
+      data: input.audioData, // base64 encoded
+    });
+    hasMultimodal = true;
+    console.log(
+      `[NeuronExecutor] Multimodal: added audio content part (${mimeType}, ${input.audioData.length} base64 chars)`
+    );
+  }
+
+  // --- Image input from attachments ---
+  if (wantsImages && triggerAttachments.length > 0) {
+    for (const attachment of triggerAttachments) {
+      const mime = attachment.mimeType || '';
+      if (!mime.startsWith('image/') && attachment.kind !== 'image') continue;
+      if (!attachment.url) continue;
+
+      contentParts.push({
+        type: 'image_url',
+        image_url: { url: attachment.url },
+      });
+      hasMultimodal = true;
+      console.log(
+        `[NeuronExecutor] Multimodal: added image content part (${mime}, ${attachment.url.substring(0, 80)})`
+      );
+    }
+  }
+
+  if (!hasMultimodal) return null;
+
+  // Append the rendered text prompt as the last part
+  if (textContent) {
+    contentParts.push({ type: 'text', text: textContent });
+  }
+
+  return new HumanMessage({ content: contentParts });
 }
 
 /**
@@ -324,6 +408,27 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       } else {
         throw new Error(`Field ${fieldName} is not an array. Cannot use as messages.`);
       }
+
+      // In messages-array mode, if multimodal is configured and audio/image data
+      // exists, upgrade the last user message to a multimodal HumanMessage.
+      // We extract the text from the last user message and pass it to
+      // buildMultimodalMessage so the content parts are: [audio/images..., text].
+      if (config.audioInput || config.imageInput || config.multimodal) {
+        const lastUserIdx = messages.reduceRight((found, msg, idx) =>
+          found === -1 && (msg.role === 'user' || msg instanceof HumanMessage) ? idx : found, -1
+        );
+        if (lastUserIdx !== -1) {
+          const lastMsg = messages[lastUserIdx];
+          const existingText = typeof lastMsg.content === 'string'
+            ? lastMsg.content
+            : (lastMsg.content?.find?.((p: any) => p.type === 'text')?.text ?? '');
+          const multimodalMsg = buildMultimodalMessage(config, existingText, state);
+          if (multimodalMsg) {
+            messages[lastUserIdx] = multimodalMsg;
+            console.log('[NeuronExecutor] Upgraded last user message to multimodal HumanMessage');
+          }
+        }
+      }
     } else {
       // Standard template rendering for prompts
       let systemPrompt: string | undefined = config.systemPrompt
@@ -345,12 +450,20 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
           outputField: config.outputField
         });
 
-      // Build messages
+      // Build messages — try multimodal first when configured
       messages = [];
       if (systemPrompt) {
         messages.push({ role: 'system', content: systemPrompt });
       }
-      messages.push({ role: 'user', content: userPrompt });
+
+      // Attempt to build a multimodal HumanMessage (audio + image content parts)
+      const multimodalMessage = buildMultimodalMessage(config, userPrompt, state);
+      if (multimodalMessage) {
+        messages.push(multimodalMessage);
+        console.log('[NeuronExecutor] Using multimodal HumanMessage for LLM call');
+      } else {
+        messages.push({ role: 'user', content: userPrompt });
+      }
     }
 
     // Normalize messages before sending to LLM
