@@ -57,10 +57,14 @@ export class ParserExecutor {
         this._maxErrors = 5;
         this._executeTool = executeTool || null;
         this._processingChain = Promise.resolve();
+        // Voice output config from parserConfig (optional, config-driven)
+        this._voiceOutput = (parserConfig as any)?.voiceOutput || null;
     }
 
     /** Serialized processing chain — ensures concurrent processChunk calls are queued. */
     private _processingChain!: Promise<void>;
+    /** Config-driven voice output routing (from parserConfig.voiceOutput). */
+    private _voiceOutput: { endpoint: string; headers?: Record<string, string>; body?: Record<string, string>; sentenceSplit?: boolean } | null;
 
     /** Inject context into the parser state (e.g. channelId, triggerType). */
     setContext(ctx: Record<string, any>): void {
@@ -68,53 +72,73 @@ export class ParserExecutor {
     }
 
     /**
-     * Voice sentence splitter — fires AFTER each _processUnit when voice mode
-     * is active. Splits _textBuffer into individual sentences and sends each
-     * via fetch_url to send-voice independently (parallel TTS calls to Kokoro).
+     * Voice output — fires AFTER each _processUnit when voiceOutput is
+     * configured in parserConfig AND context indicates voice mode.
      *
-     * This bypasses the parser step pipeline entirely for voice sends,
-     * so each sentence starts TTS immediately without waiting for the next.
-     * The step pipeline's send-voice step (step 2) is skipped by setting
-     * _shouldSendText = false after we handle it here.
+     * Splits _textBuffer into individual sentences and POSTs each to the
+     * configured endpoint independently (parallel TTS calls).
+     *
+     * Config-driven: endpoint, headers, and body template come from
+     * parserConfig.voiceOutput — the executor has no platform knowledge.
      */
-    private async _flushVoiceSentences(): Promise<void> {
+    private async _flushVoiceOutput(): Promise<void> {
+        if (!this._voiceOutput) return;
         const ps = this._parserState;
         const ctx = ps._context;
-        if (!ctx?.voiceChannel || !ctx?.guildId) return;
+        if (!ctx?.voiceChannel) return;
         if (!ps._textBuffer || ps._textBuffer.length < 5) return;
 
-        // Split on sentence boundaries
-        const boundaries = /(?<=[.!?])\s+|(?<=\.)\n|(?<=!)\n|(?<=\?)\n|(?<=—)\s+|(?<=:)\n|\n\n/;
-        const sentences = ps._textBuffer.split(boundaries).filter((s: string) => s && s.trim().length > 2);
+        const { endpoint, headers, body: bodyTemplate, sentenceSplit } = this._voiceOutput;
+        if (!endpoint) return;
 
-        if (sentences.length === 0) return;
+        let chunks: string[];
+        if (sentenceSplit !== false) {
+            // Split on sentence boundaries
+            const boundaries = /(?<=[.!?])\s+|(?<=\.)\n|(?<=!)\n|(?<=\?)\n|(?<=—)\s+|(?<=:)\n|\n\n/;
+            const sentences = ps._textBuffer.split(boundaries).filter((s: string) => s && s.trim().length > 2);
+            if (sentences.length === 0) return;
 
-        // Keep last fragment if it doesn't end with a boundary (might be incomplete)
-        const lastSentence = sentences[sentences.length - 1].trim();
-        const endsClean = /[.!?—]\s*$/.test(lastSentence) || ps._textBuffer.endsWith('\n\n');
-        const toSend = endsClean ? sentences : sentences.slice(0, -1);
-        const remainder = endsClean ? '' : sentences[sentences.length - 1];
+            // Keep last fragment if it doesn't end with a boundary
+            const endsClean = /[.!?—]\s*$/.test(ps._textBuffer.trimEnd()) || ps._textBuffer.endsWith('\n\n');
+            chunks = endsClean ? sentences : sentences.slice(0, -1);
+            const remainder = endsClean ? '' : sentences[sentences.length - 1];
+            if (chunks.length === 0) return;
+            ps._textBuffer = remainder;
+        } else {
+            // No sentence splitting — send entire buffer
+            chunks = [ps._textBuffer];
+            ps._textBuffer = '';
+        }
 
-        if (toSend.length === 0) return;
-
-        ps._textBuffer = remainder;
         // Mark as handled so step pipeline doesn't double-send
         ps._shouldSendText = false;
 
-        const url = 'https://run.redbtn.io/api/invoke/send-voice';
-        const headers = { 'Content-Type': 'application/json', 'x-api-key': ctx._apiKey || 'd1f9c55cfdb82f86917b66a93de663c0023606421e30351a390272b7583858f3' };
-        const workspaceId = ctx.botWorkspaceId || '';
-
-        // Fire each sentence independently — parallel TTS
-        for (const sentence of toSend) {
-            const text = sentence.trim();
+        // Fire each chunk to the configured endpoint
+        for (const chunk of chunks) {
+            const text = chunk.trim();
             if (!text) continue;
-            console.log(`[ParserExecutor] Voice sentence: "${text.substring(0, 60)}..." (${text.length} chars)`);
+            console.log(`[ParserExecutor] Voice output: "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}" (${text.length} chars)`);
             try {
-                fetch(url, {
+                // Render body template: replace {{text}} and {{context.X}} placeholders
+                const renderedBody: Record<string, unknown> = {};
+                if (bodyTemplate && typeof bodyTemplate === 'object') {
+                    for (const [k, v] of Object.entries(bodyTemplate as Record<string, string>)) {
+                        if (v === '{{text}}') renderedBody[k] = text;
+                        else if (typeof v === 'string' && v.startsWith('{{context.') && v.endsWith('}}')) {
+                            const field = v.slice(10, -2);
+                            renderedBody[k] = ctx[field] ?? '';
+                        } else {
+                            renderedBody[k] = v;
+                        }
+                    }
+                } else {
+                    renderedBody.text = text;
+                }
+
+                fetch(endpoint, {
                     method: 'POST',
-                    headers,
-                    body: JSON.stringify({ text, guildId: ctx.guildId, workspaceId }),
+                    headers: headers || { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(renderedBody),
                 }).catch(() => {}); // fire and forget
             } catch { /* ignore */ }
         }
@@ -159,7 +183,7 @@ export class ParserExecutor {
                 const result = await this._processUnit(this._buffer);
                 this._buffer = '';
                 if (result != null) outputs.push(result);
-                await this._flushVoiceSentences();
+                await this._flushVoiceOutput();
             } else if (this.bufferMode === 'line') {
                 // Split on newlines, process each complete line
                 const lines = this._buffer.split('\n');
@@ -171,7 +195,7 @@ export class ParserExecutor {
                     const result = await this._processUnit(trimmed);
                     if (result != null) outputs.push(result);
                     // Voice mode: flush individual sentences after each event
-                    await this._flushVoiceSentences();
+                    await this._flushVoiceOutput();
                 }
             } else if (this.bufferMode === 'json') {
                 // Try to parse buffer as JSON
