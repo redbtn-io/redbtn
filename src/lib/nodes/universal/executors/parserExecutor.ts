@@ -57,14 +57,39 @@ export class ParserExecutor {
         this._maxErrors = 5;
         this._executeTool = executeTool || null;
         this._processingChain = Promise.resolve();
-        // Voice output config from parserConfig (optional, config-driven)
-        this._voiceOutput = (parserConfig as any)?.voiceOutput || null;
+        // Config-driven outputs from parserConfig (optional)
+        const rawOutputs = (parserConfig as any)?.outputs;
+        this._outputs = Array.isArray(rawOutputs) ? rawOutputs : [];
+        // Legacy: promote voiceOutput to outputs[] entry
+        const legacyVoice = (parserConfig as any)?.voiceOutput;
+        if (legacyVoice && !this._outputs.some((o: any) => o.type === 'http' && o.id === 'voice')) {
+            this._outputs.push({ id: 'voice', type: 'http', condition: { voiceChannel: true }, ...legacyVoice });
+        }
     }
 
     /** Serialized processing chain — ensures concurrent processChunk calls are queued. */
     private _processingChain!: Promise<void>;
-    /** Config-driven voice output routing (from parserConfig.voiceOutput). */
-    private _voiceOutput: { endpoint: string; headers?: Record<string, string>; body?: Record<string, string>; sentenceSplit?: boolean } | null;
+
+    /**
+     * Config-driven output routing.
+     *
+     * Each output fires independently when its condition matches.
+     * Types:
+     *   - http: POST to an endpoint with body template
+     *   - conversation: publish to conversation stream via RunPublisher
+     *   - runStream: publish to run stream (for archivers/UI)
+     *
+     * All matching outputs fire in parallel per chunk.
+     */
+    private _outputs: Array<{
+        id?: string;
+        type: 'http' | 'conversation' | 'runStream';
+        condition?: Record<string, unknown>;
+        sentenceSplit?: boolean;
+        endpoint?: string;
+        headers?: Record<string, string>;
+        body?: Record<string, string>;
+    }>;
 
     /** Inject context into the parser state (e.g. channelId, triggerType). */
     setContext(ctx: Record<string, any>): void {
@@ -72,61 +97,78 @@ export class ParserExecutor {
     }
 
     /**
-     * Voice output — fires AFTER each _processUnit when voiceOutput is
-     * configured in parserConfig AND context indicates voice mode.
+     * Flush configured outputs — fires AFTER each _processUnit.
      *
-     * Splits _textBuffer into individual sentences and POSTs each to the
-     * configured endpoint independently (parallel TTS calls).
+     * Iterates all outputs whose conditions match the current context.
+     * Each output can independently split sentences, POST to endpoints,
+     * or publish to internal streams.
      *
-     * Config-driven: endpoint, headers, and body template come from
-     * parserConfig.voiceOutput — the executor has no platform knowledge.
+     * Config-driven: the executor has zero platform knowledge.
      */
-    private async _flushVoiceOutput(): Promise<void> {
-        if (!this._voiceOutput) return;
+    private async _flushOutputs(): Promise<void> {
+        if (this._outputs.length === 0) return;
         const ps = this._parserState;
-        const ctx = ps._context;
-        if (!ctx?.voiceChannel) return;
+        const ctx = ps._context || {};
         if (!ps._textBuffer || ps._textBuffer.length < 5) return;
 
-        const { endpoint, headers, body: bodyTemplate, sentenceSplit } = this._voiceOutput;
+        for (const output of this._outputs) {
+            // Check condition — every key in condition must match context
+            if (output.condition) {
+                let matches = true;
+                for (const [k, v] of Object.entries(output.condition)) {
+                    if (v === true && !ctx[k]) { matches = false; break; }
+                    if (v === false && ctx[k]) { matches = false; break; }
+                    if (typeof v === 'string' && ctx[k] !== v) { matches = false; break; }
+                }
+                if (!matches) continue;
+            }
+
+            if (output.type === 'http') {
+                await this._flushHttpOutput(output, ps, ctx);
+            }
+            // Future: conversation, runStream types
+        }
+    }
+
+    /** Flush text buffer to an HTTP endpoint output. */
+    private async _flushHttpOutput(
+        output: { sentenceSplit?: boolean; endpoint?: string; headers?: Record<string, string>; body?: Record<string, string>; id?: string },
+        ps: Record<string, any>,
+        ctx: Record<string, any>,
+    ): Promise<void> {
+        const { endpoint, headers, body: bodyTemplate, sentenceSplit } = output;
         if (!endpoint) return;
 
         let chunks: string[];
         if (sentenceSplit !== false) {
-            // Split on sentence boundaries
             const boundaries = /(?<=[.!?])\s+|(?<=\.)\n|(?<=!)\n|(?<=\?)\n|(?<=—)\s+|(?<=:)\n|\n\n/;
             const sentences = ps._textBuffer.split(boundaries).filter((s: string) => s && s.trim().length > 2);
             if (sentences.length === 0) return;
 
-            // Keep last fragment if it doesn't end with a boundary
             const endsClean = /[.!?—]\s*$/.test(ps._textBuffer.trimEnd()) || ps._textBuffer.endsWith('\n\n');
             chunks = endsClean ? sentences : sentences.slice(0, -1);
             const remainder = endsClean ? '' : sentences[sentences.length - 1];
             if (chunks.length === 0) return;
             ps._textBuffer = remainder;
         } else {
-            // No sentence splitting — send entire buffer
             chunks = [ps._textBuffer];
             ps._textBuffer = '';
         }
 
-        // Mark as handled so step pipeline doesn't double-send
         ps._shouldSendText = false;
 
-        // Fire each chunk to the configured endpoint
         for (const chunk of chunks) {
             const text = chunk.trim();
             if (!text) continue;
-            console.log(`[ParserExecutor] Voice output: "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}" (${text.length} chars)`);
+            const label = output.id || 'http';
+            console.log(`[ParserExecutor] Output(${label}): "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}" (${text.length} chars)`);
             try {
-                // Render body template: replace {{text}} and {{context.X}} placeholders
                 const renderedBody: Record<string, unknown> = {};
                 if (bodyTemplate && typeof bodyTemplate === 'object') {
                     for (const [k, v] of Object.entries(bodyTemplate as Record<string, string>)) {
                         if (v === '{{text}}') renderedBody[k] = text;
                         else if (typeof v === 'string' && v.startsWith('{{context.') && v.endsWith('}}')) {
-                            const field = v.slice(10, -2);
-                            renderedBody[k] = ctx[field] ?? '';
+                            renderedBody[k] = ctx[v.slice(10, -2)] ?? '';
                         } else {
                             renderedBody[k] = v;
                         }
@@ -139,7 +181,7 @@ export class ParserExecutor {
                     method: 'POST',
                     headers: headers || { 'Content-Type': 'application/json' },
                     body: JSON.stringify(renderedBody),
-                }).catch(() => {}); // fire and forget
+                }).catch(() => {});
             } catch { /* ignore */ }
         }
     }
@@ -183,7 +225,7 @@ export class ParserExecutor {
                 const result = await this._processUnit(this._buffer);
                 this._buffer = '';
                 if (result != null) outputs.push(result);
-                await this._flushVoiceOutput();
+                await this._flushOutputs();
             } else if (this.bufferMode === 'line') {
                 // Split on newlines, process each complete line
                 const lines = this._buffer.split('\n');
@@ -195,7 +237,7 @@ export class ParserExecutor {
                     const result = await this._processUnit(trimmed);
                     if (result != null) outputs.push(result);
                     // Voice mode: flush individual sentences after each event
-                    await this._flushVoiceOutput();
+                    await this._flushOutputs();
                 }
             } else if (this.bufferMode === 'json') {
                 // Try to parse buffer as JSON
