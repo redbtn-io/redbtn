@@ -192,6 +192,11 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     triggerType: state.data?.triggerType || (inputData as any).type,
                     messageId: inputData.messageId,
                     replyToMessageId: state.data?.replyToMessageId || inputData.messageId,
+                    // Voice channel routing: when true, text goes to send-voice and tools go to
+                    // voiceChannelId text chat instead of Discord text channel + thread.
+                    voiceChannel: (inputData as any).voiceChannel || false,
+                    voiceChannelId: (inputData as any).voiceChannelId || null,
+                    guildId: (inputData as any).guildId || null,
                 });
                 console.log(`[ToolExecutor] Stream parser "${(config as any).streamParser}" loaded for ${config.toolName} (tool steps enabled)`);
             } else {
