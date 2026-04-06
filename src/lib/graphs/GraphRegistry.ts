@@ -126,9 +126,9 @@ export class GraphRegistry {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const mongoose = require('mongoose');
       let User: any;
-      try {
-        User = mongoose.model('User');
-      } catch {
+      if (mongoose.models['User']) {
+        User = mongoose.models['User'];
+      } else {
         const userSchema = new mongoose.Schema({}, { collection: 'users', strict: false });
         User = mongoose.model('User', userSchema);
       }

@@ -57,11 +57,6 @@ export {
   CollectionStats
 } from "./lib/memory/vectors";
 
-export {
-  addToVectorStoreNode,
-  retrieveFromVectorStoreNode
-} from "./lib/nodes/rag";
-
 // Export MCP (Model Context Protocol) components
 export {
   McpClient,
