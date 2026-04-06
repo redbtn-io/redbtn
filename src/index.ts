@@ -11,7 +11,6 @@ import { ChatOpenAI } from "@langchain/openai";
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 
 import { MemoryManager } from "./lib/memory/memory";
-import { MessageQueue } from "./lib/memory/queue";
 import { PersistentLogger } from "./lib/logs/persistent-logger";
 import { createGeminiModel, createOpenAIModel } from "./lib/models";
 import * as background from "./functions/background";
@@ -33,13 +32,6 @@ export {
   BaseDocument,
 } from "./lib/memory/database";
 
-// Export message queue for background processing
-// @deprecated MessageQueue and its Redis key patterns (message:generating:*, message:stream:*,
-// stream:ready:*, conversation:generating:*) are legacy. New code uses RunPublisher.
-// MessageQueue is kept for webapp compatibility (getGeneratingMessages is still called by
-// GET /api/v1/conversations/:id/status and /active-generation routes).
-export { MessageQueue, MessageGenerationState } from "./lib/memory/queue";
-
 // Export logging system
 export * from "./lib/logs";
 export { PersistentLogger } from "./lib/logs/persistent-logger";
@@ -56,11 +48,6 @@ export {
   SearchConfig,
   CollectionStats
 } from "./lib/memory/vectors";
-
-export {
-  addToVectorStoreNode,
-  retrieveFromVectorStoreNode
-} from "./lib/nodes/rag";
 
 // Export MCP (Model Context Protocol) components
 export {
@@ -172,7 +159,6 @@ export class Red {
   public openAIModel?: ChatOpenAI;
   public geminiModel?: ChatGoogleGenerativeAI;
   public memory!: MemoryManager;
-  public messageQueue!: MessageQueue;
   public logger!: PersistentLogger;
   public redlog!: RedLog;
   public mcpRegistry!: McpRegistry;
@@ -198,10 +184,9 @@ export class Red {
     // Initialize memory manager
     this.memory = new MemoryManager(config.redisUrl);
 
-    // Initialize message queue with same Redis connection
+    // Initialize Redis connection
     const redis = new (require('ioredis'))(config.redisUrl);
     this.redis = redis;
-    this.messageQueue = new MessageQueue(redis);
 
     // Initialize logger with MongoDB persistence
     this.logger = new PersistentLogger(redis, this.nodeId || 'default');
@@ -215,8 +200,8 @@ export class Red {
       console: false,
     });
 
-    // Initialize MCP registry for tool servers (pass messageQueue for event publishing)
-    this.mcpRegistry = new McpRegistry(this.messageQueue);
+    // Initialize MCP registry for tool servers
+    this.mcpRegistry = new McpRegistry();
 
     // Initialize graph and neuron registries for run() execution
     this.graphRegistry = new GraphRegistry({ databaseUrl: config.databaseUrl });
