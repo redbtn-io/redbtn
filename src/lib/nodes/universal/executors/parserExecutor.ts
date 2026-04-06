@@ -68,6 +68,59 @@ export class ParserExecutor {
     }
 
     /**
+     * Voice sentence splitter — fires AFTER each _processUnit when voice mode
+     * is active. Splits _textBuffer into individual sentences and sends each
+     * via fetch_url to send-voice independently (parallel TTS calls to Kokoro).
+     *
+     * This bypasses the parser step pipeline entirely for voice sends,
+     * so each sentence starts TTS immediately without waiting for the next.
+     * The step pipeline's send-voice step (step 2) is skipped by setting
+     * _shouldSendText = false after we handle it here.
+     */
+    private async _flushVoiceSentences(): Promise<void> {
+        const ps = this._parserState;
+        const ctx = ps._context;
+        if (!ctx?.voiceChannel || !ctx?.guildId) return;
+        if (!ps._textBuffer || ps._textBuffer.length < 5) return;
+
+        // Split on sentence boundaries
+        const boundaries = /(?<=[.!?])\s+|(?<=\.)\n|(?<=!)\n|(?<=\?)\n|(?<=—)\s+|(?<=:)\n|\n\n/;
+        const sentences = ps._textBuffer.split(boundaries).filter((s: string) => s && s.trim().length > 2);
+
+        if (sentences.length === 0) return;
+
+        // Keep last fragment if it doesn't end with a boundary (might be incomplete)
+        const lastSentence = sentences[sentences.length - 1].trim();
+        const endsClean = /[.!?—]\s*$/.test(lastSentence) || ps._textBuffer.endsWith('\n\n');
+        const toSend = endsClean ? sentences : sentences.slice(0, -1);
+        const remainder = endsClean ? '' : sentences[sentences.length - 1];
+
+        if (toSend.length === 0) return;
+
+        ps._textBuffer = remainder;
+        // Mark as handled so step pipeline doesn't double-send
+        ps._shouldSendText = false;
+
+        const url = 'https://run.redbtn.io/api/invoke/send-voice';
+        const headers = { 'Content-Type': 'application/json', 'x-api-key': ctx._apiKey || 'd1f9c55cfdb82f86917b66a93de663c0023606421e30351a390272b7583858f3' };
+        const workspaceId = ctx.botWorkspaceId || '';
+
+        // Fire each sentence independently — parallel TTS
+        for (const sentence of toSend) {
+            const text = sentence.trim();
+            if (!text) continue;
+            console.log(`[ParserExecutor] Voice sentence: "${text.substring(0, 60)}..." (${text.length} chars)`);
+            try {
+                fetch(url, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({ text, guildId: ctx.guildId, workspaceId }),
+                }).catch(() => {}); // fire and forget
+            } catch { /* ignore */ }
+        }
+    }
+
+    /**
      * Process a raw chunk from tool output.
      * Returns array of parsed content strings (may be 0, 1, or many).
      *
@@ -106,6 +159,7 @@ export class ParserExecutor {
                 const result = await this._processUnit(this._buffer);
                 this._buffer = '';
                 if (result != null) outputs.push(result);
+                await this._flushVoiceSentences();
             } else if (this.bufferMode === 'line') {
                 // Split on newlines, process each complete line
                 const lines = this._buffer.split('\n');
@@ -116,6 +170,8 @@ export class ParserExecutor {
                     if (!trimmed && this.skipEmpty) continue;
                     const result = await this._processUnit(trimmed);
                     if (result != null) outputs.push(result);
+                    // Voice mode: flush individual sentences after each event
+                    await this._flushVoiceSentences();
                 }
             } else if (this.bufferMode === 'json') {
                 // Try to parse buffer as JSON
