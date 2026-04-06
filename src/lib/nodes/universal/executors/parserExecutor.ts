@@ -289,57 +289,53 @@ export class ParserExecutor {
         ps._shouldSendText = false;
         const label = output.id || 'tts_http';
         const voice = ttsVoice || 'Kore';
-        const model = ttsModel || 'gemini-2.5-flash-preview-tts';
 
-        for (const chunk of chunks) {
+        // Fire ALL TTS calls in parallel, then deliver audio sequentially (preserves order)
+        const ttsPromises = chunks.map((chunk) => {
             const text = chunk.trim();
-            if (!text) continue;
+            if (!text) return Promise.resolve(null);
             console.log(`[ParserExecutor] TTS(${label}): "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}" (${text.length} chars)`);
 
-            try {
-                // Step 1: Call TTS API
-                const ttsBody = {
-                    contents: [{ parts: [{ text: `Say naturally: ${text}` }] }],
-                    generationConfig: {
-                        responseModalities: ['AUDIO'],
-                        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
-                    },
-                };
+            const ttsBody = {
+                contents: [{ parts: [{ text: `Say naturally: ${text}` }] }],
+                generationConfig: {
+                    responseModalities: ['AUDIO'],
+                    speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+                },
+            };
+            const ttsStart = Date.now();
 
-                const ttsStart = Date.now();
-                const ttsResp = await fetch(ttsEndpoint, {
-                    method: 'POST',
-                    headers: ttsHeaders || { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(ttsBody),
-                });
-
-                if (!ttsResp.ok) {
-                    const errText = await ttsResp.text().catch(() => '');
-                    console.error(`[ParserExecutor] TTS(${label}) failed: ${ttsResp.status} ${errText.substring(0, 200)}`);
-                    continue;
+            return fetch(ttsEndpoint, {
+                method: 'POST',
+                headers: ttsHeaders || { 'Content-Type': 'application/json' },
+                body: JSON.stringify(ttsBody),
+            }).then(async (resp) => {
+                if (!resp.ok) {
+                    const errText = await resp.text().catch(() => '');
+                    console.error(`[ParserExecutor] TTS(${label}) failed: ${resp.status} ${errText.substring(0, 200)}`);
+                    return null;
                 }
-
-                const ttsData = await ttsResp.json() as any;
+                const data = await resp.json() as any;
+                const audioData = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
                 const ttsDuration = Date.now() - ttsStart;
-
-                // Step 2: Extract audio from response via path
-                let audioData: string | undefined;
-                try {
-                    // Navigate the response path: candidates[0].content.parts[0].inlineData.data
-                    audioData = ttsData?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-                } catch {
-                    console.error(`[ParserExecutor] TTS(${label}) audio extraction failed`);
-                    continue;
+                if (audioData) {
+                    console.log(`[ParserExecutor] TTS(${label}): got ${audioData.length} base64 chars in ${ttsDuration}ms`);
+                } else {
+                    console.error(`[ParserExecutor] TTS(${label}) no audio in response (${ttsDuration}ms)`);
                 }
+                return audioData || null;
+            }).catch((err) => {
+                console.error(`[ParserExecutor] TTS(${label}) fetch error:`, err.message);
+                return null;
+            });
+        });
 
-                if (!audioData) {
-                    console.error(`[ParserExecutor] TTS(${label}) no audio data in response`);
-                    continue;
-                }
+        // Wait for all TTS to complete, then deliver in order
+        const audioResults = await Promise.all(ttsPromises);
 
-                console.log(`[ParserExecutor] TTS(${label}): got ${audioData.length} base64 chars in ${ttsDuration}ms`);
-
-                // Step 3: Forward audio to delivery endpoint
+        for (const audioData of audioResults) {
+            if (!audioData) continue;
+            try {
                 const renderedDelivery: Record<string, unknown> = {};
                 if (deliveryBody && typeof deliveryBody === 'object') {
                     for (const [k, v] of Object.entries(deliveryBody as Record<string, string>)) {
@@ -351,18 +347,15 @@ export class ParserExecutor {
                         }
                     }
                 }
-
-                fetch(deliveryEndpoint, {
+                // Await delivery to preserve playback order
+                await fetch(deliveryEndpoint, {
                     method: 'POST',
                     headers: deliveryHeaders || { 'Content-Type': 'application/json' },
                     body: JSON.stringify(renderedDelivery),
-                }).catch((err) => {
-                    console.error(`[ParserExecutor] TTS(${label}) delivery failed:`, err.message);
                 });
-
-                console.log(`[ParserExecutor] TTS(${label}): audio sent to delivery endpoint`);
+                console.log(`[ParserExecutor] TTS(${label}): audio delivered`);
             } catch (err: any) {
-                console.error(`[ParserExecutor] TTS(${label}) error:`, err.message);
+                console.error(`[ParserExecutor] TTS(${label}) delivery failed:`, err.message);
             }
         }
     }
