@@ -348,7 +348,8 @@ export class ConversationPublisher {
       const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
       const queue = getArchiveQueue('conversation-archive', this.redis, prefix);
       await queue.add('archive', jobData, {
-        jobId: `${this.conversationId}:${seq}`,
+        // BullMQ does not allow colons in jobIds — use underscore separator
+        jobId: `${this.conversationId}_${seq}`,
         removeOnComplete: { age: 3600, count: 500 },
         removeOnFail: { age: 86400 },
       });
