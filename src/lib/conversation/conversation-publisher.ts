@@ -23,14 +23,51 @@ import { ConversationKeys, ConversationConfig, type ConversationEvent } from './
 // ---------------------------------------------------------------------------
 // Module-level singleton BullMQ Queue instances (C-1 fix)
 // One Queue per (name, prefix) pair — shared across all ConversationPublisher instances.
+//
+// IMPORTANT: BullMQ Queue requires a connection config object (host/port/password),
+// NOT an existing ioredis instance. We parse REDIS_URL once and reuse the config.
+// Passing an ioredis instance directly causes queue.add() to fail silently.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { Queue: _BullQueue } = require('bullmq');
 const _archiveQueues = new Map<string, InstanceType<typeof _BullQueue>>();
 
-function getArchiveQueue(name: string, redis: unknown, prefix: string): InstanceType<typeof _BullQueue> {
+/**
+ * Parse REDIS_URL into a BullMQ-compatible connection config object.
+ * BullMQ needs { host, port, password } — not an ioredis instance.
+ */
+function parseBullMQConnectionFromEnv(): { host: string; port: number; password?: string; username?: string; db?: number; tls?: object } {
+  const url = process.env.REDIS_URL ?? 'redis://localhost:6379';
+  try {
+    const parsed = new URL(url);
+    const password = parsed.password ? decodeURIComponent(parsed.password) : undefined;
+    const username = parsed.username ? decodeURIComponent(parsed.username) : undefined;
+    const db = parsed.pathname && parsed.pathname !== '/' ? parseInt(parsed.pathname.slice(1), 10) : 0;
+    return {
+      host: parsed.hostname || 'localhost',
+      port: parseInt(parsed.port || '6379', 10),
+      ...(password && { password }),
+      ...(username && { username }),
+      ...(db && { db }),
+      ...(parsed.protocol === 'rediss:' && { tls: {} }),
+    };
+  } catch {
+    return { host: 'localhost', port: 6379 };
+  }
+}
+
+let _bullMQConnection: ReturnType<typeof parseBullMQConnectionFromEnv> | null = null;
+
+function getBullMQConnection(): ReturnType<typeof parseBullMQConnectionFromEnv> {
+  if (!_bullMQConnection) {
+    _bullMQConnection = parseBullMQConnectionFromEnv();
+  }
+  return _bullMQConnection;
+}
+
+function getArchiveQueue(name: string, _redis: unknown, prefix: string): InstanceType<typeof _BullQueue> {
   const key = `${prefix}:${name}`;
   if (!_archiveQueues.has(key)) {
-    _archiveQueues.set(key, new _BullQueue(name, { connection: redis, prefix }));
+    _archiveQueues.set(key, new _BullQueue(name, { connection: getBullMQConnection(), prefix }));
   }
   return _archiveQueues.get(key)!;
 }
