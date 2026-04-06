@@ -222,6 +222,8 @@ CRITICAL RULES:
     // planner.ts, responder.ts) that called messageQueue.publishStatus() used the old redGraph
     // path, which was removed in v0.0.51-alpha alongside Red.respond(). New graph execution
     // uses RunPublisher for all SSE events.
+    // Graph registry — passed so that 'graph' step executors can invoke subgraphs
+    _graphRegistry: red.graphRegistry,
     mcpClient: {
       callTool: (toolName: string, args: unknown, meta?: unknown) =>
         red.callMcpTool(toolName, args as Record<string, unknown>, meta as Record<string, unknown>),

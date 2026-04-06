@@ -64,6 +64,20 @@ export {
 // Export registries
 export { universalNodeRegistry, getUniversalNode, getUniversalNodeRaw } from "./lib/registry/UniversalNodeRegistry";
 
+// Export universal node types (step configs, step type union)
+export type {
+  StepType,
+  NeuronStepConfig,
+  ToolStepConfig,
+  TransformStepConfig,
+  ConditionalStepConfig,
+  LoopStepConfig,
+  ConnectionStepConfig,
+  GraphStepConfig,
+  UniversalStep,
+  NodeConfig,
+} from "./lib/nodes/universal/types";
+
 // Export graph execution
 export { run, isStreamingResult } from "./functions/run";
 export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } from "./functions/run";

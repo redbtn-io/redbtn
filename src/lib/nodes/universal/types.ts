@@ -17,7 +17,7 @@
 /**
  * Step types available in universal nodes
  */
-export type StepType = 'neuron' | 'tool' | 'transform' | 'conditional' | 'loop' | 'delay' | 'connection';
+export type StepType = 'neuron' | 'tool' | 'transform' | 'conditional' | 'loop' | 'delay' | 'connection' | 'graph';
 
 /**
  * Error Handling Configuration
@@ -380,6 +380,47 @@ export interface ConnectionStepConfig {
 }
 
 /**
+ * Graph Step — invoke another graph as a subgraph
+ *
+ * Use cases:
+ * - Compose complex workflows from smaller, reusable graphs
+ * - Run a specialist graph (e.g. "research") from within a coordinator graph
+ * - Fan out to multiple specialist graphs and merge results
+ *
+ * Execution semantics:
+ * - Shares the parent's RunPublisher, mcpClient, neuronRegistry, and connectionManager
+ * - Does NOT acquire a separate RunLock — runs within the parent's lock
+ * - Does NOT create its own Redis run state — events flow through parent's publisher
+ * - Recursion guard: max depth 5 (configurable via MAX_SUBGRAPH_DEPTH in graphExecutor)
+ */
+export interface GraphStepConfig {
+    /** ID of the graph to invoke — must exist in the MongoDB 'graphs' collection */
+    graphId: string;
+    /**
+     * Maps subgraph input fields to parent state paths.
+     * Source paths support {{state.X}} template syntax.
+     * If omitted, the parent's entire data object is passed through.
+     *
+     * Example: { "topic": "{{state.data.userTopic}}", "depth": "{{state.data.searchDepth}}" }
+     */
+    inputMapping?: Record<string, string>;
+    /**
+     * State field where the subgraph's output will be stored in the parent state.
+     * Supports dot-notation for nested writes: "data.subResult"
+     */
+    outputField: string;
+    /** Maximum execution time in milliseconds. No timeout if omitted. */
+    timeout?: number;
+    /** Error handling configuration for this graph step */
+    errorHandling?: {
+        retry?: number;
+        retryDelay?: number;
+        fallbackValue?: any;
+        onError?: 'throw' | 'fallback' | 'skip';
+    };
+}
+
+/**
  * Universal Step - One of the step types
  *
  * Each step executes sequentially and can read state from previous steps.
@@ -389,7 +430,7 @@ export interface UniversalStep {
     /** Type of step to execute */
     type: StepType;
     /** Configuration for the step (type depends on step type) */
-    config: NeuronStepConfig | ToolStepConfig | TransformStepConfig | ConditionalStepConfig | LoopStepConfig | ConnectionStepConfig;
+    config: NeuronStepConfig | ToolStepConfig | TransformStepConfig | ConditionalStepConfig | LoopStepConfig | ConnectionStepConfig | GraphStepConfig;
     /**
      * Optional condition to determine if this step should run.
      * If provided, the step only runs if the condition evaluates to true.
