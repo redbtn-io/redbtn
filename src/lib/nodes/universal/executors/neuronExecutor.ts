@@ -16,6 +16,9 @@ import type { NeuronStepConfig } from '../types';
 import { renderTemplate, getNestedProperty } from '../templateRenderer';
 import { executeWithErrorHandling } from './errorHandler';
 import { AudioStreamPipeline } from '../../../tts/audio-stream';
+import { ParserExecutor, type ParserToolExecutor } from './parserExecutor';
+import { getParserRegistry } from './parserRegistry';
+import { getNativeRegistry } from '../../../tools/native-registry';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -487,6 +490,46 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       response = '';
       let chunkCount = 0;
 
+      // -----------------------------------------------------------------------
+      // Stream parser support: if config has streamParser, set up a ParserExecutor
+      // that can route output to configured destinations (voice, etc.)
+      // -----------------------------------------------------------------------
+      let neuronParser: ParserExecutor | null = null;
+      const streamParserName = (config as any).streamParser;
+      if (streamParserName && streamToUser) {
+        try {
+          const registry = getParserRegistry();
+          const parserDef = await registry.getParser(streamParserName);
+          if (parserDef) {
+            const nativeReg = getNativeRegistry();
+            const parserToolExecutor: ParserToolExecutor = async (toolName, params) => {
+              if (nativeReg.has(toolName)) {
+                const tool = nativeReg.get(toolName)!;
+                return tool.handler(params, {} as any);
+              }
+              if (state.mcpClient) return state.mcpClient.callTool(toolName, params);
+              throw new Error(`Tool "${toolName}" not available in neuron parser context`);
+            };
+            neuronParser = new ParserExecutor(parserDef.config, parserDef.parserConfig, parserToolExecutor);
+            // Inject context from state
+            const inputData = state.data?.input || state.input || {};
+            neuronParser.setContext({
+              channelId: inputData.channelId,
+              platform: state.data?.platform || inputData._trigger?.source?.platform || inputData.type,
+              messageId: inputData.messageId,
+              replyToMessageId: state.data?.replyToMessageId || inputData.messageId,
+              voiceChannel: inputData.voiceChannel || state.data?.voiceChannel || false,
+              voiceChannelId: inputData.voiceChannelId || null,
+              guildId: inputData.guildId || state.data?.input?.guildId || null,
+              botWorkspaceId: inputData.botWorkspaceId || null,
+            });
+            console.log(`[NeuronExecutor] Stream parser "${streamParserName}" loaded (outputs enabled)`);
+          }
+        } catch (parserErr: any) {
+          console.warn('[NeuronExecutor] Failed to load stream parser:', parserErr.message);
+        }
+      }
+
       // Determine inactivity timeout — configurable via node config or state parameters.
       // Priority: config.inactivityTimeout > state.parameters.inactivityTimeout > default (120 s)
       const resolvedInactivityTimeout = resolveConfigValue(
@@ -566,6 +609,14 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
             if (audioPipeline) {
               audioPipeline.push(chunk.content);
             }
+
+            // Feed text to stream parser for output routing (voice, etc.)
+            // We feed raw text as a simple JSON line that the parser transform
+            // can process. But for neuron output we bypass the parser's step
+            // pipeline and use its outputs routing directly.
+            if (neuronParser) {
+              neuronParser.feedText(chunk.content);
+            }
           }
         }
       } catch (streamErr) {
@@ -587,6 +638,16 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       console.log(
         `[NeuronExecutor] Stream complete: ${chunkCount} chunks, ${response.length} chars, ${Date.now() - streamStartTime}ms`
       );
+
+      // Flush stream parser outputs (send remaining text to voice, etc.)
+      if (neuronParser) {
+        try {
+          await neuronParser.flushText();
+          console.log('[NeuronExecutor] Stream parser outputs flushed');
+        } catch (parserFlushErr: any) {
+          console.warn('[NeuronExecutor] Stream parser flush failed:', parserFlushErr.message);
+        }
+      }
 
       // Flush TTS pipeline — waits for all pending synthesis to complete and publish
       if (audioPipeline) {

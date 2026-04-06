@@ -97,6 +97,64 @@ export class ParserExecutor {
     }
 
     /**
+     * Feed raw text directly (bypasses step pipeline).
+     * Used by neuronExecutor to route LLM output through configured outputs
+     * (voice sentence splitting, etc.) without needing a parser transform step.
+     */
+    async feedText(text: string): Promise<void> {
+        const prev = this._processingChain;
+        let resolveNext!: () => void;
+        this._processingChain = new Promise<void>((resolve) => { resolveNext = resolve; });
+        await prev;
+        try {
+            this._parserState._textBuffer = (this._parserState._textBuffer || '') + text;
+            await this._flushOutputs();
+        } finally {
+            resolveNext();
+        }
+    }
+
+    /**
+     * Flush any remaining text buffer through outputs (call after streaming ends).
+     */
+    async flushText(): Promise<void> {
+        const prev = this._processingChain;
+        let resolveNext!: () => void;
+        this._processingChain = new Promise<void>((resolve) => { resolveNext = resolve; });
+        await prev;
+        try {
+            if (this._parserState._textBuffer && this._parserState._textBuffer.length > 0) {
+                // Force flush everything remaining
+                this._parserState._shouldSendText = true;
+                this._parserState._pendingText = this._parserState._textBuffer;
+                this._parserState._textBuffer = '';
+                // Fire outputs with the remaining text
+                for (const output of this._outputs) {
+                    if (output.condition) {
+                        const ctx = this._parserState._context || {};
+                        let matches = true;
+                        for (const [k, v] of Object.entries(output.condition)) {
+                            if (v === true && !ctx[k]) { matches = false; break; }
+                            if (v === false && ctx[k]) { matches = false; break; }
+                            if (typeof v === 'string' && ctx[k] !== v) { matches = false; break; }
+                        }
+                        if (!matches) continue;
+                    }
+                    if (output.type === 'http') {
+                        await this._flushHttpOutput(
+                            output,
+                            { ...this._parserState, _textBuffer: this._parserState._pendingText },
+                            this._parserState._context || {},
+                        );
+                    }
+                }
+            }
+        } finally {
+            resolveNext();
+        }
+    }
+
+    /**
      * Flush configured outputs — fires AFTER each _processUnit.
      *
      * Iterates all outputs whose conditions match the current context.
