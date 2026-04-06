@@ -290,40 +290,86 @@ export class ParserExecutor {
         const label = output.id || 'tts_http';
         const voice = ttsVoice || 'Kore';
 
+        // Build the TTS request body from config template (provider-agnostic)
+        const ttsRequestBody = output.ttsRequestBody;
+        const ttsResponseFormat = output.ttsResponseFormat || 'json_base64'; // 'json_base64' | 'binary'
+        const responsePath = ttsResponsePath || 'candidates[0].content.parts[0].inlineData.data';
+        const ttsTextPrefix = output.ttsTextPrefix || ''; // e.g. "Say naturally: " for Gemini
+
         // Fire ALL TTS calls in parallel, then deliver audio sequentially (preserves order)
         const ttsPromises = chunks.map((chunk) => {
             const text = chunk.trim();
             if (!text) return Promise.resolve(null);
             console.log(`[ParserExecutor] TTS(${label}): "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}" (${text.length} chars)`);
 
-            const ttsBody = {
-                contents: [{ parts: [{ text: `Say naturally: ${text}` }] }],
-                generationConfig: {
-                    responseModalities: ['AUDIO'],
-                    speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
-                },
-            };
+            // Build request body — render {{text}} placeholder in the template
+            let requestBody: any;
+            if (ttsRequestBody && typeof ttsRequestBody === 'object') {
+                const rendered = JSON.parse(JSON.stringify(ttsRequestBody));
+                const replaceText = (obj: any): any => {
+                    if (typeof obj === 'string') return obj.replace(/\{\{text\}\}/g, ttsTextPrefix + text);
+                    if (Array.isArray(obj)) return obj.map(replaceText);
+                    if (obj && typeof obj === 'object') {
+                        const out: any = {};
+                        for (const [k, v] of Object.entries(obj)) out[k] = replaceText(v);
+                        return out;
+                    }
+                    return obj;
+                };
+                requestBody = replaceText(rendered);
+            } else {
+                // Legacy Gemini format (backward compat)
+                requestBody = {
+                    contents: [{ parts: [{ text: `${ttsTextPrefix}${text}` }] }],
+                    generationConfig: {
+                        responseModalities: ['AUDIO'],
+                        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+                    },
+                };
+            }
+
             const ttsStart = Date.now();
 
             return fetch(ttsEndpoint, {
                 method: 'POST',
                 headers: ttsHeaders || { 'Content-Type': 'application/json' },
-                body: JSON.stringify(ttsBody),
+                body: JSON.stringify(requestBody),
             }).then(async (resp) => {
                 if (!resp.ok) {
                     const errText = await resp.text().catch(() => '');
                     console.error(`[ParserExecutor] TTS(${label}) failed: ${resp.status} ${errText.substring(0, 200)}`);
                     return null;
                 }
-                const data = await resp.json() as any;
-                const audioData = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
                 const ttsDuration = Date.now() - ttsStart;
+                let audioData: string | null = null;
+
+                if (ttsResponseFormat === 'binary') {
+                    // Response IS the audio (OpenAI, ElevenLabs, etc.)
+                    const buffer = Buffer.from(await resp.arrayBuffer());
+                    audioData = buffer.toString('base64');
+                } else {
+                    // JSON response with base64 audio at a path (Gemini, etc.)
+                    const data = await resp.json() as any;
+                    // Navigate the response path dynamically
+                    try {
+                        const pathFn = new Function("data", `return data?.${responsePath}`);
+                        audioData = pathFn(data) || null;
+                    } catch {
+                        // Fallback: try common paths
+                        audioData = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data
+                                 || data?.audio?.data
+                                 || data?.audio_content
+                                 || null;
+                    }
+                }
+
                 if (audioData) {
                     console.log(`[ParserExecutor] TTS(${label}): got ${audioData.length} base64 chars in ${ttsDuration}ms`);
                 } else {
                     console.error(`[ParserExecutor] TTS(${label}) no audio in response (${ttsDuration}ms)`);
                 }
-                return audioData || null;
+                return audioData;
             }).catch((err) => {
                 console.error(`[ParserExecutor] TTS(${label}) fetch error:`, err.message);
                 return null;
