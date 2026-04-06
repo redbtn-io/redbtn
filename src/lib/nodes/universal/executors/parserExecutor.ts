@@ -82,12 +82,13 @@ export class ParserExecutor {
      *   - email:        fire-and-forget POST to an email service endpoint
      *   - storage:      POST content to a storage endpoint (GridFS, S3, etc.)
      *   - pubsub:       POST to a relay that publishes to a Redis channel
+     *   - subgraph:     invoke a graph when a specific tool call is dispatched
      *
      * All matching outputs fire in parallel per chunk.
      */
     private _outputs: Array<{
         id?: string;
-        type: 'http' | 'tts_http' | 'conversation' | 'websocket' | 'email' | 'storage' | 'pubsub';
+        type: 'http' | 'tts_http' | 'conversation' | 'websocket' | 'email' | 'storage' | 'pubsub' | 'subgraph';
         condition?: Record<string, unknown>;
         sentenceSplit?: boolean;
         // For type: 'http' | 'email' | 'storage' | 'pubsub'
@@ -114,17 +115,34 @@ export class ParserExecutor {
         channel?: string;
         // For type: 'websocket'
         // (no extra fields — placeholder only)
+        // For type: 'subgraph'
+        // Maps tool names → graph invocation config
+        graphMapping?: Record<string, {
+            graphId: string;
+            configOverrides?: Record<string, any>;
+            inputMapping?: Record<string, string>;
+        }>;
+        // Fallback graphId when the tool name isn't in graphMapping
+        defaultGraphId?: string;
+        // Signals the result should be fed back to the session
+        returnTo?: string;
     }>;
 
     /** RunPublisher instance injected via setContext({ runPublisher }). */
     private _runPublisher: any | null = null;
+
+    /** GraphRegistry instance injected via setContext({ _graphRegistry }). */
+    private _graphRegistry: any | null = null;
 
     /** Inject context into the parser state (e.g. channelId, triggerType, runPublisher). */
     setContext(ctx: Record<string, any>): void {
         if (ctx.runPublisher !== undefined) {
             this._runPublisher = ctx.runPublisher;
         }
-        const { runPublisher: _rp, ...rest } = ctx;
+        if (ctx._graphRegistry !== undefined) {
+            this._graphRegistry = ctx._graphRegistry;
+        }
+        const { runPublisher: _rp, _graphRegistry: _gr, ...rest } = ctx;
         this._parserState._context = { ...this._parserState._context, ...rest };
     }
 
@@ -186,6 +204,8 @@ export class ParserExecutor {
                         await this._flushStorageOutput(output, flushPs, flushCtx);
                     } else if (output.type === 'pubsub') {
                         await this._flushPubsubOutput(output, flushPs, flushCtx);
+                    } else if (output.type === 'subgraph') {
+                        await this._flushSubgraphOutput(output, flushPs, flushCtx);
                     } else if (output.type === 'websocket') {
                         console.log(`[ParserExecutor] WebSocket output "${output.id || 'websocket'}" not yet implemented`);
                     }
@@ -235,6 +255,8 @@ export class ParserExecutor {
                 await this._flushStorageOutput(output, ps, ctx);
             } else if (output.type === 'pubsub') {
                 await this._flushPubsubOutput(output, ps, ctx);
+            } else if (output.type === 'subgraph') {
+                await this._flushSubgraphOutput(output, ps, ctx);
             } else if (output.type === 'websocket') {
                 console.log(`[ParserExecutor] WebSocket output "${output.id || 'websocket'}" not yet implemented`);
             }
@@ -600,6 +622,99 @@ export class ParserExecutor {
             }
         } catch (err: any) {
             console.warn(`[ParserExecutor] Output(${label}): storage upload error:`, err.message);
+        }
+    }
+
+    /**
+     * Subgraph output: invoke a graph when a pending tool call is dispatched.
+     *
+     * The parser checks `ps._pendingToolCall` (set by a preceding transform step
+     * that parsed a tool_call event from the stream). It looks up the tool name in
+     * `output.graphMapping` and calls executeGraph() with the matched graphId +
+     * configOverrides + inputMapping.
+     *
+     * When `output.returnTo === 'session'`, the result is stored in
+     * `this._parserState._subgraphResult` so the session layer can feed it back.
+     */
+    private async _flushSubgraphOutput(
+        output: Record<string, any>,
+        ps: Record<string, any>,
+        _ctx: Record<string, any>,
+    ): Promise<void> {
+        const label = output.id || 'subgraph';
+
+        if (!this._graphRegistry) {
+            console.warn(`[ParserExecutor] subgraph output "${label}" — no graphRegistry available (pass _graphRegistry via setContext)`);
+            return;
+        }
+
+        // Retrieve the pending tool call from parser state
+        const pendingCall = ps._pendingToolCall as { name?: string; args?: Record<string, any> } | undefined;
+        if (!pendingCall || !pendingCall.name) {
+            console.warn(`[ParserExecutor] subgraph output "${label}" — no _pendingToolCall in parser state, skipping`);
+            return;
+        }
+
+        const toolName: string = pendingCall.name;
+        const toolArgs: Record<string, any> = pendingCall.args || {};
+
+        // Resolve which graph to invoke
+        const graphMapping: Record<string, { graphId: string; configOverrides?: Record<string, any>; inputMapping?: Record<string, string> }> = output.graphMapping || {};
+        const mappedEntry = graphMapping[toolName];
+        const resolvedGraphId: string | undefined = mappedEntry?.graphId || output.defaultGraphId;
+
+        if (!resolvedGraphId) {
+            console.warn(`[ParserExecutor] subgraph output "${label}" — tool "${toolName}" not in graphMapping and no defaultGraphId, skipping`);
+            return;
+        }
+
+        console.log(`[ParserExecutor] subgraph output "${label}": dispatching tool "${toolName}" → graph "${resolvedGraphId}"`);
+
+        try {
+            // Build a minimal GraphStepConfig for executeGraph
+            const { executeGraph } = require('./graphExecutor');
+            const stepConfig = {
+                graphId: resolvedGraphId,
+                outputField: '_subgraphOutput',
+                configOverrides: mappedEntry?.configOverrides,
+                inputMapping: mappedEntry?.inputMapping,
+            };
+
+            // Build a fake parent state with the registry + infrastructure forwarded
+            // from parser context. The _parserState._parentState field may hold the
+            // real graph state if set by toolExecutor.
+            const parentState = ps._parentState || {};
+            const fakeState: Record<string, any> = {
+                ...parentState,
+                _graphRegistry: this._graphRegistry,
+                _subgraphDepth: parentState._subgraphDepth ?? 0,
+            };
+
+            // runtimeOverrides: pass tool args as input overrides so the subgraph
+            // can access them as {{state.data.input.X}}
+            const runtimeOverrides = {
+                input: toolArgs,
+            };
+
+            const result = await executeGraph(stepConfig, fakeState, runtimeOverrides);
+            const subgraphOutput = result['_subgraphOutput'];
+
+            console.log(`[ParserExecutor] subgraph output "${label}": graph "${resolvedGraphId}" completed`);
+
+            // Store result for session layer if requested
+            if (output.returnTo === 'session') {
+                this._parserState._subgraphResult = {
+                    toolName,
+                    graphId: resolvedGraphId,
+                    output: subgraphOutput,
+                    returnTo: output.returnTo,
+                };
+            }
+
+            // Clear the pending tool call
+            this._parserState._pendingToolCall = undefined;
+        } catch (err: any) {
+            console.error(`[ParserExecutor] subgraph output "${label}" — graph "${resolvedGraphId}" failed:`, err.message);
         }
     }
 

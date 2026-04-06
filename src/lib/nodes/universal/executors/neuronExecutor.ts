@@ -637,6 +637,8 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
               botWorkspaceId: inputData.botWorkspaceId || null,
               // RunPublisher for conversation output type
               runPublisher: state.runPublisher || null,
+              // GraphRegistry for subgraph output type
+              _graphRegistry: state._graphRegistry || null,
             });
             console.log(`[NeuronExecutor] Stream parser "${streamParserName}" loaded (outputs enabled)`);
           }

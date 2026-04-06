@@ -454,6 +454,20 @@ export interface GraphStepConfig {
     outputField: string;
     /** Maximum execution time in milliseconds. No timeout if omitted. */
     timeout?: number;
+    /**
+     * Per-node parameter overrides injected into the subgraph as
+     * `state.data.input._configOverrides`. The universalNode picks these up
+     * the same way automation runs do.
+     *
+     * Example: { "search-node": { maxResults: 5 }, "respond-node": { temperature: 0.2 } }
+     */
+    configOverrides?: Record<string, any>;
+    /**
+     * Secret names to resolve and forward to the subgraph.
+     * Resolved secrets are injected as `state.data.input._secrets` in the subgraph.
+     * Falls back to forwarding parent state's `_secrets` when the list is empty.
+     */
+    secretNames?: string[];
     /** Error handling configuration for this graph step */
     errorHandling?: {
         retry?: number;

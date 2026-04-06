@@ -200,6 +200,8 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     botWorkspaceId: (inputData as any).botWorkspaceId || null,
                     // RunPublisher for conversation output type
                     runPublisher: runPublisher || null,
+                    // GraphRegistry for subgraph output type
+                    _graphRegistry: state._graphRegistry || null,
                 });
                 console.log(`[ToolExecutor] Stream parser "${(config as any).streamParser}" loaded for ${config.toolName} (tool steps enabled)`);
             } else {

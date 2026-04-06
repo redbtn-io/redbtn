@@ -28,6 +28,20 @@ export interface GraphStepConfig {
     outputField: string;
     /** Max time in ms before the subgraph is abandoned (no timeout if omitted) */
     timeout?: number;
+    /**
+     * Per-node parameter overrides injected into the subgraph as
+     * `state.data.input._configOverrides`. The universalNode picks these up
+     * the same way automation runs do.
+     *
+     * Example: { "search-node": { maxResults: 5 }, "respond-node": { temperature: 0.2 } }
+     */
+    configOverrides?: Record<string, any>;
+    /**
+     * Secret names to resolve and forward to the subgraph.
+     * Resolved secrets are injected as `state.data.input._secrets` in the subgraph.
+     * Falls back to forwarding parent state's `_secrets` when the list is empty.
+     */
+    secretNames?: string[];
     /** Error handling for this step (propagates to parent error handler by default) */
     errorHandling?: {
         retry?: number;
@@ -35,6 +49,18 @@ export interface GraphStepConfig {
         fallbackValue?: any;
         onError?: 'throw' | 'fallback' | 'skip';
     };
+}
+
+/**
+ * Runtime overrides passed by the caller (e.g. from a parser subgraph output).
+ * These are merged on top of the step-level config, allowing per-invocation
+ * customisation without modifying the stored step config.
+ */
+export interface GraphExecutorRuntimeOverrides {
+    /** Per-node parameter overrides (merged with / overriding config.configOverrides) */
+    configOverrides?: Record<string, any>;
+    /** Additional input fields to inject into the subgraph's data.input */
+    input?: Record<string, any>;
 }
 
 /** Max subgraph call depth — prevents infinite recursion */
@@ -75,8 +101,17 @@ function setNestedPath(obj: Record<string, any>, path: string, value: any): void
 
 /**
  * Execute a graph step — invoke a subgraph by graphId and return its output.
+ *
+ * @param config          - Step-level config (from the node's steps array in MongoDB)
+ * @param state           - Current parent graph state
+ * @param runtimeOverrides - Optional per-invocation overrides from the caller
+ *                          (e.g. parser subgraph output). Merged on top of config.
  */
-export async function executeGraph(config: GraphStepConfig, state: any): Promise<Partial<any>> {
+export async function executeGraph(
+    config: GraphStepConfig,
+    state: any,
+    runtimeOverrides?: GraphExecutorRuntimeOverrides,
+): Promise<Partial<any>> {
     const { graphId, inputMapping, outputField, timeout } = config;
 
     // Validate required config
@@ -147,6 +182,59 @@ export async function executeGraph(config: GraphStepConfig, state: any): Promise
     // Carry conversation messages so subgraph nodes can use history
     if (!subInput.data.messages) {
         subInput.messages = state.messages || [];
+    }
+
+    // -----------------------------------------------------------------------
+    // configOverrides — per-node parameter overrides for the subgraph.
+    // Merge step-level config.configOverrides with caller runtimeOverrides,
+    // then inject as state.data.input._configOverrides so universalNode picks
+    // them up the same way automation runs do.
+    // -----------------------------------------------------------------------
+    const mergedConfigOverrides: Record<string, any> = {
+        ...(config.configOverrides || {}),
+        ...(runtimeOverrides?.configOverrides || {}),
+    };
+    if (Object.keys(mergedConfigOverrides).length > 0) {
+        subInput.data.input = subInput.data.input || {};
+        subInput.data.input._configOverrides = mergedConfigOverrides;
+        console.log(`[GraphExecutor] Injecting configOverrides for '${graphId}': ${Object.keys(mergedConfigOverrides).join(', ')}`);
+    }
+
+    // -----------------------------------------------------------------------
+    // Runtime input overrides from caller (e.g. parser subgraph output).
+    // Merged into data.input so they're accessible as {{state.data.input.X}}.
+    // -----------------------------------------------------------------------
+    if (runtimeOverrides?.input && Object.keys(runtimeOverrides.input).length > 0) {
+        subInput.data.input = subInput.data.input || {};
+        Object.assign(subInput.data.input, runtimeOverrides.input);
+    }
+
+    // -----------------------------------------------------------------------
+    // secretNames — resolve secrets and forward to subgraph.
+    // If secretNames is provided and non-empty, we resolve each named secret
+    // from parent state's _secrets map (already resolved by the time it reaches
+    // a node) and forward only the requested subset.
+    // If secretNames is absent or empty, forward the parent's entire _secrets
+    // blob so the subgraph can access the same secrets the parent has.
+    // -----------------------------------------------------------------------
+    const parentSecrets: Record<string, any> = state.data?.input?._secrets || state._secrets || {};
+    if (config.secretNames && config.secretNames.length > 0) {
+        const subset: Record<string, any> = {};
+        for (const name of config.secretNames) {
+            if (parentSecrets[name] !== undefined) {
+                subset[name] = parentSecrets[name];
+            } else {
+                console.warn(`[GraphExecutor] Secret '${name}' not found in parent state for subgraph '${graphId}'`);
+            }
+        }
+        if (Object.keys(subset).length > 0) {
+            subInput.data.input = subInput.data.input || {};
+            subInput.data.input._secrets = subset;
+        }
+    } else if (Object.keys(parentSecrets).length > 0) {
+        // Forward full parent secrets when no explicit list
+        subInput.data.input = subInput.data.input || {};
+        subInput.data.input._secrets = parentSecrets;
     }
 
     // Use a unique ephemeral thread_id so the subgraph checkpointer doesn't
