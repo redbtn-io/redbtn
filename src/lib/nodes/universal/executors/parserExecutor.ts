@@ -88,7 +88,7 @@ export class ParserExecutor {
      */
     private _outputs: Array<{
         id?: string;
-        type: 'http' | 'tts_http' | 'conversation' | 'websocket' | 'email' | 'storage' | 'pubsub' | 'subgraph';
+        type: 'http' | 'tts_http' | 'conversation' | 'websocket' | 'stream' | 'email' | 'storage' | 'pubsub' | 'subgraph';
         condition?: Record<string, unknown>;
         sentenceSplit?: boolean;
         // For type: 'http' | 'email' | 'storage' | 'pubsub'
@@ -136,6 +136,13 @@ export class ParserExecutor {
     /** GraphRegistry instance injected via setContext({ _graphRegistry }). */
     private _graphRegistry: any | null = null;
 
+    /**
+     * WebSocket send callback injected via setContext({ _wsSend }).
+     * Used by the 'stream' output type to forward text to the client WS.
+     * Signature: (text: string, isFinal: boolean) => void
+     */
+    private _wsSend: ((text: string, isFinal: boolean) => void) | null = null;
+
     /** Inject context into the parser state (e.g. channelId, triggerType, runPublisher). */
     setContext(ctx: Record<string, any>): void {
         if (ctx.runPublisher !== undefined) {
@@ -144,7 +151,10 @@ export class ParserExecutor {
         if (ctx._graphRegistry !== undefined) {
             this._graphRegistry = ctx._graphRegistry;
         }
-        const { runPublisher: _rp, _graphRegistry: _gr, ...rest } = ctx;
+        if (ctx._wsSend !== undefined) {
+            this._wsSend = ctx._wsSend;
+        }
+        const { runPublisher: _rp, _graphRegistry: _gr, _wsSend: _ws, ...rest } = ctx;
         this._parserState._context = { ...this._parserState._context, ...rest };
     }
 
@@ -200,6 +210,8 @@ export class ParserExecutor {
                         await this._flushTtsHttpOutput(output, flushPs, flushCtx);
                     } else if (output.type === 'conversation') {
                         await this._flushConversationOutput(output, flushPs, flushCtx);
+                    } else if (output.type === 'stream') {
+                        await this._flushStreamOutput(output, flushPs, true);
                     } else if (output.type === 'email') {
                         await this._flushEmailOutput(output, flushPs, flushCtx);
                     } else if (output.type === 'storage') {
@@ -251,6 +263,8 @@ export class ParserExecutor {
                 await this._flushTtsHttpOutput(output, ps, ctx);
             } else if (output.type === 'conversation') {
                 await this._flushConversationOutput(output, ps, ctx);
+            } else if (output.type === 'stream') {
+                await this._flushStreamOutput(output, ps, false);
             } else if (output.type === 'email') {
                 await this._flushEmailOutput(output, ps, ctx);
             } else if (output.type === 'storage') {
@@ -747,6 +761,37 @@ export class ParserExecutor {
             this._parserState._pendingToolCall = undefined;
         } catch (err: any) {
             console.error(`[ParserExecutor] subgraph output "${label}" — graph "${resolvedGraphId}" failed:`, err.message);
+        }
+    }
+
+    /**
+     * Stream output: forward parsed text directly to the client WebSocket via the
+     * _wsSend callback injected through setContext({ _wsSend }).
+     *
+     * This is the canonical way for a parser node to route output back to the
+     * connected client. When a parser is configured and has a 'stream' output,
+     * the SessionManager will NOT also send directly to the WS (avoids duplicates).
+     *
+     * isFinal is true when called from flushText (end-of-turn), false during streaming.
+     */
+    private async _flushStreamOutput(
+        output: Record<string, any>,
+        ps: Record<string, any>,
+        isFinal: boolean,
+    ): Promise<void> {
+        if (!this._wsSend) {
+            console.warn(`[ParserExecutor] stream output "${output.id || 'stream'}" — no _wsSend callback (pass _wsSend via setContext)`);
+            return;
+        }
+        const text: string = ps._textBuffer || ps._pendingText || '';
+        if (!text) return;
+        ps._textBuffer = '';
+        const label = output.id || 'stream';
+        console.log(`[ParserExecutor] Output(${label}): → WS "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}" (${text.length} chars, isFinal=${isFinal})`);
+        try {
+            this._wsSend(text, isFinal);
+        } catch (err: any) {
+            console.warn(`[ParserExecutor] stream output "${label}" _wsSend failed:`, err.message);
         }
     }
 

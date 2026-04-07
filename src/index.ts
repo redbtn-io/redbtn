@@ -78,6 +78,10 @@ export type {
   NodeConfig,
 } from "./lib/nodes/universal/types";
 
+// Export ParserExecutor for external use (e.g. SessionManager)
+export { ParserExecutor } from "./lib/nodes/universal/executors/parserExecutor";
+export type { ParserToolExecutor } from "./lib/nodes/universal/executors/parserExecutor";
+
 // Export graph execution
 export { run, isStreamingResult } from "./functions/run";
 export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } from "./functions/run";
