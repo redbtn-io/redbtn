@@ -16,20 +16,24 @@
 // =============================================================================
 
 /**
- * The three canonical trigger classifications understood by the platform.
+ * The canonical trigger classifications understood by the platform.
  *
- * - chat    → user typed a message in the redbtn chat UI or a REST client
- * - webhook → ALL external HTTP triggers: discord bots, email forwarding,
- *             telegram, slack, CI pipelines, monitoring tools, etc.
- *             Platform-specific info is carried in trigger.source.platform
- *             and trigger.metadata (channelId, guildId, emailFrom, etc.).
- * - cron    → scheduler fired a repeatable BullMQ job (also covers
- *             one-shot delayed/interval runs)
+ * - chat     → user typed a message in the redbtn chat UI or a REST client
+ * - webhook  → ALL external HTTP triggers: discord bots, email forwarding,
+ *              telegram, slack, CI pipelines, monitoring tools, etc.
+ *              Platform-specific info is carried in trigger.source.platform
+ *              and trigger.metadata (channelId, guildId, emailFrom, etc.).
+ * - cron     → scheduler fired a repeatable BullMQ job (also covers
+ *              one-shot delayed/interval runs)
+ * - subgraph → graph was invoked as a child of another graph (graph step
+ *              executor, parser subgraph output, or stream startup/event
+ *              handler). The parent run's context flows through via
+ *              trigger.metadata.parentRunId.
  *
  * Legacy values ('email', 'discord', 'api', 'scheduled') are normalised to
- * one of these three by toTriggerType().
+ * one of the canonical values by toTriggerType().
  */
-export type TriggerType = 'chat' | 'webhook' | 'cron';
+export type TriggerType = 'chat' | 'webhook' | 'cron' | 'subgraph';
 
 /**
  * Source details captured at the edge (API route / bot adapter).
@@ -103,6 +107,11 @@ export interface TriggerMetadata extends Record<string, unknown> {
   emailFrom?: string;
   /** Email subject */
   emailSubject?: string;
+  /**
+   * For subgraph triggers: the runId of the parent graph execution.
+   * Allows tracing child runs back to the root run.
+   */
+  parentRunId?: string;
 }
 
 /**
@@ -283,10 +292,12 @@ export const LEGACY_TRIGGER_MAP: Record<string, TriggerType> = {
   discord:   'webhook',
   api:       'chat',
   scheduled: 'cron',
+  // Subgraph invocation
+  subgraph:  'subgraph',
 } as const;
 
 /**
- * Convert any legacy trigger string to the canonical 3-value TriggerType.
+ * Convert any legacy trigger string to the canonical TriggerType.
  *
  * Maps:
  *   'discord'   → 'webhook'  (platform = 'discord' in trigger.source)
@@ -295,6 +306,7 @@ export const LEGACY_TRIGGER_MAP: Record<string, TriggerType> = {
  *   'manual'    → 'chat'
  *   'scheduled' → 'cron'
  *   'event'     → 'webhook'
+ *   'subgraph'  → 'subgraph'
  *
  * Falls back to 'webhook' for unknown values.
  */

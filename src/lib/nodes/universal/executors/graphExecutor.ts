@@ -184,6 +184,20 @@ export async function executeGraph(
         subInput.messages = state.messages || [];
     }
 
+    // Tag this execution as a subgraph invocation so graph nodes and logs can
+    // distinguish it from a top-level chat/webhook/cron run.
+    // Carry the parent run's runId forward so child runs are traceable.
+    const parentRunId: string | undefined = state.data?.runId || state.data?.options?.runId;
+    subInput.data.input = subInput.data.input || {};
+    subInput.data.input._trigger = {
+        type: 'subgraph',
+        metadata: {
+            parentRunId,
+            parentGraphId: state.data?.options?.graphId,
+            subgraphDepth: currentDepth + 1,
+        },
+    };
+
     // -----------------------------------------------------------------------
     // configOverrides — per-node parameter overrides for the subgraph.
     // Merge step-level config.configOverrides with caller runtimeOverrides,
