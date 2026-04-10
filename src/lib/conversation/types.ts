@@ -161,6 +161,46 @@ export interface ConversationAttachmentEvent {
   timestamp: number;
 }
 
+// ── Live/stream-specific conversation events ──
+// Published by SessionManager when a realtime stream session is active.
+
+export interface ConversationAudioChunkEvent {
+  type: 'audio_chunk';
+  messageId: string;
+  data: string; // base64
+  mimeType: string;
+  connectionId?: string;
+  timestamp: number;
+}
+
+export interface ConversationInputTranscriptionEvent {
+  type: 'input_transcription';
+  text: string;
+  messageId?: string;
+  isFinal?: boolean;
+  timestamp: number;
+}
+
+export interface ConversationOutputTranscriptionEvent {
+  type: 'output_transcription';
+  messageId: string;
+  text: string;
+  timestamp: number;
+}
+
+export interface ConversationTurnCompleteEvent {
+  type: 'turn_complete';
+  messageId?: string;
+  connectionId?: string;
+  timestamp: number;
+}
+
+export interface ConversationInterruptedEvent {
+  type: 'interrupted';
+  messageId?: string;
+  timestamp: number;
+}
+
 export type ConversationEvent =
   | ConversationMessageEvent
   | ConversationMessageStartEvent
@@ -175,4 +215,9 @@ export type ConversationEvent =
   | ConversationToolEvent
   | ConversationRunCompleteEvent
   | ConversationRunErrorEvent
-  | ConversationAttachmentEvent;
+  | ConversationAttachmentEvent
+  | ConversationAudioChunkEvent
+  | ConversationInputTranscriptionEvent
+  | ConversationOutputTranscriptionEvent
+  | ConversationTurnCompleteEvent
+  | ConversationInterruptedEvent;

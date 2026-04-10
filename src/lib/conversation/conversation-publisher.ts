@@ -301,17 +301,76 @@ export class ConversationPublisher {
     });
   }
 
+  // ── Live/stream-specific methods ──
+
+  /** Publish a base64 audio chunk (ephemeral — not stored in replay or archive) */
+  async publishAudioChunk(messageId: string, data: string, mimeType: string, connectionId?: string): Promise<void> {
+    await this.publish({
+      type: 'audio_chunk',
+      messageId,
+      data,
+      mimeType,
+      connectionId,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Publish input transcription (user speech-to-text) */
+  async publishInputTranscription(text: string, messageId?: string, isFinal?: boolean): Promise<void> {
+    await this.publish({
+      type: 'input_transcription',
+      text,
+      messageId,
+      isFinal,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Publish output transcription (AI speech-to-text) */
+  async publishOutputTranscription(messageId: string, text: string): Promise<void> {
+    await this.publish({
+      type: 'output_transcription',
+      messageId,
+      text,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Signal end of a live turn */
+  async publishTurnComplete(messageId?: string, connectionId?: string): Promise<void> {
+    await this.publish({
+      type: 'turn_complete',
+      messageId,
+      connectionId,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Signal barge-in / interruption */
+  async publishInterrupted(messageId?: string): Promise<void> {
+    await this.publish({
+      type: 'interrupted',
+      messageId,
+      timestamp: Date.now(),
+    });
+  }
+
   // -- Internal --
+
+  /** Ephemeral event types that should NOT be stored in replay list or archived */
+  private static readonly EPHEMERAL_TYPES = new Set(['audio_chunk']);
 
   private async publish(event: ConversationEvent): Promise<void> {
     const json = JSON.stringify(event);
-    // Publish to pub/sub for live listeners
+    const isEphemeral = ConversationPublisher.EPHEMERAL_TYPES.has(event.type);
+    // Publish to pub/sub for live listeners (always)
     await this.redis.publish(this.channel, json);
-    // Store in list for replay on reconnection
-    await this.redis.rpush(this.eventsKey, json);
-    await this.redis.expire(this.eventsKey, this.ttl);
-    // Fire-and-forget archive job -- non-blocking, non-fatal
-    this._enqueueArchive(event).catch(() => {});
+    // Skip replay list and archive for ephemeral events (e.g. audio chunks)
+    if (!isEphemeral) {
+      await this.redis.rpush(this.eventsKey, json);
+      await this.redis.expire(this.eventsKey, this.ttl);
+      this._enqueueArchive(event).catch(() => {});
+    }
   }
 
   /**
