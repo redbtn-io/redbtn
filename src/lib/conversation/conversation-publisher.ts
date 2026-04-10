@@ -439,12 +439,22 @@ export class ConversationPublisher {
         ? { _id: new ObjectId(this.conversationId) }
         : { conversationId: this.conversationId };
 
+      // Use `id` (not `messageId`) so the archiver's $pull-then-$push dedup
+      // correctly removes any inline-written entry before writing its version.
+      // Without this, both the inline path (here) and the archiver would push
+      // separate entries for the same message.
+      await db.collection('user_conversations').updateOne(
+        filter,
+        {
+          $pull: { messages: { id: params.messageId } } as any,
+        }
+      );
       await db.collection('user_conversations').updateOne(
         filter,
         {
           $push: {
             messages: {
-              messageId: params.messageId,
+              id: params.messageId,
               role: params.role,
               content: params.content,
               metadata: params.metadata,
