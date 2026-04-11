@@ -131,12 +131,22 @@ export class ConversationPublisher {
     return messageId;
   }
 
-  /** Begin streaming a message -- UI shows an empty bubble */
-  async startMessage(messageId: string, role: string = 'assistant'): Promise<void> {
+  /**
+   * Begin streaming a message -- UI shows an empty bubble.
+   * Optional metadata (e.g., `{ audio: true }`) is passed through to the
+   * subscriber so the client can render role/content-specific decorations
+   * like a mic icon for voice messages.
+   */
+  async startMessage(
+    messageId: string,
+    role: string = 'assistant',
+    metadata?: Record<string, unknown>,
+  ): Promise<void> {
     await this.publish({
       type: 'message_start',
       messageId,
       role,
+      ...(metadata ? { metadata } : {}),
       timestamp: Date.now(),
     });
   }

@@ -33,6 +33,10 @@ export interface ConversationMessageStartEvent {
   messageId: string;
   role?: string;
   sourceRunId?: string;
+  /** Optional metadata propagated through to the archiver and the UI.
+   *  Example: `{ audio: true }` for a voice turn so the UI can render a
+   *  mic icon on the bubble. */
+  metadata?: Record<string, unknown>;
   timestamp: number;
 }
 
