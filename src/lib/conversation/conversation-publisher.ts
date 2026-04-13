@@ -365,6 +365,40 @@ export class ConversationPublisher {
     });
   }
 
+  // ── Ephemeral (non-stored) events ──
+
+  /**
+   * Publish an ephemeral event to live pub/sub subscribers only.
+   *
+   * Ephemeral events are NOT stored in the replay list (conversation:events:{id})
+   * and are NOT enqueued for archiving. Use this for transient signals like
+   * typing indicators and presence updates that should not appear on reconnect.
+   */
+  async publishEphemeral(event: Record<string, unknown>): Promise<void> {
+    // Publish to the pub/sub channel ONLY — no RPUSH to the events replay list
+    await this.redis.publish(
+      this.channel,
+      JSON.stringify({
+        ...event,
+        timestamp: Date.now(),
+      })
+    );
+  }
+
+  /**
+   * Publish a typing indicator for a user.
+   *
+   * Ephemeral — not stored in the replay list or archived.
+   * Clients that receive this event should show/hide a typing bubble for the user.
+   */
+  async publishTyping(userId: string, isTyping: boolean): Promise<void> {
+    await this.publishEphemeral({
+      type: 'typing',
+      userId,
+      isTyping,
+    });
+  }
+
   // -- Internal --
 
   /** Ephemeral event types that should NOT be stored in replay list or archived */
