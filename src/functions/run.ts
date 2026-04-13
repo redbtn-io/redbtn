@@ -530,10 +530,11 @@ export async function run(
   if (!redis) throw new Error('[run] Redis client not available');
 
   const lockKey = options.conversationId || runId;
+  const agentId = (options as any).agentId as string | undefined;
   const runLock = new RunLock(redis);
-  const lock = await runLock.acquire(lockKey);
-  if (!lock) throw new Error(`[run] Conversation ${lockKey} already has an active run`);
-  console.log(`[run] Acquired lock for conversation ${lockKey}`);
+  const lock = await runLock.acquire(lockKey, { agentId });
+  if (!lock) throw new Error(`[run] Conversation ${lockKey}${agentId ? `:${agentId}` : ''} already has an active run`);
+  console.log(`[run] Acquired lock for conversation ${lockKey}${agentId ? ` agent=${agentId}` : ''}`);
 
   const publisher = createRunPublisher({ redis, runId, userId, log: red.redlog });
 
