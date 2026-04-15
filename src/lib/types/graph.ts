@@ -128,8 +128,10 @@ export interface GraphConfig {
     webhookUrl?: string | null;
     notifyEmail?: string | null;
   };
-  /** Input capabilities — how clients can interact with this graph */
-  interfaces?: ('chat' | 'audio' | 'live' | 'automation' | 'images' | 'attachments')[];
+  /** Input capabilities — how clients can interact with this graph.
+   *  Note: 'automation' is not listed — every graph/stream can be driven
+   *  by automations, so the tag carries no signal. */
+  interfaces?: ('chat' | 'audio' | 'live' | 'images' | 'attachments')[];
   /** Output modalities — what the graph can produce */
   outputModalities?: ('text' | 'audio')[];
   /** True for system-provided template graphs */
