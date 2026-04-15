@@ -369,11 +369,13 @@ export const RunKeys = {
   /** Event log list: `run:events:{runId}` - stores all events for replay */
   events: (runId: string) => `run:events:${runId}`,
   /**
-   * Execution lock: `run:lock:{conversationId}`
-   * Prevents multiple runs in the same conversation.
-   * Same graph can run in different conversations simultaneously.
+   * Execution lock: `run:lock:{conversationId}` or `run:lock:{conversationId}:{agentId}`
+   * Prevents multiple runs of the SAME agent in the same conversation.
+   * Different agents can run concurrently in the same conversation (group chat).
    */
-  lock: (conversationId: string) => `run:lock:${conversationId}`,
+  lock: (conversationId: string, agentId?: string) => agentId
+    ? `run:lock:${conversationId}:${agentId}`
+    : `run:lock:${conversationId}`,
   /** Active runs for user: `run:user:{userId}` */
   userRuns: (userId: string) => `run:user:${userId}`,
   /** Active run for conversation: `run:conversation:{conversationId}` */

@@ -33,6 +33,10 @@ export interface ConversationMessageStartEvent {
   messageId: string;
   role?: string;
   sourceRunId?: string;
+  /** Optional metadata propagated through to the archiver and the UI.
+   *  Example: `{ audio: true }` for a voice turn so the UI can render a
+   *  mic icon on the bubble. */
+  metadata?: Record<string, unknown>;
   timestamp: number;
 }
 
@@ -104,6 +108,7 @@ export interface ConversationContentChunkEvent {
 export interface ConversationToolEvent {
   type: 'tool_event';
   runId: string;
+  messageId: string;
   event: {
     type: 'tool_start' | 'tool_progress' | 'tool_complete' | 'tool_error';
     toolId: string;
@@ -161,6 +166,46 @@ export interface ConversationAttachmentEvent {
   timestamp: number;
 }
 
+// ── Live/stream-specific conversation events ──
+// Published by SessionManager when a realtime stream session is active.
+
+export interface ConversationAudioChunkEvent {
+  type: 'audio_chunk';
+  messageId: string;
+  data: string; // base64
+  mimeType: string;
+  connectionId?: string;
+  timestamp: number;
+}
+
+export interface ConversationInputTranscriptionEvent {
+  type: 'input_transcription';
+  text: string;
+  messageId?: string;
+  isFinal?: boolean;
+  timestamp: number;
+}
+
+export interface ConversationOutputTranscriptionEvent {
+  type: 'output_transcription';
+  messageId: string;
+  text: string;
+  timestamp: number;
+}
+
+export interface ConversationTurnCompleteEvent {
+  type: 'turn_complete';
+  messageId?: string;
+  connectionId?: string;
+  timestamp: number;
+}
+
+export interface ConversationInterruptedEvent {
+  type: 'interrupted';
+  messageId?: string;
+  timestamp: number;
+}
+
 export type ConversationEvent =
   | ConversationMessageEvent
   | ConversationMessageStartEvent
@@ -175,4 +220,9 @@ export type ConversationEvent =
   | ConversationToolEvent
   | ConversationRunCompleteEvent
   | ConversationRunErrorEvent
-  | ConversationAttachmentEvent;
+  | ConversationAttachmentEvent
+  | ConversationAudioChunkEvent
+  | ConversationInputTranscriptionEvent
+  | ConversationOutputTranscriptionEvent
+  | ConversationTurnCompleteEvent
+  | ConversationInterruptedEvent;

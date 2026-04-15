@@ -17,7 +17,7 @@
 /**
  * Step types available in universal nodes
  */
-export type StepType = 'neuron' | 'tool' | 'transform' | 'conditional' | 'loop' | 'delay' | 'connection';
+export type StepType = 'neuron' | 'tool' | 'transform' | 'conditional' | 'loop' | 'delay' | 'connection' | 'graph';
 
 /**
  * Error Handling Configuration
@@ -84,6 +84,49 @@ export interface NeuronStepConfig {
      * @default false
      */
     stream?: boolean;
+    /**
+     * Enable multimodal content parts in the user message.
+     *
+     * When true (or when audioInput/imageInput is true), the executor will
+     * inspect state for audio/image data and build a multimodal HumanMessage
+     * before calling the LLM.
+     *
+     * @default false
+     */
+    multimodal?: boolean;
+    /**
+     * Accept audio data from state.data.input.audioData (base64 WAV).
+     *
+     * When enabled, looks for audioData + audioMimeType in state.data.input
+     * and prepends a media content part to the user message before sending
+     * to the model. Requires a multimodal-capable model (e.g. Gemini).
+     *
+     * @default false
+     */
+    audioInput?: boolean;
+    /**
+     * Accept image attachments from state.data.input.attachments or
+     * state.data._trigger.metadata.attachments.
+     *
+     * When enabled, images found in the attachments array are appended as
+     * image_url content parts to the user message.
+     *
+     * @default false
+     */
+    imageInput?: boolean;
+    /**
+     * Request audio output from the model.
+     *
+     * NOTE: Audio output requires model-level support (e.g. Gemini Live API)
+     * which is not yet available in @langchain/google-genai v2.x.
+     * This flag is reserved for future use — currently a no-op.
+     *
+     * When audio IS returned, the raw bytes are stored in state.data._audioOutput
+     * as { data: base64, mimeType: string }.
+     *
+     * @default false
+     */
+    audioOutput?: boolean;
     /**
      * JSON Schema for structured output.
      *
@@ -380,6 +423,61 @@ export interface ConnectionStepConfig {
 }
 
 /**
+ * Graph Step — invoke another graph as a subgraph
+ *
+ * Use cases:
+ * - Compose complex workflows from smaller, reusable graphs
+ * - Run a specialist graph (e.g. "research") from within a coordinator graph
+ * - Fan out to multiple specialist graphs and merge results
+ *
+ * Execution semantics:
+ * - Shares the parent's RunPublisher, mcpClient, neuronRegistry, and connectionManager
+ * - Does NOT acquire a separate RunLock — runs within the parent's lock
+ * - Does NOT create its own Redis run state — events flow through parent's publisher
+ * - Recursion guard: max depth 5 (configurable via MAX_SUBGRAPH_DEPTH in graphExecutor)
+ */
+export interface GraphStepConfig {
+    /** ID of the graph to invoke — must exist in the MongoDB 'graphs' collection */
+    graphId: string;
+    /**
+     * Maps subgraph input fields to parent state paths.
+     * Source paths support {{state.X}} template syntax.
+     * If omitted, the parent's entire data object is passed through.
+     *
+     * Example: { "topic": "{{state.data.userTopic}}", "depth": "{{state.data.searchDepth}}" }
+     */
+    inputMapping?: Record<string, string>;
+    /**
+     * State field where the subgraph's output will be stored in the parent state.
+     * Supports dot-notation for nested writes: "data.subResult"
+     */
+    outputField: string;
+    /** Maximum execution time in milliseconds. No timeout if omitted. */
+    timeout?: number;
+    /**
+     * Per-node parameter overrides injected into the subgraph as
+     * `state.data.input._configOverrides`. The universalNode picks these up
+     * the same way automation runs do.
+     *
+     * Example: { "search-node": { maxResults: 5 }, "respond-node": { temperature: 0.2 } }
+     */
+    configOverrides?: Record<string, any>;
+    /**
+     * Secret names to resolve and forward to the subgraph.
+     * Resolved secrets are injected as `state.data.input._secrets` in the subgraph.
+     * Falls back to forwarding parent state's `_secrets` when the list is empty.
+     */
+    secretNames?: string[];
+    /** Error handling configuration for this graph step */
+    errorHandling?: {
+        retry?: number;
+        retryDelay?: number;
+        fallbackValue?: any;
+        onError?: 'throw' | 'fallback' | 'skip';
+    };
+}
+
+/**
  * Universal Step - One of the step types
  *
  * Each step executes sequentially and can read state from previous steps.
@@ -389,7 +487,7 @@ export interface UniversalStep {
     /** Type of step to execute */
     type: StepType;
     /** Configuration for the step (type depends on step type) */
-    config: NeuronStepConfig | ToolStepConfig | TransformStepConfig | ConditionalStepConfig | LoopStepConfig | ConnectionStepConfig;
+    config: NeuronStepConfig | ToolStepConfig | TransformStepConfig | ConditionalStepConfig | LoopStepConfig | ConnectionStepConfig | GraphStepConfig;
     /**
      * Optional condition to determine if this step should run.
      * If provided, the step only runs if the condition evaluates to true.

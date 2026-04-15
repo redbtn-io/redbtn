@@ -16,6 +16,10 @@ import type { NeuronStepConfig } from '../types';
 import { renderTemplate, getNestedProperty } from '../templateRenderer';
 import { executeWithErrorHandling } from './errorHandler';
 import { AudioStreamPipeline } from '../../../tts/audio-stream';
+import { ParserExecutor, type ParserToolExecutor } from './parserExecutor';
+import { getParserRegistry } from './parserRegistry';
+import { getNativeRegistry } from '../../../tools/native-registry';
+import { HumanMessage } from '@langchain/core/messages';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -112,6 +116,89 @@ function resolveConfigValue(value: any, state: any): any {
 
   // Not a template or couldn't resolve - return as-is
   return value;
+}
+
+/**
+ * Attachment reference shape (mirrors the Discord bot payload + trigger metadata)
+ */
+interface AttachmentRef {
+  kind?: 'image' | 'video' | 'audio' | 'document' | 'file';
+  mimeType?: string;
+  url?: string;
+  filename?: string;
+  size?: number;
+}
+
+/**
+ * Build a multimodal HumanMessage that may include audio and/or image content parts.
+ *
+ * Audio: pulled from state.data.input.audioData (base64 WAV from Discord raw audio mode)
+ * Images: pulled from state.data.input.attachments or state.data._trigger.metadata.attachments
+ *
+ * Returns null when no multimodal content is found so the caller can fall back
+ * to a plain string message.
+ *
+ * @langchain/google-genai v2.1.26 supports:
+ *   { type: "media", mimeType: "audio/wav", data: base64 }  -> inlineData
+ *   { type: "image_url", image_url: { url: "https://..." } } -> fileData / inlineData
+ */
+function buildMultimodalMessage(
+  config: NeuronStepConfig,
+  textContent: string,
+  state: any
+): HumanMessage | null {
+  const wantsAudio = config.audioInput || config.multimodal;
+  const wantsImages = config.imageInput || config.multimodal;
+
+  if (!wantsAudio && !wantsImages) return null;
+
+  const input = state.data?.input || {};
+  const triggerAttachments: AttachmentRef[] =
+    state.data?._trigger?.metadata?.attachments || input.attachments || [];
+
+  const contentParts: any[] = [];
+  let hasMultimodal = false;
+
+  // --- Audio input ---
+  if (wantsAudio && input.audioData) {
+    const mimeType: string = input.audioMimeType || 'audio/wav';
+    contentParts.push({
+      type: 'media',
+      mimeType,
+      data: input.audioData, // base64 encoded
+    });
+    hasMultimodal = true;
+    console.log(
+      `[NeuronExecutor] Multimodal: added audio content part (${mimeType}, ${input.audioData.length} base64 chars)`
+    );
+  }
+
+  // --- Image input from attachments ---
+  if (wantsImages && triggerAttachments.length > 0) {
+    for (const attachment of triggerAttachments) {
+      const mime = attachment.mimeType || '';
+      if (!mime.startsWith('image/') && attachment.kind !== 'image') continue;
+      if (!attachment.url) continue;
+
+      contentParts.push({
+        type: 'image_url',
+        image_url: { url: attachment.url },
+      });
+      hasMultimodal = true;
+      console.log(
+        `[NeuronExecutor] Multimodal: added image content part (${mime}, ${attachment.url.substring(0, 80)})`
+      );
+    }
+  }
+
+  if (!hasMultimodal) return null;
+
+  // Append the rendered text prompt as the last part
+  if (textContent) {
+    contentParts.push({ type: 'text', text: textContent });
+  }
+
+  return new HumanMessage({ content: contentParts });
 }
 
 /**
@@ -321,6 +408,27 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       } else {
         throw new Error(`Field ${fieldName} is not an array. Cannot use as messages.`);
       }
+
+      // In messages-array mode, if multimodal is configured and audio/image data
+      // exists, upgrade the last user message to a multimodal HumanMessage.
+      // We extract the text from the last user message and pass it to
+      // buildMultimodalMessage so the content parts are: [audio/images..., text].
+      if (config.audioInput || config.imageInput || config.multimodal) {
+        const lastUserIdx = messages.reduceRight((found, msg, idx) =>
+          found === -1 && (msg.role === 'user' || msg instanceof HumanMessage) ? idx : found, -1
+        );
+        if (lastUserIdx !== -1) {
+          const lastMsg = messages[lastUserIdx];
+          const existingText = typeof lastMsg.content === 'string'
+            ? lastMsg.content
+            : (lastMsg.content?.find?.((p: any) => p.type === 'text')?.text ?? '');
+          const multimodalMsg = buildMultimodalMessage(config, existingText, state);
+          if (multimodalMsg) {
+            messages[lastUserIdx] = multimodalMsg;
+            console.log('[NeuronExecutor] Upgraded last user message to multimodal HumanMessage');
+          }
+        }
+      }
     } else {
       // Standard template rendering for prompts
       let systemPrompt: string | undefined = config.systemPrompt
@@ -342,12 +450,20 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
           outputField: config.outputField
         });
 
-      // Build messages
+      // Build messages — try multimodal first when configured
       messages = [];
       if (systemPrompt) {
         messages.push({ role: 'system', content: systemPrompt });
       }
-      messages.push({ role: 'user', content: userPrompt });
+
+      // Attempt to build a multimodal HumanMessage (audio + image content parts)
+      const multimodalMessage = buildMultimodalMessage(config, userPrompt, state);
+      if (multimodalMessage) {
+        messages.push(multimodalMessage);
+        console.log('[NeuronExecutor] Using multimodal HumanMessage for LLM call');
+      } else {
+        messages.push({ role: 'user', content: userPrompt });
+      }
     }
 
     // Normalize messages before sending to LLM
@@ -487,6 +603,50 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       response = '';
       let chunkCount = 0;
 
+      // -----------------------------------------------------------------------
+      // Stream parser support: if config has streamParser, set up a ParserExecutor
+      // that can route output to configured destinations (voice, etc.)
+      // -----------------------------------------------------------------------
+      let neuronParser: ParserExecutor | null = null;
+      const streamParserName = (config as any).streamParser;
+      if (streamParserName && streamToUser) {
+        try {
+          const registry = getParserRegistry();
+          const parserDef = await registry.getParser(streamParserName);
+          if (parserDef) {
+            const nativeReg = getNativeRegistry();
+            const parserToolExecutor: ParserToolExecutor = async (toolName, params) => {
+              if (nativeReg.has(toolName)) {
+                const tool = nativeReg.get(toolName)!;
+                return tool.handler(params, {} as any);
+              }
+              if (state.mcpClient) return state.mcpClient.callTool(toolName, params);
+              throw new Error(`Tool "${toolName}" not available in neuron parser context`);
+            };
+            neuronParser = new ParserExecutor(parserDef.config, parserDef.parserConfig, parserToolExecutor);
+            // Inject context from state
+            const inputData = state.data?.input || state.input || {};
+            neuronParser.setContext({
+              channelId: inputData.channelId,
+              platform: state.data?.platform || inputData._trigger?.source?.platform || inputData.type,
+              messageId: inputData.messageId,
+              replyToMessageId: state.data?.replyToMessageId || inputData.messageId,
+              voiceChannel: inputData.voiceChannel || state.data?.voiceChannel || false,
+              voiceChannelId: inputData.voiceChannelId || null,
+              guildId: inputData.guildId || state.data?.input?.guildId || null,
+              botWorkspaceId: inputData.botWorkspaceId || null,
+              // RunPublisher for conversation output type
+              runPublisher: state.runPublisher || null,
+              // GraphRegistry for subgraph output type
+              _graphRegistry: state._graphRegistry || null,
+            });
+            console.log(`[NeuronExecutor] Stream parser "${streamParserName}" loaded (outputs enabled)`);
+          }
+        } catch (parserErr: any) {
+          console.warn('[NeuronExecutor] Failed to load stream parser:', parserErr.message);
+        }
+      }
+
       // Determine inactivity timeout — configurable via node config or state parameters.
       // Priority: config.inactivityTimeout > state.parameters.inactivityTimeout > default (120 s)
       const resolvedInactivityTimeout = resolveConfigValue(
@@ -566,6 +726,14 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
             if (audioPipeline) {
               audioPipeline.push(chunk.content);
             }
+
+            // Feed text to stream parser for output routing (voice, etc.)
+            // We feed raw text as a simple JSON line that the parser transform
+            // can process. But for neuron output we bypass the parser's step
+            // pipeline and use its outputs routing directly.
+            if (neuronParser) {
+              neuronParser.feedText(chunk.content);
+            }
           }
         }
       } catch (streamErr) {
@@ -587,6 +755,16 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       console.log(
         `[NeuronExecutor] Stream complete: ${chunkCount} chunks, ${response.length} chars, ${Date.now() - streamStartTime}ms`
       );
+
+      // Flush stream parser outputs (send remaining text to voice, etc.)
+      if (neuronParser) {
+        try {
+          await neuronParser.flushText();
+          console.log('[NeuronExecutor] Stream parser outputs flushed');
+        } catch (parserFlushErr: any) {
+          console.warn('[NeuronExecutor] Stream parser flush failed:', parserFlushErr.message);
+        }
+      }
 
       // Flush TTS pipeline — waits for all pending synthesis to complete and publish
       if (audioPipeline) {

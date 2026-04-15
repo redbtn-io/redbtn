@@ -459,7 +459,7 @@ export function validateUniversalNodeConfig(nodeConfig: NodeConfig): void {
             throw new Error(`Step ${stepNumber}: missing "config" field`);
         }
 
-        const validTypes = ['neuron', 'tool', 'transform', 'conditional', 'loop'];
+        const validTypes = ['neuron', 'tool', 'transform', 'conditional', 'loop', 'delay', 'connection', 'graph'];
         if (!validTypes.includes(step.type)) {
             throw new Error(`Step ${stepNumber}: invalid type "${step.type}". Must be one of: ${validTypes.join(', ')}`);
         }
