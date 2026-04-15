@@ -108,6 +108,7 @@ export interface ConversationContentChunkEvent {
 export interface ConversationToolEvent {
   type: 'tool_event';
   runId: string;
+  messageId: string;
   event: {
     type: 'tool_start' | 'tool_progress' | 'tool_complete' | 'tool_error';
     toolId: string;

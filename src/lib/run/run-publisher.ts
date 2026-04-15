@@ -228,7 +228,11 @@ export class RunPublisher {
           conversationId,
           userId: this.userId,
         });
-        this.convMessageId = `msg_run_${this.runId}`;
+        // Unified message id format for both graph runs and streams:
+        // `msg_<ts>_<rand>`. Previously graph messages used `msg_run_<runId>`
+        // which mixed an identifier with a derivation rule and forced clients
+        // to know the convention. Now every message id is just a unique id.
+        this.convMessageId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         await this.convPublisher.publishRunStart(this.runId, this.convMessageId, graphId, graphName);
         if (DEBUG) console.log(`[RunPublisher] Conversation forwarding enabled for ${conversationId}`);
       } catch (err) {
@@ -599,7 +603,7 @@ export class RunPublisher {
     await this.publish({ type: 'tool_start', toolId, toolName, toolType, input: options?.input, timestamp: ts });
     // Forward to conversation stream
     if (this.convPublisher) {
-      this.convPublisher.publishToolEvent(this.runId, {
+      this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_start', toolId, toolName, toolType, input: options?.input, timestamp: ts,
       }).catch(() => {});
     }
@@ -626,7 +630,7 @@ export class RunPublisher {
     await this.publish({ type: 'tool_progress', toolId, step, progress: options?.progress, data: options?.data, timestamp: ts });
     // Forward to conversation stream
     if (this.convPublisher) {
-      this.convPublisher.publishToolEvent(this.runId, {
+      this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_progress', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
         step, progress: options?.progress, data: options?.data, timestamp: ts,
       }).catch(() => {});
@@ -653,7 +657,7 @@ export class RunPublisher {
     await this.publish({ type: 'tool_complete', toolId, result, metadata, timestamp: ts });
     // Forward to conversation stream
     if (this.convPublisher) {
-      this.convPublisher.publishToolEvent(this.runId, {
+      this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_complete', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
         result, metadata, timestamp: ts,
       }).catch(() => {});
@@ -684,7 +688,7 @@ export class RunPublisher {
     await this.publish({ type: 'tool_error', toolId, error, timestamp: ts });
     // Forward to conversation stream
     if (this.convPublisher) {
-      this.convPublisher.publishToolEvent(this.runId, {
+      this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_error', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
         error, timestamp: ts,
       }).catch(() => {});

@@ -210,7 +210,7 @@ export class ConversationPublisher {
   }
 
   /** Publish a tool event from a run */
-  async publishToolEvent(runId: string, event: {
+  async publishToolEvent(runId: string, messageId: string, event: {
     type: 'tool_start' | 'tool_progress' | 'tool_complete' | 'tool_error';
     toolId: string;
     toolName: string;
@@ -227,6 +227,7 @@ export class ConversationPublisher {
     await this.publish({
       type: 'tool_event',
       runId,
+      messageId,
       event,
       timestamp: Date.now(),
     });
