@@ -62,8 +62,8 @@ function generateToken(): string {
 export class RunLock {
   constructor(private readonly redis: Redis) {}
 
-  async acquire(conversationId: string, options?: AcquireLockOptions): Promise<RunLockHandle | null> {
-    const key = RunKeys.lock(conversationId);
+  async acquire(conversationId: string, options?: AcquireLockOptions & { agentId?: string }): Promise<RunLockHandle | null> {
+    const key = RunKeys.lock(conversationId, options?.agentId);
     const token = generateToken();
     const ttl = options?.ttlSeconds ?? RunConfig.LOCK_TTL_SECONDS;
 
@@ -136,7 +136,7 @@ export function createRunLock(redis: Redis): RunLock {
 export async function acquireRunLock(
   redis: Redis,
   conversationId: string,
-  options?: AcquireLockOptions,
+  options?: AcquireLockOptions & { agentId?: string },
 ): Promise<RunLockHandle | null> {
   const lock = new RunLock(redis);
   return lock.acquire(conversationId, options);

@@ -50,7 +50,7 @@ const fetchUrlTool: NativeToolDefinition = {
     }
 
     const { publisher } = context;
-    publisher?.emit('log', `fetch_url ${method} ${url}`);
+    console.log('[fetch_url]', `fetch_url ${method} ${url}`);
 
     try {
       const fetchHeaders: Record<string, string> = { ...headers };
@@ -81,13 +81,13 @@ const fetchUrlTool: NativeToolDefinition = {
 
           // Server error (5xx) — retry
           if (attempt < MAX_RETRIES) {
-            publisher?.emit('log', `fetch_url ${method} ${url} → ${response.status}, retrying (${attempt + 1}/${MAX_RETRIES})`);
+            console.log('[fetch_url]', `fetch_url ${method} ${url} → ${response.status}, retrying (${attempt + 1}/${MAX_RETRIES})`);
             await new Promise(r => setTimeout(r, BACKOFF[attempt] || 5_000));
           }
         } catch (retryErr: any) {
           clearTimeout(timer);
           if (retryErr.name === 'AbortError' || attempt >= MAX_RETRIES) throw retryErr;
-          publisher?.emit('log', `fetch_url ${method} ${url} → error, retrying (${attempt + 1}/${MAX_RETRIES}): ${retryErr.message}`);
+          console.log('[fetch_url]', `fetch_url ${method} ${url} → error, retrying (${attempt + 1}/${MAX_RETRIES}): ${retryErr.message}`);
           await new Promise(r => setTimeout(r, BACKOFF[attempt] || 5_000));
         }
       }
@@ -120,7 +120,7 @@ const fetchUrlTool: NativeToolDefinition = {
         output = output.slice(0, 500000) + '...(truncated)';
       }
 
-      publisher?.emit('log', `fetch_url ${method} ${url} → ${response.status}`);
+      console.log('[fetch_url]', `fetch_url ${method} ${url} → ${response.status}`);
 
       return {
         content: [{
@@ -138,7 +138,7 @@ const fetchUrlTool: NativeToolDefinition = {
         ? `Request timed out after ${timeout}ms`
         : error.message || 'Unknown error';
 
-      publisher?.emit('log', `fetch_url ${method} ${url} → ERROR: ${errorMessage}`);
+      console.log('[fetch_url]', `fetch_url ${method} ${url} → ERROR: ${errorMessage}`);
 
       return {
         content: [{ type: 'text', text: JSON.stringify({ error: `HTTP request failed: ${errorMessage}` }) }],

@@ -9,7 +9,7 @@
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry.js';
 
-const POLL_INTERVAL = 5_000; // 5 seconds (was 10s — faster for streaming)
+const POLL_INTERVAL = 1_000; // 1 second — fast enough for interactive use, low overhead for long functions
 const LOG_POLL_INTERVAL = 2_000; // 2 seconds for log streaming
 const DEFAULT_MAX_WAIT = 900_000; // 15 minutes
 const SUBMIT_RETRIES = 3;

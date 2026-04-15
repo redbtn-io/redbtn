@@ -128,6 +128,10 @@ export interface GraphConfig {
     webhookUrl?: string | null;
     notifyEmail?: string | null;
   };
+  /** Input capabilities — how clients can interact with this graph */
+  interfaces?: ('chat' | 'audio' | 'live' | 'automation' | 'images' | 'attachments')[];
+  /** Output modalities — what the graph can produce */
+  outputModalities?: ('text' | 'audio')[];
   /** True for system-provided template graphs */
   isDefault: boolean;
   /** True for protected system graphs */

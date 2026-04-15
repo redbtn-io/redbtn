@@ -12,6 +12,7 @@ import type { TransformStepConfig } from './types';
 import type { ConditionalStepConfig } from './types';
 import type { LoopStepConfig } from './types';
 import type { ConnectionStepConfig } from './types';
+import type { GraphStepConfig } from './types';
 import { resolveValue } from './templateRenderer';
 
 // These imports resolve from the dist/ directory at runtime — they are
@@ -28,6 +29,8 @@ const { executeConditional } = require('./executors/conditionalExecutor') as { e
 const { executeLoop } = require('./executors/loopExecutor') as { executeLoop: (config: LoopStepConfig, state: any) => Promise<Partial<any>> };
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { executeConnection } = require('./executors/connectionExecutor') as { executeConnection: (config: ConnectionStepConfig, state: any) => Promise<Partial<any>> };
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { executeGraph } = require('./executors/graphExecutor') as { executeGraph: (config: GraphStepConfig, state: any) => Promise<Partial<any>> };
 
 /**
  * Execute a single step based on its type
@@ -95,6 +98,12 @@ export async function executeStep(step: UniversalStep, state: any): Promise<Part
             await new Promise(resolve => setTimeout(resolve, delayMs));
             console.log(`[StepExecutor] Delay completed`);
             return {};
+        }
+        case 'graph': {
+            console.log(`[StepExecutor] Calling executeGraph for subgraph: ${(step.config as GraphStepConfig).graphId}`);
+            const result = await executeGraph(step.config as GraphStepConfig, state);
+            console.log(`[StepExecutor] executeGraph completed in ${Date.now() - startTime}ms, result keys:`, Object.keys(result || {}));
+            return result;
         }
         default:
             console.log(`[StepExecutor] ERROR: Unknown step type: ${step.type}`);

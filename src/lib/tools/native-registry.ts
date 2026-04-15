@@ -248,4 +248,15 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register upload_attachment:', msg);
   }
+
+  try {
+    // TTS Synthesize — Google Gemini TTS, returns PCM audio as base64
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const ttsSynthesize = require('./native/tts-synthesize.js');
+    registry.register('tts_synthesize', ttsSynthesize.default || ttsSynthesize);
+    console.log('[NativeRegistry] Registered built-in tool: tts_synthesize');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register tts_synthesize:', msg);
+  }
 }

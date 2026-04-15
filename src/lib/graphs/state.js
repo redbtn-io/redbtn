@@ -63,6 +63,15 @@ exports.RedGraphState = langgraph_1.Annotation.Root({
     nodeCounter: (0, langgraph_1.Annotation)({
         reducer: (x, y) => y,
         default: () => 1
+    }),
+    // Graph registry for subgraph execution (graph step type)
+    _graphRegistry: (0, langgraph_1.Annotation)({
+        reducer: (x, y) => y !== null && y !== void 0 ? y : x
+    }),
+    // Subgraph depth counter (prevents infinite recursion)
+    _subgraphDepth: (0, langgraph_1.Annotation)({
+        reducer: (x, y) => y !== null && y !== void 0 ? y : x,
+        default: () => 0
     })
 });
 /**

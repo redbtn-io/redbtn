@@ -1,6 +1,6 @@
 {
   "name": "@redbtn/redbtn",
-  "version": "0.0.55-alpha",
+  "version": "0.0.78-alpha",
   "description": "Graph-based automation engine for building, running, and orchestrating dynamic workflows",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -37,6 +37,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google/genai": "^1.48.0",
     "@langchain/anthropic": "^1.2.3",
     "@langchain/core": "^1.1.4",
     "@langchain/google-genai": "^2.0.4",

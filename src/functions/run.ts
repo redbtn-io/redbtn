@@ -222,6 +222,8 @@ CRITICAL RULES:
     // planner.ts, responder.ts) that called messageQueue.publishStatus() used the old redGraph
     // path, which was removed in v0.0.51-alpha alongside Red.respond(). New graph execution
     // uses RunPublisher for all SSE events.
+    // Graph registry — passed so that 'graph' step executors can invoke subgraphs
+    _graphRegistry: red.graphRegistry,
     mcpClient: {
       callTool: (toolName: string, args: unknown, meta?: unknown) =>
         red.callMcpTool(toolName, args as Record<string, unknown>, meta as Record<string, unknown>),
@@ -528,10 +530,11 @@ export async function run(
   if (!redis) throw new Error('[run] Redis client not available');
 
   const lockKey = options.conversationId || runId;
+  const agentId = (options as any).agentId as string | undefined;
   const runLock = new RunLock(redis);
-  const lock = await runLock.acquire(lockKey);
-  if (!lock) throw new Error(`[run] Conversation ${lockKey} already has an active run`);
-  console.log(`[run] Acquired lock for conversation ${lockKey}`);
+  const lock = await runLock.acquire(lockKey, { agentId });
+  if (!lock) throw new Error(`[run] Conversation ${lockKey}${agentId ? `:${agentId}` : ''} already has an active run`);
+  console.log(`[run] Acquired lock for conversation ${lockKey}${agentId ? ` agent=${agentId}` : ''}`);
 
   const publisher = createRunPublisher({ redis, runId, userId, log: red.redlog });
 

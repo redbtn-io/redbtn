@@ -131,12 +131,22 @@ export class ConversationPublisher {
     return messageId;
   }
 
-  /** Begin streaming a message -- UI shows an empty bubble */
-  async startMessage(messageId: string, role: string = 'assistant'): Promise<void> {
+  /**
+   * Begin streaming a message -- UI shows an empty bubble.
+   * Optional metadata (e.g., `{ audio: true }`) is passed through to the
+   * subscriber so the client can render role/content-specific decorations
+   * like a mic icon for voice messages.
+   */
+  async startMessage(
+    messageId: string,
+    role: string = 'assistant',
+    metadata?: Record<string, unknown>,
+  ): Promise<void> {
     await this.publish({
       type: 'message_start',
       messageId,
       role,
+      ...(metadata ? { metadata } : {}),
       timestamp: Date.now(),
     });
   }
@@ -200,7 +210,7 @@ export class ConversationPublisher {
   }
 
   /** Publish a tool event from a run */
-  async publishToolEvent(runId: string, event: {
+  async publishToolEvent(runId: string, messageId: string, event: {
     type: 'tool_start' | 'tool_progress' | 'tool_complete' | 'tool_error';
     toolId: string;
     toolName: string;
@@ -217,6 +227,7 @@ export class ConversationPublisher {
     await this.publish({
       type: 'tool_event',
       runId,
+      messageId,
       event,
       timestamp: Date.now(),
     });
@@ -301,17 +312,110 @@ export class ConversationPublisher {
     });
   }
 
+  // ── Live/stream-specific methods ──
+
+  /** Publish a base64 audio chunk (ephemeral — not stored in replay or archive) */
+  async publishAudioChunk(messageId: string, data: string, mimeType: string, connectionId?: string): Promise<void> {
+    await this.publish({
+      type: 'audio_chunk',
+      messageId,
+      data,
+      mimeType,
+      connectionId,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Publish input transcription (user speech-to-text) */
+  async publishInputTranscription(text: string, messageId?: string, isFinal?: boolean): Promise<void> {
+    await this.publish({
+      type: 'input_transcription',
+      text,
+      messageId,
+      isFinal,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Publish output transcription (AI speech-to-text) */
+  async publishOutputTranscription(messageId: string, text: string): Promise<void> {
+    await this.publish({
+      type: 'output_transcription',
+      messageId,
+      text,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Signal end of a live turn */
+  async publishTurnComplete(messageId?: string, connectionId?: string): Promise<void> {
+    await this.publish({
+      type: 'turn_complete',
+      messageId,
+      connectionId,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Signal barge-in / interruption */
+  async publishInterrupted(messageId?: string): Promise<void> {
+    await this.publish({
+      type: 'interrupted',
+      messageId,
+      timestamp: Date.now(),
+    });
+  }
+
+  // ── Ephemeral (non-stored) events ──
+
+  /**
+   * Publish an ephemeral event to live pub/sub subscribers only.
+   *
+   * Ephemeral events are NOT stored in the replay list (conversation:events:{id})
+   * and are NOT enqueued for archiving. Use this for transient signals like
+   * typing indicators and presence updates that should not appear on reconnect.
+   */
+  async publishEphemeral(event: Record<string, unknown>): Promise<void> {
+    // Publish to the pub/sub channel ONLY — no RPUSH to the events replay list
+    await this.redis.publish(
+      this.channel,
+      JSON.stringify({
+        ...event,
+        timestamp: Date.now(),
+      })
+    );
+  }
+
+  /**
+   * Publish a typing indicator for a user.
+   *
+   * Ephemeral — not stored in the replay list or archived.
+   * Clients that receive this event should show/hide a typing bubble for the user.
+   */
+  async publishTyping(userId: string, isTyping: boolean): Promise<void> {
+    await this.publishEphemeral({
+      type: 'typing',
+      userId,
+      isTyping,
+    });
+  }
+
   // -- Internal --
+
+  /** Ephemeral event types that should NOT be stored in replay list or archived */
+  private static readonly EPHEMERAL_TYPES = new Set(['audio_chunk']);
 
   private async publish(event: ConversationEvent): Promise<void> {
     const json = JSON.stringify(event);
-    // Publish to pub/sub for live listeners
+    const isEphemeral = ConversationPublisher.EPHEMERAL_TYPES.has(event.type);
+    // Publish to pub/sub for live listeners (always)
     await this.redis.publish(this.channel, json);
-    // Store in list for replay on reconnection
-    await this.redis.rpush(this.eventsKey, json);
-    await this.redis.expire(this.eventsKey, this.ttl);
-    // Fire-and-forget archive job -- non-blocking, non-fatal
-    this._enqueueArchive(event).catch(() => {});
+    // Skip replay list and archive for ephemeral events (e.g. audio chunks)
+    if (!isEphemeral) {
+      await this.redis.rpush(this.eventsKey, json);
+      await this.redis.expire(this.eventsKey, this.ttl);
+      this._enqueueArchive(event).catch(() => {});
+    }
   }
 
   /**
@@ -348,7 +452,8 @@ export class ConversationPublisher {
       const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
       const queue = getArchiveQueue('conversation-archive', this.redis, prefix);
       await queue.add('archive', jobData, {
-        jobId: `${this.conversationId}:${seq}`,
+        // BullMQ does not allow colons in jobIds — use underscore separator
+        jobId: `${this.conversationId}_${seq}`,
         removeOnComplete: { age: 3600, count: 500 },
         removeOnFail: { age: 86400 },
       });
@@ -379,12 +484,22 @@ export class ConversationPublisher {
         ? { _id: new ObjectId(this.conversationId) }
         : { conversationId: this.conversationId };
 
+      // Use `id` (not `messageId`) so the archiver's $pull-then-$push dedup
+      // correctly removes any inline-written entry before writing its version.
+      // Without this, both the inline path (here) and the archiver would push
+      // separate entries for the same message.
+      await db.collection('user_conversations').updateOne(
+        filter,
+        {
+          $pull: { messages: { id: params.messageId } } as any,
+        }
+      );
       await db.collection('user_conversations').updateOne(
         filter,
         {
           $push: {
             messages: {
-              messageId: params.messageId,
+              id: params.messageId,
               role: params.role,
               content: params.content,
               metadata: params.metadata,

@@ -64,6 +64,24 @@ export {
 // Export registries
 export { universalNodeRegistry, getUniversalNode, getUniversalNodeRaw } from "./lib/registry/UniversalNodeRegistry";
 
+// Export universal node types (step configs, step type union)
+export type {
+  StepType,
+  NeuronStepConfig,
+  ToolStepConfig,
+  TransformStepConfig,
+  ConditionalStepConfig,
+  LoopStepConfig,
+  ConnectionStepConfig,
+  GraphStepConfig,
+  UniversalStep,
+  NodeConfig,
+} from "./lib/nodes/universal/types";
+
+// Export ParserExecutor for external use (e.g. SessionManager)
+export { ParserExecutor } from "./lib/nodes/universal/executors/parserExecutor";
+export type { ParserToolExecutor } from "./lib/nodes/universal/executors/parserExecutor";
+
 // Export graph execution
 export { run, isStreamingResult } from "./functions/run";
 export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } from "./functions/run";
@@ -96,6 +114,26 @@ export type { SynthesizeOptions, AudioStreamPipelineOptions, TranscribeOptions, 
 // Export conversation streaming
 export { ConversationPublisher, createConversationPublisher, ConversationKeys } from './lib/conversation';
 export type { ConversationEvent, ConversationAttachmentEvent } from './lib/conversation';
+
+// Export stream session pub/sub
+export { StreamEventPublisher, createStreamEventPublisher, StreamSessionKeys, StreamSessionConfig } from './lib/streams';
+export type {
+  StreamEvent,
+  StreamEventType,
+  StreamEventPublisherOptions,
+  StreamSessionState,
+  StreamSessionStartEvent,
+  StreamSessionReadyEvent,
+  StreamSessionEndEvent,
+  StreamSessionErrorEvent,
+  StreamAudioInEvent,
+  StreamAudioOutEvent,
+  StreamTextInEvent,
+  StreamTextOutEvent,
+  StreamToolCallEvent,
+  StreamToolResultEvent,
+  StreamSubgraphResultEvent,
+} from './lib/streams';
 
 // --- Type Definitions ---
 
