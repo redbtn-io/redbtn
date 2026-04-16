@@ -206,6 +206,18 @@ export interface ConversationInterruptedEvent {
   timestamp: number;
 }
 
+/**
+ * Signals that audio output has been produced for a message. Published once
+ * per message by any audio producer (stream audio_chunks, client-side TTS
+ * POST endpoint). Drives the mic icon on the message bubble. Non-ephemeral
+ * so it survives page reload via catchup replay.
+ */
+export interface ConversationMessageAudioEvent {
+  type: 'message_audio';
+  messageId: string;
+  timestamp: number;
+}
+
 export type ConversationEvent =
   | ConversationMessageEvent
   | ConversationMessageStartEvent
@@ -225,4 +237,5 @@ export type ConversationEvent =
   | ConversationInputTranscriptionEvent
   | ConversationOutputTranscriptionEvent
   | ConversationTurnCompleteEvent
-  | ConversationInterruptedEvent;
+  | ConversationInterruptedEvent
+  | ConversationMessageAudioEvent;

@@ -86,6 +86,10 @@ export class ConversationPublisher {
   private readonly channel: string;
   private readonly eventsKey: string;
   private readonly ttl: number;
+  /** Track messageIds for which message_audio has already been published
+   *  by this publisher instance — so the tag fires exactly once per message
+   *  per publisher (idempotent at the event level regardless). */
+  private readonly audioTaggedMessages: Set<string> = new Set();
 
   constructor(options: ConversationPublisherOptions) {
     this.redis = options.redis;
@@ -314,14 +318,34 @@ export class ConversationPublisher {
 
   // ── Live/stream-specific methods ──
 
-  /** Publish a base64 audio chunk (ephemeral — not stored in replay or archive) */
+  /** Publish a base64 audio chunk (ephemeral — not stored in replay or archive).
+   *  On the FIRST audio chunk per messageId, also publishes a `message_audio`
+   *  event (non-ephemeral) so the archiver can tag metadata.audio=true on the
+   *  message. Every audio-producing path automatically gets the tag without
+   *  explicit callsite coupling. */
   async publishAudioChunk(messageId: string, data: string, mimeType: string, connectionId?: string): Promise<void> {
+    if (!this.audioTaggedMessages.has(messageId)) {
+      this.audioTaggedMessages.add(messageId);
+      await this.publishMessageAudio(messageId);
+    }
     await this.publish({
       type: 'audio_chunk',
       messageId,
       data,
       mimeType,
       connectionId,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Publish a message_audio tag event. Non-ephemeral — archived + replayed.
+   *  Callers that produce audio without going through publishAudioChunk
+   *  (e.g. the client-side TTS endpoint) invoke this directly. Idempotent
+   *  on the archiver side. */
+  async publishMessageAudio(messageId: string): Promise<void> {
+    await this.publish({
+      type: 'message_audio',
+      messageId,
       timestamp: Date.now(),
     });
   }
