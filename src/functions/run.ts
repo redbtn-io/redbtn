@@ -13,7 +13,7 @@
  * @module functions/run
  */
 import type { Red } from '../index';
-import { RunPublisher, RunLock, createRunPublisher, type RunState } from '../lib/run';
+import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState } from '../lib/run';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
 import { SYSTEM_TEMPLATES } from '../lib/types/graph';
@@ -306,7 +306,23 @@ async function executeNonStreaming(
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    await publisher.fail(errorMessage);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+    try {
+      await publisher.fail(errorMessage, errorStack);
+    } catch (publishErr) {
+      // If even publisher.fail() fails (e.g., Redis disconnected mid-run),
+      // fall back to the raw helper so subscribers still see a terminal
+      // event and don't hang on the 60s timeout.
+      console.error('[run:executeNonStreaming] publisher.fail() failed, falling back:', publishErr);
+      try {
+        await publishRunError(
+          (publisher as any).redis,
+          publisher.id,
+          errorMessage,
+          { errorStack, userId: publisher.user },
+        );
+      } catch { /* give up — we tried */ }
+    }
     const state = await publisher.getState();
     return {
       runId,
@@ -470,7 +486,22 @@ async function executeStreaming(
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    await publisher.fail(errorMessage);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+    try {
+      await publisher.fail(errorMessage, errorStack);
+    } catch (publishErr) {
+      // If publisher.fail() itself fails (Redis hiccup mid-run), fall back
+      // to the raw helper so subscribers still see a terminal event.
+      console.error('[run:executeStreaming] publisher.fail() failed, falling back:', publishErr);
+      try {
+        await publishRunError(
+          (publisher as any).redis,
+          publisher.id,
+          errorMessage,
+          { errorStack, userId: publisher.user },
+        );
+      } catch { /* give up — we tried */ }
+    }
     const state = await publisher.getState();
     return {
       runId,
@@ -521,19 +552,69 @@ export async function run(
 
   console.log(`[run] Starting run ${runId} for user ${userId}`);
 
-  const userSettings = await loadUserSettings(userId);
-  const graphId = options.graphId || userSettings.defaultGraphId;
-  const { compiledGraph, graphId: actualGraphId, graphName } = await loadGraph(red, graphId, userId);
-  console.log(`[run] Using graph: ${actualGraphId} (${graphName})`);
+  // Track RunPublisher readiness so we can publish a fallback terminal
+  // `run_error` event if anything throws BEFORE `publisher.init()` succeeds
+  // (loadGraph / runLock.acquire / publisher.init itself). Without this,
+  // subscribers on the run stream channel (dispatchToolCall, runStartupGraph,
+  // _subscribeAndRouteOutput) have no terminal event to latch onto and hang
+  // until their 60s timeout.
+  const redisForFallback = red.redis;
+  const publishFallbackError = async (err: unknown, where: string) => {
+    if (!redisForFallback) return;
+    const message = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    try {
+      await publishRunError(redisForFallback, runId, `[run:${where}] ${message}`, {
+        errorStack: stack,
+        userId,
+        graphId: options.graphId,
+        conversationId: options.conversationId,
+      });
+    } catch (publishErr) {
+      console.error(`[run] Fallback publishRunError failed for ${runId}:`, publishErr);
+    }
+  };
+
+  let userSettings: Awaited<ReturnType<typeof loadUserSettings>>;
+  let actualGraphId: string;
+  let graphName: string;
+  let compiledGraph: any;
+  try {
+    userSettings = await loadUserSettings(userId);
+    const graphId = options.graphId || userSettings.defaultGraphId;
+    const loaded = await loadGraph(red, graphId, userId);
+    compiledGraph = loaded.compiledGraph;
+    actualGraphId = loaded.graphId;
+    graphName = loaded.graphName;
+    console.log(`[run] Using graph: ${actualGraphId} (${graphName})`);
+  } catch (err) {
+    await publishFallbackError(err, 'pre-init');
+    throw err;
+  }
 
   const redis = red.redis;
-  if (!redis) throw new Error('[run] Redis client not available');
+  if (!redis) {
+    // Can't publish without redis — just throw for the worker's outer catch.
+    throw new Error('[run] Redis client not available');
+  }
 
   const lockKey = options.conversationId || runId;
   const agentId = (options as any).agentId as string | undefined;
   const runLock = new RunLock(redis);
-  const lock = await runLock.acquire(lockKey, { agentId });
-  if (!lock) throw new Error(`[run] Conversation ${lockKey}${agentId ? `:${agentId}` : ''} already has an active run`);
+  let lock;
+  try {
+    lock = await runLock.acquire(lockKey, { agentId });
+  } catch (err) {
+    await publishFallbackError(err, 'lock-acquire');
+    throw err;
+  }
+  if (!lock) {
+    const err = new Error(
+      `[run] Conversation ${lockKey}${agentId ? `:${agentId}` : ''} already has an active run`,
+    );
+    await publishFallbackError(err, 'lock-busy');
+    throw err;
+  }
   console.log(`[run] Acquired lock for conversation ${lockKey}${agentId ? ` agent=${agentId}` : ''}`);
 
   const publisher = createRunPublisher({ redis, runId, userId, log: red.redlog });
@@ -543,7 +624,16 @@ export async function run(
   const triggerType = (input as Record<string, any>)?._trigger?.type as string | undefined;
 
   console.log(`[run] ${new Date().toISOString()} Calling publisher.init() for run ${runId}`);
-  await publisher.init(actualGraphId, graphName, input, options.conversationId, triggerType);
+  try {
+    await publisher.init(actualGraphId, graphName, input, options.conversationId, triggerType);
+  } catch (err) {
+    // publisher.init() bootstraps Redis state + emits run_start. If it fails,
+    // the publisher isn't usable for `fail()` — emit a terminal error via the
+    // bare helper and release the lock before rethrowing.
+    await publishFallbackError(err, 'publisher-init');
+    try { await lock.release(); } catch { /* ignore */ }
+    throw err;
+  }
   console.log(`[run] ${new Date().toISOString()} publisher.init() complete for run ${runId}`);
 
   // Check for existing checkpoint (crash recovery)
@@ -567,12 +657,28 @@ export async function run(
     console.warn('[run] Could not check for existing checkpoint:', checkpointErr);
   }
 
-  const initialState = buildInitialState(red, input, options, userSettings, runId, publisher);
+  let initialState: any;
+  try {
+    initialState = buildInitialState(red, input, options, userSettings, runId, publisher);
 
-  const nodeCount = compiledGraph.config?.nodes?.length || 0;
-  const entryNodeId = compiledGraph.config?.nodes?.[0]?.id || 'entry';
-  console.log(`[run] ${new Date().toISOString()} Publishing graph_start for run ${runId}`);
-  await publisher.graphStart(nodeCount, entryNodeId);
+    const nodeCount = compiledGraph.config?.nodes?.length || 0;
+    const entryNodeId = compiledGraph.config?.nodes?.[0]?.id || 'entry';
+    console.log(`[run] ${new Date().toISOString()} Publishing graph_start for run ${runId}`);
+    await publisher.graphStart(nodeCount, entryNodeId);
+  } catch (err) {
+    // Any failure here (state builder throws, graphStart publish fails) must
+    // still emit a terminal error via the initialised publisher — and if that
+    // itself fails, fall through to the raw helper as a last resort.
+    const message = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    try {
+      await publisher.fail(`[run:graph-start] ${message}`, stack);
+    } catch {
+      await publishFallbackError(err, 'graph-start');
+    }
+    try { await lock.release(); } catch { /* ignore */ }
+    throw err;
+  }
 
   const cleanup = async () => {
     await lock.release();
