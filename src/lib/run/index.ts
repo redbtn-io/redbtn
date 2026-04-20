@@ -57,6 +57,7 @@ export {
   createRunPublisher,
   getRunState,
   getActiveRunForConversation,
+  publishRunError,
   ARCHIVE_QUEUE_NAMES,
 } from './run-publisher';
 

@@ -13,7 +13,7 @@
  * @module functions/run
  */
 import type { Red } from '../index';
-import { RunPublisher, RunLock, createRunPublisher, type RunState } from '../lib/run';
+import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState } from '../lib/run';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
 import { SYSTEM_TEMPLATES } from '../lib/types/graph';
