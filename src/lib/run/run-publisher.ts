@@ -366,7 +366,21 @@ export class RunPublisher {
     });
   }
 
-  async fail(error: string): Promise<void> {
+  /**
+   * Mark the run as failed and publish the terminal `run_error` event.
+   *
+   * Symmetric with `complete()` — callers should ALWAYS be able to rely on
+   * a terminal event landing on the run stream channel so that subscribers
+   * (`dispatchToolCall`, `runStartupGraph`, `_subscribeAndRouteOutput`) can
+   * early-reject instead of hanging until their 60s timeout.
+   *
+   * Emits BOTH `run_error` (canonical) and `run_failed` (alias) so consumers
+   * that listen for either name keep working.
+   *
+   * @param error - Human-readable error message (required)
+   * @param errorStack - Optional error stack trace for debugging
+   */
+  async fail(error: string, errorStack?: string): Promise<void> {
     this.ensureInitialized();
     this.state!.status = 'error';
     this.state!.error = error;
@@ -383,12 +397,35 @@ export class RunPublisher {
         if (DEBUG) console.warn('[RunPublisher] Conv forward run_error failed:', err);
       }
     }
-    await this.publish({ type: 'run_error', error, timestamp: Date.now() });
+    // Cap stack trace size to keep pub/sub + archive-queue payloads small.
+    const truncatedStack =
+      errorStack && errorStack.length > 4000
+        ? errorStack.slice(0, 4000) + '\n...[truncated]'
+        : errorStack;
+    const ts = Date.now();
+    // Canonical terminal event
+    await this.publish({
+      type: 'run_error',
+      error,
+      errorStack: truncatedStack,
+      runId: this.runId,
+      timestamp: ts,
+    });
+    // Alias event — publish both so any consumer listening for either name
+    // resolves its wait. Webapp's dispatchToolCall already listens for both;
+    // this future-proofs other consumers (e.g., logs page, chat UI).
+    await this.publish({
+      type: 'run_failed',
+      error,
+      errorStack: truncatedStack,
+      runId: this.runId,
+      timestamp: ts,
+    });
     await this.persistLog({
       level: 'error',
       category: 'run',
       message: `Run failed: ${error}`,
-      metadata: { error },
+      metadata: { error, errorStack: truncatedStack },
     });
   }
 
@@ -969,6 +1006,107 @@ function stripNonSerialisableStateFields(
     out[key] = value;
   }
   return out;
+}
+
+/**
+ * Publish a terminal `run_error` + `run_failed` event WITHOUT a RunPublisher
+ * instance.
+ *
+ * Use this from callers that may fail BEFORE they manage to initialise a
+ * RunPublisher (e.g. the engine's `run()` entry point throwing from
+ * loadGraph / runLock.acquire / loadUserSettings, or the worker processor's
+ * outer catch). Without this, consumers subscribed to the run stream channel
+ * (`dispatchToolCall`, `runStartupGraph`, `_subscribeAndRouteOutput`) have no
+ * terminal event to latch onto and hang until their 60s timeout.
+ *
+ * Safe to call even when a RunPublisher DID manage to publish its own
+ * run_error — the extra event is harmless; consumers have already resolved
+ * on the first terminal event they see.
+ *
+ * Also pushes into the events log (`run:events:{runId}`) for replay parity,
+ * and writes a minimal error state so status probes see `status: 'error'`.
+ */
+export async function publishRunError(
+  redis: Redis,
+  runId: string,
+  error: string,
+  options?: {
+    errorStack?: string;
+    stateTtl?: number;
+    userId?: string;
+    graphId?: string;
+    conversationId?: string;
+  },
+): Promise<void> {
+  const ttl = options?.stateTtl ?? RunConfig.STATE_TTL_SECONDS;
+  const truncatedStack =
+    options?.errorStack && options.errorStack.length > 4000
+      ? options.errorStack.slice(0, 4000) + '\n...[truncated]'
+      : options?.errorStack;
+  const ts = Date.now();
+
+  // Best-effort: update run state so status probes observe `error`.
+  try {
+    const existingRaw = await redis.get(RunKeys.state(runId));
+    const existing = existingRaw ? (JSON.parse(existingRaw) as RunState) : null;
+    const errorState: Partial<RunState> = {
+      runId,
+      userId: options?.userId ?? existing?.userId ?? 'unknown',
+      graphId: options?.graphId ?? existing?.graphId ?? 'unknown',
+      graphName: existing?.graphName ?? options?.graphId ?? 'unknown',
+      conversationId: options?.conversationId ?? existing?.conversationId,
+      status: 'error',
+      error,
+      startedAt: existing?.startedAt ?? ts,
+      completedAt: ts,
+      input: existing?.input ?? {},
+      output: existing?.output ?? { content: '', thinking: '', data: {} },
+      graph: existing?.graph ?? { executionPath: [], nodesExecuted: 0, nodeProgress: {} },
+      tools: existing?.tools ?? [],
+    };
+    await redis.set(RunKeys.state(runId), JSON.stringify(errorState), 'EX', ttl);
+    const convId = options?.conversationId ?? existing?.conversationId;
+    if (convId) {
+      await redis.del(RunKeys.conversationRun(convId));
+    }
+  } catch {
+    // non-fatal — the pub/sub terminal event is what unblocks consumers
+  }
+
+  // Publish BOTH terminal events through StreamPublisher (keeps events log
+  // in sync with the pub/sub channel for replay).
+  const errorEvent = {
+    type: 'run_error' as const,
+    error,
+    errorStack: truncatedStack,
+    runId,
+    timestamp: ts,
+  };
+  const failedEvent = {
+    type: 'run_failed' as const,
+    error,
+    errorStack: truncatedStack,
+    runId,
+    timestamp: ts,
+  };
+  try {
+    const pub = new StreamPublisher({
+      redis,
+      channel: RunKeys.stream(runId),
+      eventsKey: RunKeys.events(runId),
+      ttl,
+    });
+    await pub.publish(errorEvent as any);
+    await pub.publish(failedEvent as any);
+  } catch (err) {
+    // Fall back to a raw PUBLISH so at least SSE pub/sub consumers wake up
+    try {
+      await redis.publish(RunKeys.stream(runId), JSON.stringify(errorEvent));
+      await redis.publish(RunKeys.stream(runId), JSON.stringify(failedEvent));
+    } catch {
+      console.error('[publishRunError] Failed to publish terminal event:', err);
+    }
+  }
 }
 
 /**
