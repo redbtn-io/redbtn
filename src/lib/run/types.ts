@@ -177,9 +177,24 @@ export interface RunCompleteEvent extends BaseEvent {
   };
 }
 
+/**
+ * Terminal failure event emitted by RunPublisher when a run errors out.
+ *
+ * Symmetric with `run_complete` — consumers MUST treat either name as a
+ * terminal event (publishers emit both `run_error` and `run_failed` aliases
+ * for backwards / forwards compatibility). Subscribers on the run stream
+ * channel (`dispatchToolCall`, `runStartupGraph`, `_subscribeAndRouteOutput`)
+ * should early-reject on receiving this to avoid hanging until their 60s
+ * timeout.
+ */
 export interface RunErrorEvent extends BaseEvent {
-  type: 'run_error';
+  type: 'run_error' | 'run_failed';
+  /** Human-readable error message */
   error: string;
+  /** Optional error stack trace (may be truncated for payload size) */
+  errorStack?: string;
+  /** Run identifier — included on failure events for correlation */
+  runId?: string;
 }
 
 /**
