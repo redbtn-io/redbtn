@@ -255,7 +255,26 @@ export class RunPublisher {
     this.initialized = true;
   }
 
-  async complete(output?: Partial<RunOutput>): Promise<void> {
+  /**
+   * Mark the run as completed and publish the `run_complete` event.
+   *
+   * @param output - Optional convenience fields (content/thinking/data) captured
+   *   by the caller. These are merged into `RunState.output` so they appear in
+   *   `getRunState()` results.
+   * @param finalState - Optional FULL final graph state object (the return value
+   *   of `graph.invoke()` or equivalent). When provided, the published
+   *   `run_complete` event's `output` carries this entire object verbatim, so
+   *   downstream consumers can read any state field the graph wrote — not just
+   *   the LLM-shaped `content`/`thinking`/`data`/`response` quadrant.
+   *
+   *   Canonical aliases (`content`, `thinking`, `data`, `response`) are always
+   *   layered on top of the emitted `output` so existing consumers keep working
+   *   even when `finalState` is not supplied.
+   */
+  async complete(
+    output?: Partial<RunOutput>,
+    finalState?: Record<string, unknown>,
+  ): Promise<void> {
     this.ensureInitialized();
     if (output) {
       if (output.content !== undefined) this.state!.output.content = output.content;
@@ -280,31 +299,58 @@ export class RunPublisher {
         if (DEBUG) console.warn('[RunPublisher] Conv forward run_complete failed:', err);
       }
     }
-    // Include the final output snapshot so pub/sub consumers can read the
-    // response without having to fetch run state from Redis separately.
-    // Surfaces `output.response` for callers that read it (webapp's
-    // runStartupGraph + dispatchToolCall) — falls back to `content` when
-    // the graph state doesn't set a dedicated `data.response` field.
-    const finalOutput = this.state!.output;
+
+    // Build the run_complete event `output`:
+    //   1. Start from the FULL final graph state (so any state-root field —
+    //      `systemPrompt`, `setupOutput`, custom graph fields — is preserved).
+    //   2. Layer canonical aliases (content/thinking/data/response) on top so
+    //      consumers reading `output.response` or `output.content` keep working
+    //      regardless of the underlying graph shape.
+    //
+    // If no finalState was supplied, the event still carries the legacy
+    // RunOutput quadrant via the aliases — behaviour is backwards-compatible.
+    const runOutput = this.state!.output;
+
+    // Derive a canonical `response` alias: prefer state.data.response,
+    // then state.response (when finalState is supplied), then content.
     const dataResponse =
-      finalOutput?.data && typeof finalOutput.data === 'object'
-        ? (finalOutput.data as Record<string, unknown>).response
+      runOutput?.data && typeof runOutput.data === 'object'
+        ? (runOutput.data as Record<string, unknown>).response
+        : undefined;
+    const rootResponse =
+      finalState && typeof finalState === 'object'
+        ? (finalState as Record<string, unknown>).response
         : undefined;
     const responseValue =
       dataResponse !== undefined
         ? dataResponse
-        : finalOutput?.content
-        ? finalOutput.content
+        : rootResponse !== undefined
+        ? rootResponse
+        : runOutput?.content
+        ? runOutput.content
         : undefined;
+
+    // Spread the full state first, then overwrite with canonical aliases.
+    // Guard against accidental circular-ref fields (neuronRegistry, memory, etc.)
+    // that the engine passes into initial state — strip well-known non-serialisable
+    // keys so JSON.stringify in StreamPublisher doesn't blow up.
+    const safeFinalState =
+      finalState && typeof finalState === 'object'
+        ? stripNonSerialisableStateFields(finalState)
+        : {};
+
+    const eventOutput: Record<string, unknown> = {
+      ...safeFinalState,
+      content: runOutput?.content ?? '',
+      thinking: runOutput?.thinking ?? '',
+      data: runOutput?.data ?? {},
+      response: responseValue,
+    };
+
     await this.publish({
       type: 'run_complete',
       metadata: this.state!.metadata,
-      output: {
-        content: finalOutput?.content ?? '',
-        thinking: finalOutput?.thinking ?? '',
-        data: finalOutput?.data ?? {},
-        response: responseValue,
-      },
+      output: eventOutput,
       timestamp: Date.now(),
     });
     const duration = this.state!.completedAt! - this.state!.startedAt;
@@ -890,6 +936,39 @@ export class RunPublisher {
 
 export function createRunPublisher(options: RunPublisherOptions): RunPublisher {
   return new RunPublisher(options);
+}
+
+/**
+ * Strip well-known non-serialisable fields from the final graph state before
+ * publishing it in a `run_complete` event.
+ *
+ * `buildInitialState()` in functions/run.ts injects live service objects into
+ * state (neuronRegistry, memory, mcpClient, connectionManager, runPublisher,
+ * _graphRegistry). LangGraph preserves these across the run, so they appear
+ * in the final state. They must not be JSON-serialised — they contain
+ * circular refs (ioredis connections, Mongoose models) that would blow up
+ * StreamPublisher.publish().
+ *
+ * We keep every other field — including user-defined ones with or without a
+ * leading underscore — so graphs can output anything they want.
+ */
+const NON_SERIALISABLE_STATE_KEYS = new Set([
+  'neuronRegistry',
+  'memory',
+  'mcpClient',
+  'connectionManager',
+  'runPublisher',
+  '_graphRegistry',
+]);
+function stripNonSerialisableStateFields(
+  state: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(state)) {
+    if (NON_SERIALISABLE_STATE_KEYS.has(key)) continue;
+    out[key] = value;
+  }
+  return out;
 }
 
 /**

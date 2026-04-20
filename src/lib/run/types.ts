@@ -148,17 +148,33 @@ export interface RunCompleteEvent extends BaseEvent {
   type: 'run_complete';
   metadata?: TokenMetadata;
   /**
-   * Final run output snapshot.
+   * Final run output — the FULL final graph state.
    *
-   * Mirrors `RunState.output` (content/thinking/data) and additionally surfaces
-   * a top-level `response` field for convenience: consumers such as webapp's
-   * `runStartupGraph` and `dispatchToolCall` read `event.output?.response`
-   * without having to know the graph's state shape.
+   * This is the complete state object as returned by the graph's terminal node.
+   * Any field the graph writes to state root (e.g. `systemPrompt`, `setupOutput`,
+   * arbitrary user-defined fields) is present here. Consumers can read whatever
+   * they need without being constrained to a fixed shape.
    *
-   * `response` is derived at publish time from `data.response` when present,
-   * otherwise falls back to `content`.
+   * The following canonical aliases are always layered on top for convenience:
+   *  - `content`   — the streamed response text (from RunState.output.content)
+   *  - `thinking`  — the streamed reasoning text (from RunState.output.thinking)
+   *  - `data`      — the legacy `state.data` bag (RunState.output.data)
+   *  - `response`  — derived from `state.data.response`, `state.response`,
+   *                  or `content` in that order, so consumers reading
+   *                  `event.output?.response` keep working regardless of the
+   *                  graph's state shape.
+   *
+   * Webapp's `runStartupGraph` and `dispatchToolCall` rely on `response`
+   * (with graceful fallback to the full object). All other state fields —
+   * whatever a specific graph happens to put at state root — are preserved
+   * verbatim, so new graphs can output anything they want.
    */
-  output?: RunOutput & { response?: unknown };
+  output?: Record<string, unknown> & {
+    content?: string;
+    thinking?: string;
+    data?: Record<string, unknown>;
+    response?: unknown;
+  };
 }
 
 export interface RunErrorEvent extends BaseEvent {
