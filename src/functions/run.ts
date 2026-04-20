@@ -272,7 +272,14 @@ async function executeNonStreaming(
         ? rawResponse
         : rawResponse?.content || '';
     const { thinking, cleanedContent } = extractThinkingFromContent(responseContent);
-    await publisher.complete({ content: cleanedContent, thinking, data: result.data || {} });
+    // Pass the FULL final graph state as the second arg so the run_complete
+    // event's `output` carries every state-root field (not just the
+    // content/thinking/data quadrant). Canonical aliases are still layered
+    // on top by RunPublisher for backwards compatibility.
+    await publisher.complete(
+      { content: cleanedContent, thinking, data: result.data || {} },
+      result as Record<string, unknown>,
+    );
     const state = await publisher.getState();
     return {
       runId,
@@ -357,6 +364,11 @@ async function executeStreaming(
   let inThinkingTag = false;
   let pendingBuffer = '';
   let graphOutputData: Record<string, unknown> | null = null;
+  // Full final graph state (state-root object, not just .data). Captured at
+  // LangGraph on_chain_end so we can pass it to publisher.complete() and thus
+  // into the run_complete event's `output` field. This is what enables graphs
+  // to return arbitrary state-root fields (e.g. `systemPrompt`, `setupOutput`).
+  let graphFinalState: Record<string, unknown> | null = null;
   try {
     const streamConfig = { version: 'v1' as const, configurable: { thread_id: runId } };
     const stream = compiledGraph.graph.streamEvents(initialState, streamConfig);
@@ -394,6 +406,12 @@ async function executeStreaming(
         // Capture graph output data for the final result
         if (graphOutput?.data) {
           graphOutputData = graphOutput.data;
+        }
+        // Capture the FULL final state object so publisher.complete() can emit
+        // every state-root field in the run_complete event. Non-serialisable
+        // service objects are stripped by RunPublisher before publish.
+        if (graphOutput && typeof graphOutput === 'object') {
+          graphFinalState = graphOutput as Record<string, unknown>;
         }
 
         // Try multiple response content locations used by different graph types:
@@ -436,7 +454,14 @@ async function executeStreaming(
     const finalThinking = thinkingBuffer || cachedState?.output?.thinking || '';
     // Use graph output data if available, fall back to initial state data
     const finalData = graphOutputData || initialState.data || {};
-    await publisher.complete({ content: finalContent, thinking: finalThinking, data: finalData });
+    // Pass the full captured graph state (when available) so the run_complete
+    // event's `output` carries every state-root field — not just the legacy
+    // content/thinking/data quadrant. Falls back to just the convenience
+    // fields when on_chain_end never fired (defensive).
+    await publisher.complete(
+      { content: finalContent, thinking: finalThinking, data: finalData },
+      graphFinalState ?? undefined,
+    );
     const state = await publisher.getState();
     return {
       runId,
