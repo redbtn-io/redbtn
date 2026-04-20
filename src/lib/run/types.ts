@@ -147,6 +147,18 @@ export interface RunStartEvent extends BaseEvent {
 export interface RunCompleteEvent extends BaseEvent {
   type: 'run_complete';
   metadata?: TokenMetadata;
+  /**
+   * Final run output snapshot.
+   *
+   * Mirrors `RunState.output` (content/thinking/data) and additionally surfaces
+   * a top-level `response` field for convenience: consumers such as webapp's
+   * `runStartupGraph` and `dispatchToolCall` read `event.output?.response`
+   * without having to know the graph's state shape.
+   *
+   * `response` is derived at publish time from `data.response` when present,
+   * otherwise falls back to `content`.
+   */
+  output?: RunOutput & { response?: unknown };
 }
 
 export interface RunErrorEvent extends BaseEvent {

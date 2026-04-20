@@ -280,9 +280,31 @@ export class RunPublisher {
         if (DEBUG) console.warn('[RunPublisher] Conv forward run_complete failed:', err);
       }
     }
+    // Include the final output snapshot so pub/sub consumers can read the
+    // response without having to fetch run state from Redis separately.
+    // Surfaces `output.response` for callers that read it (webapp's
+    // runStartupGraph + dispatchToolCall) — falls back to `content` when
+    // the graph state doesn't set a dedicated `data.response` field.
+    const finalOutput = this.state!.output;
+    const dataResponse =
+      finalOutput?.data && typeof finalOutput.data === 'object'
+        ? (finalOutput.data as Record<string, unknown>).response
+        : undefined;
+    const responseValue =
+      dataResponse !== undefined
+        ? dataResponse
+        : finalOutput?.content
+        ? finalOutput.content
+        : undefined;
     await this.publish({
       type: 'run_complete',
       metadata: this.state!.metadata,
+      output: {
+        content: finalOutput?.content ?? '',
+        thinking: finalOutput?.thinking ?? '',
+        data: finalOutput?.data ?? {},
+        response: responseValue,
+      },
       timestamp: Date.now(),
     });
     const duration = this.state!.completedAt! - this.state!.startedAt;
