@@ -39,6 +39,7 @@ export interface RunOptions {
   userId: string;
   graphId?: string;
   conversationId?: string;
+  threadId?: string;
   runId?: string;
   stream?: boolean;
   source?: {
@@ -262,7 +263,14 @@ async function executeNonStreaming(
 ): Promise<RunResult> {
   const runId = publisher.id;
   try {
-    const invokeConfig = { configurable: { thread_id: runId } };
+    const conversationId = initialState.data.conversationId;
+    const threadId = initialState.data.options.threadId || runId;
+    const invokeConfig = { 
+      configurable: { 
+        conversation_id: conversationId,
+        thread_id: threadId 
+      } 
+    };
     const result = await compiledGraph.graph.invoke(initialState, invokeConfig);
     const rawResponse = result.data?.response || result.response;
     const responseContent =
@@ -386,7 +394,15 @@ async function executeStreaming(
   // to return arbitrary state-root fields (e.g. `systemPrompt`, `setupOutput`).
   let graphFinalState: Record<string, unknown> | null = null;
   try {
-    const streamConfig = { version: 'v1' as const, configurable: { thread_id: runId } };
+    const conversationId = initialState.data.conversationId;
+    const threadId = initialState.data.options.threadId || runId;
+    const streamConfig = { 
+      version: 'v1' as const, 
+      configurable: { 
+        conversation_id: conversationId,
+        thread_id: threadId 
+      } 
+    };
     const stream = compiledGraph.graph.streamEvents(initialState, streamConfig);
     for await (const event of stream) {
       const runName = event.metadata?.langgraph_node || '';
@@ -664,7 +680,13 @@ export async function run(
   // Check for existing checkpoint (crash recovery)
   try {
     const checkpointer = createMongoCheckpointer();
-    const existingCheckpoint = await checkpointer.getTuple({ configurable: { thread_id: runId } });
+    const threadIdForRecovery = options.threadId || runId;
+    const existingCheckpoint = await checkpointer.getTuple({ 
+      configurable: { 
+        conversation_id: options.conversationId,
+        thread_id: threadIdForRecovery 
+      } 
+    });
     if (existingCheckpoint) {
       const step = existingCheckpoint.metadata?.step;
       const source = existingCheckpoint.metadata?.source;
