@@ -49,6 +49,10 @@ export {
   CollectionStats
 } from "./lib/memory/vectors";
 
+// Export document parser (PDF / DOCX / XLSX / CSV / JSON / text / markdown)
+export { DocumentParser } from "./lib/memory/documentParser";
+export type { ParsedDocument } from "./lib/memory/documentParser";
+
 // Export MCP (Model Context Protocol) components
 export {
   McpClient,
