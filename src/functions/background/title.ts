@@ -5,8 +5,33 @@
 import type { Red } from '../../index';
 import type { ChatOllama } from '@langchain/ollama';
 import { extractThinking } from '../../lib/utils/thinking';
-import { getDatabase } from '../../lib/memory/database';
 import { invokeWithRetry } from '../../lib/utils/retry';
+
+/**
+ * Update the conversation title on the canonical user_conversations doc.
+ * Matches by _id (ObjectId) when possible, otherwise by a schema-less
+ * `conversationId` field (quietly no-ops if neither matches).
+ */
+async function persistTitle(conversationId: string, title: string): Promise<void> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mongoose = require('mongoose');
+    if (mongoose.connection.readyState !== 1) return;
+    const db = mongoose.connection.db;
+    if (!db) return;
+    const { ObjectId } = mongoose.Types;
+    const filter = ObjectId.isValid(conversationId)
+      ? { _id: new ObjectId(conversationId) }
+      : { conversationId };
+    await db.collection('user_conversations').updateOne(
+      filter,
+      { $set: { title, updatedAt: new Date() } },
+    );
+  } catch (err) {
+    console.warn('[Title] Failed to persist title to user_conversations:',
+      err instanceof Error ? err.message : String(err));
+  }
+}
 
 /**
  * Generate a title for the conversation based on the first few messages
@@ -81,11 +106,10 @@ ${conversationText}`;
     // Store title in Redis metadata (use memory manager for direct access)
     const metaKey = `conversation:${conversationId}:metadata`;
     await red.memory['redis'].hset(metaKey, 'title', title);
-    
-    // Also update title in MongoDB database
-    const database = await getDatabase();
-    await database.updateConversationTitle(conversationId, title);
-    
+
+    // Also update title on the canonical user_conversations doc
+    await persistTitle(conversationId, title);
+
     console.log(`[Red] Generated title for ${conversationId}: "${title}"`);
   } catch (err) {
     console.error('[Red] Title generation failed:', err);
@@ -106,11 +130,10 @@ export async function setConversationTitle(
     'title': title,
     'titleSetByUser': 'true'
   });
-  
-  // Also update title in MongoDB database
-  const database = await getDatabase();
-  await database.updateConversationTitle(conversationId, title);
-  
+
+  // Also update title on the canonical user_conversations doc
+  await persistTitle(conversationId, title);
+
   console.log(`[Red] User set title for ${conversationId}: "${title}"`);
 }
 

@@ -157,10 +157,13 @@ class DatabaseManager {
   private collections: Map<string, Collection<any>> = new Map();
   private connectionPromise: Promise<void> | null = null;
 
-  // Pre-defined collection names
+  // Pre-defined collection names.
+  // NOTE: `messages` and `conversations` collections are deliberately
+  // absent — the engine writes messages into the embedded
+  // `user_conversations.messages[]` array (see MemoryManager and
+  // ConversationPublisher). This class handles cross-cutting concerns
+  // like logs, generations, and thoughts only.
   private readonly COLLECTIONS = {
-    MESSAGES: 'messages',
-    CONVERSATIONS: 'conversations',
     LOGS: 'logs',
     GENERATIONS: 'generations',
     THOUGHTS: 'thoughts',
@@ -228,35 +231,14 @@ class DatabaseManager {
   }
 
   /**
-   * Initialize collections with indexes
+   * Initialize collections with indexes.
+   *
+   * Only logs/generations/thoughts live here. Messages and conversations
+   * are stored in the webapp-managed `user_conversations` collection,
+   * which has its own indexes declared in the webapp schema.
    */
   private async initializeCollections(): Promise<void> {
     if (!this.db) throw new Error('Database not connected');
-
-    // Messages collection
-    const messages = this.db.collection<StoredMessage>(this.COLLECTIONS.MESSAGES);
-    await messages.createIndex({ conversationId: 1, timestamp: 1 });
-    await messages.createIndex({ timestamp: -1 });
-    
-    // Try to create unique index on messageId, but don't fail if it exists or has duplicates
-    try {
-      await messages.createIndex({ messageId: 1 }, { unique: true, sparse: true });
-    } catch (error: any) {
-      if (error.code === 11000) {
-        console.warn('[Database] ⚠️ Duplicate messageId values exist. Run migration to fix: npm run db:fix-messageids');
-      } else if (error.codeName !== 'IndexOptionsConflict' && error.codeName !== 'IndexAlreadyExists') {
-        console.warn('[Database] ⚠️ Failed to create messageId index:', error.message);
-      }
-    }
-    
-    this.collections.set(this.COLLECTIONS.MESSAGES, messages);
-
-    // Conversations collection
-    const conversations = this.db.collection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
-    await conversations.createIndex({ conversationId: 1 }, { unique: true });
-    await conversations.createIndex({ updatedAt: -1 });
-    await conversations.createIndex({ userId: 1 });
-    this.collections.set(this.COLLECTIONS.CONVERSATIONS, conversations);
 
     // Logs collection with 6-month TTL
     const logs = this.db.collection<StoredLog>(this.COLLECTIONS.LOGS);
@@ -490,201 +472,6 @@ class DatabaseManager {
   }
 
   // ==========================================================================
-  // MESSAGE OPERATIONS (Backward Compatible)
-  // ==========================================================================
-
-  // ==========================================================================
-  // MESSAGE OPERATIONS (Backward Compatible)
-  // ==========================================================================
-
-  /**
-   * Store a message in the database
-   */
-  async storeMessage(message: Omit<StoredMessage, '_id'>): Promise<ObjectId> {
-    await this.ensureConnected();
-    const messagesCol = this.getCollection<StoredMessage>(this.COLLECTIONS.MESSAGES);
-    
-    console.log(`[Database] storeMessage called - messageId:${message.messageId}, role:${message.role}`);
-    try {
-      const result = await messagesCol.insertOne({
-        ...message,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      } as any);
-      
-      console.log(`[Database] Message stored successfully - messageId:${message.messageId}, _id:${result.insertedId}`);
-      
-      // Update conversation's updatedAt timestamp
-      const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
-      await conversationsCol.updateOne(
-        { conversationId: message.conversationId },
-        { 
-          $set: { updatedAt: new Date() },
-          $inc: { 'metadata.messageCount': 1 },
-        },
-        { upsert: true }
-      );
-      
-      return result.insertedId;
-    } catch (error: any) {
-      // If duplicate key error (code 11000), message already exists - silently ignore
-      if (error.code === 11000) {
-        console.log(`[Database] Message ${message.messageId} already exists, skipping duplicate`);
-        // Return a dummy ObjectId since we don't have the real one
-        return new ObjectId();
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Store multiple messages in bulk
-   */
-  async storeMessages(messages: Omit<StoredMessage, '_id'>[]): Promise<void> {
-    if (messages.length === 0) return;
-    
-    await this.ensureConnected();
-    const messagesCol = this.getCollection<StoredMessage>(this.COLLECTIONS.MESSAGES);
-    
-    await messagesCol.insertMany(messages.map(msg => ({
-      ...msg,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    })) as any);
-    
-    // Update conversation timestamp
-    const conversationId = messages[0].conversationId;
-    const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
-    await conversationsCol.updateOne(
-      { conversationId },
-      { 
-        $set: { updatedAt: new Date() },
-        $inc: { 'metadata.messageCount': messages.length },
-      },
-      { upsert: true }
-    );
-  }
-
-  /**
-   * Get messages for a conversation
-   * @param limit - Maximum number of messages to retrieve (0 = all)
-   * @param skip - Number of messages to skip (for pagination)
-   */
-  async getMessages(conversationId: string, limit: number = 0, skip: number = 0): Promise<StoredMessage[]> {
-    await this.ensureConnected();
-    const messagesCol = this.getCollection<StoredMessage>(this.COLLECTIONS.MESSAGES);
-    
-    const query = messagesCol
-      .find({ conversationId })
-      .sort({ timestamp: 1 })
-      .skip(skip);
-    
-    if (limit > 0) {
-      query.limit(limit);
-    }
-    
-    return await query.toArray() as any;
-  }
-
-  /**
-   * Get the last N messages for a conversation
-   */
-  async getLastMessages(conversationId: string, count: number): Promise<StoredMessage[]> {
-    await this.ensureConnected();
-    const messagesCol = this.getCollection<StoredMessage>(this.COLLECTIONS.MESSAGES);
-    
-    const messages = await messagesCol
-      .find({ conversationId })
-      .sort({ timestamp: -1 })
-      .limit(count)
-      .toArray();
-    
-    // Reverse to get chronological order
-    return messages.reverse() as any;
-  }
-
-  /**
-   * Get message count for a conversation
-   */
-  async getMessageCount(conversationId: string): Promise<number> {
-    await this.ensureConnected();
-    const messagesCol = this.getCollection<StoredMessage>(this.COLLECTIONS.MESSAGES);
-    return await messagesCol.countDocuments({ conversationId });
-  }
-
-  // ==========================================================================
-  // CONVERSATION OPERATIONS (Backward Compatible)
-  // ==========================================================================
-
-  /**
-   * Create or update a conversation
-   */
-  async upsertConversation(conversation: Omit<Conversation, '_id'>): Promise<void> {
-    await this.ensureConnected();
-    const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
-    
-    await conversationsCol.updateOne(
-      { conversationId: conversation.conversationId },
-      { 
-        $set: { ...conversation, updatedAt: new Date() },
-        $setOnInsert: { createdAt: new Date() }
-      },
-      { upsert: true }
-    );
-  }
-
-  /**
-   * Update conversation title
-   */
-  async updateConversationTitle(conversationId: string, title: string): Promise<void> {
-    await this.ensureConnected();
-    const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
-    
-    await conversationsCol.updateOne(
-      { conversationId },
-      { 
-        $set: { title, updatedAt: new Date() }
-      }
-    );
-  }
-
-  /**
-   * Get a conversation by ID
-   */
-  async getConversation(conversationId: string): Promise<Conversation | null> {
-    await this.ensureConnected();
-    const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
-    return await conversationsCol.findOne({ conversationId }) as any;
-  }
-
-  /**
-   * Get all conversations (sorted by most recent)
-   */
-  async getConversations(limit: number = 50, skip: number = 0): Promise<Conversation[]> {
-    await this.ensureConnected();
-    const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
-    
-    return await conversationsCol
-      .find({})
-      .sort({ updatedAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .toArray() as any;
-  }
-
-  /**
-   * Delete a conversation and all its messages
-   */
-  async deleteConversation(conversationId: string): Promise<void> {
-    await this.ensureConnected();
-    const messagesCol = this.getCollection<StoredMessage>(this.COLLECTIONS.MESSAGES);
-    const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
-    
-    await messagesCol.deleteMany({ conversationId });
-    await conversationsCol.deleteOne({ conversationId });
-  }
-
-  // ==========================================================================
   // LOG OPERATIONS (New)
   // ==========================================================================
 
@@ -762,7 +549,9 @@ class DatabaseManager {
   }
 
   /**
-   * Get all conversations that have logs with counts and metadata
+   * Get all conversations that have logs with counts and metadata.
+   * Titles are looked up in `user_conversations` by _id (the logs'
+   * conversationId is usually the ObjectId string from the webapp).
    */
   async getConversationsWithLogs(): Promise<Array<{
     conversationId: string;
@@ -773,9 +562,9 @@ class DatabaseManager {
   }>> {
     await this.ensureConnected();
     const logsCol = this.getCollection<StoredLog>(this.COLLECTIONS.LOGS);
-    const conversationsCol = this.getCollection<Conversation>(this.COLLECTIONS.CONVERSATIONS);
     const generationsCol = this.getCollection<Generation>(this.COLLECTIONS.GENERATIONS);
-    
+    const userConversationsCol = this.db!.collection('user_conversations');
+
     // Aggregate logs by conversationId
     const logAggregation = await logsCol.aggregate([
       {
@@ -787,7 +576,7 @@ class DatabaseManager {
       },
       { $sort: { lastLogTime: -1 } }
     ]).toArray();
-    
+
     // Get generation counts
     const generationAggregation = await generationsCol.aggregate([
       {
@@ -797,30 +586,41 @@ class DatabaseManager {
         }
       }
     ]).toArray();
-    
+
     // Create maps for quick lookup
     const generationMap = new Map(
       generationAggregation.map(g => [g._id, g.generationCount])
     );
-    
-    // Build result with conversation titles
+
+    // Build result with conversation titles (looked up in user_conversations)
     const results = await Promise.all(
       logAggregation.map(async (agg: any) => {
         const conversationId = agg._id;
-        
-        // Try to get conversation title
-        const conversation = await conversationsCol.findOne({ conversationId });
-        
+
+        // Titles live on user_conversations. The id in logs is usually a
+        // serialized ObjectId -- try that first, fall back to a raw match
+        // for legacy string ids (quiet null on miss).
+        let title: string | undefined;
+        try {
+          const filter = ObjectId.isValid(conversationId)
+            ? { _id: new ObjectId(conversationId) }
+            : { conversationId };
+          const conversation = await userConversationsCol.findOne(filter, { projection: { title: 1 } });
+          title = conversation?.title as string | undefined;
+        } catch {
+          title = undefined;
+        }
+
         return {
           conversationId,
-          title: conversation?.title,
+          title,
           lastLogTime: agg.lastLogTime,
           logCount: agg.logCount,
           generationCount: generationMap.get(conversationId) || 0
         };
       })
     );
-    
+
     return results;
   }
 
