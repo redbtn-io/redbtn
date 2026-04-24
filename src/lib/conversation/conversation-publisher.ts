@@ -483,6 +483,7 @@ export class ConversationPublisher {
     messageId: string;
     role: string;
     content: string;
+    thinking?: string;
     metadata?: Record<string, unknown>;
   }): Promise<void> {
     try {
@@ -501,24 +502,24 @@ export class ConversationPublisher {
         ? { _id: new ObjectId(this.conversationId) }
         : { conversationId: this.conversationId };
 
-      // Use `id` (not `messageId`) so the archiver's $pull-then-$push dedup
-      // correctly removes any inline-written entry before writing its version.
-      // Without this, both the inline path (here) and the archiver would push
-      // separate entries for the same message.
+      // Invariant: at most ONE messages[] entry per messageId.
+      //
+      // Atomic dedup: the filter `'messages.id': { $ne: params.messageId }`
+      // means MongoDB will only $push when no entry with this id exists yet.
+      // Two concurrent writers with the same messageId will race on this
+      // filter -- whichever commits first wins; the other finds a matching
+      // entry and its update is a no-op. This replaces the old non-atomic
+      // `$pull then $push` pattern which produced duplicates when two
+      // writers both raced past the $pull.
       await db.collection('user_conversations').updateOne(
-        filter,
-        {
-          $pull: { messages: { id: params.messageId } } as any,
-        }
-      );
-      await db.collection('user_conversations').updateOne(
-        filter,
+        { ...filter, 'messages.id': { $ne: params.messageId } },
         {
           $push: {
             messages: {
               id: params.messageId,
               role: params.role,
               content: params.content,
+              ...(params.thinking ? { thinking: params.thinking } : {}),
               metadata: params.metadata,
               timestamp: new Date(),
             },
@@ -528,6 +529,14 @@ export class ConversationPublisher {
             updatedAt: new Date(),
           },
         }
+      );
+
+      // Always bump lastMessageAt/updatedAt on the conversation doc, even if
+      // the push above was a duplicate no-op. Keeps "most recently active"
+      // conversations sorted correctly regardless of which writer won.
+      await db.collection('user_conversations').updateOne(
+        filter,
+        { $set: { lastMessageAt: new Date(), updatedAt: new Date() } },
       );
 
       // Emit stored event
