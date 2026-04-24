@@ -1,17 +1,32 @@
 /**
  * @file src/lib/memory.ts
- * @description Conversation memory management with MongoDB persistence and Redis caching
+ * @description Conversation memory management with MongoDB persistence and Redis caching.
+ *
+ * Canonical storage:
+ *   MongoDB collection `user_conversations`, document shape:
+ *     { _id, userId, messages: [{ id, role, content, thinking?, toolExecutions?,
+ *                                  metadata?, timestamp }], lastMessageAt, updatedAt, ... }
+ *
+ *   The conversationId flowing through this class is a string that is
+ *   usually the ObjectId of the user_conversations document (from the
+ *   webapp). We match it as `_id` when it's a valid ObjectId, otherwise
+ *   we fall back to a (schema-less) `conversationId` field lookup --
+ *   if neither matches we silently no-op.
+ *
+ *   Redis holds a hot cache of the last 100 messages plus
+ *   summary/metadata state; it is never authoritative.
  */
 
 import Redis from 'ioredis';
 import { countTokens, freeTiktoken } from '../utils/tokenizer';
-import { getDatabase, StoredMessage, StoredToolExecution } from './database';
+import { StoredToolExecution } from './database';
 
 export interface ConversationMessage {
   id?: string; // Optional message ID (e.g., msg_1234567890_abc123def)
   role: 'system' | 'user' | 'assistant';
   content: string;
   timestamp: number;
+  thinking?: string; // Optional thinking/reasoning text
   toolExecutions?: StoredToolExecution[]; // Tool executions for this message
 }
 
@@ -36,6 +51,38 @@ export class MemoryManager {
   constructor(redisUrl: string) {
     this.redisUrl = redisUrl;
     this.redis = new Redis(redisUrl);
+  }
+
+  /**
+   * Build a MongoDB filter to match the conversation document in
+   * `user_conversations`. If `conversationId` is a valid ObjectId, match
+   * `_id`; otherwise fall back to a schema-less `conversationId` field
+   * (which doesn't exist on the canonical schema and thus will not match --
+   * that's intentional, we fail quietly for legacy string ids).
+   */
+  private buildConversationFilter(conversationId: string): Record<string, unknown> {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mongoose = require('mongoose');
+    const { ObjectId } = mongoose.Types;
+    return ObjectId.isValid(conversationId)
+      ? { _id: new ObjectId(conversationId) }
+      : { conversationId };
+  }
+
+  /**
+   * Get the mongoose-managed native MongoDB db handle, or null if mongoose
+   * is not connected. All Memory persistence flows through mongoose so we
+   * stay wired to the same connection the rest of the engine uses.
+   */
+  private getMongoDb(): any | null {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const mongoose = require('mongoose');
+      if (mongoose.connection.readyState !== 1) return null;
+      return mongoose.connection.db || null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -159,19 +206,40 @@ export class MemoryManager {
     }
 
     try {
-      // Store in MongoDB for persistence (blocking to ensure consistency)
-      await getDatabase().storeMessage({
-        messageId: message.id,
-        conversationId,
-        role: message.role,
-        content: message.content,
-        timestamp: new Date(message.timestamp),
-        toolExecutions: message.toolExecutions || [],
-        metadata: {}
-      }).catch(err => {
-        console.error('[Memory] Failed to save message to MongoDB:', err.message);
-        throw err; // Re-throw to trigger rollback
-      });
+      // Store in MongoDB for persistence — atomic upsert into
+      // user_conversations.messages[]. The `'messages.id': { $ne: id }`
+      // filter makes concurrent writers with the same messageId safe:
+      // only the first push lands, subsequent ones are silent no-ops.
+      const db = this.getMongoDb();
+      if (db) {
+        const filter = this.buildConversationFilter(conversationId);
+        try {
+          await db.collection('user_conversations').updateOne(
+            { ...filter, 'messages.id': { $ne: message.id } },
+            {
+              $push: {
+                messages: {
+                  id: message.id,
+                  role: message.role,
+                  content: message.content,
+                  timestamp: new Date(message.timestamp),
+                  thinking: message.thinking ?? '',
+                  toolExecutions: message.toolExecutions ?? [],
+                  metadata: {},
+                },
+              },
+              $set: {
+                lastMessageAt: new Date(),
+                updatedAt: new Date(),
+              },
+            }
+          );
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error('[Memory] Failed to save message to MongoDB:', msg);
+          throw err; // Re-throw to trigger rollback
+        }
+      }
 
       // Add to Redis (hot cache)
       await this.redis.rpush(key, JSON.stringify(message));
@@ -206,22 +274,31 @@ export class MemoryManager {
       return messagesJson.map((json: string) => JSON.parse(json));
     }
     
-    // If not in Redis, try to fetch from MongoDB and populate Redis
+    // If not in Redis, try to fetch from user_conversations.messages[] and populate Redis
     try {
-      const db = getDatabase();
-      const dbMessages = await db.getLastMessages(conversationId, this.REDIS_MESSAGE_LIMIT);
-      
-      if (dbMessages.length > 0) {
+      const db = this.getMongoDb();
+      if (!db) return [];
+      const filter = this.buildConversationFilter(conversationId);
+      // $slice: -N returns the last N array elements (chronological tail)
+      const doc = await db.collection('user_conversations').findOne(
+        filter,
+        { projection: { messages: { $slice: -this.REDIS_MESSAGE_LIMIT } } },
+      );
+      const embedded: Array<Record<string, any>> = Array.isArray(doc?.messages) ? doc.messages : [];
+
+      if (embedded.length > 0) {
+        const dbMessages: ConversationMessage[] = embedded.map((m) => ({
+          id: (m.id ?? m.messageId) as string | undefined,
+          role: m.role,
+          content: m.content ?? '',
+          timestamp: m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp) || Date.now(),
+          thinking: typeof m.thinking === 'string' ? m.thinking : undefined,
+          toolExecutions: Array.isArray(m.toolExecutions) ? m.toolExecutions : [],
+        }));
+
         // Populate Redis cache
         const pipeline = this.redis.pipeline();
-        for (const msg of dbMessages) {
-          const convMsg: ConversationMessage = {
-            id: msg.messageId, // Include message ID
-            role: msg.role,
-            content: msg.content,
-            timestamp: msg.timestamp.getTime(),
-            toolExecutions: msg.toolExecutions || [] // Include tool executions
-          };
+        for (const convMsg of dbMessages) {
           pipeline.rpush(key, JSON.stringify(convMsg));
           if (convMsg.id) {
             pipeline.sadd(`${key}:ids`, convMsg.id);
@@ -229,37 +306,36 @@ export class MemoryManager {
         }
         pipeline.expire(`${key}:ids`, this.MESSAGE_ID_INDEX_TTL);
         await pipeline.exec();
-        
-        console.log(`[Memory] Populated Redis cache with ${dbMessages.length} messages from MongoDB for ${conversationId}`);
-        
-        return dbMessages.map(msg => ({
-          id: msg.messageId, // Include message ID
-          role: msg.role,
-          content: msg.content,
-          timestamp: msg.timestamp.getTime(),
-          toolExecutions: msg.toolExecutions || [] // Include tool executions
-        }));
+
+        console.log(`[Memory] Populated Redis cache with ${dbMessages.length} messages from user_conversations for ${conversationId}`);
+        return dbMessages;
       }
     } catch (error) {
       console.warn('[Memory] Failed to fetch from MongoDB:', error instanceof Error ? error.message : String(error));
     }
-    
+
     return [];
   }
 
   /**
-   * Get all messages from MongoDB (for full conversation history)
+   * Get all messages from MongoDB (full conversation history).
+   * Reads the embedded `messages` array from the canonical
+   * `user_conversations` document.
    */
   async getAllMessagesFromDB(conversationId: string): Promise<ConversationMessage[]> {
-    const db = getDatabase();
-    const dbMessages = await db.getMessages(conversationId);
-    
-    return dbMessages.map(msg => ({
-      id: msg.messageId, // Include message ID
-      role: msg.role,
-      content: msg.content,
-      timestamp: msg.timestamp.getTime(),
-      toolExecutions: msg.toolExecutions || [] // Include tool executions
+    const db = this.getMongoDb();
+    if (!db) return [];
+    const filter = this.buildConversationFilter(conversationId);
+    const doc = await db.collection('user_conversations').findOne(filter);
+    const embedded: Array<Record<string, any>> = Array.isArray(doc?.messages) ? doc.messages : [];
+
+    return embedded.map((m) => ({
+      id: (m.id ?? m.messageId) as string | undefined,
+      role: m.role,
+      content: m.content ?? '',
+      timestamp: m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp) || Date.now(),
+      thinking: typeof m.thinking === 'string' ? m.thinking : undefined,
+      toolExecutions: Array.isArray(m.toolExecutions) ? m.toolExecutions : [],
     }));
   }
 
@@ -324,21 +400,43 @@ export class MemoryManager {
   }
 
   /**
-   * Update conversation metadata
+   * Update conversation metadata.
+   * - Writes hot stats (messageCount, totalTokens, lastUpdated) to Redis.
+   * - Writes `metadata.messageCount` + `updatedAt` directly onto the
+   *   `user_conversations` document. No separate conversations collection.
    */
   private async updateMetadata(conversationId: string): Promise<void> {
     const key = `conversations:${conversationId}:metadata`;
     const messageCount = await this.redis.llen(`conversations:${conversationId}:messages`);
-    
+
     // Calculate total tokens
     const messages = await this.getMessages(conversationId);
     const totalTokens = await this.countMessagesTokens(messages);
-    
+
     await this.redis.hset(key, {
       messageCount: messageCount.toString(),
       lastUpdated: Date.now().toString(),
-      totalTokens: totalTokens.toString()
+      totalTokens: totalTokens.toString(),
     });
+
+    // Reflect the count onto the canonical user_conversations doc.
+    try {
+      const db = this.getMongoDb();
+      if (!db) return;
+      const filter = this.buildConversationFilter(conversationId);
+      await db.collection('user_conversations').updateOne(
+        filter,
+        {
+          $set: {
+            'metadata.messageCount': messageCount,
+            updatedAt: new Date(),
+          },
+        },
+      );
+    } catch (err) {
+      console.warn('[Memory] Failed to update metadata on user_conversations:',
+        err instanceof Error ? err.message : String(err));
+    }
   }
 
   /**
