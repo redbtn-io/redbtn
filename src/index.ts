@@ -11,7 +11,6 @@ import { ChatOpenAI } from "@langchain/openai";
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 
 import { MemoryManager } from "./lib/memory/memory";
-import { PersistentLogger } from "./lib/logs/persistent-logger";
 import { createGeminiModel, createOpenAIModel } from "./lib/models";
 import * as background from "./functions/background";
 import { McpRegistry } from "./lib/mcp/registry";
@@ -27,14 +26,8 @@ export {
   DatabaseManager,
   StoredMessage,
   Conversation,
-  StoredLog,
-  Generation,
   BaseDocument,
 } from "./lib/memory/database";
-
-// Export logging system
-export * from "./lib/logs";
-export { PersistentLogger } from "./lib/logs/persistent-logger";
 
 // Export thinking utilities for DeepSeek-R1 and similar models
 export { extractThinking, logThinking, extractAndLogThinking } from "./lib/utils/thinking";
@@ -201,7 +194,6 @@ export class Red {
   public openAIModel?: ChatOpenAI;
   public geminiModel?: ChatGoogleGenerativeAI;
   public memory!: MemoryManager;
-  public logger!: PersistentLogger;
   public redlog!: RedLog;
   public mcpRegistry!: McpRegistry;
   public graphRegistry!: GraphRegistry;
@@ -229,9 +221,6 @@ export class Red {
     // Initialize Redis connection
     const redis = new (require('ioredis'))(config.redisUrl);
     this.redis = redis;
-
-    // Initialize logger with MongoDB persistence
-    this.logger = new PersistentLogger(redis, this.nodeId || 'default');
 
     // Initialize RedLog for structured logging via @redbtn/redlog (used by RunPublisher)
     this.redlog = RedLog.create({
@@ -438,90 +427,14 @@ export class Red {
     args: Record<string, unknown>,
     context?: { conversationId?: string; generationId?: string; messageId?: string; credentials?: any }
   ): Promise<any> {
-    const startTime = Date.now();
-
-    // Log tool call start
-    await this.logger.log({
-      level: 'info',
-      category: 'mcp',
-      message: `📡 MCP Tool Call: ${toolName}`,
+    // Tool start/complete/error events flow through RunPublisher.toolStart/toolComplete/toolError
+    // which already persist to redlogs. No additional logging needed here.
+    return await this.mcpRegistry.callTool(toolName, args, {
       conversationId: context?.conversationId,
       generationId: context?.generationId,
-      metadata: {
-        toolName,
-        args: this.sanitizeArgsForLogging(args),
-        protocol: 'MCP/JSON-RPC 2.0'
-      }
+      messageId: context?.messageId,
+      credentials: context?.credentials,
     });
-
-    try {
-      const result = await this.mcpRegistry.callTool(toolName, args, {
-        conversationId: context?.conversationId,
-        generationId: context?.generationId,
-        messageId: context?.messageId,
-        credentials: context?.credentials,
-      });
-      const duration = Date.now() - startTime;
-
-      // Log success
-      await this.logger.log({
-        level: result.isError ? 'warn' : 'success',
-        category: 'mcp',
-        message: result.isError
-          ? `⚠️ MCP Tool Error: ${toolName} (${duration}ms)`
-          : `✓ MCP Tool Complete: ${toolName} (${duration}ms)`,
-        conversationId: context?.conversationId,
-        generationId: context?.generationId,
-        metadata: {
-          toolName,
-          duration,
-          isError: result.isError || false,
-          resultLength: result.content?.[0]?.text?.length || 0,
-          protocol: 'MCP/JSON-RPC 2.0'
-        }
-      });
-
-      return result;
-
-    } catch (error) {
-      const duration = Date.now() - startTime;
-      const errorMessage = error instanceof Error ? error.message : String(error);
-
-      // Log error
-      await this.logger.log({
-        level: 'error',
-        category: 'mcp',
-        message: `✗ MCP Tool Failed: ${toolName} (${duration}ms)`,
-        conversationId: context?.conversationId,
-        generationId: context?.generationId,
-        metadata: {
-          toolName,
-          duration,
-          error: errorMessage,
-          protocol: 'MCP/JSON-RPC 2.0'
-        }
-      });
-
-      throw error;
-    }
-  }
-
-  /**
-   * Sanitize arguments for logging (remove sensitive data, truncate long values)
-   */
-  private sanitizeArgsForLogging(args: Record<string, unknown>): Record<string, unknown> {
-    const sanitized: Record<string, unknown> = {};
-
-    for (const [key, value] of Object.entries(args)) {
-      if (typeof value === 'string') {
-        // Truncate long strings
-        sanitized[key] = value.length > 200 ? value.substring(0, 200) + '...' : value;
-      } else {
-        sanitized[key] = value;
-      }
-    }
-
-    return sanitized;
   }
 
   /**
