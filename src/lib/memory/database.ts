@@ -86,70 +86,16 @@ export interface Conversation extends BaseDocument {
   };
 }
 
-/**
- * Stored log entry interface for system/generation logs
- */
-export interface StoredLog extends BaseDocument {
-  logId: string;
-  generationId?: string;
-  conversationId?: string;
-  level: 'info' | 'warn' | 'error' | 'debug' | 'trace';
-  category: string;
-  message: string;
-  timestamp: Date;
-  nodeId?: string;
-  metadata?: {
-    duration?: number;
-    statusCode?: number;
-    error?: any;
-    [key: string]: any;
-  };
-}
-
-/**
- * Stored thought/reasoning interface for LLM thinking content
- * Stored separately from messages to keep conversation context clean
- */
-export interface StoredThought extends BaseDocument {
-  thoughtId: string;
-  messageId?: string; // Associated message ID (if linked to a specific message)
-  conversationId: string;
-  generationId?: string;
-  source: 'chat' | 'router' | 'toolPicker'; // Where the thinking came from
-  content: string; // The actual thinking/reasoning text
-  timestamp: Date;
-  metadata?: {
-    model?: string;
-    [key: string]: any;
-  };
-}
-
-/**
- * Generation metadata interface for tracking AI generations
- */
-export interface Generation extends BaseDocument {
-  generationId: string;
-  conversationId: string;
-  status: 'pending' | 'streaming' | 'completed' | 'failed';
-  model?: string;
-  nodeId?: string;
-  startTime: Date;
-  endTime?: Date;
-  duration?: number;
-  tokensUsed?: number;
-  error?: string;
-  metadata?: {
-    [key: string]: any;
-  };
-}
-
 // ============================================================================
 // DATABASE MANAGER CLASS
 // ============================================================================
 
 /**
- * Universal database manager for MongoDB operations
- * Supports messages, conversations, logs, generations, and generic collections
+ * Universal database manager for MongoDB operations.
+ * Provides generic CRUD against arbitrary collections via `collection<T>(name)`.
+ * Structured engine logging lives in `@redbtn/redlog` (collection: `redlogs`),
+ * and conversation/message storage is handled by the webapp-managed
+ * `user_conversations` collection.
  */
 class DatabaseManager {
   private client: MongoClient | null = null;
@@ -157,17 +103,12 @@ class DatabaseManager {
   private collections: Map<string, Collection<any>> = new Map();
   private connectionPromise: Promise<void> | null = null;
 
-  // Pre-defined collection names.
-  // NOTE: `messages` and `conversations` collections are deliberately
-  // absent — the engine writes messages into the embedded
-  // `user_conversations.messages[]` array (see MemoryManager and
-  // ConversationPublisher). This class handles cross-cutting concerns
-  // like logs, generations, and thoughts only.
-  private readonly COLLECTIONS = {
-    LOGS: 'logs',
-    GENERATIONS: 'generations',
-    THOUGHTS: 'thoughts',
-  };
+  // No pre-defined collections. Messages and conversations live in
+  // the webapp-managed `user_conversations` collection (the engine
+  // writes into its embedded `messages[]` via MemoryManager and
+  // ConversationPublisher). Structured logs are handled by
+  // `@redbtn/redlog` against the `redlogs` collection. Anything else
+  // can be opened on-demand via `db.collection<T>(name)`.
 
   constructor(private mongoUrl: string = 'mongodb://localhost:27017', private dbName: string = 'redbtn_ai') {}
 
@@ -233,59 +174,19 @@ class DatabaseManager {
   /**
    * Initialize collections with indexes.
    *
-   * Only logs/generations/thoughts live here. Messages and conversations
-   * are stored in the webapp-managed `user_conversations` collection,
-   * which has its own indexes declared in the webapp schema.
+   * No collections are pre-initialized. Use `db.collection<T>(name)` to
+   * open arbitrary collections on demand.
    */
   private async initializeCollections(): Promise<void> {
     if (!this.db) throw new Error('Database not connected');
-
-    // Logs collection with 6-month TTL
-    const logs = this.db.collection<StoredLog>(this.COLLECTIONS.LOGS);
-    await logs.createIndex({ timestamp: -1 });
-    await logs.createIndex({ generationId: 1 });
-    await logs.createIndex({ conversationId: 1 });
-    await logs.createIndex({ level: 1 });
-    await logs.createIndex({ category: 1 });
-    await logs.createIndex({ logId: 1 }, { unique: true });
-    // TTL index: automatically delete logs after 6 months (15552000 seconds)
-    await logs.createIndex({ timestamp: 1 }, { expireAfterSeconds: 15552000 });
-    this.collections.set(this.COLLECTIONS.LOGS, logs);
-
-    // Generations collection
-    const generations = this.db.collection<Generation>(this.COLLECTIONS.GENERATIONS);
-    await generations.createIndex({ generationId: 1 }, { unique: true });
-    await generations.createIndex({ conversationId: 1 });
-    await generations.createIndex({ status: 1 });
-    await generations.createIndex({ startTime: -1 });
-    await generations.createIndex({ nodeId: 1 });
-    this.collections.set(this.COLLECTIONS.GENERATIONS, generations);
-
-    // Thoughts collection (stores thinking/reasoning separately from messages)
-    const thoughts = this.db.collection<StoredThought>(this.COLLECTIONS.THOUGHTS);
-    await thoughts.createIndex({ thoughtId: 1 }, { unique: true });
-    
-    // Single field indexes for basic queries
-    await thoughts.createIndex({ conversationId: 1 });
-    await thoughts.createIndex({ messageId: 1 });
-    await thoughts.createIndex({ generationId: 1 });
-    await thoughts.createIndex({ timestamp: -1 });
-    await thoughts.createIndex({ source: 1 });
-    
-    // Composite indexes for optimized multi-field queries
-    await thoughts.createIndex({ messageId: 1, timestamp: -1 });           // messageId + time sort
-    await thoughts.createIndex({ conversationId: 1, timestamp: -1 });      // conversation + time sort
-    await thoughts.createIndex({ generationId: 1, timestamp: 1 });         // generation + time sort
-    await thoughts.createIndex({ source: 1, conversationId: 1, timestamp: -1 }); // multi-field query with sort
-    
-    this.collections.set(this.COLLECTIONS.THOUGHTS, thoughts);
+    // intentionally empty
   }
 
   /**
    * Ensure connection is established
    */
   private async ensureConnected(): Promise<void> {
-    if (!this.db || this.collections.size === 0) {
+    if (!this.db) {
       await this.connect();
     }
   }
@@ -469,326 +370,6 @@ class DatabaseManager {
     await this.ensureConnected();
     const col = await this.collection<T>(collectionName);
     return await col.countDocuments(filter);
-  }
-
-  // ==========================================================================
-  // LOG OPERATIONS (New)
-  // ==========================================================================
-
-  /**
-   * Store a log entry
-   */
-  async storeLog(log: Omit<StoredLog, '_id'>): Promise<ObjectId> {
-    return await this.insertOne<StoredLog>(this.COLLECTIONS.LOGS, log);
-  }
-
-  /**
-   * Store multiple log entries
-   */
-  async storeLogs(logs: Omit<StoredLog, '_id'>[]): Promise<ObjectId[]> {
-    return await this.insertMany<StoredLog>(this.COLLECTIONS.LOGS, logs);
-  }
-
-  /**
-   * Get logs by generation ID
-   */
-  async getLogsByGeneration(generationId: string, limit?: number): Promise<StoredLog[]> {
-    await this.ensureConnected();
-    const logsCol = this.getCollection<StoredLog>(this.COLLECTIONS.LOGS);
-    
-    const query = logsCol.find({ generationId }).sort({ timestamp: 1 });
-    if (limit) query.limit(limit);
-    
-    return await query.toArray() as any;
-  }
-
-  /**
-   * Get logs by conversation ID
-   */
-  async getLogsByConversation(conversationId: string, limit?: number): Promise<StoredLog[]> {
-    await this.ensureConnected();
-    const logsCol = this.getCollection<StoredLog>(this.COLLECTIONS.LOGS);
-    
-    const query = logsCol.find({ conversationId }).sort({ timestamp: -1 });
-    if (limit) query.limit(limit);
-    
-    return await query.toArray() as any;
-  }
-
-  /**
-   * Get logs by level
-   */
-  async getLogsByLevel(level: StoredLog['level'], limit?: number): Promise<StoredLog[]> {
-    await this.ensureConnected();
-    const logsCol = this.getCollection<StoredLog>(this.COLLECTIONS.LOGS);
-    
-    const query = logsCol.find({ level }).sort({ timestamp: -1 });
-    if (limit) query.limit(limit);
-    
-    return await query.toArray() as any;
-  }
-
-  /**
-   * Get logs with filters
-   */
-  async getLogs(filter: Partial<StoredLog> = {}, limit: number = 100, skip: number = 0): Promise<StoredLog[]> {
-    return await this.find<StoredLog>(this.COLLECTIONS.LOGS, filter as Filter<StoredLog>, {
-      sort: { timestamp: -1 },
-      limit,
-      skip,
-    }) as any;
-  }
-
-  /**
-   * Delete old logs (older than specified date)
-   */
-  async deleteOldLogs(olderThan: Date): Promise<number> {
-    return await this.deleteMany<StoredLog>(this.COLLECTIONS.LOGS, {
-      timestamp: { $lt: olderThan }
-    } as Filter<StoredLog>);
-  }
-
-  /**
-   * Get all conversations that have logs with counts and metadata.
-   * Titles are looked up in `user_conversations` by _id (the logs'
-   * conversationId is usually the ObjectId string from the webapp).
-   */
-  async getConversationsWithLogs(): Promise<Array<{
-    conversationId: string;
-    title?: string;
-    lastLogTime: Date;
-    logCount: number;
-    generationCount: number;
-  }>> {
-    await this.ensureConnected();
-    const logsCol = this.getCollection<StoredLog>(this.COLLECTIONS.LOGS);
-    const generationsCol = this.getCollection<Generation>(this.COLLECTIONS.GENERATIONS);
-    const userConversationsCol = this.db!.collection('user_conversations');
-
-    // Aggregate logs by conversationId
-    const logAggregation = await logsCol.aggregate([
-      {
-        $group: {
-          _id: '$conversationId',
-          logCount: { $sum: 1 },
-          lastLogTime: { $max: '$timestamp' }
-        }
-      },
-      { $sort: { lastLogTime: -1 } }
-    ]).toArray();
-
-    // Get generation counts
-    const generationAggregation = await generationsCol.aggregate([
-      {
-        $group: {
-          _id: '$conversationId',
-          generationCount: { $sum: 1 }
-        }
-      }
-    ]).toArray();
-
-    // Create maps for quick lookup
-    const generationMap = new Map(
-      generationAggregation.map(g => [g._id, g.generationCount])
-    );
-
-    // Build result with conversation titles (looked up in user_conversations)
-    const results = await Promise.all(
-      logAggregation.map(async (agg: any) => {
-        const conversationId = agg._id;
-
-        // Titles live on user_conversations. The id in logs is usually a
-        // serialized ObjectId -- try that first, fall back to a raw match
-        // for legacy string ids (quiet null on miss).
-        let title: string | undefined;
-        try {
-          const filter = ObjectId.isValid(conversationId)
-            ? { _id: new ObjectId(conversationId) }
-            : { conversationId };
-          const conversation = await userConversationsCol.findOne(filter, { projection: { title: 1 } });
-          title = conversation?.title as string | undefined;
-        } catch {
-          title = undefined;
-        }
-
-        return {
-          conversationId,
-          title,
-          lastLogTime: agg.lastLogTime,
-          logCount: agg.logCount,
-          generationCount: generationMap.get(conversationId) || 0
-        };
-      })
-    );
-
-    return results;
-  }
-
-  // ==========================================================================
-  // GENERATION OPERATIONS (New)
-  // ==========================================================================
-
-  /**
-   * Store a generation entry
-   */
-  async storeGeneration(generation: Omit<Generation, '_id'>): Promise<ObjectId> {
-    return await this.insertOne<Generation>(this.COLLECTIONS.GENERATIONS, generation);
-  }
-
-  /**
-   * Update generation status
-   */
-  async updateGenerationStatus(
-    generationId: string,
-    status: Generation['status'],
-    metadata?: Partial<Generation>
-  ): Promise<boolean> {
-    return await this.updateOne<Generation>(
-      this.COLLECTIONS.GENERATIONS,
-      { generationId } as Filter<Generation>,
-      {
-        $set: {
-          status,
-          ...(status === 'completed' || status === 'failed' ? { endTime: new Date() } : {}),
-          ...metadata,
-        } as any,
-      }
-    );
-  }
-
-  /**
-   * Get a generation by ID
-   */
-  async getGeneration(generationId: string): Promise<Generation | null> {
-    return await this.findOne<Generation>(this.COLLECTIONS.GENERATIONS, {
-      generationId
-    } as Filter<Generation>) as any;
-  }
-
-  /**
-   * Get generations by conversation ID
-   */
-  async getGenerationsByConversation(conversationId: string, limit?: number): Promise<Generation[]> {
-    return await this.find<Generation>(
-      this.COLLECTIONS.GENERATIONS,
-      { conversationId } as Filter<Generation>,
-      {
-        sort: { startTime: -1 },
-        limit,
-      }
-    ) as any;
-  }
-
-  /**
-   * Get active generations (pending or streaming)
-   */
-  async getActiveGenerations(): Promise<Generation[]> {
-    return await this.find<Generation>(
-      this.COLLECTIONS.GENERATIONS,
-      { status: { $in: ['pending', 'streaming'] } } as Filter<Generation>,
-      { sort: { startTime: -1 } }
-    ) as any;
-  }
-
-  /**
-   * Delete old generations (older than specified date)
-   */
-  async deleteOldGenerations(olderThan: Date): Promise<number> {
-    return await this.deleteMany<Generation>(this.COLLECTIONS.GENERATIONS, {
-      startTime: { $lt: olderThan },
-      status: { $in: ['completed', 'failed'] }
-    } as Filter<Generation>);
-  }
-
-  // ==========================================================================
-  // THOUGHT OPERATIONS
-  // ==========================================================================
-
-  /**
-   * Store a thought/reasoning entry
-   */
-  async storeThought(thought: Omit<StoredThought, '_id'>): Promise<ObjectId> {
-    return await this.insertOne<StoredThought>(this.COLLECTIONS.THOUGHTS, thought);
-  }
-
-  /**
-   * Store multiple thoughts in bulk
-   */
-  async storeThoughts(thoughts: Omit<StoredThought, '_id'>[]): Promise<void> {
-    if (thoughts.length === 0) return;
-    await this.insertMany<StoredThought>(this.COLLECTIONS.THOUGHTS, thoughts);
-  }
-
-  /**
-   * Get thought by ID
-   */
-  async getThought(thoughtId: string): Promise<StoredThought | null> {
-    return await this.findOne<StoredThought>(this.COLLECTIONS.THOUGHTS, {
-      thoughtId
-    } as Filter<StoredThought>) as any;
-  }
-
-  /**
-   * Get thoughts for a specific message
-   */
-  async getThoughtsByMessage(messageId: string): Promise<StoredThought[]> {
-    return await this.find<StoredThought>(
-      this.COLLECTIONS.THOUGHTS,
-      { messageId } as Filter<StoredThought>,
-      { sort: { timestamp: 1 } }
-    ) as any;
-  }
-
-  /**
-   * Get thoughts for a conversation
-   */
-  async getThoughtsByConversation(conversationId: string, limit?: number): Promise<StoredThought[]> {
-    return await this.find<StoredThought>(
-      this.COLLECTIONS.THOUGHTS,
-      { conversationId } as Filter<StoredThought>,
-      {
-        sort: { timestamp: -1 },
-        limit,
-      }
-    ) as any;
-  }
-
-  /**
-   * Get thoughts for a generation
-   */
-  async getThoughtsByGeneration(generationId: string): Promise<StoredThought[]> {
-    return await this.find<StoredThought>(
-      this.COLLECTIONS.THOUGHTS,
-      { generationId } as Filter<StoredThought>,
-      { sort: { timestamp: 1 } }
-    ) as any;
-  }
-
-  /**
-   * Get thoughts by source (chat, router, toolPicker)
-   */
-  async getThoughtsBySource(source: string, conversationId?: string, limit?: number): Promise<StoredThought[]> {
-    const filter: any = { source };
-    if (conversationId) {
-      filter.conversationId = conversationId;
-    }
-    return await this.find<StoredThought>(
-      this.COLLECTIONS.THOUGHTS,
-      filter as Filter<StoredThought>,
-      {
-        sort: { timestamp: -1 },
-        limit,
-      }
-    ) as any;
-  }
-
-  /**
-   * Delete old thoughts (older than specified date)
-   */
-  async deleteOldThoughts(olderThan: Date): Promise<number> {
-    return await this.deleteMany<StoredThought>(this.COLLECTIONS.THOUGHTS, {
-      timestamp: { $lt: olderThan }
-    } as Filter<StoredThought>);
   }
 
   // ==========================================================================
