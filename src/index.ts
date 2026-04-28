@@ -86,7 +86,7 @@ export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } fro
 // Export run utilities (used by SSE stream endpoints)
 export { RunKeys } from "./lib/run/types";
 export type { AudioChunkEvent, AttachmentEvent, AttachmentKind } from "./lib/run/types";
-export { getRunState, getActiveRunForConversation, publishRunError, ARCHIVE_QUEUE_NAMES } from "./lib/run/run-publisher";
+export { getRunState, getActiveRunForConversation, publishRunError, publishRunInterrupt, ARCHIVE_QUEUE_NAMES } from "./lib/run/run-publisher";
 
 // Export unified run trigger types and enrichment pipeline (Phase 1)
 export type {

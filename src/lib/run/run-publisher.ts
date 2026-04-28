@@ -429,6 +429,59 @@ export class RunPublisher {
     });
   }
 
+  /**
+   * Mark the run as interrupted by an external actor and publish the terminal
+   * `run_interrupted` event.
+   *
+   * Symmetric with `complete()` and `fail()` — emitted when the engine's
+   * `AbortController` for this run trips because someone published to the
+   * `run:interrupt:{runId}` channel.
+   *
+   * State at the last completed graph node has already been written to
+   * MongoCheckpointer (graphcheckpoints collection, 7-day TTL); a new run can
+   * resume from it by passing `resumeFromRunId: <prevRunId>` in RunOptions.
+   * The replay materialises prior channel values onto `state.previousRun` so
+   * graph nodes can read them via `{{state.previousRun.someField}}` templates.
+   *
+   * @param reason - Optional free-form reason supplied by the interrupter
+   */
+  async interrupt(reason?: string): Promise<void> {
+    this.ensureInitialized();
+    this.state!.status = 'interrupted';
+    this.state!.completedAt = Date.now();
+    if (reason) this.state!.error = `interrupted: ${reason}`;
+    await this.saveState();
+    if (this.state!.conversationId) {
+      await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
+    }
+    // Forward to conversation stream if present so chat UI can render the
+    // interrupt indicator and stop showing the spinner.
+    if (this.convPublisher && this.convMessageId) {
+      try {
+        await this.convPublisher.publishRunError(
+          this.runId,
+          this.convMessageId,
+          reason ? `Run interrupted: ${reason}` : 'Run interrupted',
+        );
+      } catch (err) {
+        if (DEBUG) console.warn('[RunPublisher] Conv forward run_interrupted failed:', err);
+      }
+    }
+    const ts = Date.now();
+    await this.publish({
+      type: 'run_interrupted',
+      runId: this.runId,
+      reason,
+      timestamp: ts,
+    });
+    await this.persistLog({
+      level: 'info',
+      category: 'run',
+      message: `Run interrupted${reason ? `: ${reason}` : ''}`,
+      metadata: { reason },
+    });
+  }
+
   // ===========================================================================
   // Status Updates
   // ===========================================================================
@@ -1106,6 +1159,43 @@ export async function publishRunError(
     } catch {
       console.error('[publishRunError] Failed to publish terminal event:', err);
     }
+  }
+}
+
+/**
+ * External interrupt helper.
+ *
+ * Publishes ANY message to the `run:interrupt:{runId}` channel — the engine's
+ * subscriber (set up in `functions/run.ts` before graph invocation) will trip
+ * its `AbortController`, halt the graph between nodes, and emit a terminal
+ * `run_interrupted` event via RunPublisher.interrupt().
+ *
+ * Safe to call from any process (webapp API, worker concurrency block,
+ * external automation hook). Returns the number of subscribers that received
+ * the message — `0` means nobody is listening (run already done, or never
+ * reached the subscription stage).
+ *
+ * @param redis - Redis client
+ * @param runId - Run to interrupt
+ * @param reason - Optional free-form reason (forwarded as `payload.reason`)
+ * @returns Number of subscribers that received the interrupt
+ */
+export async function publishRunInterrupt(
+  redis: Redis,
+  runId: string,
+  reason?: string,
+): Promise<number> {
+  const payload = JSON.stringify({
+    type: 'interrupt',
+    runId,
+    reason,
+    timestamp: Date.now(),
+  });
+  try {
+    return await redis.publish(RunKeys.interrupt(runId), payload);
+  } catch (err) {
+    console.error('[publishRunInterrupt] PUBLISH failed:', err);
+    return 0;
   }
 }
 
