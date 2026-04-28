@@ -172,10 +172,16 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                         const tool = nativeReg.get(toolName);
                         return tool.handler(params, {});
                     }
-                    // Fall back to MCP
+                    // Fall back to MCP — pass abort signal so parser-driven tool
+                    // calls also honor mid-step interrupt.
                     const mcpClient = state.mcpClient;
                     if (mcpClient) {
-                        return mcpClient.callTool(toolName, params);
+                        return mcpClient.callTool(
+                            toolName,
+                            params,
+                            undefined,
+                            state._abortController?.signal,
+                        );
                     }
                     throw new Error(`Tool "${toolName}" not available in parser context`);
                 };
@@ -546,9 +552,16 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     });
                 }
                 // Call tool via registry (handles server lookup and execution)
+                // Pass abort signal so external interrupt cancels the in-flight
+                // tool call immediately (PR #2 — mid-step interrupt completion).
                 if (DEBUG)
                     console.log(`[ToolExecutor] Calling mcpClient.callTool: ${config.toolName}`);
-                const result = await mcpClient.callTool(config.toolName, renderedParams, meta);
+                const result = await mcpClient.callTool(
+                    config.toolName,
+                    renderedParams,
+                    meta,
+                    state._abortController?.signal,
+                );
                 if (DEBUG)
                     console.log(`[ToolExecutor] mcpClient.callTool returned for ${config.toolName}`);
                 if (DEBUG)

@@ -91,16 +91,31 @@ const libraryWrite: NativeToolDefinition = {
     const startTime = Date.now();
     const publisher = context?.publisher || null;
     const nodeId = context?.nodeId || 'library_write';
+    const abortSignal = context?.abortSignal || null;
 
     console.log(`[library_write] Writing "${title}" to library ${libraryId}`);
 
+    // Helper: abort guard. Throws AbortError so the outer try/catch surfaces
+    // a clean failure that universalNode's between-step boundary check turns
+    // into a clean cancellation.
+    const checkAbort = () => {
+      if (abortSignal?.aborted) {
+        const err: Error & { name: string } = new Error('library_write aborted by caller');
+        err.name = 'AbortError';
+        throw err;
+      }
+    };
+
     try {
+      checkAbort();
       const db = mongoose.connection.db;
       if (!db) throw new Error('MongoDB connection not available');
 
       const librariesCol = db.collection('libraries');
       const library = await librariesCol.findOne({ libraryId });
       if (!library) throw new Error(`Knowledge Library not found: ${libraryId}`);
+
+      checkAbort();
 
       // Store content in GridFS
       const bucket = new GridFSBucket(db, { bucketName: 'library_files' });
@@ -164,6 +179,8 @@ const libraryWrite: NativeToolDefinition = {
         } as any
       );
 
+      checkAbort();
+
       // Try to chunk and index in vector store
       let chunked = false;
       let chunkCount = 0;
@@ -177,6 +194,10 @@ const libraryWrite: NativeToolDefinition = {
             chunkSize: library.chunkSize || 2000,
             chunkOverlap: library.chunkOverlap || 200,
           });
+
+          // Abort before kicking off the slow embedding phase — this is the
+          // expensive Chroma + Ollama embedding round-trip.
+          checkAbort();
 
           if (chunks.length > 0) {
             await vsm.addDocuments(library.vectorCollection, chunks.map((chunk: string, i: number) => ({
@@ -207,6 +228,11 @@ const libraryWrite: NativeToolDefinition = {
           }
         }
       } catch (vecErr: unknown) {
+        // Re-throw abort errors so the outer handler returns the abort
+        // result instead of silently completing as success.
+        if (vecErr instanceof Error && vecErr.name === 'AbortError') {
+          throw vecErr;
+        }
         const msg = vecErr instanceof Error ? vecErr.message : String(vecErr);
         console.warn(`[library_write] Vector indexing skipped: ${msg}`);
         // Non-fatal — document is still stored in GridFS

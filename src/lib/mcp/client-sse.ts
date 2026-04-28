@@ -73,6 +73,12 @@ export class McpClientSSE {
 
   /**
    * Call a tool
+   *
+   * @param name Tool name
+   * @param args Tool arguments
+   * @param meta Optional metadata + credentials
+   * @param signal Optional AbortSignal — passed through to the underlying
+   *   fetch() so mid-step interrupt cancels the HTTP request immediately.
    */
   async callTool(
     name: string,
@@ -88,13 +94,14 @@ export class McpClientSSE {
         connectionId: string;
         accountInfo?: { email?: string; name?: string; externalId?: string };
       };
-    }
+    },
+    signal?: AbortSignal
   ): Promise<CallToolResult> {
     return await this.sendRequest<CallToolResult>('tools/call', {
       name,
       arguments: args,
       _meta: meta,
-    });
+    }, signal);
   }
 
   /**
@@ -113,8 +120,15 @@ export class McpClientSSE {
 
   /**
    * Send JSON-RPC request
+   *
+   * `fetch` natively supports AbortSignal, so mid-step interrupt is wired
+   * directly into the underlying request.
    */
-  private async sendRequest<T>(method: string, params?: Record<string, unknown>): Promise<T> {
+  private async sendRequest<T>(
+    method: string,
+    params?: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<T> {
     const id = ++this.requestId;
 
     const request = {
@@ -131,6 +145,7 @@ export class McpClientSSE {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(request),
+        signal,
       });
 
       if (!response.ok) {
@@ -144,7 +159,11 @@ export class McpClientSSE {
       }
 
       return result.result as T;
-    } catch (error) {
+    } catch (error: any) {
+      // Re-throw AbortError as-is so callers can detect interrupt cleanly.
+      if (error?.name === 'AbortError') {
+        throw error;
+      }
       throw new Error(`Request to ${this.serverName} failed: ${error}`);
     }
   }
