@@ -150,6 +150,10 @@ export class McpRegistry {
 
   /**
    * Call a tool (automatically finds the right server)
+   *
+   * @param signal Optional AbortSignal — passed through to the underlying
+   *   client.callTool so mid-step interrupt cancels the in-flight HTTP/SSE
+   *   request immediately. Required for the run-level abort path.
    */
   async callTool(
     toolName: string,
@@ -165,7 +169,8 @@ export class McpRegistry {
         connectionId: string;
         accountInfo?: { email?: string; name?: string; externalId?: string };
       };
-    }
+    },
+    signal?: AbortSignal
   ): Promise<any> {
     const found = this.findTool(toolName);
 
@@ -182,7 +187,7 @@ export class McpRegistry {
 
     const startTime = Date.now();
     try {
-      const result = await client.callTool(toolName, args, meta);
+      const result = await client.callTool(toolName, args, meta, signal);
       const duration = Date.now() - startTime;
 
       console.log(`[Registry] Tool ${toolName} returned in ${duration}ms, isError: ${result?.isError}`);

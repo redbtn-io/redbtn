@@ -95,7 +95,34 @@ export async function executeStep(step: UniversalStep, state: any): Promise<Part
         case 'delay': {
             const delayMs = (step.config as any)?.ms ?? 1000;
             console.log(`[StepExecutor] Executing delay: ${delayMs}ms`);
-            await new Promise(resolve => setTimeout(resolve, delayMs));
+            // Abort-aware delay: respect state._abortController.signal so a long
+            // delay in a node step yields immediately on external interrupt
+            // instead of blocking until the timeout fires. The thrown error
+            // surfaces as a step failure; universalNode's between-step abort
+            // check at the next boundary translates it to clean cancellation.
+            const signal: AbortSignal | undefined = state?._abortController?.signal;
+            await new Promise<void>((resolve, reject) => {
+                if (signal?.aborted) {
+                    reject(new Error('Delay aborted'));
+                    return;
+                }
+                let timer: ReturnType<typeof setTimeout> | null = null;
+                const onAbort = () => {
+                    if (timer !== null) {
+                        clearTimeout(timer);
+                        timer = null;
+                    }
+                    reject(new Error('Delay aborted'));
+                };
+                timer = setTimeout(() => {
+                    timer = null;
+                    if (signal) signal.removeEventListener('abort', onAbort);
+                    resolve();
+                }, delayMs);
+                if (signal) {
+                    signal.addEventListener('abort', onAbort, { once: true });
+                }
+            });
             console.log(`[StepExecutor] Delay completed`);
             return {};
         }

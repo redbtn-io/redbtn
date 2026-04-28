@@ -425,16 +425,19 @@ export class Red {
   public async callMcpTool(
     toolName: string,
     args: Record<string, unknown>,
-    context?: { conversationId?: string; generationId?: string; messageId?: string; credentials?: any }
+    context?: { conversationId?: string; generationId?: string; messageId?: string; credentials?: any },
+    signal?: AbortSignal
   ): Promise<any> {
     // Tool start/complete/error events flow through RunPublisher.toolStart/toolComplete/toolError
     // which already persist to redlogs. No additional logging needed here.
+    // signal (when provided) is forwarded to the McpRegistry → client so mid-step
+    // interrupt cancels the in-flight tool call immediately.
     return await this.mcpRegistry.callTool(toolName, args, {
       conversationId: context?.conversationId,
       generationId: context?.generationId,
       messageId: context?.messageId,
       credentials: context?.credentials,
-    });
+    }, signal);
   }
 
   /**

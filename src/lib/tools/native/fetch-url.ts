@@ -62,9 +62,29 @@ const fetchUrlTool: NativeToolDefinition = {
       const BACKOFF = [2_000, 5_000];
       let response: Response | null = null;
 
+      // Pull the run-level abort signal so external interrupt cancels the
+      // in-flight HTTP request immediately (fetch supports AbortSignal natively).
+      // We chain the per-request timeout AbortController to the run signal so
+      // either source can cancel.
+      const runAbortSignal = context?.abortSignal || null;
+
+      // Pre-aborted check
+      if (runAbortSignal?.aborted) {
+        const err: Error & { name: string } = new Error('fetch_url aborted before send');
+        err.name = 'AbortError';
+        throw err;
+      }
+
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeout);
+        // Forward run abort to this request's controller
+        const runAbortListener = runAbortSignal
+          ? () => controller.abort()
+          : null;
+        if (runAbortSignal && runAbortListener) {
+          runAbortSignal.addEventListener('abort', runAbortListener, { once: true });
+        }
 
         try {
           response = await fetch(url, {
@@ -75,17 +95,29 @@ const fetchUrlTool: NativeToolDefinition = {
             redirect: followRedirects ? 'follow' : 'manual',
           });
           clearTimeout(timer);
+          if (runAbortSignal && runAbortListener) {
+            runAbortSignal.removeEventListener('abort', runAbortListener);
+          }
 
           // Don't retry on success or client errors (4xx)
           if (response.ok || (response.status >= 400 && response.status < 500)) break;
 
-          // Server error (5xx) — retry
+          // Server error (5xx) — retry, but bail immediately if run was aborted.
+          if (runAbortSignal?.aborted) {
+            const err: Error & { name: string } = new Error('fetch_url aborted between retries');
+            err.name = 'AbortError';
+            throw err;
+          }
           if (attempt < MAX_RETRIES) {
             console.log('[fetch_url]', `fetch_url ${method} ${url} → ${response.status}, retrying (${attempt + 1}/${MAX_RETRIES})`);
             await new Promise(r => setTimeout(r, BACKOFF[attempt] || 5_000));
           }
         } catch (retryErr: any) {
           clearTimeout(timer);
+          if (runAbortSignal && runAbortListener) {
+            runAbortSignal.removeEventListener('abort', runAbortListener);
+          }
+          // AbortError (from either timeout or run signal) is terminal.
           if (retryErr.name === 'AbortError' || attempt >= MAX_RETRIES) throw retryErr;
           console.log('[fetch_url]', `fetch_url ${method} ${url} → error, retrying (${attempt + 1}/${MAX_RETRIES}): ${retryErr.message}`);
           await new Promise(r => setTimeout(r, BACKOFF[attempt] || 5_000));
