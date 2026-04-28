@@ -14,11 +14,30 @@
  */
 import type { Red } from '../index';
 import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys } from '../lib/run';
+import { runControlRegistry, type CancelResult } from '../lib/run/RunControlRegistry';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
 import { SYSTEM_TEMPLATES } from '../lib/types/graph';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const IORedis = require('ioredis');
+
+/**
+ * Per-process worker identifier — used in interrupt ACK payloads so the
+ * webapp endpoint can tell WHICH worker handled the cancel (useful for
+ * debugging cross-worker scenarios).
+ *
+ * Sourced from env vars in priority order:
+ *   - WORKER_NAME (set by worker startup, e.g. "worker", "worker-2")
+ *   - HOSTNAME (k8s default)
+ *   - falls back to "engine-${pid}"
+ *
+ * This is intentionally cheap to compute — no introspection of cluster
+ * topology, just a stable per-process string for diagnostics.
+ */
+const WORKER_ID =
+  process.env.WORKER_NAME ||
+  process.env.HOSTNAME ||
+  `engine-${process.pid}`;
 
 export { RunPublisher, type RunState };
 
@@ -398,10 +417,19 @@ CRITICAL RULES:
     },
     connectionManager,
     runPublisher: publisher,
-    // Stash the AbortController on a top-level state field so step executors
-    // (toolExecutor.ts already references state._abortController for fetch
-    // cancellation) and universalNode (between-step abort check) can access
-    // the signal without having to thread it through every helper.
+    // Top-level runId for ergonomic access by step executors / universalNode
+    // when resolving the run-control registry context. Mirrors the canonical
+    // `state.data.runId` path but saves the lookup hop. This is a primitive
+    // string so it survives MongoCheckpointer JSON round-trips.
+    runId,
+    // Top-level userId mirror — same rationale as runId. Some neuron paths
+    // need the user for tier-gated model access.
+    userId: options.userId,
+    // LEGACY — kept for any callers that still read `state._abortController`
+    // directly. The authoritative signal source for new code is the
+    // RunControlRegistry (per-process, survives checkpoints). This local
+    // controller is wired to abort whenever the registry's controller does.
+    // Will be removed once we're confident no external code depends on it.
     _abortController: abortController,
     // Replayed prior-run state surface — populated when RunOptions.resumeFromRunId
     // is set. Templates can read fields via `{{state.previousRun.someField}}`.
@@ -625,15 +653,24 @@ async function executeStreaming(
       } 
     };
     const stream = compiledGraph.graph.streamEvents(initialState, streamConfig);
+    // Read the run-control AbortSignal from the registry. This is the
+    // authoritative source — it survives any LangGraph checkpoint round
+    // trip (state-stashed controllers are stripped between nodes — see
+    // RunControlRegistry.ts for the full rationale). We capture once
+    // outside the loop because `runId` doesn't change.
+    const runCtrlForStream = runControlRegistry.get(runId);
     for await (const event of stream) {
       // External-interrupt check between every streamed event. The signal is
       // tripped by the `run:interrupt:{runId}` Redis subscriber set up in
       // run() before this generator was created. We throw the sentinel so
       // the outer catch (below) routes to publisher.interrupt() instead of
       // publisher.fail().
-      if (initialState._abortController?.signal?.aborted) {
-        const reason =
-          (initialState._abortController.signal.reason as { reason?: string } | string | undefined);
+      const ctrlSignal = runCtrlForStream?.controller?.signal;
+      const legacySignal = initialState._abortController?.signal;
+      const aborted = ctrlSignal?.aborted || legacySignal?.aborted;
+      if (aborted) {
+        const reasonRaw = ctrlSignal?.aborted ? ctrlSignal.reason : legacySignal?.reason;
+        const reason = reasonRaw as { reason?: string } | string | undefined;
         const reasonStr =
           typeof reason === 'string'
             ? reason
@@ -858,46 +895,126 @@ async function executeStreaming(
 // =============================================================================
 
 /**
- * Subscribe to `run:interrupt:{runId}` and trip an AbortController on the
- * first message. Returns the dedicated subscriber Redis client so the caller
- * can `quit()` it during cleanup (we don't reuse the engine's main client
- * because ioredis enters subscriber mode on `subscribe()` and can no longer
- * issue regular commands).
+ * Subscribe to `run:interrupt:{runId}` and cancel the run via
+ * `runControlRegistry.cancel(runId)` on the first message. After cancellation
+ * lands, publishes an ACK to `run:interrupt:ack:{runId}` carrying diagnostic
+ * data so the webapp interrupt endpoint's handshake can confirm the worker
+ * received and processed the request.
  *
- * The payload is intentionally not parsed here — any message trips the abort.
- * If the message contains `{ reason: "..." }`, we forward it to the abort
- * controller via the AbortSignal `reason` field so executeStreaming /
- * universalNode can attach it to the RunInterruptedError.
+ * Returns the dedicated subscriber Redis client so the caller can `quit()`
+ * it during cleanup (we don't reuse the engine's main client because ioredis
+ * enters subscriber mode on `subscribe()` and can no longer issue regular
+ * commands).
+ *
+ * The payload is intentionally only minimally parsed — any message trips
+ * the cancel. If the message contains `{ reason: "..." }`, we forward it
+ * through the registry's cancel method (which threads it into the AbortSignal
+ * `reason` field) and into the ACK payload.
+ *
+ * We also cancel the local AbortController for legacy/fallback paths
+ * (anyone reading `state._abortController` directly — should be no one
+ * left, but it's cheap insurance).
  */
 async function subscribeForInterrupt(
   runId: string,
   controller: AbortController,
+  publisherRedis?: any,
 ): Promise<{ quit: () => Promise<void> }> {
   const url = process.env.REDIS_URL || 'redis://localhost:6379';
   // Dedicated subscriber connection — required for ioredis subscribe mode.
   const sub = new IORedis(url, { maxRetriesPerRequest: null, enableReadyCheck: false });
+  // Dedicated publisher connection for the ACK channel. We don't reuse `sub`
+  // (it's in subscriber mode) and don't reuse the engine's main client
+  // because ioredis can be in subscriber mode there too. Cheap and isolated.
+  const ackPub = new IORedis(url, { maxRetriesPerRequest: null, enableReadyCheck: false });
   const channel = RunKeys.interrupt(runId);
+  const ackChannel = RunKeys.interruptAck(runId);
   try {
     await sub.subscribe(channel);
   } catch (err) {
     console.warn(`[run] subscribeForInterrupt(${runId}): subscribe failed:`, err);
     try { await sub.quit(); } catch { /* ignore */ }
+    try { await ackPub.quit(); } catch { /* ignore */ }
     return { quit: async () => { /* noop */ } };
   }
-  sub.on('message', (_chan: string, raw: string) => {
+  sub.on('message', async (_chan: string, raw: string) => {
+    let reason: string | undefined;
     try {
       const parsed = raw ? JSON.parse(raw) : {};
-      const reason = typeof parsed?.reason === 'string' ? parsed.reason : undefined;
-      console.log(`[run] Interrupt received for ${runId}${reason ? ` (reason: ${reason})` : ''}`);
-      // Pass reason via the AbortSignal `reason` field — Node 18+ supports
-      // arbitrary reasons; consumers downcast to extract { reason }.
-      try {
-        controller.abort({ reason } as any);
-      } catch {
-        controller.abort();
-      }
+      if (typeof parsed?.reason === 'string') reason = parsed.reason;
     } catch {
-      controller.abort();
+      // Malformed JSON — still cancel, just without a reason.
+    }
+    console.log(`[run] Interrupt received for ${runId}${reason ? ` (reason: ${reason})` : ''}`);
+
+    // 1. Drive the registry — this aborts the run-level controller AND
+    //    walks every in-flight NeuronCall set up by the neuron registry,
+    //    cancelling them directly (cooperative + force-close fallback).
+    let cancelResult: CancelResult;
+    try {
+      cancelResult = runControlRegistry.cancel(runId, reason);
+    } catch (err) {
+      console.warn(`[run] runControlRegistry.cancel(${runId}) threw:`, err);
+      cancelResult = { ack: false, runId, reason };
+    }
+
+    // 2. Also abort the local controller for any legacy callers that
+    //    might still read `state._abortController` (defensive).
+    try { controller.abort({ reason } as any); } catch {
+      try { controller.abort(); } catch { /* ignore */ }
+    }
+
+    // 3. Publish ACK so the webapp interrupt endpoint's handshake can
+    //    confirm the worker received and processed the request. We send
+    //    the same JSON shape regardless of ack-success — endpoint reads
+    //    `ack` field to discriminate.
+    try {
+      const ackPayload = {
+        ...cancelResult,
+        ackedAt: new Date().toISOString(),
+        // Ensure workerId always lands on the wire even when the run isn't
+        // registered (e.g. cancellation arrived after run completion).
+        workerId: cancelResult.ack ? cancelResult.workerId : WORKER_ID,
+      };
+      const subscribers = await ackPub.publish(ackChannel, JSON.stringify(ackPayload));
+      console.log(
+        `[run] Published interrupt ACK for ${runId} ` +
+        `(ack=${cancelResult.ack} subscribers=${subscribers}` +
+        (cancelResult.ack ? ` neuronCallsCancelled=${cancelResult.neuronCallsCancelled}` : '') +
+        ')'
+      );
+    } catch (err) {
+      // ACK publish failure is logged but not fatal — the abort still
+      // happened locally. The webapp endpoint will time out and force-kill,
+      // which is the correct fallback for an unhealthy worker.
+      console.warn(`[run] Failed to publish interrupt ACK for ${runId}:`, err);
+    }
+
+    // Also append to events log via the publisher's redis (cheap forward
+    // for SSE-replay clients) — best-effort, ignore failure.
+    if (publisherRedis) {
+      try {
+        const ev = {
+          type: 'run_interrupt_acked',
+          runId,
+          workerId: cancelResult.ack ? cancelResult.workerId : WORKER_ID,
+          ack: cancelResult.ack,
+          reason,
+          timestamp: Date.now(),
+          ...(cancelResult.ack
+            ? {
+                currentNodeId: cancelResult.currentNodeId,
+                currentStep: cancelResult.currentStep,
+                neuronCallsCancelled: cancelResult.neuronCallsCancelled,
+              }
+            : {}),
+        };
+        await publisherRedis.rpush(RunKeys.events(runId), JSON.stringify(ev));
+        await publisherRedis.expire(RunKeys.events(runId), 60 * 60);
+        await publisherRedis.publish(RunKeys.stream(runId), JSON.stringify(ev));
+      } catch {
+        /* ignore */
+      }
     }
   });
   return {
@@ -907,6 +1024,9 @@ async function subscribeForInterrupt(
       } catch { /* ignore */ }
       try {
         await sub.quit();
+      } catch { /* ignore */ }
+      try {
+        await ackPub.quit();
       } catch { /* ignore */ }
     },
   };
@@ -1064,17 +1184,43 @@ export async function run(
     }
   }
 
+  // ── Run-control registry ───────────────────────────────────────────────────
+  // Register this run with the per-process registry BEFORE the interrupt
+  // subscriber so any interrupt published during/after subscribe finds a
+  // valid context to cancel. The registry's controller is what
+  // universalNode / step executors / neuronExecutor read via
+  // `runControlRegistry.get(runId).controller.signal` — that path survives
+  // LangGraph checkpoint round-trips, unlike state-stashed controllers.
+  const runCtx = runControlRegistry.register(runId, WORKER_ID);
+  // Local controller kept for legacy/fallback paths (anyone reading
+  // `state._abortController` directly). Wired so the run-controller
+  // aborting ALSO trips this one — no functional dependency, just defense.
+  const abortController = new AbortController();
+  if (!runCtx.controller.signal.aborted) {
+    runCtx.controller.signal.addEventListener('abort', () => {
+      try { abortController.abort(runCtx.controller.signal.reason as any); } catch {
+        try { abortController.abort(); } catch { /* ignore */ }
+      }
+    }, { once: true });
+  } else {
+    try { abortController.abort(); } catch { /* ignore */ }
+  }
+
   // ── External-interrupt subscriber ──────────────────────────────────────────
   // Spin up before the graph executes so any interrupt published during
-  // execution trips this AbortController. The signal is also stashed on
-  // initialState._abortController for step executors to read.
-  const abortController = new AbortController();
+  // execution reaches the registry. The subscriber:
+  //   1. Calls `runControlRegistry.cancel(runId)` (aborts run controller +
+  //      every in-flight NeuronCall).
+  //   2. Publishes an ACK to `run:interrupt:ack:{runId}` so the webapp
+  //      handshake protocol can confirm receipt. Without this ACK, the
+  //      webapp endpoint times out and force-kills the run.
   let interruptSub: { quit: () => Promise<void> } | null = null;
   try {
-    interruptSub = await subscribeForInterrupt(runId, abortController);
+    interruptSub = await subscribeForInterrupt(runId, abortController, redis);
   } catch (subErr) {
     // If we can't subscribe, the run still proceeds — interrupts will simply
-    // be no-ops. Log but don't fail.
+    // be no-ops (and the webapp endpoint will time out → force-kill). Log
+    // but don't fail.
     console.warn(`[run] Could not subscribe to interrupt channel for ${runId}:`, subErr);
   }
 
@@ -1101,6 +1247,7 @@ export async function run(
     }
     try { await lock.release(); } catch { /* ignore */ }
     if (interruptSub) { try { await interruptSub.quit(); } catch { /* ignore */ } }
+    runControlRegistry.unregister(runId);
     throw err;
   }
 
@@ -1108,6 +1255,10 @@ export async function run(
     if (interruptSub) {
       try { await interruptSub.quit(); } catch { /* ignore */ }
     }
+    // Unregister AFTER the interrupt subscriber has stopped accepting
+    // messages. If we unregistered first, an interrupt arriving in the gap
+    // would find no context and ack:false even though the run was healthy.
+    runControlRegistry.unregister(runId);
     await lock.release();
     console.log(`[run] Released lock for conversation ${lockKey}`);
   };
