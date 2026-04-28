@@ -92,3 +92,13 @@ export {
   enrichInput,
   type EnrichInputOptions,
 } from './enrich-input';
+
+export {
+  RunControlRegistry,
+  NeuronCall,
+  runControlRegistry,
+  type RunControlContext,
+  type CancelAck,
+  type CancelNoAck,
+  type CancelResult,
+} from './RunControlRegistry';
