@@ -277,6 +277,13 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // Get neuron registry from state
     const neuronRegistry = state.neuronRegistry;
 
+    // Pull the run-level AbortSignal once. LangChain's BaseChatModel
+    // (.invoke / .stream) accepts `{ signal }` as a call option and routes it
+    // through to the underlying transport — this is how mid-step interrupt
+    // cancels a long LLM generation. Ollama, OpenAI, Anthropic, and Google
+    // models all honor this in LangChain v0.2+.
+    const abortSignal: AbortSignal | undefined = state?._abortController?.signal;
+
     // Determine which neuron ID to use
     const neuronId = config.neuronId || state.defaultNeuronId || state.data?.defaultNeuronId;
     if (!neuronId) {
@@ -484,13 +491,16 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       let rawResponse: any;
 
       if (useNativeFormat) {
-        // For Ollama, pass the format option at invocation time
+        // For Ollama, pass the format option at invocation time.
+        // Signal threads through to the underlying HTTP request so external
+        // interrupt cancels a stuck Ollama call instead of hanging.
         rawResponse = await model.invoke(messages, {
-          format: config.structuredOutput.schema
+          format: config.structuredOutput.schema,
+          signal: abortSignal,
         });
       } else {
         // For other providers using withStructuredOutput
-        rawResponse = await model.invoke(messages);
+        rawResponse = await model.invoke(messages, { signal: abortSignal });
       }
 
       // Handle different response formats based on provider
@@ -561,8 +571,11 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
 
       const streamStartTime = Date.now();
 
-      // Add timeout to stream start to avoid indefinite hangs
-      const streamPromise = model.stream(normalizedMessages);
+      // Add timeout to stream start to avoid indefinite hangs.
+      // Signal lets external interrupt cancel before the model even starts
+      // emitting tokens — and after the stream is open it is also honored
+      // mid-stream by the underlying transport.
+      const streamPromise = model.stream(normalizedMessages, { signal: abortSignal });
       const timeoutPromise = new Promise<never>((_, reject) => {
         setTimeout(() => {
           reject(
@@ -620,7 +633,16 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
                 const tool = nativeReg.get(toolName)!;
                 return tool.handler(params, {} as any);
               }
-              if (state.mcpClient) return state.mcpClient.callTool(toolName, params);
+              if (state.mcpClient) {
+                // Pass abort signal so parser-driven tool calls also honor
+                // mid-step interrupt.
+                return state.mcpClient.callTool(
+                  toolName,
+                  params,
+                  undefined,
+                  abortSignal,
+                );
+              }
               throw new Error(`Tool "${toolName}" not available in neuron parser context`);
             };
             neuronParser = new ParserExecutor(parserDef.config, parserDef.parserConfig, parserToolExecutor);
@@ -692,6 +714,20 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       try {
         // Accumulate chunks with per-chunk inactivity guard
         while (true) {
+          // Mid-stream abort check — if external interrupt fired while we
+          // were waiting for the next chunk (or between chunks), break out
+          // immediately. The underlying transport may also reject the
+          // pending iterator.next() once it sees the signal, but checking
+          // here ensures a clean exit even if the transport is slow to
+          // notice.
+          if (abortSignal?.aborted) {
+            console.log('[NeuronExecutor] Abort signal detected during streaming, breaking loop');
+            // Throw so the catch below closes the iterator and rethrows.
+            const err: Error & { name: string } = new Error('Neuron stream aborted');
+            err.name = 'AbortError';
+            throw err;
+          }
+
           // Race the next chunk against the inactivity timer
           const inactivityPromise = makeInactivityPromise();
           let iterResult: IteratorResult<any>;
