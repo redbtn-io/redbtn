@@ -19,6 +19,7 @@
 
 import { executeStep } from './stepExecutor';
 import { getNodeSystemPrefix } from '../../utils/node-helpers';
+import { runControlRegistry } from '../../run/RunControlRegistry';
 import type { NodeConfig } from './types';
 
 // Debug logging - set to true to enable verbose logs
@@ -40,13 +41,43 @@ class RunInterruptedError extends Error {
 }
 
 /**
- * Check the abort signal that `run()` stashes on `state._abortController`.
- * Throws RunInterruptedError if the external `run:interrupt:{runId}` channel
- * has been triggered. Called at the top of every node invocation and
- * between steps so cancellation lands cleanly between checkpointed boundaries.
+ * Resolve the run-level AbortSignal for the current state.
+ *
+ * Reads the signal from the `RunControlRegistry` keyed by `state.runId`.
+ * The registry is a per-process Map populated by `run()` BEFORE the graph
+ * is invoked, so it survives any state serialization round-trip
+ * (MongoCheckpointer round-trips state through JSON between every node and
+ * strips `_abortController` since it's in `NON_SERIALIZABLE_STATE_KEYS` —
+ * which is exactly why we can't read the signal from state).
+ *
+ * Falls back to `state._abortController?.signal` for compatibility with
+ * direct callers that bypass `run()` (tests, ad-hoc graph invocation).
+ *
+ * Returns `undefined` when no signal is available — callers must treat
+ * this as "no external interrupt support" and proceed normally.
+ */
+function getRunSignal(state: any): AbortSignal | undefined {
+    // Resolve the runId from the canonical paths used across the codebase.
+    // (run.ts seeds this on `state.data.runId` and on `state.runId` for
+    // ergonomic access. Either is authoritative; we check both because the
+    // shape varies depending on where in the pipeline the lookup happens.)
+    const runId = state?.runId || state?.data?.runId;
+    const ctx = runControlRegistry.get(runId);
+    if (ctx) return ctx.controller.signal;
+    return state?._abortController?.signal;
+}
+
+/**
+ * Check the run-level abort signal. Throws RunInterruptedError if the
+ * external `run:interrupt:{runId}` channel has been triggered. Called at
+ * the top of every node invocation and between steps so cancellation lands
+ * cleanly between checkpointed boundaries.
+ *
+ * The signal is resolved via RunControlRegistry — see `getRunSignal()` for
+ * why this is critical (state-stashed signals don't survive checkpoints).
  */
 function checkAbort(state: any): void {
-    const signal = state?._abortController?.signal;
+    const signal = getRunSignal(state);
     if (signal?.aborted) {
         const reason = signal.reason as { reason?: string } | string | undefined;
         const reasonStr =
@@ -245,6 +276,17 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
 
         const step = steps[i];
         const stepNumber = i + 1;
+
+        // Update RunControlRegistry diagnostics so the interrupt ACK
+        // payload reflects what was running when the interrupt landed.
+        // Best-effort — the registry handles unknown runIds gracefully.
+        const _runId = state?.runId || state?.data?.runId;
+        if (_runId) {
+            runControlRegistry.setCurrentStep(_runId, graphNodeId, {
+                type: step.type,
+                index: i,
+            });
+        }
 
         console.log(`[UniversalNode] Executing step ${stepNumber}/${steps.length}: ${step.type}`);
 

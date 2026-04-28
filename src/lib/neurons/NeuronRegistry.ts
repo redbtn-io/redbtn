@@ -16,12 +16,14 @@ import { ChatOpenAI } from '@langchain/openai';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import { AIMessage, BaseMessage } from '@langchain/core/messages';
 import { LRUCache } from 'lru-cache';
 import { createHash, createDecipheriv } from 'crypto';
 import { getDatabase } from '../memory/database';
 import Neuron from '../models/Neuron';
 import { createLogger } from '../utils/logger';
 import { NeuronConfig } from '../types/neuron';
+import { runControlRegistry, NeuronCall } from '../run/RunControlRegistry';
 import type { RedConfig } from '../../index';
 
 type PartialRedConfig = Pick<RedConfig, 'databaseUrl'> & Partial<Omit<RedConfig, 'databaseUrl'>>;
@@ -71,6 +73,95 @@ export interface ModelOverrides {
   topP?: number;
 }
 
+/**
+ * Options accepted by `NeuronRegistry.callNeuron()`.
+ *
+ * @see callNeuron — top-level wrapper around `model.invoke()` / `model.stream()`
+ *      that gives the run-control registry direct visibility into in-flight
+ *      LLM calls so external interrupt can cancel them sub-second instead of
+ *      waiting for the next chunk-loop boundary.
+ */
+export interface CallNeuronOptions {
+  /** External AbortSignal — typically from `runControlRegistry.get(runId).controller.signal`. */
+  signal?: AbortSignal;
+  /**
+   * Run identifier — when provided, the call is registered with the
+   * RunControlRegistry so an external interrupt can cancel it directly.
+   * Without this, only the explicit `signal` (if any) is honored.
+   */
+  runId?: string;
+  /** When true, returns an async iterable of chunks instead of awaiting full response. */
+  stream?: boolean;
+  /** Per-call model parameter overrides (passed through to `getModel`). */
+  overrides?: ModelOverrides;
+  /**
+   * Provider-specific invocation options (e.g. `{ format: schema }` for
+   * Ollama structured output). Forwarded verbatim into `model.invoke()` /
+   * `model.stream()` along with the AbortSignal. The signal in this object
+   * (if any) is ignored — the wrapper merges its own signal.
+   */
+  invokeOptions?: Record<string, unknown>;
+  /**
+   * Override of the model instance to use. When set, the wrapper skips
+   * `getModel()` and uses this directly. Useful for callers that need to
+   * apply `withStructuredOutput()` or other transforms before invoking —
+   * they can build their own model and still get registry integration.
+   */
+  modelOverride?: BaseChatModel | { invoke: Function; stream: Function };
+}
+
+/**
+ * Wrap an async iterable so a `cleanup()` callback fires once the consumer
+ * is done with the iterator (whether by exhaustion, throw, or `return`).
+ *
+ * Used by `NeuronRegistry.callNeuron(stream: true)` to remove the call from
+ * the run-control registry after streaming finishes — if we just removed
+ * pre-iteration, the registry would lose visibility before the call really
+ * completed and the interrupt couldn't reach it.
+ */
+function wrapStreamWithCleanup(
+  inner: AsyncIterable<unknown>,
+  cleanup: () => void,
+): AsyncIterable<unknown> {
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<unknown> {
+      const innerIter = inner[Symbol.asyncIterator]();
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        try { cleanup(); } catch { /* ignore */ }
+      };
+      return {
+        async next(...args: [] | [undefined]) {
+          try {
+            const r = await innerIter.next(...(args as []));
+            if (r.done) finish();
+            return r;
+          } catch (err) {
+            finish();
+            throw err;
+          }
+        },
+        async return(value?: unknown) {
+          finish();
+          if (innerIter.return) {
+            try { return await innerIter.return(value as any); } catch { /* ignore */ }
+          }
+          return { value: value as any, done: true };
+        },
+        async throw(err?: unknown) {
+          finish();
+          if (innerIter.throw) {
+            try { return await innerIter.throw(err); } catch (e) { throw e; }
+          }
+          throw err;
+        },
+      };
+    },
+  };
+}
+
 export class NeuronRegistry {
   private configCache: LRUCache<string, NeuronConfig>;
   private db: ReturnType<typeof getDatabase>;
@@ -108,6 +199,134 @@ export class NeuronRegistry {
       throw new NeuronProviderError(
         `Failed to create model for neuron '${neuronId}' (provider: ${config.provider}): ${errorMessage}`
       );
+    }
+  }
+
+  /**
+   * Top-level wrapper around `model.invoke()` / `model.stream()` that
+   * registers the in-flight call with the RunControlRegistry so an external
+   * interrupt can cancel it directly.
+   *
+   * # Why this exists
+   *
+   * `model.invoke()` and `model.stream()` accept `{ signal }` in their
+   * options, and LangChain claims to forward this through to the underlying
+   * transport. In practice that forwarding is incomplete and version-
+   * dependent (Ollama-via-ollama-js wraps fetch, OpenAI uses its own client,
+   * etc.) — so an in-flight LLM call may keep running for many seconds after
+   * the signal aborts.
+   *
+   * `callNeuron` solves this by:
+   *   1. Creating a per-call `NeuronCall` with its OWN AbortController.
+   *   2. Bridging both the explicit `signal` and the run-level signal
+   *      (looked up via RunControlRegistry) into the call's controller.
+   *      Either source aborting cancels the call.
+   *   3. Registering the NeuronCall on the run-context's `neuronCalls` Set
+   *      so `runControlRegistry.cancel(runId)` can walk every in-flight
+   *      call and cancel each directly (cooperative + force-close fallback).
+   *   4. Passing the call's controller signal to `model.invoke()` /
+   *      `model.stream()` so cooperative cancellation still works for any
+   *      provider that does honor the signal correctly.
+   *
+   * # Returns
+   *
+   * - When `stream: true` — the AsyncIterable returned by `model.stream()`.
+   *   Caller MUST iterate to completion (or break / throw) for proper cleanup;
+   *   the wrapper installs cleanup in a `finally` outside the iterator
+   *   contract, so partial iteration is fine but never iterating at all
+   *   leaves the call registered for the duration of the run.
+   * - When `stream: false` (default) — awaits the model.invoke() promise
+   *   and returns its result.
+   *
+   * # Cleanup
+   *
+   * The NeuronCall is removed from the registry on completion (success,
+   * error, or abort). Callers don't need to do anything special.
+   */
+  async callNeuron(
+    neuronId: string,
+    userId: string,
+    messages: BaseMessage[] | Array<{ role: string; content: string | unknown }>,
+    options: CallNeuronOptions = {},
+  ): Promise<AIMessage | AsyncIterable<unknown>> {
+    const model: any = options.modelOverride
+      ? options.modelOverride
+      : await this.getModel(neuronId, userId, options.overrides);
+
+    if (!model) {
+      throw new NeuronProviderError(`Failed to get model for neuron: ${neuronId}`);
+    }
+
+    const call = new NeuronCall(neuronId);
+
+    // Bridge explicit caller-supplied signal into our call controller.
+    // We can't merge AbortSignals natively pre-Node-20 in a portable way,
+    // so we use addEventListener — both edges (explicit signal, registry
+    // controller) trigger our call.cancel().
+    if (options.signal) {
+      if (options.signal.aborted) {
+        call.cancel({ reason: 'pre-aborted' });
+      } else {
+        options.signal.addEventListener(
+          'abort',
+          () => call.cancel({ reason: 'external-signal-aborted' }),
+          { once: true },
+        );
+      }
+    }
+
+    // Bridge the run-control registry signal so an external interrupt
+    // (`runControlRegistry.cancel`) propagates here even if the caller
+    // didn't pass an explicit `signal`. Also: register this call so the
+    // registry's `cancel()` can walk our Set and force-close us.
+    const runCtx = options.runId ? runControlRegistry.get(options.runId) : undefined;
+    if (runCtx) {
+      runCtx.neuronCalls.add(call);
+      if (runCtx.controller.signal.aborted) {
+        call.cancel({ reason: 'run-already-aborted' });
+      } else {
+        runCtx.controller.signal.addEventListener(
+          'abort',
+          () => call.cancel({ reason: 'run-aborted' }),
+          { once: true },
+        );
+      }
+    }
+
+    const cleanup = () => {
+      if (runCtx) {
+        runCtx.neuronCalls.delete(call);
+      }
+    };
+
+    // Build invoke options — caller-supplied opts merged with our signal.
+    // Caller's options.invokeOptions.signal (if any) is overridden — this
+    // wrapper owns the signal for the call.
+    const invokeOpts: Record<string, unknown> = {
+      ...(options.invokeOptions || {}),
+      signal: call.controller.signal,
+    };
+
+    if (options.stream) {
+      // Streaming path: model.stream() returns an async iterable. We can't
+      // await it (it's lazy), so we wrap it to install cleanup once the
+      // caller is done iterating.
+      let inner: AsyncIterable<unknown>;
+      try {
+        inner = await model.stream(messages as any, invokeOpts);
+      } catch (err) {
+        cleanup();
+        throw err;
+      }
+      return wrapStreamWithCleanup(inner, cleanup);
+    }
+
+    // Non-streaming path: await + cleanup.
+    try {
+      const result = await model.invoke(messages as any, invokeOpts);
+      return result as AIMessage;
+    } finally {
+      cleanup();
     }
   }
 

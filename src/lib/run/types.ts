@@ -461,6 +461,28 @@ export const RunKeys = {
    * passing `resumeFromRunId: <prevRunId>` in RunOptions.
    */
   interrupt: (runId: string) => `run:interrupt:${runId}`,
+  /**
+   * Interrupt-ACK channel: `run:interrupt:ack:{runId}`.
+   *
+   * Pub/sub-only — no state stored. Companion to `interrupt`. The webapp's
+   * interrupt endpoint subscribes to this channel BEFORE publishing the
+   * interrupt request, then waits up to 5 seconds for the worker to
+   * confirm cancellation. The worker (engine's interrupt subscriber)
+   * publishes a JSON payload here after invoking
+   * `runControlRegistry.cancel(runId)` so the endpoint knows:
+   *   - which worker handled the cancellation (workerId)
+   *   - what node/step was running at the time
+   *   - how many in-flight neuron calls were cancelled
+   *
+   * If the endpoint times out waiting for ACK, it force-kills the run by
+   * marking it `interrupted` in MongoDB and clearing Redis state. This
+   * covers worker-crash scenarios where the cancel never lands.
+   *
+   * NOTE: The channel name is part of the public API contract between the
+   * engine and the webapp interrupt endpoint. Do not change it without
+   * coordinating both sides.
+   */
+  interruptAck: (runId: string) => `run:interrupt:ack:${runId}`,
 } as const;
 
 // =============================================================================
