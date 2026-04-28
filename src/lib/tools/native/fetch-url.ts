@@ -52,6 +52,22 @@ const fetchUrlTool: NativeToolDefinition = {
     const { publisher } = context;
     console.log('[fetch_url]', `fetch_url ${method} ${url}`);
 
+    // Pull the run-level abort signal so external interrupt cancels the
+    // in-flight HTTP request immediately (fetch supports AbortSignal natively).
+    // We chain the per-request timeout AbortController to the run signal so
+    // either source can cancel.
+    //
+    // Hoisted above the try/catch (instead of declared inside) so the catch
+    // block can read both `runAbortSignal.aborted` and `timeoutFired` to
+    // distinguish abort sources. Without this, every AbortError is reported
+    // as "Request timed out after Xms" — even when the run was interrupted
+    // in the first 100ms by an external signal.
+    const runAbortSignal = context?.abortSignal || null;
+
+    // Set by the per-attempt timer when (and only when) the timeout actually
+    // fires. The run-signal abort path leaves this false.
+    let timeoutFired = false;
+
     try {
       const fetchHeaders: Record<string, string> = { ...headers };
       if (body && !fetchHeaders['Content-Type'] && !fetchHeaders['content-type']) {
@@ -62,12 +78,6 @@ const fetchUrlTool: NativeToolDefinition = {
       const BACKOFF = [2_000, 5_000];
       let response: Response | null = null;
 
-      // Pull the run-level abort signal so external interrupt cancels the
-      // in-flight HTTP request immediately (fetch supports AbortSignal natively).
-      // We chain the per-request timeout AbortController to the run signal so
-      // either source can cancel.
-      const runAbortSignal = context?.abortSignal || null;
-
       // Pre-aborted check
       if (runAbortSignal?.aborted) {
         const err: Error & { name: string } = new Error('fetch_url aborted before send');
@@ -77,7 +87,10 @@ const fetchUrlTool: NativeToolDefinition = {
 
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeout);
+        const timer = setTimeout(() => {
+          timeoutFired = true;
+          controller.abort();
+        }, timeout);
         // Forward run abort to this request's controller
         const runAbortListener = runAbortSignal
           ? () => controller.abort()
@@ -166,9 +179,28 @@ const fetchUrlTool: NativeToolDefinition = {
         }],
       };
     } catch (error: any) {
-      const errorMessage = error.name === 'AbortError'
-        ? `Request timed out after ${timeout}ms`
-        : error.message || 'Unknown error';
+      // Distinguish abort sources for an accurate error message:
+      //   - run-level abort (external interrupt)  → "aborted by caller"
+      //   - per-attempt timer fired              → "timed out after Xms"
+      //   - everything else                       → fall back to error.message
+      //
+      // The run signal takes precedence: if BOTH the timer and the run signal
+      // are aborted (e.g. timer fires a moment after a run abort), we still
+      // report the higher-level cause that the caller actually triggered.
+      let errorMessage: string;
+      if (error.name === 'AbortError') {
+        if (runAbortSignal?.aborted) {
+          errorMessage = 'fetch_url aborted by caller';
+        } else if (timeoutFired) {
+          errorMessage = `Request timed out after ${timeout}ms`;
+        } else {
+          // Aborted but neither source flag is set — surface the original
+          // message so post-mortems aren't lying about the cause.
+          errorMessage = error.message || 'Request aborted (unknown source)';
+        }
+      } else {
+        errorMessage = error.message || 'Unknown error';
+      }
 
       console.log('[fetch_url]', `fetch_url ${method} ${url} → ERROR: ${errorMessage}`);
 
