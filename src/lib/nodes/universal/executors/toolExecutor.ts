@@ -9,8 +9,22 @@ import { renderParameters, renderTemplate } from '../templateRenderer';
 import { executeWithErrorHandling } from './errorHandler';
 import { getParserRegistry } from './parserRegistry';
 import { ParserExecutor } from './parserExecutor';
+import { runControlRegistry } from '../../../run/RunControlRegistry';
 import type { ToolStepConfig } from '../types';
 const { getNativeRegistry } = require('../../../tools/native-registry.js');
+
+/**
+ * Resolve the run-level AbortSignal — see universalNode.ts for the full
+ * rationale. Reads from the per-process RunControlRegistry (survives
+ * checkpoint round-trips), with `state._abortController` as a fallback for
+ * direct/test callers.
+ */
+function getRunSignal(state: any): AbortSignal | undefined {
+    const runId = state?.runId || state?.data?.runId;
+    const ctx = runControlRegistry.get(runId);
+    if (ctx) return ctx.controller.signal;
+    return state?._abortController?.signal;
+}
 
 /** Resolved credentials shape passed to tools via meta/context */
 interface ResolvedToolCredentials {
@@ -173,14 +187,15 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                         return tool.handler(params, {});
                     }
                     // Fall back to MCP — pass abort signal so parser-driven tool
-                    // calls also honor mid-step interrupt.
+                    // calls also honor mid-step interrupt. Signal comes from the
+                    // RunControlRegistry (survives checkpoint round-trips).
                     const mcpClient = state.mcpClient;
                     if (mcpClient) {
                         return mcpClient.callTool(
                             toolName,
                             params,
                             undefined,
-                            state._abortController?.signal,
+                            getRunSignal(state),
                         );
                     }
                     throw new Error(`Tool "${toolName}" not available in parser context`);
@@ -430,13 +445,14 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                 : undefined;
 
             // Build context for the native tool handler
+            // Signal resolved from RunControlRegistry — survives checkpoints.
             const nativeContext = {
                 publisher: runPublisher || null,
                 state,
                 runId: state.data?.runId || state.runId || null,
                 nodeId: state.nodeConfig?.graphNodeId || state.nodeConfig?.nodeId || null,
                 toolId: toolId,
-                abortSignal: state._abortController?.signal || null,
+                abortSignal: getRunSignal(state) || null,
                 onChunk,
                 credentials: resolvedCredentials,
             };
@@ -554,13 +570,16 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                 // Call tool via registry (handles server lookup and execution)
                 // Pass abort signal so external interrupt cancels the in-flight
                 // tool call immediately (PR #2 — mid-step interrupt completion).
+                // Signal sourced from RunControlRegistry so it survives any
+                // LangGraph checkpoint round-trip (state-stashed controllers
+                // are stripped between nodes — see RunControlRegistry.ts).
                 if (DEBUG)
                     console.log(`[ToolExecutor] Calling mcpClient.callTool: ${config.toolName}`);
                 const result = await mcpClient.callTool(
                     config.toolName,
                     renderedParams,
                     meta,
-                    state._abortController?.signal,
+                    getRunSignal(state),
                 );
                 if (DEBUG)
                     console.log(`[ToolExecutor] mcpClient.callTool returned for ${config.toolName}`);
