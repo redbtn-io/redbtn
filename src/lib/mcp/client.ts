@@ -101,27 +101,44 @@ export class McpClient {
 
   /**
    * Call a tool
+   *
+   * @param name Tool name
+   * @param args Tool arguments
+   * @param meta Optional metadata (conversation/generation/message ids)
+   * @param signal Optional AbortSignal — when fired, the pending request is
+   *   immediately rejected with an AbortError and removed from pendingRequests.
+   *   Required for mid-step interrupt support.
    */
   async callTool(
-    name: string, 
+    name: string,
     args: Record<string, unknown>,
-    meta?: { conversationId?: string; generationId?: string; messageId?: string }
+    meta?: { conversationId?: string; generationId?: string; messageId?: string },
+    signal?: AbortSignal
   ): Promise<CallToolResult> {
     const params: ToolCallParams = {
       name,
       arguments: args,
       _meta: meta,
     };
-    
-    return await this.sendRequest<CallToolResult>('tools/call', params as unknown as Record<string, unknown>);
+
+    return await this.sendRequest<CallToolResult>('tools/call', params as unknown as Record<string, unknown>, signal);
   }
 
   /**
    * Send JSON-RPC request
+   *
+   * Accepts an optional AbortSignal. When the signal fires, the pending
+   * promise is rejected immediately with an AbortError, the 30s timeout is
+   * cleared, and the request is removed from pendingRequests. This enables
+   * mid-step interrupt for MCP tool calls that route over the Redis transport.
    */
-  private async sendRequest<T>(method: string, params?: Record<string, unknown>): Promise<T> {
+  private async sendRequest<T>(
+    method: string,
+    params?: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<T> {
     const id = ++this.requestId;
-    
+
     const request: JsonRpcRequest = {
       jsonrpc: '2.0',
       id,
@@ -129,19 +146,66 @@ export class McpClient {
       params,
     };
 
-    return new Promise((resolve, reject) => {
+    return new Promise<T>((resolve, reject) => {
       this.pendingRequests.set(id, { resolve, reject });
-      
-      // Send request
-      this.redis.publish(this.requestChannel, JSON.stringify(request)).catch(reject);
-      
-      // Timeout after 30 seconds
-      setTimeout(() => {
+
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+      const cleanup = () => {
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        if (signal) {
+          signal.removeEventListener('abort', onAbort);
+        }
+      };
+
+      const onAbort = () => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
+          cleanup();
+          const reason = signal?.reason as { reason?: string } | string | undefined;
+          const reasonStr =
+            typeof reason === 'string'
+              ? reason
+              : reason && typeof (reason as any).reason === 'string'
+                ? (reason as any).reason
+                : 'aborted';
+          const err: Error & { name: string } = new Error(`MCP request aborted: ${method} (${reasonStr})`);
+          err.name = 'AbortError';
+          reject(err);
+        }
+      };
+
+      // Pre-aborted signal — reject synchronously without ever sending the request
+      if (signal?.aborted) {
+        this.pendingRequests.delete(id);
+        const err: Error & { name: string } = new Error(`MCP request aborted before send: ${method}`);
+        err.name = 'AbortError';
+        reject(err);
+        return;
+      }
+
+      // Wrap the original resolve/reject so we always cleanup before settling
+      const pending = this.pendingRequests.get(id)!;
+      pending.resolve = (value: any) => { cleanup(); resolve(value); };
+      pending.reject = (error: any) => { cleanup(); reject(error); };
+
+      // Send request
+      this.redis.publish(this.requestChannel, JSON.stringify(request)).catch(pending.reject);
+
+      // Timeout after 30 seconds
+      timeoutId = setTimeout(() => {
+        if (this.pendingRequests.has(id)) {
+          this.pendingRequests.delete(id);
+          cleanup();
           reject(new Error(`Request timeout: ${method}`));
         }
       }, 30000);
+
+      if (signal) {
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
     });
   }
 

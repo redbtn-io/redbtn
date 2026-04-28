@@ -384,8 +384,17 @@ CRITICAL RULES:
     // Graph registry — passed so that 'graph' step executors can invoke subgraphs
     _graphRegistry: red.graphRegistry,
     mcpClient: {
-      callTool: (toolName: string, args: unknown, meta?: unknown) =>
-        red.callMcpTool(toolName, args as Record<string, unknown>, meta as Record<string, unknown>),
+      // 4th arg is an optional AbortSignal; toolExecutor passes
+      // state._abortController?.signal so external interrupt cancels the
+      // in-flight tool call immediately instead of waiting on the bare 30s
+      // setTimeout in McpClient.sendRequest.
+      callTool: (toolName: string, args: unknown, meta?: unknown, signal?: AbortSignal) =>
+        red.callMcpTool(
+          toolName,
+          args as Record<string, unknown>,
+          meta as Record<string, unknown>,
+          signal,
+        ),
     },
     connectionManager,
     runPublisher: publisher,
