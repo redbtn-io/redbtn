@@ -25,6 +25,41 @@ import type { NodeConfig } from './types';
 const DEBUG = false;
 
 /**
+ * Lightweight inline sentinel — must mirror RunInterruptedError in
+ * `functions/run.ts`. We avoid importing from there to dodge circular deps
+ * (this module is loaded by the graph compiler which is loaded by run.ts).
+ *
+ * The outer execution wrapper checks `error.name === 'RunInterruptedError'`
+ * to route to publisher.interrupt() instead of publisher.fail().
+ */
+class RunInterruptedError extends Error {
+    readonly name = 'RunInterruptedError';
+    constructor(public readonly reason?: string) {
+        super(reason ? `Run interrupted: ${reason}` : 'Run interrupted');
+    }
+}
+
+/**
+ * Check the abort signal that `run()` stashes on `state._abortController`.
+ * Throws RunInterruptedError if the external `run:interrupt:{runId}` channel
+ * has been triggered. Called at the top of every node invocation and
+ * between steps so cancellation lands cleanly between checkpointed boundaries.
+ */
+function checkAbort(state: any): void {
+    const signal = state?._abortController?.signal;
+    if (signal?.aborted) {
+        const reason = signal.reason as { reason?: string } | string | undefined;
+        const reasonStr =
+            typeof reason === 'string'
+                ? reason
+                : reason && typeof (reason as any).reason === 'string'
+                    ? (reason as any).reason
+                    : undefined;
+        throw new RunInterruptedError(reasonStr);
+    }
+}
+
+/**
  * Create an event publisher from RunPublisher
  * Returns null if no RunPublisher is available (events will be skipped)
  */
@@ -67,6 +102,11 @@ function createNodeEventPublisher(state: any): {
  * @returns Partial state with updates from all executed steps
  */
 export const universalNode = async (state: any): Promise<Partial<any>> => {
+    // External-interrupt check at the top of every node invocation.
+    // MongoCheckpointer has already persisted state at the prior node's exit,
+    // so throwing here gives a clean checkpoint boundary for resume.
+    checkAbort(state);
+
     // Extract node config (injected by compiler)
     let nodeConfig: NodeConfig = state.nodeConfig || {};
 
@@ -199,6 +239,10 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
 
     // Execute steps sequentially
     for (let i = 0; i < steps.length; i++) {
+        // Between-step abort check — bails immediately on external interrupt
+        // without leaving a half-completed step on the state.
+        checkAbort(state);
+
         const step = steps[i];
         const stepNumber = i + 1;
 
@@ -263,6 +307,15 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
                 }
             }
         } catch (error: any) {
+            // External-interrupt sentinel — re-throw so the run wrapper can
+            // route to publisher.interrupt() instead of treating this as a
+            // generic error and triggering the error_handler fallback.
+            // MongoCheckpointer has the prior-node state; resuming will
+            // skip whatever this node was working on.
+            if (error?.name === 'RunInterruptedError') {
+                throw error;
+            }
+
             // Provide detailed error context
             const errorMessage = `Step ${stepNumber} (${step.type}) failed: ${error.message}`;
             console.error(`[UniversalNode] ${errorMessage}`);
@@ -297,6 +350,10 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
             };
         }
     }
+
+    // Final between-step abort check (after the last step but before
+    // we publish nodeComplete + return state).
+    checkAbort(state);
 
     // Publish node complete event
     if (eventPublisher) {
