@@ -19,7 +19,21 @@ import { AudioStreamPipeline } from '../../../tts/audio-stream';
 import { ParserExecutor, type ParserToolExecutor } from './parserExecutor';
 import { getParserRegistry } from './parserRegistry';
 import { getNativeRegistry } from '../../../tools/native-registry';
+import { runControlRegistry } from '../../../run/RunControlRegistry';
 import { HumanMessage } from '@langchain/core/messages';
+
+/**
+ * Resolve the run-level AbortSignal — see universalNode.ts for the full
+ * rationale. Reads from the per-process RunControlRegistry (survives
+ * checkpoint round-trips), with `state._abortController` as a fallback for
+ * direct/test callers.
+ */
+function getRunSignal(state: any): AbortSignal | undefined {
+    const runId = state?.runId || state?.data?.runId;
+    const ctx = runControlRegistry.get(runId);
+    if (ctx) return ctx.controller.signal;
+    return state?._abortController?.signal;
+}
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -277,12 +291,21 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // Get neuron registry from state
     const neuronRegistry = state.neuronRegistry;
 
-    // Pull the run-level AbortSignal once. LangChain's BaseChatModel
-    // (.invoke / .stream) accepts `{ signal }` as a call option and routes it
-    // through to the underlying transport — this is how mid-step interrupt
-    // cancels a long LLM generation. Ollama, OpenAI, Anthropic, and Google
-    // models all honor this in LangChain v0.2+.
-    const abortSignal: AbortSignal | undefined = state?._abortController?.signal;
+    // Pull the run-level AbortSignal once. Sourced from RunControlRegistry
+    // so it survives any LangGraph checkpoint round-trip (state-stashed
+    // controllers are stripped between nodes — see RunControlRegistry.ts).
+    //
+    // LangChain's BaseChatModel (.invoke / .stream) accepts `{ signal }` as
+    // a call option and routes it through to the underlying transport — this
+    // is how mid-step interrupt cancels a long LLM generation cooperatively.
+    // For the cases LangChain's signal forwarding doesn't cover, we also
+    // route the call through `neuronRegistry.callNeuron()` which registers
+    // the in-flight call with RunControlRegistry so a process-level
+    // interrupt can force-close it.
+    const abortSignal: AbortSignal | undefined = getRunSignal(state);
+
+    // Run identifier — needed by callNeuron for direct cancellation.
+    const callRunId: string | undefined = state?.runId || state?.data?.runId;
 
     // Determine which neuron ID to use
     const neuronId = config.neuronId || state.defaultNeuronId || state.data?.defaultNeuronId;
@@ -487,20 +510,36 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     let response: any;
 
     if (config.structuredOutput) {
-      // Invoke for structured output
+      // Invoke for structured output. We route through `callNeuron` (rather
+      // than calling `model.invoke()` directly) so the call gets registered
+      // with RunControlRegistry — that gives the interrupt subscriber a
+      // direct handle on this in-flight LLM call (cooperative abort +
+      // optional force-close after grace period).
+      //
+      // We pass `modelOverride` because the local `model` may have been
+      // wrapped with `withStructuredOutput()` further up — the wrapped
+      // instance still has `.invoke()` so it's compatible with callNeuron.
       let rawResponse: any;
 
       if (useNativeFormat) {
         // For Ollama, pass the format option at invocation time.
         // Signal threads through to the underlying HTTP request so external
         // interrupt cancels a stuck Ollama call instead of hanging.
-        rawResponse = await model.invoke(messages, {
-          format: config.structuredOutput.schema,
+        rawResponse = await neuronRegistry.callNeuron(neuronId, userId, messages, {
           signal: abortSignal,
+          runId: callRunId,
+          stream: false,
+          modelOverride: model,
+          invokeOptions: { format: config.structuredOutput.schema },
         });
       } else {
         // For other providers using withStructuredOutput
-        rawResponse = await model.invoke(messages, { signal: abortSignal });
+        rawResponse = await neuronRegistry.callNeuron(neuronId, userId, messages, {
+          signal: abortSignal,
+          runId: callRunId,
+          stream: false,
+          modelOverride: model,
+        });
       }
 
       // Handle different response formats based on provider
@@ -572,10 +611,24 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       const streamStartTime = Date.now();
 
       // Add timeout to stream start to avoid indefinite hangs.
-      // Signal lets external interrupt cancel before the model even starts
-      // emitting tokens — and after the stream is open it is also honored
-      // mid-stream by the underlying transport.
-      const streamPromise = model.stream(normalizedMessages, { signal: abortSignal });
+      //
+      // Routed through `callNeuron` so the in-flight stream is registered
+      // with RunControlRegistry — that lets `runControlRegistry.cancel()`
+      // reach this call directly (cooperative abort + optional force-close
+      // after grace period). LangChain's BaseChatModel.stream still honors
+      // the AbortSignal cooperatively, so this is belt-and-suspenders for
+      // providers where signal forwarding is incomplete.
+      const streamPromise = neuronRegistry.callNeuron(
+        neuronId,
+        userId,
+        normalizedMessages,
+        {
+          signal: abortSignal,
+          runId: callRunId,
+          stream: true,
+          modelOverride: model,
+        },
+      );
       const timeoutPromise = new Promise<never>((_, reject) => {
         setTimeout(() => {
           reject(
