@@ -13,12 +13,38 @@
  * @module functions/run
  */
 import type { Red } from '../index';
-import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState } from '../lib/run';
+import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys } from '../lib/run';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
 import { SYSTEM_TEMPLATES } from '../lib/types/graph';
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const IORedis = require('ioredis');
 
 export { RunPublisher, type RunState };
+
+/**
+ * Sentinel error thrown when the run's AbortController fires (external
+ * interrupt via `run:interrupt:{runId}`). Distinguished from generic errors
+ * via `error.name === 'RunInterruptedError'` so the outer execution wrapper
+ * can call `publisher.interrupt()` instead of `publisher.fail()`.
+ *
+ * Carries the optional reason string supplied by the interrupter.
+ */
+export class RunInterruptedError extends Error {
+  readonly name = 'RunInterruptedError';
+  constructor(public readonly reason?: string) {
+    super(reason ? `Run interrupted: ${reason}` : 'Run interrupted');
+  }
+}
+
+/** Type guard for the abort sentinel — used by universalNode + execution wrappers. */
+export function isRunInterruptedError(err: unknown): err is RunInterruptedError {
+  return (
+    err instanceof RunInterruptedError ||
+    (err instanceof Error && err.name === 'RunInterruptedError') ||
+    (typeof err === 'object' && err !== null && (err as any).name === 'RunInterruptedError')
+  );
+}
 
 /**
  * Connection fetcher callbacks for runtime credential access
@@ -47,17 +73,34 @@ export interface RunOptions {
     application?: string;
   };
   connectionFetcher?: ConnectionFetcher;
+  /**
+   * Resume from a previous run that was interrupted (or any prior run with a
+   * checkpoint). Reads channel_values from MongoCheckpointer keyed on the
+   * prior run's thread_id and merges them onto `state.previousRun` of the
+   * NEW run's initial state. Templates can read prior fields via
+   * `{{state.previousRun.someField}}`.
+   *
+   * The new run uses its OWN runId/thread_id — checkpoints aren't shared,
+   * just replayed once at startup.
+   */
+  resumeFromRunId?: string;
 }
 
 export interface RunResult {
   runId: string;
   graphId: string;
   graphName: string;
-  status: 'completed' | 'error';
+  status: 'completed' | 'error' | 'interrupted';
   content: string;
   thinking: string;
   data: Record<string, unknown>;
   error?: string;
+  /**
+   * Set when this run was halted by an external interrupt (see
+   * `RunOptions.resumeFromRunId` to replay state into a successor run).
+   * The optional reason is whatever the interrupter passed to publishRunInterrupt().
+   */
+  interruptedReason?: string;
   metadata: {
     startedAt: number;
     completedAt: number;
@@ -176,6 +219,119 @@ function extractThinkingFromContent(content: string): { thinking: string; cleane
 }
 
 // =============================================================================
+// Resume helper — load checkpointed state from a prior run
+// =============================================================================
+
+/**
+ * Snapshot of a prior run's terminal state, materialised from MongoCheckpointer
+ * and surfaced on the new run as `state.previousRun` (and `state.data.previousRun`).
+ *
+ * Templates can dereference any field the prior graph wrote to its state root:
+ * e.g. `{{state.previousRun.state.systemPrompt}}` or
+ * `{{state.previousRun.state.data.executionPlan}}`.
+ */
+export interface PreviousRunSnapshot {
+  /** Source run identifier */
+  runId: string;
+  /** When the source run was interrupted (or last checkpointed) */
+  interruptedAt: number;
+  /** Optional reason captured from the interrupt event */
+  reason?: string;
+  /**
+   * The new triggering input — what caused this resume to fire. Useful for
+   * graphs that need to know "the user said this NEW thing while the prior
+   * run was processing X".
+   */
+  newTrigger?: Record<string, unknown>;
+  /**
+   * Full channel_values from the prior LangGraph checkpoint. Shape mirrors
+   * whatever the prior graph wrote: top-level fields like `data`, `messages`,
+   * etc., plus any custom state-root fields. Service objects (memory,
+   * neuronRegistry, mcpClient, runPublisher, _abortController) are stripped.
+   */
+  state: Record<string, unknown>;
+}
+
+/**
+ * List of state keys that hold service objects / closures and must NOT be
+ * carried into a resumed run. They're rebuilt fresh from the new Red instance
+ * by buildInitialState().
+ */
+const NON_SERIALIZABLE_STATE_KEYS = new Set([
+  'memory',
+  'neuronRegistry',
+  '_graphRegistry',
+  'mcpClient',
+  'connectionManager',
+  'runPublisher',
+  '_abortController',
+  'systemPrefix',
+]);
+
+function stripNonSerializable(obj: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (NON_SERIALIZABLE_STATE_KEYS.has(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * Load the most-recent checkpoint for a prior run and assemble a
+ * PreviousRunSnapshot suitable for embedding on the new run's initial state.
+ *
+ * Returns null when no checkpoint exists (prior run never reached its first
+ * `on_chain_end`) or when MongoCheckpointer fails — the new run still starts,
+ * just without prior context.
+ *
+ * @param prevRunId - Source run to replay (used as both thread_id and conversation_id fallback)
+ * @param conversationId - New run's conversation (also used as conversation_id for checkpoint lookup when matching)
+ * @param newTrigger - The new triggering input (just for metadata on the snapshot)
+ * @param reason - Optional reason from the interrupt event
+ */
+async function loadPreviousRunSnapshot(
+  prevRunId: string,
+  conversationId: string | undefined,
+  newTrigger: Record<string, unknown> | undefined,
+  reason?: string,
+): Promise<PreviousRunSnapshot | null> {
+  try {
+    const checkpointer = createMongoCheckpointer();
+    // First try: lookup with the new conversation_id. If MongoCheckpointer
+    // was using a composite key and the new run is in the same conversation,
+    // the prior thread_id alone is enough.
+    let tuple = conversationId
+      ? await checkpointer.getTuple({
+          configurable: { conversation_id: conversationId, thread_id: prevRunId },
+        })
+      : null;
+    // Fallback: legacy callers that flat-stored conversation_id == thread_id.
+    if (!tuple) {
+      tuple = await checkpointer.getTuple({
+        configurable: { conversation_id: prevRunId, thread_id: prevRunId },
+      });
+    }
+    if (!tuple) {
+      console.warn(`[run] resumeFromRunId=${prevRunId} requested but no checkpoint found`);
+      return null;
+    }
+    const channelValues = (tuple.checkpoint?.channel_values as Record<string, unknown>) || {};
+    const stripped = stripNonSerializable(channelValues);
+    return {
+      runId: prevRunId,
+      interruptedAt: Date.now(),
+      reason,
+      newTrigger,
+      state: stripped,
+    };
+  } catch (err) {
+    console.warn(`[run] loadPreviousRunSnapshot(${prevRunId}) failed:`, err);
+    return null;
+  }
+}
+
+// =============================================================================
 // Initial State Builder
 // =============================================================================
 
@@ -186,6 +342,8 @@ function buildInitialState(
   userSettings: Awaited<ReturnType<typeof loadUserSettings>>,
   runId: string,
   publisher: RunPublisher,
+  abortController: AbortController,
+  previousRun: PreviousRunSnapshot | null,
 ) {
   const message = (input.message as string) || '';
   const systemPrompt =
@@ -231,6 +389,16 @@ CRITICAL RULES:
     },
     connectionManager,
     runPublisher: publisher,
+    // Stash the AbortController on a top-level state field so step executors
+    // (toolExecutor.ts already references state._abortController for fetch
+    // cancellation) and universalNode (between-step abort check) can access
+    // the signal without having to thread it through every helper.
+    _abortController: abortController,
+    // Replayed prior-run state surface — populated when RunOptions.resumeFromRunId
+    // is set. Templates can read fields via `{{state.previousRun.someField}}`.
+    // `state` carries the entire prior LangGraph channel_values (after they
+    // were materialised from the checkpoint via `.data.previousRun.*`).
+    previousRun: previousRun ?? undefined,
     data: {
       query: { message },
       input,
@@ -246,6 +414,9 @@ CRITICAL RULES:
       currentDateISO: now.toISOString(),
       currentDate: now.toLocaleDateString(),
       currentDateTime: now.toLocaleString(),
+      // Mirror previousRun under .data so the dot-path templates that the
+      // `transform` step executor uses (`{{data.previousRun.foo}}`) work too.
+      ...(previousRun ? { previousRun } : {}),
     },
   };
 }
@@ -322,6 +493,47 @@ async function executeNonStreaming(
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorStack = error instanceof Error ? error.stack : undefined;
+    // External interrupt — emit a terminal `run_interrupted` event instead of
+    // `run_error`. State at the last completed graph node is already in
+    // MongoCheckpointer; a successor run can replay it via resumeFromRunId.
+    if (isRunInterruptedError(error)) {
+      const reason = (error as RunInterruptedError).reason;
+      try {
+        await publisher.interrupt(reason);
+      } catch (publishErr) {
+        console.error('[run:executeNonStreaming] publisher.interrupt() failed:', publishErr);
+      }
+      const state = await publisher.getState();
+      return {
+        runId,
+        graphId: state?.graphId || '',
+        graphName: state?.graphName || '',
+        status: 'interrupted',
+        content: '',
+        thinking: '',
+        data: {},
+        interruptedReason: reason,
+        metadata: {
+          startedAt: state?.startedAt || Date.now(),
+          completedAt: Date.now(),
+          duration: state?.startedAt ? Date.now() - state.startedAt : 0,
+          nodesExecuted: state?.graph.nodesExecuted || 0,
+          executionPath: state?.graph.executionPath || [],
+        },
+        graphTrace: {
+          executionPath: state?.graph.executionPath || [],
+          nodeProgress: Object.fromEntries(
+            Object.entries(state?.graph.nodeProgress || {}).map(([nodeId, progress]: [string, any]) => [
+              nodeId,
+              { status: progress.status, nodeName: progress.nodeName, nodeType: progress.nodeType, startedAt: progress.startedAt, completedAt: progress.completedAt, error: progress.error },
+            ])
+          ),
+          startTime: state?.startedAt,
+          endTime: Date.now(),
+        },
+        tools: state?.tools || [],
+      };
+    }
     try {
       await publisher.fail(errorMessage, errorStack);
     } catch (publishErr) {
@@ -405,6 +617,22 @@ async function executeStreaming(
     };
     const stream = compiledGraph.graph.streamEvents(initialState, streamConfig);
     for await (const event of stream) {
+      // External-interrupt check between every streamed event. The signal is
+      // tripped by the `run:interrupt:{runId}` Redis subscriber set up in
+      // run() before this generator was created. We throw the sentinel so
+      // the outer catch (below) routes to publisher.interrupt() instead of
+      // publisher.fail().
+      if (initialState._abortController?.signal?.aborted) {
+        const reason =
+          (initialState._abortController.signal.reason as { reason?: string } | string | undefined);
+        const reasonStr =
+          typeof reason === 'string'
+            ? reason
+            : reason && typeof (reason as any).reason === 'string'
+              ? (reason as any).reason
+              : undefined;
+        throw new RunInterruptedError(reasonStr);
+      }
       const runName = event.metadata?.langgraph_node || '';
       const isRespondNode = runName === 'respond' || runName === 'responder';
       if (event.event === 'on_llm_stream' && event.data?.chunk?.content && isRespondNode) {
@@ -528,6 +756,46 @@ async function executeStreaming(
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorStack = error instanceof Error ? error.stack : undefined;
+    // External interrupt — clean shutdown via publisher.interrupt() so
+    // subscribers see a terminal `run_interrupted` event (not `run_error`).
+    if (isRunInterruptedError(error)) {
+      const reason = (error as RunInterruptedError).reason;
+      try {
+        await publisher.interrupt(reason);
+      } catch (publishErr) {
+        console.error('[run:executeStreaming] publisher.interrupt() failed:', publishErr);
+      }
+      const state = await publisher.getState();
+      return {
+        runId,
+        graphId: state?.graphId || '',
+        graphName: state?.graphName || '',
+        status: 'interrupted',
+        content: fullContent,
+        thinking: thinkingBuffer,
+        data: {},
+        interruptedReason: reason,
+        metadata: {
+          startedAt: state?.startedAt || Date.now(),
+          completedAt: Date.now(),
+          duration: state?.startedAt ? Date.now() - state.startedAt : 0,
+          nodesExecuted: state?.graph.nodesExecuted || 0,
+          executionPath: state?.graph.executionPath || [],
+        },
+        graphTrace: {
+          executionPath: state?.graph.executionPath || [],
+          nodeProgress: Object.fromEntries(
+            Object.entries(state?.graph.nodeProgress || {}).map(([nodeId, progress]: [string, any]) => [
+              nodeId,
+              { status: progress.status, nodeName: progress.nodeName, nodeType: progress.nodeType, startedAt: progress.startedAt, completedAt: progress.completedAt, error: progress.error },
+            ])
+          ),
+          startTime: state?.startedAt,
+          endTime: Date.now(),
+        },
+        tools: state?.tools || [],
+      };
+    }
     try {
       await publisher.fail(errorMessage, errorStack);
     } catch (publishErr) {
@@ -574,6 +842,65 @@ async function executeStreaming(
       tools: state?.tools || [],
     };
   }
+}
+
+// =============================================================================
+// Interrupt subscriber helper
+// =============================================================================
+
+/**
+ * Subscribe to `run:interrupt:{runId}` and trip an AbortController on the
+ * first message. Returns the dedicated subscriber Redis client so the caller
+ * can `quit()` it during cleanup (we don't reuse the engine's main client
+ * because ioredis enters subscriber mode on `subscribe()` and can no longer
+ * issue regular commands).
+ *
+ * The payload is intentionally not parsed here — any message trips the abort.
+ * If the message contains `{ reason: "..." }`, we forward it to the abort
+ * controller via the AbortSignal `reason` field so executeStreaming /
+ * universalNode can attach it to the RunInterruptedError.
+ */
+async function subscribeForInterrupt(
+  runId: string,
+  controller: AbortController,
+): Promise<{ quit: () => Promise<void> }> {
+  const url = process.env.REDIS_URL || 'redis://localhost:6379';
+  // Dedicated subscriber connection — required for ioredis subscribe mode.
+  const sub = new IORedis(url, { maxRetriesPerRequest: null, enableReadyCheck: false });
+  const channel = RunKeys.interrupt(runId);
+  try {
+    await sub.subscribe(channel);
+  } catch (err) {
+    console.warn(`[run] subscribeForInterrupt(${runId}): subscribe failed:`, err);
+    try { await sub.quit(); } catch { /* ignore */ }
+    return { quit: async () => { /* noop */ } };
+  }
+  sub.on('message', (_chan: string, raw: string) => {
+    try {
+      const parsed = raw ? JSON.parse(raw) : {};
+      const reason = typeof parsed?.reason === 'string' ? parsed.reason : undefined;
+      console.log(`[run] Interrupt received for ${runId}${reason ? ` (reason: ${reason})` : ''}`);
+      // Pass reason via the AbortSignal `reason` field — Node 18+ supports
+      // arbitrary reasons; consumers downcast to extract { reason }.
+      try {
+        controller.abort({ reason } as any);
+      } catch {
+        controller.abort();
+      }
+    } catch {
+      controller.abort();
+    }
+  });
+  return {
+    quit: async () => {
+      try {
+        await sub.unsubscribe(channel);
+      } catch { /* ignore */ }
+      try {
+        await sub.quit();
+      } catch { /* ignore */ }
+    },
+  };
 }
 
 // =============================================================================
@@ -681,11 +1008,11 @@ export async function run(
   try {
     const checkpointer = createMongoCheckpointer();
     const threadIdForRecovery = options.threadId || runId;
-    const existingCheckpoint = await checkpointer.getTuple({ 
-      configurable: { 
+    const existingCheckpoint = await checkpointer.getTuple({
+      configurable: {
         conversation_id: options.conversationId,
-        thread_id: threadIdForRecovery 
-      } 
+        thread_id: threadIdForRecovery
+      }
     });
     if (existingCheckpoint) {
       const step = existingCheckpoint.metadata?.step;
@@ -704,9 +1031,49 @@ export async function run(
     console.warn('[run] Could not check for existing checkpoint:', checkpointErr);
   }
 
+  // ── Resume from a prior interrupted run (loads channel_values) ─────────────
+  let previousRun: PreviousRunSnapshot | null = null;
+  if (options.resumeFromRunId) {
+    console.log(`[run] Resuming context from prior run ${options.resumeFromRunId}`);
+    previousRun = await loadPreviousRunSnapshot(
+      options.resumeFromRunId,
+      options.conversationId,
+      input,
+      // We don't carry the prior interrupt's reason here — the caller (worker
+      // concurrency block) is welcome to enrich `input._resumeReason`.
+      typeof (input as any)?._resumeReason === 'string' ? (input as any)._resumeReason : undefined,
+    );
+    if (previousRun) {
+      try {
+        await (publisher as any).publish({
+          type: 'status',
+          action: 'resumed',
+          description: `Resumed context from prior run ${options.resumeFromRunId}`,
+          timestamp: Date.now(),
+        });
+      } catch { /* non-fatal */ }
+    }
+  }
+
+  // ── External-interrupt subscriber ──────────────────────────────────────────
+  // Spin up before the graph executes so any interrupt published during
+  // execution trips this AbortController. The signal is also stashed on
+  // initialState._abortController for step executors to read.
+  const abortController = new AbortController();
+  let interruptSub: { quit: () => Promise<void> } | null = null;
+  try {
+    interruptSub = await subscribeForInterrupt(runId, abortController);
+  } catch (subErr) {
+    // If we can't subscribe, the run still proceeds — interrupts will simply
+    // be no-ops. Log but don't fail.
+    console.warn(`[run] Could not subscribe to interrupt channel for ${runId}:`, subErr);
+  }
+
   let initialState: any;
   try {
-    initialState = buildInitialState(red, input, options, userSettings, runId, publisher);
+    initialState = buildInitialState(
+      red, input, options, userSettings, runId, publisher, abortController, previousRun,
+    );
 
     const nodeCount = compiledGraph.config?.nodes?.length || 0;
     const entryNodeId = compiledGraph.config?.nodes?.[0]?.id || 'entry';
@@ -724,10 +1091,14 @@ export async function run(
       await publishFallbackError(err, 'graph-start');
     }
     try { await lock.release(); } catch { /* ignore */ }
+    if (interruptSub) { try { await interruptSub.quit(); } catch { /* ignore */ } }
     throw err;
   }
 
   const cleanup = async () => {
+    if (interruptSub) {
+      try { await interruptSub.quit(); } catch { /* ignore */ }
+    }
     await lock.release();
     console.log(`[run] Released lock for conversation ${lockKey}`);
   };
