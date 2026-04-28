@@ -9,8 +9,13 @@
 
 /**
  * Status of a run execution
+ *
+ * `'interrupted'` indicates the run was halted by an external actor via the
+ * `run:interrupt:{runId}` Redis pub/sub channel (see RunKeys.interrupt).
+ * State at the last completed node is preserved by MongoCheckpointer; a new
+ * run can resume by passing `resumeFromRunId` in RunOptions.
  */
-export type RunStatus = 'pending' | 'running' | 'completed' | 'error';
+export type RunStatus = 'pending' | 'running' | 'completed' | 'error' | 'interrupted';
 
 /**
  * Status of a node within a run
@@ -207,6 +212,27 @@ export interface StatusEvent extends BaseEvent {
 }
 
 /**
+ * Run interrupted event — emitted by RunPublisher.interrupt() when an
+ * external actor halts the run via the `run:interrupt:{runId}` channel.
+ *
+ * Symmetric with `run_complete` and `run_error` — subscribers should treat
+ * this as a terminal event that resolves their wait Promises. State at the
+ * last completed node is persisted in MongoCheckpointer (graphcheckpoints
+ * collection, 7-day TTL) and can be replayed by starting a new run with
+ * `resumeFromRunId: <prevRunId>` in RunOptions.
+ */
+export interface RunInterruptedEvent extends BaseEvent {
+  type: 'run_interrupted';
+  /** Run identifier — included for correlation */
+  runId: string;
+  /**
+   * Optional reason supplied by the interrupter (e.g. 'automation-superseded',
+   * 'user-cancelled', 'god-stream-correction'). Free-form string.
+   */
+  reason?: string;
+}
+
+/**
  * Graph lifecycle events
  */
 export interface GraphStartEvent extends BaseEvent {
@@ -374,6 +400,7 @@ export type RunEvent =
   | RunStartEvent
   | RunCompleteEvent
   | RunErrorEvent
+  | RunInterruptedEvent
   | StatusEvent
   | GraphStartEvent
   | GraphCompleteEvent
@@ -423,6 +450,17 @@ export const RunKeys = {
   userRuns: (userId: string) => `run:user:${userId}`,
   /** Active run for conversation: `run:conversation:{conversationId}` */
   conversationRun: (conversationId: string) => `run:conversation:${conversationId}`,
+  /**
+   * External interrupt channel: `run:interrupt:{runId}`.
+   *
+   * Pub/sub-only — no state stored. When any actor publishes ANY message to
+   * this channel, the engine's run subscriber (set up before graph invocation
+   * in `functions/run.ts`) calls `AbortController.abort('interrupted')`. The
+   * graph then halts cleanly between nodes; MongoCheckpointer has already
+   * persisted state at the last completed node so a new run can resume by
+   * passing `resumeFromRunId: <prevRunId>` in RunOptions.
+   */
+  interrupt: (runId: string) => `run:interrupt:${runId}`,
 } as const;
 
 // =============================================================================

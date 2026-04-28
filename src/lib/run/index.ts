@@ -25,6 +25,7 @@ export {
   type RunStartEvent,
   type RunCompleteEvent,
   type RunErrorEvent,
+  type RunInterruptedEvent,
   type StatusEvent,
   type GraphStartEvent,
   type GraphCompleteEvent,
@@ -58,6 +59,7 @@ export {
   getRunState,
   getActiveRunForConversation,
   publishRunError,
+  publishRunInterrupt,
   ARCHIVE_QUEUE_NAMES,
 } from './run-publisher';
 
