@@ -621,4 +621,62 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register upload_to_library:', msg);
   }
+
+  // ─── Pattern pack (TOOL-HANDOFF.md §4.6) ──────────────────────────────────
+  // Pure utility tools. No API calls, no side effects — they only manipulate
+  // strings, regexes, JSON, or token counts.
+  try {
+    // Regex Match — apply a regex to text; returns match(es) with groups + index
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const regexMatch = require('./native/regex-match.js');
+    registry.register('regex_match', regexMatch.default || regexMatch);
+    console.log('[NativeRegistry] Registered built-in tool: regex_match');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register regex_match:', msg);
+  }
+
+  try {
+    // JSON Query — JSONPath-style accessor against an arbitrary JSON value
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const jsonQuery = require('./native/json-query.js');
+    registry.register('json_query', jsonQuery.default || jsonQuery);
+    console.log('[NativeRegistry] Registered built-in tool: json_query');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register json_query:', msg);
+  }
+
+  try {
+    // Extract Thinking — strip <think>...</think> tags; returns thinking + content
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const extractThinking = require('./native/extract-thinking.js');
+    registry.register('extract_thinking', extractThinking.default || extractThinking);
+    console.log('[NativeRegistry] Registered built-in tool: extract_thinking');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register extract_thinking:', msg);
+  }
+
+  try {
+    // Strip Formatting — remove Markdown or HTML formatting from text
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const stripFormatting = require('./native/strip-formatting.js');
+    registry.register('strip_formatting', stripFormatting.default || stripFormatting);
+    console.log('[NativeRegistry] Registered built-in tool: strip_formatting');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register strip_formatting:', msg);
+  }
+
+  try {
+    // Count Tokens — tiktoken-backed token count for a given model (default gpt-4)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const countTokens = require('./native/count-tokens.js');
+    registry.register('count_tokens', countTokens.default || countTokens);
+    console.log('[NativeRegistry] Registered built-in tool: count_tokens');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register count_tokens:', msg);
+  }
 }
