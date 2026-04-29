@@ -292,4 +292,71 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register scrape_url:', msg);
   }
+
+  // ─── Global-state pack (TOOL-HANDOFF.md §4.2) ─────────────────────────────
+  try {
+    // Get Global State — read a single namespace value
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getGlobalState = require('./native/get-global-state.js');
+    registry.register('get_global_state', getGlobalState.default || getGlobalState);
+    console.log('[NativeRegistry] Registered built-in tool: get_global_state');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_global_state:', msg);
+  }
+
+  try {
+    // Set Global State — write a single namespace value (with optional TTL)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const setGlobalState = require('./native/set-global-state.js');
+    registry.register('set_global_state', setGlobalState.default || setGlobalState);
+    console.log('[NativeRegistry] Registered built-in tool: set_global_state');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register set_global_state:', msg);
+  }
+
+  try {
+    // Delete Global State — delete a single namespace key
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const deleteGlobalState = require('./native/delete-global-state.js');
+    registry.register('delete_global_state', deleteGlobalState.default || deleteGlobalState);
+    console.log('[NativeRegistry] Registered built-in tool: delete_global_state');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register delete_global_state:', msg);
+  }
+
+  try {
+    // List Global State — return all key/value pairs in a namespace
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listGlobalState = require('./native/list-global-state.js');
+    registry.register('list_global_state', listGlobalState.default || listGlobalState);
+    console.log('[NativeRegistry] Registered built-in tool: list_global_state');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_global_state:', msg);
+  }
+
+  try {
+    // List Namespaces — list every namespace the caller can access
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listNamespaces = require('./native/list-namespaces.js');
+    registry.register('list_namespaces', listNamespaces.default || listNamespaces);
+    console.log('[NativeRegistry] Registered built-in tool: list_namespaces');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_namespaces:', msg);
+  }
+
+  try {
+    // Delete Namespace — delete an entire namespace and all keys (owner-only)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const deleteNamespace = require('./native/delete-namespace.js');
+    registry.register('delete_namespace', deleteNamespace.default || deleteNamespace);
+    console.log('[NativeRegistry] Registered built-in tool: delete_namespace');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register delete_namespace:', msg);
+  }
 }
