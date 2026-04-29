@@ -11,12 +11,30 @@
  * - RunPublisher access for live UI streaming
  * - Large output support (truncated at 100KB in return value, full output
  *   is available as the streaming feed)
+ *
+ * # Two execution modes (Phase B)
+ *
+ * 1. **environmentId mode (preferred)** — when `environmentId` is provided,
+ *    the tool routes through `EnvironmentManager.acquire()` to use a pooled,
+ *    drop-tolerant `EnvironmentSession`. First call opens the SSH session;
+ *    subsequent calls reuse it (no per-call handshake). Inline `host`/`user`/
+ *    `sshKey`/`sshKeyPath`/`password` are IGNORED in this mode.
+ *
+ * 2. **inline mode (legacy)** — when `environmentId` is omitted, the tool
+ *    opens a one-shot SSH connection using the inline credentials, runs the
+ *    command, and tears the connection down. Backwards-compatible — every
+ *    existing graph that uses `ssh_shell` continues to work unchanged.
+ *
+ * For any sustained SSH usage (multiple calls to the same host), prefer the
+ * environmentId mode — it removes the handshake cost and adds drop tolerance.
  */
 
 import { Client, ConnectConfig } from 'ssh2';
 import * as fs from 'fs';
 import * as os from 'os';
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
+import { environmentManager } from '../../environments/EnvironmentManager';
+import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
 
 // No limits — Claude sessions can produce large outputs and we need
 // the full stream-json including the final result event
@@ -28,7 +46,14 @@ const MAX_BUFFER_BYTES = Infinity;
 type AnyObject = Record<string, any>;
 
 interface SshShellArgs {
-  host: string;
+  /**
+   * **Phase B (preferred):** Execute against a managed Environment session.
+   * When supplied, all inline auth/host fields are ignored — the engine
+   * loads the IEnvironment doc, resolves the secret, and routes through
+   * `EnvironmentManager.acquire()` for connection pooling + drop tolerance.
+   */
+  environmentId?: string;
+  host?: string;
   port?: number;
   user?: string;
   sshKeyPath?: string;
@@ -41,15 +66,19 @@ interface SshShellArgs {
 }
 
 const sshShell: NativeToolDefinition = {
-  description: 'Execute a command on a remote machine via SSH with real-time output streaming. Returns stdout, stderr, and exit code.',
+  description: 'Execute a command on a remote machine via SSH with real-time output streaming. Returns stdout, stderr, and exit code. Pass `environmentId` (preferred) to use a pooled, drop-tolerant managed Environment session — first call opens, subsequent calls reuse. Inline `host`/`user`/`sshKey` still work for one-shot use.',
   server: 'system',
 
   inputSchema: {
     type: 'object',
     properties: {
+      environmentId: {
+        type: 'string',
+        description: 'PREFERRED: ID of a managed Environment configured under /api/v1/environments. When set, the tool uses a pooled SSH session (no per-call handshake, drop-tolerant). All inline host/user/sshKey fields are ignored when this is set.',
+      },
       host: {
         type: 'string',
-        description: 'SSH hostname or IP address',
+        description: 'SSH hostname or IP address (ignored when environmentId is set)',
       },
       port: {
         type: 'number',
@@ -92,12 +121,13 @@ const sshShell: NativeToolDefinition = {
         default: {},
       },
     },
-    required: ['host', 'command'],
+    required: ['command'],
   },
 
   handler: async (rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> => {
     const args = rawArgs as SshShellArgs;
     const {
+      environmentId,
       host,
       port = 22,
       user = 'alpha',
@@ -113,6 +143,48 @@ const sshShell: NativeToolDefinition = {
     const publisher = context?.publisher || null;
     const runId = context?.runId || null;
     const nodeId = context?.nodeId || 'ssh_shell';
+
+    // -----------------------------------------------------------------------
+    // Phase B: environmentId mode — route through EnvironmentManager
+    //
+    // When the caller passes an environmentId, we bypass the inline SSH path
+    // entirely. The session is pooled per-process so subsequent invocations
+    // reuse the same connection (no per-call handshake) and we get drop
+    // tolerance "for free" via EnvironmentSession's reconnect machinery.
+    // -----------------------------------------------------------------------
+    if (environmentId && typeof environmentId === 'string') {
+      return executeViaEnvironment({
+        environmentId,
+        command,
+        workingDir,
+        timeout,
+        env,
+        context,
+        publisher,
+        runId,
+        nodeId,
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // Inline mode (legacy) — one-shot SSH connection
+    //
+    // Host is required when environmentId is not provided. Surface that as a
+    // clean tool error rather than letting ssh2 throw `Cannot connect to
+    // undefined`.
+    // -----------------------------------------------------------------------
+    if (!host) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: 'ssh_shell requires either `environmentId` (preferred) or inline `host` to connect',
+          }),
+        }],
+        isError: true,
+      };
+    }
 
     console.log(`[ssh_shell] Connecting to ${user}@${host}:${port}`);
     console.log(`[ssh_shell] Command: ${command.substring(0, 200)}${command.length > 200 ? '...' : ''}`);
@@ -400,6 +472,202 @@ const sshShell: NativeToolDefinition = {
     });
   },
 };
+
+// ---------------------------------------------------------------------------
+// Phase B — environmentId-mode handler
+// ---------------------------------------------------------------------------
+
+interface ExecuteViaEnvironmentArgs {
+  environmentId: string;
+  command: string;
+  workingDir?: string;
+  timeout: number;
+  env: Record<string, string>;
+  context: NativeToolContext;
+  publisher: AnyObject | null;
+  runId: string | null;
+  nodeId: string;
+}
+
+/**
+ * Execute a command through the EnvironmentManager. Loads the IEnvironment
+ * doc, resolves its secret, acquires (or reuses) the pooled session, and
+ * runs the command via `session.exec()`.
+ *
+ * # Why this is a separate function
+ *
+ * The inline-SSH path is an entire ~250 line ssh2 promise dance. The
+ * environment path is a 30-line acquire+exec. Splitting them keeps the
+ * inline path completely unchanged for backwards compat, while letting the
+ * env path stay readable.
+ *
+ * # State streaming
+ *
+ * `EnvironmentSession.exec` is request/response — it doesn't stream output
+ * mid-command (the underlying ssh2 stream is buffered into stdout/stderr
+ * tails before resolving). We still emit `tool_start` and a final
+ * `tool_output` so the UI sees activity. For chunk-by-chunk streaming the
+ * caller should use the inline path or the upcoming `ssh_run_async` (Phase
+ * D) which is purpose-built for long-running commands.
+ *
+ * # Userid
+ *
+ * Pulled from `context.state.userId` (graph state root) — this is the
+ * userId of the run that triggered the tool. The access check inside
+ * `loadAndResolveEnvironment` enforces owner-OR-public.
+ */
+async function executeViaEnvironment(args: ExecuteViaEnvironmentArgs): Promise<NativeMcpResult> {
+  const { environmentId, command, workingDir, timeout, env, context, publisher, runId, nodeId } = args;
+  const startTime = Date.now();
+  // userId source — graph state root (set by buildInitialState in run.ts) is
+  // the canonical place. Defensive fallback to context.state.data.userId
+  // for any caller that didn't go through the standard graph init path.
+  const userId =
+    (context?.state as AnyObject | undefined)?.userId
+    || (context?.state as AnyObject | undefined)?.data?.userId
+    || '';
+
+  console.log(`[ssh_shell] env=${environmentId} cmd: ${command.substring(0, 200)}${command.length > 200 ? '...' : ''}`);
+  if (runId) console.log(`[ssh_shell] Run: ${runId}, Node: ${nodeId}, User: ${userId}`);
+
+  if (!userId) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: false,
+          error: `ssh_shell with environmentId requires a userId in graph state — got empty. This usually means the tool was invoked outside a run context.`,
+        }),
+      }],
+      isError: true,
+    };
+  }
+
+  // ── Load + access-check + secret-resolve ────────────────────────────────
+  let env_, sshKey;
+  try {
+    const resolved = await loadAndResolveEnvironment(environmentId, userId);
+    env_ = resolved.env;
+    sshKey = resolved.sshKey;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const code = (err as { code?: string })?.code || 'ENV_RESOLVE_FAILED';
+    console.error(`[ssh_shell] Environment resolution failed for ${environmentId}: ${msg}`);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: false,
+          error: msg,
+          code,
+          environmentId,
+        }),
+      }],
+      isError: true,
+    };
+  }
+
+  // ── Acquire session (pooled — first call opens, rest reuse) ─────────────
+  let session;
+  try {
+    session = await environmentManager.acquire(env_, sshKey, userId);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[ssh_shell] EnvironmentManager.acquire failed for ${environmentId}: ${msg}`);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: false,
+          error: `Failed to acquire environment session: ${msg}`,
+          environmentId,
+        }),
+      }],
+      isError: true,
+    };
+  }
+
+  if (publisher) {
+    try {
+      (publisher as AnyObject).publish({
+        type: 'tool_start',
+        nodeId,
+        data: {
+          tool: 'ssh_shell',
+          environmentId,
+          host: env_.host,
+          user: env_.user,
+          command: command.substring(0, 200),
+          timestamp: Date.now(),
+          mode: 'environment',
+        },
+      });
+    } catch (pubErr: unknown) {
+      const msg = pubErr instanceof Error ? pubErr.message : String(pubErr);
+      console.warn('[ssh_shell] Failed to publish tool_start:', msg);
+    }
+  }
+
+  // ── Exec ────────────────────────────────────────────────────────────────
+  try {
+    const result = await session.exec(command, {
+      cwd: workingDir,
+      env,
+      timeout: timeout > 0 ? timeout : undefined,
+      abortSignal: context?.abortSignal || undefined,
+    });
+    const duration = Date.now() - startTime;
+    const success = result.exitCode === 0;
+
+    if (publisher) {
+      try {
+        (publisher as AnyObject).publish({
+          type: 'tool_output',
+          nodeId,
+          data: {
+            chunk: result.stdout,
+            stream: 'stdout',
+            totalBytes: result.stdout.length + result.stderr.length,
+          },
+        });
+      } catch { /* ignore */ }
+    }
+
+    console.log(`[ssh_shell] env=${environmentId} completed in ${duration}ms exitCode=${result.exitCode} stdout=${result.stdout.length}B stderr=${result.stderr.length}B`);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success,
+          exitCode: result.exitCode,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          totalBytes: result.stdout.length + result.stderr.length,
+          truncated: result.truncated,
+          durationMs: duration,
+          environmentId,
+        }),
+      }],
+    };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const duration = Date.now() - startTime;
+    console.error(`[ssh_shell] env=${environmentId} exec failed after ${duration}ms: ${msg}`);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: false,
+          error: msg,
+          environmentId,
+          durationMs: duration,
+        }),
+      }],
+      isError: true,
+    };
+  }
+}
 
 export default sshShell;
 // Also export as module.exports for CJS require() compatibility (the .js files use require())
