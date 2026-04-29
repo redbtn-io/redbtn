@@ -1268,4 +1268,50 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register list_dir:', msg);
   }
+
+  // ─── Platform pack — Phase C (PLATFORM-PACK-HANDOFF.md §2 Phase C) ────────
+  // Validation tooling that closes the agent's iteration loop. The Phase A
+  // PR (parallel work — see PLATFORM-PACK-HANDOFF.md §2 Phase A) wires the
+  // CRUD tools (create_graph, update_graph, fork_graph, etc.) and ships
+  // STUB versions of these two tool names with NOT_IMPLEMENTED responses.
+  // Phase C SUPERSEDES those stubs with real implementations:
+  //   - validate_graph_config → engine-side dry-run validator (collects ALL
+  //                              errors + warnings without persisting). Used
+  //                              by the agent BEFORE create_graph.
+  //   - get_graph_compile_log → fetches the most recent compile attempts for
+  //                              a graph from the new webapp endpoint. Used
+  //                              AFTER create_graph / update_graph to debug.
+  //
+  // When the Phase A PR also lands, these registrations should remain — the
+  // merge resolution is to KEEP these real Phase C registrations and DROP
+  // the stub registrations from Phase A.
+  try {
+    // Validate Graph Config — engine-side dry-run validator. Returns ALL
+    // errors + warnings in one shot. SUPERSEDES Phase A stub.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const validateGraphConfig = require('./native/validate-graph-config.js');
+    registry.register(
+      'validate_graph_config',
+      validateGraphConfig.default || validateGraphConfig,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: validate_graph_config');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register validate_graph_config:', msg);
+  }
+
+  try {
+    // Get Graph Compile Log — proxies GET /api/v1/graphs/:graphId/compile-log.
+    // SUPERSEDES Phase A stub.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getGraphCompileLog = require('./native/get-graph-compile-log.js');
+    registry.register(
+      'get_graph_compile_log',
+      getGraphCompileLog.default || getGraphCompileLog,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: get_graph_compile_log');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_graph_compile_log:', msg);
+  }
 }
