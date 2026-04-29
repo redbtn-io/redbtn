@@ -270,4 +270,26 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register get_recent_runs:', msg);
   }
+
+  try {
+    // Web Search — Google Custom Search API (ported from web-sse.ts)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const webSearch = require('./native/web-search.js');
+    registry.register('web_search', webSearch.default || webSearch);
+    console.log('[NativeRegistry] Registered built-in tool: web_search');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register web_search:', msg);
+  }
+
+  try {
+    // Scrape URL — fetch + smart-extract main readable content (ported from web-sse.ts)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const scrapeUrl = require('./native/scrape-url.js');
+    registry.register('scrape_url', scrapeUrl.default || scrapeUrl);
+    console.log('[NativeRegistry] Registered built-in tool: scrape_url');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register scrape_url:', msg);
+  }
 }
