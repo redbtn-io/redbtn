@@ -922,4 +922,37 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register cancel_run:', msg);
   }
+
+  // ─── Notifications pack (TOOL-HANDOFF.md §4.13) ───────────────────────────
+  // Two tools that complement the existing `push_message` (in-app conversation
+  // push). These extend notification reach beyond the app:
+  //   - send_email     → outbound SMTP via the same Gmail relay used by the
+  //                      magic-link auth flow. Markdown-by-default body with
+  //                      HTML + plain-text delivery; attachments supported.
+  //   - send_webhook   → outbound HTTP to an arbitrary URL (Slack, Discord,
+  //                      Zapier, custom backends). Defaults to POST + JSON;
+  //                      returns { status, response } with parsed JSON body
+  //                      when possible. Honours the run-level abort signal.
+  try {
+    // Send Email — SMTP via nodemailer, env: EMAIL_HOST/PORT/USER/PASS/FROM.
+    // Default From address is agent@redbtn.io.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sendEmail = require('./native/send-email.js');
+    registry.register('send_email', sendEmail.default || sendEmail);
+    console.log('[NativeRegistry] Registered built-in tool: send_email');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register send_email:', msg);
+  }
+
+  try {
+    // Send Webhook — outbound HTTP with JSON-by-default body serialisation.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sendWebhook = require('./native/send-webhook.js');
+    registry.register('send_webhook', sendWebhook.default || sendWebhook);
+    console.log('[NativeRegistry] Registered built-in tool: send_webhook');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register send_webhook:', msg);
+  }
 }
