@@ -744,6 +744,74 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     console.error('[NativeRegistry] Failed to register invoke_graph:', msg);
   }
 
+  // ─── Stream pack (TOOL-HANDOFF.md §4.10) ──────────────────────────────────
+  // Four tools that let an agent dynamically start, end, inspect, and list
+  // live stream sessions (chat, voice, websocket, etc.). The session-listing
+  // and per-session GET routes are scoped under :streamId in the webapp; the
+  // tools that take only a sessionId fall back to a bounded discovery walk
+  // across the caller's accessible streams.
+  try {
+    // Start Stream Session — POST /api/v1/streams/:streamId/sessions; metadata
+    // is forwarded as triggerData on the new session doc.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const startStreamSession = require('./native/start-stream-session.js');
+    registry.register(
+      'start_stream_session',
+      startStreamSession.default || startStreamSession,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: start_stream_session');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register start_stream_session:', msg);
+  }
+
+  try {
+    // End Stream Session — POST /api/v1/streams/sessions/:sessionId/end;
+    // returns the persisted lifecycle status (typically `'draining'`).
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const endStreamSession = require('./native/end-stream-session.js');
+    registry.register(
+      'end_stream_session',
+      endStreamSession.default || endStreamSession,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: end_stream_session');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register end_stream_session:', msg);
+  }
+
+  try {
+    // Get Stream Session — GET /api/v1/streams/:streamId/sessions/:sessionId;
+    // when streamId is omitted, walks the caller's accessible streams to find
+    // the session.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getStreamSession = require('./native/get-stream-session.js');
+    registry.register(
+      'get_stream_session',
+      getStreamSession.default || getStreamSession,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: get_stream_session');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_stream_session:', msg);
+  }
+
+  try {
+    // List Stream Sessions — GET /api/v1/streams/:streamId/sessions; when
+    // streamId is omitted, fans out across the caller's accessible streams
+    // and merges + re-sorts the results.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listStreamSessions = require('./native/list-stream-sessions.js');
+    registry.register(
+      'list_stream_sessions',
+      listStreamSessions.default || listStreamSessions,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: list_stream_sessions');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_stream_sessions:', msg);
+  }
+
   // ─── Automation pack (TOOL-HANDOFF.md §4.8) ───────────────────────────────
   // Five tools that let an agent dynamically discover, inspect, and control
   // automations. trigger_automation supports optional polling for terminal
