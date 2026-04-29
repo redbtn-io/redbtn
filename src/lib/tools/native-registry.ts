@@ -1118,4 +1118,80 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register ssh_jobs:', msg);
   }
+
+  // ─── fs pack (TOOL-HANDOFF.md follow-up via ENVIRONMENT-HANDOFF.md §4.1) ──
+  // Six coding-agent file-ops tools, all REQUIRE environmentId and route
+  // through the EnvironmentSession's pooled SFTP/exec channels:
+  //   - read_file    → SFTP read; line-numbered Claude-Code-style output
+  //   - write_file   → atomic SFTP write (temp + rename via session helper)
+  //   - edit_file    → unique-match-or-reject find/replace; replaceAll opt-in
+  //   - glob         → bash globstar+dotglob+nullglob over SSH exec
+  //   - grep_files   → ripgrep when available, grep -rn fallback
+  //   - list_dir     → SFTP readdir (single-level) or BFS walk (recursive)
+  //                    with default skip set (.git/node_modules/.next/dist)
+  try {
+    // Read File — SFTP read with offset/limit and line-numbered output
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const readFile = require('./native/read-file.js');
+    registry.register('read_file', readFile.default || readFile);
+    console.log('[NativeRegistry] Registered built-in tool: read_file');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register read_file:', msg);
+  }
+
+  try {
+    // Write File — atomic SFTP write with optional file mode
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const writeFile = require('./native/write-file.js');
+    registry.register('write_file', writeFile.default || writeFile);
+    console.log('[NativeRegistry] Registered built-in tool: write_file');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register write_file:', msg);
+  }
+
+  try {
+    // Edit File — Claude-Code-style unique-match-or-reject find/replace
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const editFile = require('./native/edit-file.js');
+    registry.register('edit_file', editFile.default || editFile);
+    console.log('[NativeRegistry] Registered built-in tool: edit_file');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register edit_file:', msg);
+  }
+
+  try {
+    // Glob — bash globstar+dotglob+nullglob over SSH exec
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const glob = require('./native/glob.js');
+    registry.register('glob', glob.default || glob);
+    console.log('[NativeRegistry] Registered built-in tool: glob');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register glob:', msg);
+  }
+
+  try {
+    // Grep Files — ripgrep when available, grep -rn fallback; structured matches
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const grepFiles = require('./native/grep-files.js');
+    registry.register('grep_files', grepFiles.default || grepFiles);
+    console.log('[NativeRegistry] Registered built-in tool: grep_files');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register grep_files:', msg);
+  }
+
+  try {
+    // List Dir — SFTP readdir (flat) or BFS walk (recursive); ignore patterns
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listDir = require('./native/list-dir.js');
+    registry.register('list_dir', listDir.default || listDir);
+    console.log('[NativeRegistry] Registered built-in tool: list_dir');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_dir:', msg);
+  }
 }
