@@ -133,6 +133,45 @@ export type {
   StreamSubgraphResultEvent,
 } from './lib/streams';
 
+// Export Environments runtime (Phase A — long-running SSH/SFTP sessions)
+export {
+  EnvironmentManager,
+  environmentManager,
+  EnvironmentSession,
+  EXEC_MAX_OUTPUT_BYTES,
+  BUFFER_MAX_COMMANDS,
+  BUFFER_MAX_BYTES,
+  ENV_DEFAULTS,
+  EnvironmentClosedError,
+  EnvironmentTimeoutError,
+  EnvironmentBufferOverflowError,
+} from './lib/environments';
+export type {
+  // Manager / session config
+  EnvironmentManagerOptions,
+  EnvironmentSessionOptions,
+  SshClientFactory,
+  OnExecCompleteHandler,
+  // Doc shapes
+  IEnvironment,
+  IEnvironmentLog,
+  EnvironmentReconnectPolicy,
+  // Lifecycle
+  EnvironmentLifecycleState,
+  EnvironmentLifecycleEvent,
+  EnvironmentExecCompletedEvent,
+  EnvironmentStatus,
+  // Exec / SFTP
+  ExecOptions,
+  ExecResult,
+  SftpStatResult,
+  SftpDirEntry,
+  SftpReadOptions,
+  SftpWriteOptions,
+  // Pending buffer
+  PendingCommand,
+} from './lib/environments';
+
 // --- Type Definitions ---
 
 /**
