@@ -923,6 +923,36 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     console.error('[NativeRegistry] Failed to register cancel_run:', msg);
   }
 
+  // ─── Files pack (TOOL-HANDOFF.md §4.14) ───────────────────────────────────
+  // Two tools that complement the existing `upload_attachment`:
+  //   - download_file   → fetch a remote URL as base64 + MIME type + size
+  //   - parse_document  → decode base64 bytes and extract readable text via
+  //                       the shared DocumentParser (PDF / DOCX / XLSX / etc.)
+  // Together they let an agent pull a file off the network, hand it to the
+  // parser, and feed the resulting text into prompts or RAG without ever
+  // touching disk.
+  try {
+    // Download File — bounded HTTP/HTTPS download → base64 + mimeType + size.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const downloadFile = require('./native/download-file.js');
+    registry.register('download_file', downloadFile.default || downloadFile);
+    console.log('[NativeRegistry] Registered built-in tool: download_file');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register download_file:', msg);
+  }
+
+  try {
+    // Parse Document — base64 + mimeType → extracted text via DocumentParser.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const parseDocument = require('./native/parse-document.js');
+    registry.register('parse_document', parseDocument.default || parseDocument);
+    console.log('[NativeRegistry] Registered built-in tool: parse_document');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register parse_document:', msg);
+  }
+
   // ─── Notifications pack (TOOL-HANDOFF.md §4.13) ───────────────────────────
   // Two tools that complement the existing `push_message` (in-app conversation
   // push). These extend notification reach beyond the app:
