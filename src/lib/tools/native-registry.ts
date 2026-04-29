@@ -359,4 +359,146 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register delete_namespace:', msg);
   }
+
+  // ─── Conversation pack (TOOL-HANDOFF.md §4.3) ─────────────────────────────
+  try {
+    // Create Conversation — POST /api/v1/conversations
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const createConversation = require('./native/create-conversation.js');
+    registry.register('create_conversation', createConversation.default || createConversation);
+    console.log('[NativeRegistry] Registered built-in tool: create_conversation');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register create_conversation:', msg);
+  }
+
+  try {
+    // List Conversations — GET /api/v1/conversations
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listConversations = require('./native/list-conversations.js');
+    registry.register('list_conversations', listConversations.default || listConversations);
+    console.log('[NativeRegistry] Registered built-in tool: list_conversations');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_conversations:', msg);
+  }
+
+  try {
+    // Get Conversation — GET /api/v1/conversations/:id
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getConversation = require('./native/get-conversation.js');
+    registry.register('get_conversation', getConversation.default || getConversation);
+    console.log('[NativeRegistry] Registered built-in tool: get_conversation');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_conversation:', msg);
+  }
+
+  try {
+    // Get Messages — GET /api/v1/conversations/:id/messages (replaces MCP get_messages)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getMessages = require('./native/get-messages.js');
+    registry.register('get_messages', getMessages.default || getMessages);
+    console.log('[NativeRegistry] Registered built-in tool: get_messages');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_messages:', msg);
+  }
+
+  try {
+    // Get Conversation Metadata — projection from GET /api/v1/conversations/:id
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getConversationMetadata = require('./native/get-conversation-metadata.js');
+    registry.register(
+      'get_conversation_metadata',
+      getConversationMetadata.default || getConversationMetadata,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: get_conversation_metadata');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_conversation_metadata:', msg);
+  }
+
+  try {
+    // Get Conversation Summary — GET /api/v1/conversations/:id/summary
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getConversationSummary = require('./native/get-conversation-summary.js');
+    registry.register(
+      'get_conversation_summary',
+      getConversationSummary.default || getConversationSummary,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: get_conversation_summary');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_conversation_summary:', msg);
+  }
+
+  try {
+    // Set Conversation Title — PATCH /api/v1/conversations/:id { title }
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const setConversationTitle = require('./native/set-conversation-title.js');
+    registry.register(
+      'set_conversation_title',
+      setConversationTitle.default || setConversationTitle,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: set_conversation_title');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register set_conversation_title:', msg);
+  }
+
+  try {
+    // Delete Conversation — PATCH (archive) or DELETE (hard) /api/v1/conversations/:id
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const deleteConversation = require('./native/delete-conversation.js');
+    registry.register('delete_conversation', deleteConversation.default || deleteConversation);
+    console.log('[NativeRegistry] Registered built-in tool: delete_conversation');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register delete_conversation:', msg);
+  }
+
+  try {
+    // List Threads — GET /api/v1/conversations/:id/threads
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listThreads = require('./native/list-threads.js');
+    registry.register('list_threads', listThreads.default || listThreads);
+    console.log('[NativeRegistry] Registered built-in tool: list_threads');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_threads:', msg);
+  }
+
+  try {
+    // Create Thread — POST /api/v1/conversations/:id/threads (+ optional first message)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const createThread = require('./native/create-thread.js');
+    registry.register('create_thread', createThread.default || createThread);
+    console.log('[NativeRegistry] Registered built-in tool: create_thread');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register create_thread:', msg);
+  }
+
+  try {
+    // List Participants — GET /api/v1/conversations/:id/participants
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listParticipants = require('./native/list-participants.js');
+    registry.register('list_participants', listParticipants.default || listParticipants);
+    console.log('[NativeRegistry] Registered built-in tool: list_participants');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_participants:', msg);
+  }
+
+  try {
+    // Add Participant — POST /api/v1/conversations/:id/participants by userId
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const addParticipant = require('./native/add-participant.js');
+    registry.register('add_participant', addParticipant.default || addParticipant);
+    console.log('[NativeRegistry] Registered built-in tool: add_participant');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register add_participant:', msg);
+  }
 }
