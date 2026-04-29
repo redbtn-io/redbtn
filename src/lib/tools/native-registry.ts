@@ -880,4 +880,46 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register disable_automation:', msg);
   }
+
+  // ─── Runs pack (TOOL-HANDOFF.md §4.11) ────────────────────────────────────
+  // Three tools that complement the existing `get_recent_runs` (archive
+  // reader). These work against live Redis state via the webapp routes:
+  //   - get_run         → GET /api/v1/runs/:runId (live RunState)
+  //   - get_run_logs    → GET /api/v1/runs/:runId/logs (redlog entries)
+  //   - cancel_run      → POST /api/v1/runs/:runId/interrupt (handshake +
+  //                       force-kill fallback)
+  // Together they let an agent poll, audit, and abort runs it has triggered
+  // via trigger_automation / invoke_graph (with wait:false).
+  try {
+    // Get Run — live RunState lookup; 404 once Redis TTL expires (~1 hour).
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getRun = require('./native/get-run.js');
+    registry.register('get_run', getRun.default || getRun);
+    console.log('[NativeRegistry] Registered built-in tool: get_run');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_run:', msg);
+  }
+
+  try {
+    // Get Run Logs — redlog entries for a run, with client-side level + limit.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getRunLogs = require('./native/get-run-logs.js');
+    registry.register('get_run_logs', getRunLogs.default || getRunLogs);
+    console.log('[NativeRegistry] Registered built-in tool: get_run_logs');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_run_logs:', msg);
+  }
+
+  try {
+    // Cancel Run — request/ACK interrupt with force-kill fallback.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const cancelRun = require('./native/cancel-run.js');
+    registry.register('cancel_run', cancelRun.default || cancelRun);
+    console.log('[NativeRegistry] Registered built-in tool: cancel_run');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register cancel_run:', msg);
+  }
 }
