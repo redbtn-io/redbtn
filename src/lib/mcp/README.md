@@ -24,13 +24,13 @@ This implementation follows the MCP specification with a custom Redis-based tran
          │     Redis      │
          └───────┬────────┘
                  │
-      ┌──────────┼──────────┐
-      │          │          │
-      ▼          ▼          ▼
-┌──────────┐ ┌──────────┐ ┌──────────┐
-│   Web    │ │  System  │ │  Future  │
-│  Server  │ │  Server  │ │  Server  │
-└──────────┘ └──────────┘ └──────────┘
+      ┌──────────┴──────────┐
+      │                     │
+      ▼                     ▼
+┌──────────┐         ┌──────────┐
+│   Web    │         │  Future  │
+│  Server  │         │  Server  │
+└──────────┘         └──────────┘
 ```
 
 ### Protocol Flow
@@ -155,7 +155,6 @@ const registry = new McpRegistry(redis);
 
 // Register servers
 await registry.registerServer('web');
-await registry.registerServer('system');
 
 // List all tools
 const tools = registry.getAllTools();
@@ -184,21 +183,6 @@ Combines web search and URL scraping:
 export BRAVE_API_KEY=your_brave_api_key
 ```
 
-### System Server
-
-Execute system commands safely:
-
-**Tools:**
-- `execute_command` - Execute allowed system commands
-
-**Configuration:**
-```typescript
-const systemServer = new SystemServer(redis, {
-  allowedCommands: ['ls', 'cat', 'pwd', 'echo'],
-  workingDirectory: '/path/to/work'
-});
-```
-
 ## Running the Servers
 
 ### Start All Servers
@@ -209,7 +193,6 @@ npm run mcp:start
 
 This starts:
 - **Web Server** on channel `mcp:server:web:*`
-- **System Server** on channel `mcp:server:system:*`
 
 ### Test the Servers
 
@@ -233,7 +216,6 @@ Each server uses two channels:
 
 Example:
 - Web Server: `mcp:server:web:request` / `mcp:server:web:response`
-- System Server: `mcp:server:system:request` / `mcp:server:system:response`
 
 ## JSON-RPC 2.0 Message Format
 
