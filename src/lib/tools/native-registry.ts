@@ -238,12 +238,37 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     console.error('[NativeRegistry] Failed to register upload_attachment:', msg);
   }
 
+  // ─── Voice pack (TOOL-HANDOFF.md §4.5) ────────────────────────────────────
   try {
-    // TTS Synthesize — Google Gemini TTS, returns PCM audio as base64
+    // Synthesize Speech — consolidated TTS (Kokoro default + Gemini fallback)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const synthesizeSpeech = require('./native/synthesize-speech.js');
+    registry.register('synthesize_speech', synthesizeSpeech.default || synthesizeSpeech);
+    console.log('[NativeRegistry] Registered built-in tool: synthesize_speech');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register synthesize_speech:', msg);
+  }
+
+  try {
+    // Transcribe Audio — Whisper STT proxy (base64 OR audioUrl input)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const transcribeAudio = require('./native/transcribe-audio.js');
+    registry.register('transcribe_audio', transcribeAudio.default || transcribeAudio);
+    console.log('[NativeRegistry] Registered built-in tool: transcribe_audio');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register transcribe_audio:', msg);
+  }
+
+  try {
+    // TTS Synthesize — DEPRECATED alias for synthesize_speech (provider=gemini).
+    // Kept registered for one engine version so existing graphs keep working.
+    // Removed in the follow-up PR.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const ttsSynthesize = require('./native/tts-synthesize.js');
     registry.register('tts_synthesize', ttsSynthesize.default || ttsSynthesize);
-    console.log('[NativeRegistry] Registered built-in tool: tts_synthesize');
+    console.log('[NativeRegistry] Registered built-in tool: tts_synthesize (alias for synthesize_speech)');
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register tts_synthesize:', msg);
