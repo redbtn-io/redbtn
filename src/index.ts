@@ -48,12 +48,12 @@ export type { ParsedDocument } from "./lib/memory/documentParser";
 
 // Export MCP (Model Context Protocol) components
 // SystemServerSSE/RagServerSSE/ContextServerSSE removed in Phase A of native-tools
-// restructure (TOOL-HANDOFF.md §2). Their tools moved to native (in-process).
+// restructure (TOOL-HANDOFF.md §2). WebServerSSE removed in Phase B-1 (web pack).
+// All bundled MCP servers are gone — their tools live as native (in-process) tools.
 export {
   McpClient,
   McpRegistry,
   McpServer,
-  WebServerSSE as WebServer,
   Tool,
   CallToolResult,
   ServerRegistration,
@@ -296,19 +296,12 @@ export class Red {
     this.baseState = { loadedAt: new Date(), nodeId: this.nodeId };
     this.isLoaded = true;
 
-    // Register bundled MCP servers (SSE transport).
-    // After Phase A of the native-tools restructure (TOOL-HANDOFF.md §2),
-    // only the web MCP server remains bundled — system/rag/context tools
-    // moved to native (in-process) tools in src/lib/tools/native/.
-    // Phase B's web pack will delete the web MCP server entirely.
-    try {
-      await this.mcpRegistry.registerServer({ name: 'web', url: 'http://localhost:3001/mcp' });
-      const tools = this.mcpRegistry.getAllTools();
-      process.stdout.write(`\r✓ Red AI initialized (${tools.length} MCP tools)\n`);
-    } catch (error) {
-      console.warn('⚠️ MCP server registration failed:', error);
-      console.warn('  Tool calls will fail. Make sure MCP servers are running: npm run mcp:start');
-    }
+    // Bundled MCP servers (system/rag/context/web) all deleted as part of the
+    // native-tools restructure (TOOL-HANDOFF.md §2). Their tools live as native
+    // (in-process) tools in src/lib/tools/native/ and are registered by
+    // NativeToolRegistry. mcpRegistry remains live for *user-supplied* MCP
+    // connections registered at runtime (see worker/MCP connection management).
+    process.stdout.write(`\r✓ Red AI initialized\n`);
 
     // Start heartbeat to register node as active
     this.heartbeatInterval = background.startHeartbeat(this.nodeId, this.redis);
