@@ -1,6 +1,12 @@
 /**
  * Web MCP Server - SSE Transport
  * Combines web search and URL scraping capabilities
+ *
+ * TODO: delete after Phase B web pack lands.
+ * This is the only remaining bundled MCP server — `web_search` and
+ * `scrape_url` will be ported to native tools in Phase B (see TOOL-HANDOFF.md
+ * §2 / §4.1). Once those land, delete this file plus the WebServerSSE startup
+ * call in worker/src/mcp-servers.ts and the registerServer call in src/index.ts.
  */
 
 import { McpServerSSE } from '../server-sse';
