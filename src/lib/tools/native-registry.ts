@@ -1055,4 +1055,67 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register query_logs:', msg);
   }
+
+  // ─── process pack (ENVIRONMENT-HANDOFF.md §4.2) ──────────────────────────
+  // Four tools that let an agent manage long-running shell processes on a
+  // managed Environment. All require `environmentId` and route through the
+  // EnvironmentSession's pooled SSH channel. Job state lives in:
+  //   - per-environment Redis hash `env:<envId>:jobs` (24h TTL) — index
+  //   - remote /tmp/<jobId>_out  (stdout tail)
+  //   - remote /tmp/<jobId>_err  (stderr tail)
+  //   - remote /tmp/<jobId>_exit (exit code, written by wrapper after exit)
+  //
+  // The four tools form a coherent fire-and-forget lifecycle:
+  //   - ssh_run_async → start, return jobId immediately
+  //   - ssh_tail      → poll: stdout/stderr tail + isRunning + exitCode?
+  //   - ssh_kill      → send signal (default TERM), update status='killed'
+  //   - ssh_jobs      → enumerate (Redis-side only, no SSH)
+  //
+  // Cleanup of remote /tmp files is out of scope for v1 (24h hash TTL keeps
+  // the index honest; orphaned /tmp files are tiny and tmp-cleanup will
+  // sweep them eventually). A periodic worker job to delete /tmp/<jobId>_*
+  // older than 24h is a sensible follow-up.
+  try {
+    // SSH Run Async — kick off a backgrounded command, return jobId + PID
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sshRunAsync = require('./native/ssh-run-async.js');
+    registry.register('ssh_run_async', sshRunAsync.default || sshRunAsync);
+    console.log('[NativeRegistry] Registered built-in tool: ssh_run_async');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register ssh_run_async:', msg);
+  }
+
+  try {
+    // SSH Tail — read stdout/stderr tail + run/exit status of an async job
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sshTail = require('./native/ssh-tail.js');
+    registry.register('ssh_tail', sshTail.default || sshTail);
+    console.log('[NativeRegistry] Registered built-in tool: ssh_tail');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register ssh_tail:', msg);
+  }
+
+  try {
+    // SSH Kill — send signal to an async job; idempotent; updates status
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sshKill = require('./native/ssh-kill.js');
+    registry.register('ssh_kill', sshKill.default || sshKill);
+    console.log('[NativeRegistry] Registered built-in tool: ssh_kill');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register ssh_kill:', msg);
+  }
+
+  try {
+    // SSH Jobs — enumerate jobs known to a managed Environment (Redis only)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sshJobs = require('./native/ssh-jobs.js');
+    registry.register('ssh_jobs', sshJobs.default || sshJobs);
+    console.log('[NativeRegistry] Registered built-in tool: ssh_jobs');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register ssh_jobs:', msg);
+  }
 }
