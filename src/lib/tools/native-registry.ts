@@ -1055,4 +1055,217 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register query_logs:', msg);
   }
+
+  // ─── task pack (ENVIRONMENT-HANDOFF.md §4.3) ──────────────────────────────
+  // Five tools that give agents first-class TODO tracking. Backed by Global
+  // State (existing infrastructure — no new storage):
+  //   - task_create   → mint a `task_<8-char>` ID, append to the list, return ID
+  //   - task_list     → status / parentTaskId / limit filters, FIFO sort
+  //   - task_update   → mutate status / subject / description (bumps updatedAt)
+  //   - task_complete → status='completed' + completedAt + optional result
+  //   - task_get      → full task doc by ID, or `task: null`
+  //
+  // Storage layout:
+  //   - namespace = `agent-tasks:${runId}` (scope='run', default)
+  //               | `agent-tasks:${conversationId}` (scope='conversation')
+  //   - key       = 'tasks'
+  //   - value     = { tasks: AgentTask[] }
+  //
+  // Each tool resolves the scope → namespace via context.runId or
+  // context.state.conversationId; missing → VALIDATION error. The
+  // read-mutate-write pattern is acceptable for v1 since each agent
+  // typically owns its own task list per run/conversation.
+  try {
+    // Task Create — mint taskId, append to list, return { taskId }
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const taskCreate = require('./native/task-create.js');
+    registry.register('task_create', taskCreate.default || taskCreate);
+    console.log('[NativeRegistry] Registered built-in tool: task_create');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register task_create:', msg);
+  }
+
+  try {
+    // Task List — status/parentTaskId/limit filters, FIFO by createdAt
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const taskList = require('./native/task-list.js');
+    registry.register('task_list', taskList.default || taskList);
+    console.log('[NativeRegistry] Registered built-in tool: task_list');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register task_list:', msg);
+  }
+
+  try {
+    // Task Update — mutate status/subject/description, bump updatedAt
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const taskUpdate = require('./native/task-update.js');
+    registry.register('task_update', taskUpdate.default || taskUpdate);
+    console.log('[NativeRegistry] Registered built-in tool: task_update');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register task_update:', msg);
+  }
+
+  try {
+    // Task Complete — convenience: status='completed' + completedAt + result
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const taskComplete = require('./native/task-complete.js');
+    registry.register('task_complete', taskComplete.default || taskComplete);
+    console.log('[NativeRegistry] Registered built-in tool: task_complete');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register task_complete:', msg);
+  }
+
+  try {
+    // Task Get — full task doc by ID, or { task: null } when not found
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const taskGet = require('./native/task-get.js');
+    registry.register('task_get', taskGet.default || taskGet);
+    console.log('[NativeRegistry] Registered built-in tool: task_get');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register task_get:', msg);
+  }
+
+  // ─── process pack (ENVIRONMENT-HANDOFF.md §4.2) ──────────────────────────
+  // Four tools that let an agent manage long-running shell processes on a
+  // managed Environment. All require `environmentId` and route through the
+  // EnvironmentSession's pooled SSH channel. Job state lives in:
+  //   - per-environment Redis hash `env:<envId>:jobs` (24h TTL) — index
+  //   - remote /tmp/<jobId>_out  (stdout tail)
+  //   - remote /tmp/<jobId>_err  (stderr tail)
+  //   - remote /tmp/<jobId>_exit (exit code, written by wrapper after exit)
+  //
+  // The four tools form a coherent fire-and-forget lifecycle:
+  //   - ssh_run_async → start, return jobId immediately
+  //   - ssh_tail      → poll: stdout/stderr tail + isRunning + exitCode?
+  //   - ssh_kill      → send signal (default TERM), update status='killed'
+  //   - ssh_jobs      → enumerate (Redis-side only, no SSH)
+  //
+  // Cleanup of remote /tmp files is out of scope for v1 (24h hash TTL keeps
+  // the index honest; orphaned /tmp files are tiny and tmp-cleanup will
+  // sweep them eventually). A periodic worker job to delete /tmp/<jobId>_*
+  // older than 24h is a sensible follow-up.
+  try {
+    // SSH Run Async — kick off a backgrounded command, return jobId + PID
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sshRunAsync = require('./native/ssh-run-async.js');
+    registry.register('ssh_run_async', sshRunAsync.default || sshRunAsync);
+    console.log('[NativeRegistry] Registered built-in tool: ssh_run_async');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register ssh_run_async:', msg);
+  }
+
+  try {
+    // SSH Tail — read stdout/stderr tail + run/exit status of an async job
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sshTail = require('./native/ssh-tail.js');
+    registry.register('ssh_tail', sshTail.default || sshTail);
+    console.log('[NativeRegistry] Registered built-in tool: ssh_tail');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register ssh_tail:', msg);
+  }
+
+  try {
+    // SSH Kill — send signal to an async job; idempotent; updates status
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sshKill = require('./native/ssh-kill.js');
+    registry.register('ssh_kill', sshKill.default || sshKill);
+    console.log('[NativeRegistry] Registered built-in tool: ssh_kill');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register ssh_kill:', msg);
+  }
+
+  try {
+    // SSH Jobs — enumerate jobs known to a managed Environment (Redis only)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sshJobs = require('./native/ssh-jobs.js');
+    registry.register('ssh_jobs', sshJobs.default || sshJobs);
+    console.log('[NativeRegistry] Registered built-in tool: ssh_jobs');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register ssh_jobs:', msg);
+  }
+
+  // ─── fs pack (TOOL-HANDOFF.md follow-up via ENVIRONMENT-HANDOFF.md §4.1) ──
+  // Six coding-agent file-ops tools, all REQUIRE environmentId and route
+  // through the EnvironmentSession's pooled SFTP/exec channels:
+  //   - read_file    → SFTP read; line-numbered Claude-Code-style output
+  //   - write_file   → atomic SFTP write (temp + rename via session helper)
+  //   - edit_file    → unique-match-or-reject find/replace; replaceAll opt-in
+  //   - glob         → bash globstar+dotglob+nullglob over SSH exec
+  //   - grep_files   → ripgrep when available, grep -rn fallback
+  //   - list_dir     → SFTP readdir (single-level) or BFS walk (recursive)
+  //                    with default skip set (.git/node_modules/.next/dist)
+  try {
+    // Read File — SFTP read with offset/limit and line-numbered output
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const readFile = require('./native/read-file.js');
+    registry.register('read_file', readFile.default || readFile);
+    console.log('[NativeRegistry] Registered built-in tool: read_file');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register read_file:', msg);
+  }
+
+  try {
+    // Write File — atomic SFTP write with optional file mode
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const writeFile = require('./native/write-file.js');
+    registry.register('write_file', writeFile.default || writeFile);
+    console.log('[NativeRegistry] Registered built-in tool: write_file');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register write_file:', msg);
+  }
+
+  try {
+    // Edit File — Claude-Code-style unique-match-or-reject find/replace
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const editFile = require('./native/edit-file.js');
+    registry.register('edit_file', editFile.default || editFile);
+    console.log('[NativeRegistry] Registered built-in tool: edit_file');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register edit_file:', msg);
+  }
+
+  try {
+    // Glob — bash globstar+dotglob+nullglob over SSH exec
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const glob = require('./native/glob.js');
+    registry.register('glob', glob.default || glob);
+    console.log('[NativeRegistry] Registered built-in tool: glob');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register glob:', msg);
+  }
+
+  try {
+    // Grep Files — ripgrep when available, grep -rn fallback; structured matches
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const grepFiles = require('./native/grep-files.js');
+    registry.register('grep_files', grepFiles.default || grepFiles);
+    console.log('[NativeRegistry] Registered built-in tool: grep_files');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register grep_files:', msg);
+  }
+
+  try {
+    // List Dir — SFTP readdir (flat) or BFS walk (recursive); ignore patterns
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listDir = require('./native/list-dir.js');
+    registry.register('list_dir', listDir.default || listDir);
+    console.log('[NativeRegistry] Registered built-in tool: list_dir');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_dir:', msg);
+  }
 }
