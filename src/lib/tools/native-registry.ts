@@ -922,4 +922,35 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register cancel_run:', msg);
   }
+
+  // ─── Logs pack (TOOL-HANDOFF.md §4.12) ────────────────────────────────────
+  // Two tools that let an agent participate in the structured-logging fabric
+  // already used by RunPublisher and the conversation/run log viewers:
+  //   - write_log   → write a scoped redlog entry (auto runId + conversationId)
+  //   - query_logs  → read entries by runId or conversationId, with optional
+  //                   level/category/limit filters
+  // Both go direct to @redbtn/redlog (no HTTP hop) since the engine + worker
+  // already share the Redis + Mongo connection strings, and the scope is
+  // already bound by the time the tool sees it.
+  try {
+    // Write Log — scoped write into the shared redlog store
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const writeLog = require('./native/write-log.js');
+    registry.register('write_log', writeLog.default || writeLog);
+    console.log('[NativeRegistry] Registered built-in tool: write_log');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register write_log:', msg);
+  }
+
+  try {
+    // Query Logs — bounded LogReader.query (runId or conversationId required)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const queryLogs = require('./native/query-logs.js');
+    registry.register('query_logs', queryLogs.default || queryLogs);
+    console.log('[NativeRegistry] Registered built-in tool: query_logs');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register query_logs:', msg);
+  }
 }
