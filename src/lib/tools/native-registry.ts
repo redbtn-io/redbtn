@@ -704,4 +704,43 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register count_tokens:', msg);
   }
+
+  // ─── Graph pack (TOOL-HANDOFF.md §4.9) ────────────────────────────────────
+  // Three tools that let an LLM-driven agent dynamically introspect and
+  // invoke other graphs. invoke_graph is the showstopper: full access
+  // checking, recursion depth limit (5), parent linkage via input metadata.
+  try {
+    // List Graphs — GET /api/v1/graphs (system + public + owned + shared)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listGraphs = require('./native/list-graphs.js');
+    registry.register('list_graphs', listGraphs.default || listGraphs);
+    console.log('[NativeRegistry] Registered built-in tool: list_graphs');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_graphs:', msg);
+  }
+
+  try {
+    // Get Graph — GET /api/v1/graphs/:graphId (full definition + inputSchema)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getGraph = require('./native/get-graph.js');
+    registry.register('get_graph', getGraph.default || getGraph);
+    console.log('[NativeRegistry] Registered built-in tool: get_graph');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_graph:', msg);
+  }
+
+  try {
+    // Invoke Graph — dynamically invoke another graph as a tool. Access check
+    // mirrors verifyGraphAccess; recursion limit 5; parent linkage via
+    // input.parentRunId and input._invokeGraphDepth.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const invokeGraph = require('./native/invoke-graph.js');
+    registry.register('invoke_graph', invokeGraph.default || invokeGraph);
+    console.log('[NativeRegistry] Registered built-in tool: invoke_graph');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register invoke_graph:', msg);
+  }
 }
