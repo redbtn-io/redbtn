@@ -1,7 +1,33 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
+import type { Plugin } from 'vite';
+
+/**
+ * Strip `module.exports = ...` lines from native tool source files.
+ * These tools use a dual export pattern (export default + module.exports)
+ * for CJS compatibility, but it breaks vitest's ESM transform.
+ *
+ * Required for ssh-shell-environment.test.ts (Phase B) which imports the
+ * native tool source directly to verify environmentId routing.
+ */
+function stripModuleExports(): Plugin {
+  return {
+    name: 'strip-module-exports',
+    enforce: 'pre',
+    transform(code, id) {
+      if (id.includes('src/lib/tools/native/') && id.endsWith('.ts')) {
+        const cleaned = code.replace(/^module\.exports\s*=\s*.+;?\s*$/gm, '// (module.exports stripped for ESM)');
+        if (cleaned !== code) {
+          return { code: cleaned, map: null };
+        }
+      }
+      return null;
+    },
+  };
+}
 
 export default defineConfig({
+  plugins: [stripModuleExports()],
   test: {
     globals: true,
     environment: 'node',

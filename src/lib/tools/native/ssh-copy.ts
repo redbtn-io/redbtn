@@ -14,6 +14,16 @@
  *    Writes raw string or base64-decoded content directly.
  *
  * Uses ssh2 SFTP for efficient binary-safe file transfer.
+ *
+ * # Two execution modes (Phase B)
+ *
+ * 1. **environmentId mode (preferred)** — when `environmentId` is provided,
+ *    the tool routes through `EnvironmentManager.acquire()` and uses the
+ *    pooled session's SFTP channel. Multiple sequential `ssh_copy` calls
+ *    against the same env reuse the same connection.
+ *
+ * 2. **inline mode (legacy)** — opens a one-shot SSH+SFTP connection per
+ *    call. Backwards-compatible with all existing graphs.
  */
 
 import { Client, SFTPWrapper } from 'ssh2';
@@ -21,6 +31,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import mongoose from 'mongoose';
+import { environmentManager } from '../../environments/EnvironmentManager';
+import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
 
 // Use GridFSBucket and ObjectId from mongoose's bundled mongodb to avoid BSON version mismatch
 const { GridFSBucket } = mongoose.mongo;
@@ -31,8 +43,14 @@ import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '.
 type AnyObject = Record<string, any>;
 
 interface SshCopyArgs {
-  // SSH connection
-  host: string;
+  /**
+   * **Phase B (preferred):** Use a managed Environment session for the SSH
+   * connection. When set, all inline auth/host fields are ignored.
+   */
+  environmentId?: string;
+
+  // SSH connection (inline mode — ignored when environmentId is set)
+  host?: string;
   port?: number;
   user?: string;
   sshKeyPath?: string;
@@ -219,15 +237,19 @@ async function sftpMkdirp(sftp: SFTPWrapper, dirPath: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 const sshCopy: NativeToolDefinition = {
-  description: 'Copy files to a remote machine via SSH/SFTP. Supports three content sources: Knowledge Library (libraryId), URL (sourceUrl), or inline content. Can sync an entire library to a remote directory.',
+  description: 'Copy files to a remote machine via SSH/SFTP. Supports three content sources: Knowledge Library (libraryId), URL (sourceUrl), or inline content. Can sync an entire library to a remote directory. Pass `environmentId` (preferred) to use a pooled, drop-tolerant managed Environment session.',
   server: 'system',
 
   inputSchema: {
     type: 'object',
     properties: {
+      environmentId: {
+        type: 'string',
+        description: 'PREFERRED: ID of a managed Environment configured under /api/v1/environments. When set, the tool uses a pooled SSH/SFTP session (no per-call handshake, drop-tolerant). All inline host/user/sshKey fields are ignored when this is set.',
+      },
       host: {
         type: 'string',
-        description: 'SSH hostname or IP address',
+        description: 'SSH hostname or IP address (ignored when environmentId is set)',
       },
       port: {
         type: 'number',
@@ -298,12 +320,13 @@ const sshCopy: NativeToolDefinition = {
         default: true,
       },
     },
-    required: ['host', 'remotePath'],
+    required: ['remotePath'],
   },
 
   handler: async (rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> => {
     const args = rawArgs as SshCopyArgs;
     const {
+      environmentId,
       host,
       port = 22,
       user = 'alpha',
@@ -317,6 +340,59 @@ const sshCopy: NativeToolDefinition = {
     const publisher = context?.publisher || null;
     const nodeId = context?.nodeId || 'ssh_copy';
     const startTime = Date.now();
+
+    // ── Phase B: environmentId mode ─────────────────────────────────────────
+    if (environmentId && typeof environmentId === 'string') {
+      // Resolve files first (same logic as inline mode), then route through
+      // the environment session for the SFTP transfer.
+      let files: FileToTransfer[];
+      try {
+        if (args.libraryId) {
+          files = await resolveFromLibrary(args, publisher, nodeId);
+        } else if (args.sourceUrl) {
+          files = await resolveFromUrl(args);
+        } else if (args.content !== undefined) {
+          files = resolveFromContent(args);
+        } else {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'No content source provided. Specify libraryId, sourceUrl, or content.' }) }],
+            isError: true,
+          };
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: false, error: `Content resolution failed: ${msg}` }) }],
+          isError: true,
+        };
+      }
+
+      return executeViaEnvironment({
+        environmentId,
+        files,
+        remotePath,
+        overwrite,
+        isDirectoryHint: !!args.libraryId,
+        context,
+        publisher,
+        nodeId,
+        startTime,
+      });
+    }
+
+    // ── Inline mode (legacy) ────────────────────────────────────────────────
+    if (!host) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: 'ssh_copy requires either `environmentId` (preferred) or inline `host` to connect',
+          }),
+        }],
+        isError: true,
+      };
+    }
 
     console.log(`[ssh_copy] Target: ${user}@${host}:${port}:${remotePath}`);
 
@@ -492,6 +568,200 @@ const sshCopy: NativeToolDefinition = {
     });
   },
 };
+
+// ---------------------------------------------------------------------------
+// Phase B — environmentId-mode handler
+// ---------------------------------------------------------------------------
+
+interface ExecuteViaEnvironmentArgs {
+  environmentId: string;
+  files: FileToTransfer[];
+  remotePath: string;
+  overwrite: boolean;
+  /**
+   * Treat remotePath as a directory regardless of multi-file count. Library
+   * sources always set this — they sync N files into a directory even when
+   * N === 1.
+   */
+  isDirectoryHint: boolean;
+  context: NativeToolContext;
+  publisher: AnyObject | null;
+  nodeId: string;
+  startTime: number;
+}
+
+/**
+ * Run the SFTP transfer through a managed Environment session. Mirrors the
+ * inline path's directory semantics + per-file write loop, but uses
+ * `EnvironmentSession`'s SFTP wrapper instead of opening a fresh ssh2.Client.
+ *
+ * Note: `EnvironmentSession.sftpWrite` does atomic temp+rename writes for
+ * each file. The inline path uses a streaming write — different but
+ * equivalent in outcome. Atomic temp+rename is the safer default; if you
+ * need streaming for huge files, fall back to the inline path.
+ */
+async function executeViaEnvironment(args: ExecuteViaEnvironmentArgs): Promise<NativeMcpResult> {
+  const { environmentId, files, remotePath, overwrite, isDirectoryHint, context, publisher, nodeId, startTime } = args;
+  const userId =
+    (context?.state as AnyObject | undefined)?.userId
+    || (context?.state as AnyObject | undefined)?.data?.userId
+    || '';
+
+  if (!userId) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: false,
+          error: `ssh_copy with environmentId requires a userId in graph state — got empty.`,
+        }),
+      }],
+      isError: true,
+    };
+  }
+
+  if (files.length === 0) {
+    const duration = Date.now() - startTime;
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ success: true, filesTransferred: 0, message: 'No files to transfer (library may be empty or no documents match the since filter)', durationMs: duration, environmentId }) }],
+    };
+  }
+
+  let env_, sshKey;
+  try {
+    const resolved = await loadAndResolveEnvironment(environmentId, userId);
+    env_ = resolved.env;
+    sshKey = resolved.sshKey;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const code = (err as { code?: string })?.code || 'ENV_RESOLVE_FAILED';
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ success: false, error: msg, code, environmentId }) }],
+      isError: true,
+    };
+  }
+
+  let session;
+  try {
+    session = await environmentManager.acquire(env_, sshKey, userId);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ success: false, error: `Failed to acquire environment session: ${msg}`, environmentId }) }],
+      isError: true,
+    };
+  }
+
+  // Determine if remotePath is a directory target — same logic as inline path.
+  const isMultiFile = files.length > 1;
+  const endsWithSlash = remotePath.endsWith('/');
+  const isDirectory = isMultiFile || endsWithSlash || isDirectoryHint;
+
+  // Helper: ensure a directory exists on the remote via SFTP. Walks parts
+  // and best-effort mkdirs each one (EEXIST tolerated). We use exec + mkdir
+  // -p instead of session.sftpReaddir because EnvironmentSession.sftpReaddir
+  // doesn't expose mkdir directly. exec is portable enough for this.
+  const ensureRemoteDir = async (dir: string) => {
+    try {
+      await session.exec(`mkdir -p ${JSON.stringify(dir)}`);
+    } catch (err) {
+      // Surface the failure so the caller knows the parent dir creation
+      // failed — otherwise a write to a missing dir returns a confusing
+      // "no such file or directory" error.
+      throw new Error(`Failed to create remote directory ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  try {
+    if (isDirectory) {
+      await ensureRemoteDir(remotePath);
+    } else {
+      const parentDir = remotePath.substring(0, remotePath.lastIndexOf('/'));
+      if (parentDir) await ensureRemoteDir(parentDir);
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ success: false, error: msg, environmentId }) }],
+      isError: true,
+    };
+  }
+
+  const transferred: Array<{ filename: string; bytes: number }> = [];
+  const skipped: string[] = [];
+
+  for (const file of files) {
+    const targetPath = isDirectory
+      ? `${remotePath.replace(/\/+$/, '')}/${file.filename}`
+      : remotePath;
+
+    if (!overwrite) {
+      try {
+        await session.sftpStat(targetPath);
+        // stat succeeded — file exists, skip
+        skipped.push(file.filename);
+        continue;
+      } catch {
+        // stat failed — file doesn't exist, proceed with write
+      }
+    }
+
+    // Ensure THIS file's parent dir exists (handles nested paths in libraries).
+    const fileParent = targetPath.substring(0, targetPath.lastIndexOf('/'));
+    if (fileParent) {
+      try {
+        await ensureRemoteDir(fileParent);
+      } catch {
+        // Best-effort — write below will surface the failure clearly.
+      }
+    }
+
+    try {
+      await session.sftpWrite(targetPath, file.buffer);
+      transferred.push({ filename: file.filename, bytes: file.buffer.length });
+
+      if (publisher) {
+        try {
+          (publisher as AnyObject).publish({
+            type: 'tool_output',
+            nodeId,
+            data: {
+              chunk: `[ssh_copy] Transferred ${file.filename} (${file.buffer.length} bytes) → ${targetPath}\n`,
+              stream: 'stdout',
+            },
+          });
+        } catch { /* ignore */ }
+      }
+    } catch (writeErr: unknown) {
+      const msg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+      const duration = Date.now() - startTime;
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          success: false,
+          error: `Failed to write ${targetPath}: ${msg}`,
+          environmentId,
+          filesTransferredBeforeFailure: transferred.length,
+          durationMs: duration,
+        }) }],
+        isError: true,
+      };
+    }
+  }
+
+  const duration = Date.now() - startTime;
+  return {
+    content: [{ type: 'text', text: JSON.stringify({
+      success: true,
+      filesTransferred: transferred.length,
+      filesSkipped: skipped.length,
+      totalBytes: transferred.reduce((s, f) => s + f.bytes, 0),
+      files: transferred,
+      ...(skipped.length > 0 ? { skipped } : {}),
+      durationMs: duration,
+      environmentId,
+    }) }],
+  };
+}
 
 export default sshCopy;
 module.exports = sshCopy;
