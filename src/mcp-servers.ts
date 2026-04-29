@@ -1,13 +1,16 @@
 #!/usr/bin/env tsx
 /**
  * MCP Servers Launcher - SSE Transport
- * Starts all MCP tool servers as HTTP/SSE endpoints
+ * Starts all MCP tool servers as HTTP/SSE endpoints.
+ *
+ * After Phase A of the native-tools restructure (see TOOL-HANDOFF.md §2):
+ *   - system, rag, and context MCP servers were deleted; their tools live as
+ *     native (in-process) tools in src/lib/tools/native/.
+ *   - Only the web MCP server remains, pending Phase B's web pack which will
+ *     port web_search/scrape_url to native and delete this launcher entirely.
  */
 
 import { WebServerSSE } from './lib/mcp/servers/web-sse';
-import { SystemServerSSE } from './lib/mcp/servers/system-sse';
-import { RagServerSSE } from './lib/mcp/servers/rag-sse';
-import { ContextServerSSE } from './lib/mcp/servers/context-sse';
 
 async function main() {
   console.log('[MCP Launcher] Starting MCP servers with SSE transport...');
@@ -21,42 +24,20 @@ async function main() {
     servers.push(webServer);
     console.log('[MCP Launcher] ✓ Web server started on http://localhost:3001/mcp');
 
-    // System Server (port 3002)
-    const systemServer = new SystemServerSSE('system', '1.0.0', 3002);
-    await systemServer.start();
-    servers.push(systemServer);
-    console.log('[MCP Launcher] ✓ System server started on http://localhost:3002/mcp');
-
-    // RAG Server (port 3003)
-    const ragServer = new RagServerSSE('rag', '1.0.0', 3003);
-    await ragServer.start();
-    servers.push(ragServer);
-    console.log('[MCP Launcher] ✓ RAG server started on http://localhost:3003/mcp');
-
-    // Context Server (port 3004)
-    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-    const contextServer = new ContextServerSSE('context', '1.0.0', 3004, redisUrl);
-    await contextServer.start();
-    servers.push(contextServer);
-    console.log('[MCP Launcher] ✓ Context server started on http://localhost:3004/mcp');
-
     console.log('\n[MCP Launcher] All servers started successfully');
     console.log('[MCP Launcher] Protocol: JSON-RPC 2.0 over HTTP/SSE');
     console.log('[MCP Launcher] Health checks:');
     console.log('  - http://localhost:3001/mcp/health');
-    console.log('  - http://localhost:3002/mcp/health');
-    console.log('  - http://localhost:3003/mcp/health');
-    console.log('  - http://localhost:3004/mcp/health');
     console.log('\n[MCP Launcher] Press Ctrl+C to stop');
 
     // Handle shutdown
     const shutdown = async () => {
       console.log('\n[MCP Launcher] Shutting down servers...');
-      
+
       for (const server of servers) {
         await server.stop();
       }
-      
+
       process.exit(0);
     };
 
@@ -70,4 +51,3 @@ async function main() {
 }
 
 main();
-
