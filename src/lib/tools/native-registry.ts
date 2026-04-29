@@ -811,4 +811,73 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register list_stream_sessions:', msg);
   }
+
+  // ─── Automation pack (TOOL-HANDOFF.md §4.8) ───────────────────────────────
+  // Five tools that let an agent dynamically discover, inspect, and control
+  // automations. trigger_automation supports optional polling for terminal
+  // status via wait:true; enable/disable_automation are owner-only.
+  try {
+    // Trigger Automation — POST /api/v1/automations/:id/trigger; optional
+    // polling via wait:true returns terminal status.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const triggerAutomation = require('./native/trigger-automation.js');
+    registry.register(
+      'trigger_automation',
+      triggerAutomation.default || triggerAutomation,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: trigger_automation');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register trigger_automation:', msg);
+  }
+
+  try {
+    // List Automations — GET /api/v1/automations (owned + participated)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listAutomations = require('./native/list-automations.js');
+    registry.register('list_automations', listAutomations.default || listAutomations);
+    console.log('[NativeRegistry] Registered built-in tool: list_automations');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_automations:', msg);
+  }
+
+  try {
+    // Get Automation — GET /api/v1/automations/:id
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getAutomation = require('./native/get-automation.js');
+    registry.register('get_automation', getAutomation.default || getAutomation);
+    console.log('[NativeRegistry] Registered built-in tool: get_automation');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_automation:', msg);
+  }
+
+  try {
+    // Enable Automation — POST /api/v1/automations/:id/enable (owner-only)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const enableAutomation = require('./native/enable-automation.js');
+    registry.register(
+      'enable_automation',
+      enableAutomation.default || enableAutomation,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: enable_automation');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register enable_automation:', msg);
+  }
+
+  try {
+    // Disable Automation — POST /api/v1/automations/:id/disable (owner-only)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const disableAutomation = require('./native/disable-automation.js');
+    registry.register(
+      'disable_automation',
+      disableAutomation.default || disableAutomation,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: disable_automation');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register disable_automation:', msg);
+  }
 }
