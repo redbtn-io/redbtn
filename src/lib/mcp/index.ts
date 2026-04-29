@@ -10,15 +10,12 @@ export * from './types';
 export * from './server';
 export * from './client';
 export * from './registry';
-export * from './servers/web-sse';
 // system-sse, rag-sse, context-sse deleted in Phase A of native-tools restructure.
+// web-sse deleted in Phase B-1 (web pack) — see TOOL-HANDOFF.md §2 / §4.1.
 // Their tools (fetch_url, add_document, search_documents, store_message,
-// get_context_history) live as native tools in src/lib/tools/native/. The unused
-// tools (delete_documents, list_collections, get_collection_stats, get_summary,
-// get_messages, get_conversation_metadata) were dropped — see TOOL-HANDOFF.md §2.
+// get_context_history, web_search, scrape_url) live as native tools in
+// src/lib/tools/native/. The unused tools (delete_documents, list_collections,
+// get_collection_stats, get_summary, get_messages, get_conversation_metadata)
+// were dropped.
 // event-publisher (McpEventPublisher / tool:event:* Redis key) removed in v0.0.51-alpha.
 // McpEventPublisher was never instantiated; RunPublisher handles all tool events now.
-
-// Legacy exports for backward compatibility
-export { WebServerSSE as WebServer } from './servers/web-sse';
-export { WebServerSSE as WebSearchServer } from './servers/web-sse';
