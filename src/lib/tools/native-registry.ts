@@ -162,17 +162,6 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   }
 
   try {
-    // Library Write — programmatic document ingestion into Knowledge Libraries
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const libraryWrite = require('./native/library-write.js');
-    registry.register('library_write', libraryWrite);
-    console.log('[NativeRegistry] Registered built-in tool: library_write');
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error('[NativeRegistry] Failed to register library_write:', msg);
-  }
-
-  try {
     // Store Message — persist messages to Redis + MongoDB (ported from context-sse.ts)
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const storeMessage = require('./native/store-message.js');
@@ -500,5 +489,136 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register add_participant:', msg);
+  }
+
+  // ─── Library pack (TOOL-HANDOFF.md §4.4) ──────────────────────────────────
+  // `add_document` and `search_documents` are already registered above (the
+  // existing rag-sse ports). The pack adds 12 net-new tools and consolidates
+  // `library_write` into `add_document` (which now accepts content + fileBase64).
+  try {
+    // Search All Libraries — fan-out semantic search across every accessible library
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const searchAllLibraries = require('./native/search-all-libraries.js');
+    registry.register(
+      'search_all_libraries',
+      searchAllLibraries.default || searchAllLibraries,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: search_all_libraries');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register search_all_libraries:', msg);
+  }
+
+  try {
+    // List Libraries — GET /api/v1/libraries
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listLibraries = require('./native/list-libraries.js');
+    registry.register('list_libraries', listLibraries.default || listLibraries);
+    console.log('[NativeRegistry] Registered built-in tool: list_libraries');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_libraries:', msg);
+  }
+
+  try {
+    // Create Library — POST /api/v1/libraries
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const createLibrary = require('./native/create-library.js');
+    registry.register('create_library', createLibrary.default || createLibrary);
+    console.log('[NativeRegistry] Registered built-in tool: create_library');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register create_library:', msg);
+  }
+
+  try {
+    // Update Library — PATCH /api/v1/libraries/:libraryId
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const updateLibrary = require('./native/update-library.js');
+    registry.register('update_library', updateLibrary.default || updateLibrary);
+    console.log('[NativeRegistry] Registered built-in tool: update_library');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register update_library:', msg);
+  }
+
+  try {
+    // Delete Library — DELETE /api/v1/libraries/:libraryId?permanent=true
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const deleteLibrary = require('./native/delete-library.js');
+    registry.register('delete_library', deleteLibrary.default || deleteLibrary);
+    console.log('[NativeRegistry] Registered built-in tool: delete_library');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register delete_library:', msg);
+  }
+
+  try {
+    // List Documents — GET /api/v1/libraries/:libraryId (paginated documents)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listDocuments = require('./native/list-documents.js');
+    registry.register('list_documents', listDocuments.default || listDocuments);
+    console.log('[NativeRegistry] Registered built-in tool: list_documents');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_documents:', msg);
+  }
+
+  try {
+    // Get Document — GET /api/v1/libraries/:libraryId/documents/:documentId[/full|/chunks]
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getDocument = require('./native/get-document.js');
+    registry.register('get_document', getDocument.default || getDocument);
+    console.log('[NativeRegistry] Registered built-in tool: get_document');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_document:', msg);
+  }
+
+  try {
+    // Delete Document — DELETE /api/v1/libraries/:libraryId/documents/:documentId
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const deleteDocument = require('./native/delete-document.js');
+    registry.register('delete_document', deleteDocument.default || deleteDocument);
+    console.log('[NativeRegistry] Registered built-in tool: delete_document');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register delete_document:', msg);
+  }
+
+  try {
+    // Update Document — PATCH /api/v1/libraries/:libraryId/documents/:documentId
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const updateDocument = require('./native/update-document.js');
+    registry.register('update_document', updateDocument.default || updateDocument);
+    console.log('[NativeRegistry] Registered built-in tool: update_document');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register update_document:', msg);
+  }
+
+  try {
+    // Reprocess Document — POST /api/v1/libraries/:libraryId/documents/:documentId/process
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const reprocessDocument = require('./native/reprocess-document.js');
+    registry.register(
+      'reprocess_document',
+      reprocessDocument.default || reprocessDocument,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: reprocess_document');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register reprocess_document:', msg);
+  }
+
+  try {
+    // Upload To Library — POST /api/v1/libraries/:libraryId/upload (multipart, base64 input)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const uploadToLibrary = require('./native/upload-to-library.js');
+    registry.register('upload_to_library', uploadToLibrary.default || uploadToLibrary);
+    console.log('[NativeRegistry] Registered built-in tool: upload_to_library');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register upload_to_library:', msg);
   }
 }
