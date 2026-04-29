@@ -961,4 +961,98 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register generate_id:', msg);
   }
+
+  // ─── Files pack (TOOL-HANDOFF.md §4.14) ───────────────────────────────────
+  // Two tools that complement the existing `upload_attachment`:
+  //   - download_file   → fetch a remote URL as base64 + MIME type + size
+  //   - parse_document  → decode base64 bytes and extract readable text via
+  //                       the shared DocumentParser (PDF / DOCX / XLSX / etc.)
+  // Together they let an agent pull a file off the network, hand it to the
+  // parser, and feed the resulting text into prompts or RAG without ever
+  // touching disk.
+  try {
+    // Download File — bounded HTTP/HTTPS download → base64 + mimeType + size.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const downloadFile = require('./native/download-file.js');
+    registry.register('download_file', downloadFile.default || downloadFile);
+    console.log('[NativeRegistry] Registered built-in tool: download_file');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register download_file:', msg);
+  }
+
+  try {
+    // Parse Document — base64 + mimeType → extracted text via DocumentParser.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const parseDocument = require('./native/parse-document.js');
+    registry.register('parse_document', parseDocument.default || parseDocument);
+    console.log('[NativeRegistry] Registered built-in tool: parse_document');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register parse_document:', msg);
+  }
+
+  // ─── Notifications pack (TOOL-HANDOFF.md §4.13) ───────────────────────────
+  // Two tools that complement the existing `push_message` (in-app conversation
+  // push). These extend notification reach beyond the app:
+  //   - send_email     → outbound SMTP via the same Gmail relay used by the
+  //                      magic-link auth flow. Markdown-by-default body with
+  //                      HTML + plain-text delivery; attachments supported.
+  //   - send_webhook   → outbound HTTP to an arbitrary URL (Slack, Discord,
+  //                      Zapier, custom backends). Defaults to POST + JSON;
+  //                      returns { status, response } with parsed JSON body
+  //                      when possible. Honours the run-level abort signal.
+  try {
+    // Send Email — SMTP via nodemailer, env: EMAIL_HOST/PORT/USER/PASS/FROM.
+    // Default From address is agent@redbtn.io.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sendEmail = require('./native/send-email.js');
+    registry.register('send_email', sendEmail.default || sendEmail);
+    console.log('[NativeRegistry] Registered built-in tool: send_email');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register send_email:', msg);
+  }
+
+  try {
+    // Send Webhook — outbound HTTP with JSON-by-default body serialisation.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const sendWebhook = require('./native/send-webhook.js');
+    registry.register('send_webhook', sendWebhook.default || sendWebhook);
+    console.log('[NativeRegistry] Registered built-in tool: send_webhook');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register send_webhook:', msg);
+  }
+
+  // ─── Logs pack (TOOL-HANDOFF.md §4.12) ────────────────────────────────────
+  // Two tools that let an agent participate in the structured-logging fabric
+  // already used by RunPublisher and the conversation/run log viewers:
+  //   - write_log   → write a scoped redlog entry (auto runId + conversationId)
+  //   - query_logs  → read entries by runId or conversationId, with optional
+  //                   level/category/limit filters
+  // Both go direct to @redbtn/redlog (no HTTP hop) since the engine + worker
+  // already share the Redis + Mongo connection strings, and the scope is
+  // already bound by the time the tool sees it.
+  try {
+    // Write Log — scoped write into the shared redlog store
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const writeLog = require('./native/write-log.js');
+    registry.register('write_log', writeLog.default || writeLog);
+    console.log('[NativeRegistry] Registered built-in tool: write_log');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register write_log:', msg);
+  }
+
+  try {
+    // Query Logs — bounded LogReader.query (runId or conversationId required)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const queryLogs = require('./native/query-logs.js');
+    registry.register('query_logs', queryLogs.default || queryLogs);
+    console.log('[NativeRegistry] Registered built-in tool: query_logs');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register query_logs:', msg);
+  }
 }
