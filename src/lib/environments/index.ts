@@ -27,6 +27,14 @@ export {
 } from './EnvironmentSession';
 
 export {
+  loadAndResolveEnvironment,
+  EnvironmentNotFoundError,
+  EnvironmentAccessDeniedError,
+  EnvironmentSecretMissingError,
+  type LoadEnvironmentDeps,
+} from './loadAndResolveEnvironment';
+
+export {
   // Lifecycle
   type EnvironmentLifecycleState,
   type EnvironmentLifecycleEvent,

@@ -145,6 +145,11 @@ export {
   EnvironmentClosedError,
   EnvironmentTimeoutError,
   EnvironmentBufferOverflowError,
+  // Phase B helpers — schema lookup + access check + secret resolution
+  loadAndResolveEnvironment,
+  EnvironmentNotFoundError,
+  EnvironmentAccessDeniedError,
+  EnvironmentSecretMissingError,
 } from './lib/environments';
 export type {
   // Manager / session config
@@ -170,6 +175,8 @@ export type {
   SftpWriteOptions,
   // Pending buffer
   PendingCommand,
+  // Phase B
+  LoadEnvironmentDeps,
 } from './lib/environments';
 
 // --- Type Definitions ---
