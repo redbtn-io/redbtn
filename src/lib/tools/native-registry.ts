@@ -923,6 +923,45 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     console.error('[NativeRegistry] Failed to register cancel_run:', msg);
   }
 
+  // ─── Utility pack (TOOL-HANDOFF.md §4.15) ─────────────────────────────────
+  // Three pure utility tools — current time, abort-aware sleep, and ID
+  // minting. No API calls; the only external surface is `wait`'s integration
+  // with the run-level AbortSignal via RunControlRegistry (same pattern as
+  // the `delay` step) so cancellations propagate immediately.
+  try {
+    // Now — current time in a chosen timezone + format (iso/unix/human)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const now = require('./native/now.js');
+    registry.register('now', now.default || now);
+    console.log('[NativeRegistry] Registered built-in tool: now');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register now:', msg);
+  }
+
+  try {
+    // Wait — sleep ms (1..300000), respects run-level AbortSignal
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const wait = require('./native/wait.js');
+    registry.register('wait', wait.default || wait);
+    console.log('[NativeRegistry] Registered built-in tool: wait');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register wait:', msg);
+  }
+
+  try {
+    // Generate ID — uuid (default) / short (nanoid-8) / numeric (12 digits),
+    // with optional verbatim prefix
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const generateId = require('./native/generate-id.js');
+    registry.register('generate_id', generateId.default || generateId);
+    console.log('[NativeRegistry] Registered built-in tool: generate_id');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register generate_id:', msg);
+  }
+
   // ─── Files pack (TOOL-HANDOFF.md §4.14) ───────────────────────────────────
   // Two tools that complement the existing `upload_attachment`:
   //   - download_file   → fetch a remote URL as base64 + MIME type + size
