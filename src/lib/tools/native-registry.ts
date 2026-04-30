@@ -1268,4 +1268,288 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register list_dir:', msg);
   }
+
+  // ─── Platform pack — Phase A (PLATFORM-PACK-HANDOFF.md §2 Phase A) ────────
+  // Agents-build-agents meta-tools. Native CRUD over the platform's own
+  // primitives — graphs, nodes, neurons, streams. Combined with the
+  // redbtn-platform-docs Knowledge Library (Phase B) and the validation
+  // tooling (Phase C), this lets an LLM-driven agent discover, draft,
+  // validate, persist, and iterate on a graph end-to-end — the same loop a
+  // human uses in Studio.
+  //
+  // Safety contract:
+  //   - All delete_* tools fetch the asset first and REFUSE if isSystem is
+  //     true (SYSTEM_ASSET_PROTECTED). Agents must fork_* first.
+  //   - All fork_* tools delegate to the existing webapp fork routes, which
+  //     already enforce viewer+ access and create user-owned copies.
+  //   - All create_* / update_* tools forward to the existing API, which
+  //     enforces per-user quotas, tier-gating, and ownership.
+  //
+  // The 7-graph + 4-node + 4-neuron + 3-stream layout mirrors the inventory
+  // in PLATFORM-PACK-HANDOFF.md §3.
+
+  // Platform pack — graph tools (7)
+  try {
+    // Create Graph — POST /api/v1/graphs
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const createGraph = require('./native/create-graph.js');
+    registry.register('create_graph', createGraph.default || createGraph);
+    console.log('[NativeRegistry] Registered built-in tool: create_graph');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register create_graph:', msg);
+  }
+
+  try {
+    // Update Graph — PATCH /api/v1/graphs/:graphId (auto-forks system graphs)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const updateGraph = require('./native/update-graph.js');
+    registry.register('update_graph', updateGraph.default || updateGraph);
+    console.log('[NativeRegistry] Registered built-in tool: update_graph');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register update_graph:', msg);
+  }
+
+  try {
+    // Delete Graph — DELETE /api/v1/graphs/:graphId; refuses isSystem
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const deleteGraph = require('./native/delete-graph.js');
+    registry.register('delete_graph', deleteGraph.default || deleteGraph);
+    console.log('[NativeRegistry] Registered built-in tool: delete_graph');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register delete_graph:', msg);
+  }
+
+  try {
+    // Fork Graph — POST /api/v1/graphs/:graphId/fork
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const forkGraph = require('./native/fork-graph.js');
+    registry.register('fork_graph', forkGraph.default || forkGraph);
+    console.log('[NativeRegistry] Registered built-in tool: fork_graph');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register fork_graph:', msg);
+  }
+
+  try {
+    // Publish Graph — POST /api/v1/graphs/:graphId/publish
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const publishGraph = require('./native/publish-graph.js');
+    registry.register('publish_graph', publishGraph.default || publishGraph);
+    console.log('[NativeRegistry] Registered built-in tool: publish_graph');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register publish_graph:', msg);
+  }
+
+  try {
+    // Validate Graph Config — STUB in Phase A; Phase C SUPERSEDES with a real
+    // engine-side dry-run validator.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const validateGraphConfig = require('./native/validate-graph-config.js');
+    registry.register(
+      'validate_graph_config',
+      validateGraphConfig.default || validateGraphConfig,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: validate_graph_config');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register validate_graph_config:', msg);
+  }
+
+  try {
+    // Get Graph Compile Log — STUB in Phase A; Phase C SUPERSEDES with a real
+    // proxy to GET /api/v1/graphs/:graphId/compile-log.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getGraphCompileLog = require('./native/get-graph-compile-log.js');
+    registry.register(
+      'get_graph_compile_log',
+      getGraphCompileLog.default || getGraphCompileLog,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: get_graph_compile_log');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_graph_compile_log:', msg);
+  }
+
+  // Platform pack — node tools (4)
+  try {
+    // Create Node — POST /api/v1/nodes
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const createNode = require('./native/create-node.js');
+    registry.register('create_node', createNode.default || createNode);
+    console.log('[NativeRegistry] Registered built-in tool: create_node');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register create_node:', msg);
+  }
+
+  try {
+    // Update Node — PATCH /api/v1/nodes/:nodeId (auto-forks system nodes)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const updateNode = require('./native/update-node.js');
+    registry.register('update_node', updateNode.default || updateNode);
+    console.log('[NativeRegistry] Registered built-in tool: update_node');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register update_node:', msg);
+  }
+
+  try {
+    // Delete Node — DELETE /api/v1/nodes/:nodeId; refuses isSystem
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const deleteNode = require('./native/delete-node.js');
+    registry.register('delete_node', deleteNode.default || deleteNode);
+    console.log('[NativeRegistry] Registered built-in tool: delete_node');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register delete_node:', msg);
+  }
+
+  try {
+    // Fork Node — POST /api/v1/nodes/:nodeId/fork
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const forkNode = require('./native/fork-node.js');
+    registry.register('fork_node', forkNode.default || forkNode);
+    console.log('[NativeRegistry] Registered built-in tool: fork_node');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register fork_node:', msg);
+  }
+
+  // Platform pack — neuron tools (4)
+  try {
+    // Create Neuron — POST /api/v1/neurons
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const createNeuron = require('./native/create-neuron.js');
+    registry.register('create_neuron', createNeuron.default || createNeuron);
+    console.log('[NativeRegistry] Registered built-in tool: create_neuron');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register create_neuron:', msg);
+  }
+
+  try {
+    // Update Neuron — PATCH /api/v1/neurons/:neuronId
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const updateNeuron = require('./native/update-neuron.js');
+    registry.register('update_neuron', updateNeuron.default || updateNeuron);
+    console.log('[NativeRegistry] Registered built-in tool: update_neuron');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register update_neuron:', msg);
+  }
+
+  try {
+    // Delete Neuron — DELETE /api/v1/neurons/:neuronId; refuses isSystem
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const deleteNeuron = require('./native/delete-neuron.js');
+    registry.register('delete_neuron', deleteNeuron.default || deleteNeuron);
+    console.log('[NativeRegistry] Registered built-in tool: delete_neuron');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register delete_neuron:', msg);
+  }
+
+  try {
+    // Fork Neuron — POST /api/v1/neurons/:neuronId/fork
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const forkNeuron = require('./native/fork-neuron.js');
+    registry.register('fork_neuron', forkNeuron.default || forkNeuron);
+    console.log('[NativeRegistry] Registered built-in tool: fork_neuron');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register fork_neuron:', msg);
+  }
+
+  // Platform pack — stream tools (3)
+  try {
+    // Create Stream — POST /api/v1/streams
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const createStream = require('./native/create-stream.js');
+    registry.register('create_stream', createStream.default || createStream);
+    console.log('[NativeRegistry] Registered built-in tool: create_stream');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register create_stream:', msg);
+  }
+
+  try {
+    // Update Stream — PATCH /api/v1/streams/:streamId
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const updateStream = require('./native/update-stream.js');
+    registry.register('update_stream', updateStream.default || updateStream);
+    console.log('[NativeRegistry] Registered built-in tool: update_stream');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register update_stream:', msg);
+  }
+
+  try {
+    // Delete Stream — DELETE /api/v1/streams/:streamId; refuses isSystem
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const deleteStream = require('./native/delete-stream.js');
+    registry.register('delete_stream', deleteStream.default || deleteStream);
+    console.log('[NativeRegistry] Registered built-in tool: delete_stream');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register delete_stream:', msg);
+  }
+
+  // ─── meta pack ("tool tools") (META-PACK-HANDOFF.md) ──────────────────────
+  // Three thin tools that wrap NativeToolRegistry so an agent can dynamically
+  // discover and dispatch any other native tool at runtime. Solves the
+  // "I want this stream to have full tool access without manually wiring 80
+  // entries into toolGraphs" problem.
+  //   - list_available_tools → catalogue (filter / source supported)
+  //   - get_tool_schema      → introspect a single tool's inputSchema
+  //   - invoke_tool          → dispatch by name with caller-supplied args
+  //
+  // Safety:
+  //   - invoke_tool refuses to dispatch to itself or the other two meta tools
+  //     (META_RECURSION_BLOCKED).
+  //   - All three honour state.toolToolsConfig.{allow, deny} with glob-style
+  //     matching (`fs_*`, `delete_*`). Deny wins over allow. If neither set,
+  //     all tools allowed.
+  //   - The meta tools themselves are stripped from list_available_tools so
+  //     the agent doesn't even know they exist (they're already wired).
+  //   - Every invoke_tool call writes a `[meta-pack] invoking <name>` audit
+  //     line to console for post-hoc review.
+  try {
+    // List Available Tools — catalogue native tools w/ optional filter
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listAvailableTools = require('./native/list-available-tools.js');
+    registry.register(
+      'list_available_tools',
+      listAvailableTools.default || listAvailableTools,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: list_available_tools');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_available_tools:', msg);
+  }
+
+  try {
+    // Get Tool Schema — return inputSchema for one tool
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getToolSchema = require('./native/get-tool-schema.js');
+    registry.register('get_tool_schema', getToolSchema.default || getToolSchema);
+    console.log('[NativeRegistry] Registered built-in tool: get_tool_schema');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_tool_schema:', msg);
+  }
+
+  try {
+    // Invoke Tool — dynamic dispatch to any native tool by name
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const invokeTool = require('./native/invoke-tool.js');
+    registry.register('invoke_tool', invokeTool.default || invokeTool);
+    console.log('[NativeRegistry] Registered built-in tool: invoke_tool');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register invoke_tool:', msg);
+  }
 }
