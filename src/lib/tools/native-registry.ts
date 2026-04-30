@@ -1497,4 +1497,59 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register delete_stream:', msg);
   }
+
+  // ─── meta pack ("tool tools") (META-PACK-HANDOFF.md) ──────────────────────
+  // Three thin tools that wrap NativeToolRegistry so an agent can dynamically
+  // discover and dispatch any other native tool at runtime. Solves the
+  // "I want this stream to have full tool access without manually wiring 80
+  // entries into toolGraphs" problem.
+  //   - list_available_tools → catalogue (filter / source supported)
+  //   - get_tool_schema      → introspect a single tool's inputSchema
+  //   - invoke_tool          → dispatch by name with caller-supplied args
+  //
+  // Safety:
+  //   - invoke_tool refuses to dispatch to itself or the other two meta tools
+  //     (META_RECURSION_BLOCKED).
+  //   - All three honour state.toolToolsConfig.{allow, deny} with glob-style
+  //     matching (`fs_*`, `delete_*`). Deny wins over allow. If neither set,
+  //     all tools allowed.
+  //   - The meta tools themselves are stripped from list_available_tools so
+  //     the agent doesn't even know they exist (they're already wired).
+  //   - Every invoke_tool call writes a `[meta-pack] invoking <name>` audit
+  //     line to console for post-hoc review.
+  try {
+    // List Available Tools — catalogue native tools w/ optional filter
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listAvailableTools = require('./native/list-available-tools.js');
+    registry.register(
+      'list_available_tools',
+      listAvailableTools.default || listAvailableTools,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: list_available_tools');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_available_tools:', msg);
+  }
+
+  try {
+    // Get Tool Schema — return inputSchema for one tool
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getToolSchema = require('./native/get-tool-schema.js');
+    registry.register('get_tool_schema', getToolSchema.default || getToolSchema);
+    console.log('[NativeRegistry] Registered built-in tool: get_tool_schema');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_tool_schema:', msg);
+  }
+
+  try {
+    // Invoke Tool — dynamic dispatch to any native tool by name
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const invokeTool = require('./native/invoke-tool.js');
+    registry.register('invoke_tool', invokeTool.default || invokeTool);
+    console.log('[NativeRegistry] Registered built-in tool: invoke_tool');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register invoke_tool:', msg);
+  }
 }
