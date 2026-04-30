@@ -166,4 +166,3 @@ const createNeuronTool: NativeToolDefinition = {
 };
 
 export default createNeuronTool;
-module.exports = createNeuronTool;

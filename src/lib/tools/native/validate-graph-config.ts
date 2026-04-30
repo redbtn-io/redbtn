@@ -60,4 +60,3 @@ const validateGraphConfigTool: NativeToolDefinition = {
 };
 
 export default validateGraphConfigTool;
-module.exports = validateGraphConfigTool;

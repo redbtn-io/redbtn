@@ -210,4 +210,3 @@ const deleteNeuronTool: NativeToolDefinition = {
 };
 
 export default deleteNeuronTool;
-module.exports = deleteNeuronTool;

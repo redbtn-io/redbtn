@@ -173,4 +173,3 @@ const createStreamTool: NativeToolDefinition = {
 };
 
 export default createStreamTool;
-module.exports = createStreamTool;

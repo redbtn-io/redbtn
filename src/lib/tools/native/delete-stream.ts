@@ -215,4 +215,3 @@ const deleteStreamTool: NativeToolDefinition = {
 };
 
 export default deleteStreamTool;
-module.exports = deleteStreamTool;

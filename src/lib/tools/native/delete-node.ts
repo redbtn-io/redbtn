@@ -214,4 +214,3 @@ const deleteNodeTool: NativeToolDefinition = {
 };
 
 export default deleteNodeTool;
-module.exports = deleteNodeTool;

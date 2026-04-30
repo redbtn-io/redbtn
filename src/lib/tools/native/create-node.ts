@@ -166,4 +166,3 @@ const createNodeTool: NativeToolDefinition = {
 };
 
 export default createNodeTool;
-module.exports = createNodeTool;

@@ -164,4 +164,3 @@ const forkNodeTool: NativeToolDefinition = {
 };
 
 export default forkNodeTool;
-module.exports = forkNodeTool;

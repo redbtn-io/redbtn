@@ -169,4 +169,3 @@ const forkGraphTool: NativeToolDefinition = {
 };
 
 export default forkGraphTool;
-module.exports = forkGraphTool;

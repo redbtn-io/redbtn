@@ -167,4 +167,3 @@ const forkNeuronTool: NativeToolDefinition = {
 };
 
 export default forkNeuronTool;
-module.exports = forkNeuronTool;

@@ -165,4 +165,3 @@ const updateNeuronTool: NativeToolDefinition = {
 };
 
 export default updateNeuronTool;
-module.exports = updateNeuronTool;

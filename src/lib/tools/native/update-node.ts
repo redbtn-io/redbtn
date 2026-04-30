@@ -180,4 +180,3 @@ const updateNodeTool: NativeToolDefinition = {
 };
 
 export default updateNodeTool;
-module.exports = updateNodeTool;

@@ -214,4 +214,3 @@ const deleteGraphTool: NativeToolDefinition = {
 };
 
 export default deleteGraphTool;
-module.exports = deleteGraphTool;

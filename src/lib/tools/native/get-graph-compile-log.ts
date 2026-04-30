@@ -58,4 +58,3 @@ const getGraphCompileLogTool: NativeToolDefinition = {
 };
 
 export default getGraphCompileLogTool;
-module.exports = getGraphCompileLogTool;

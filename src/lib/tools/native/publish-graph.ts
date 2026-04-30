@@ -150,4 +150,3 @@ const publishGraphTool: NativeToolDefinition = {
 };
 
 export default publishGraphTool;
-module.exports = publishGraphTool;

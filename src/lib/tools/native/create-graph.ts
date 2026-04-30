@@ -166,4 +166,3 @@ const createGraphTool: NativeToolDefinition = {
 };
 
 export default createGraphTool;
-module.exports = createGraphTool;

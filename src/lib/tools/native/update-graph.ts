@@ -174,4 +174,3 @@ const updateGraphTool: NativeToolDefinition = {
 };
 
 export default updateGraphTool;
-module.exports = updateGraphTool;

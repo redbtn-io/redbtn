@@ -170,4 +170,3 @@ const updateStreamTool: NativeToolDefinition = {
 };
 
 export default updateStreamTool;
-module.exports = updateStreamTool;
