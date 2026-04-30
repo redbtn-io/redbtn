@@ -130,6 +130,19 @@ export interface RunControlContext {
    */
   neuronCalls: Set<NeuronCall>;
   /**
+   * Tool-supplied cancel callbacks. Long-running tools (ssh_shell,
+   * ssh_run_async, etc) register cleanup hooks here on entry and remove
+   * them on exit. cancel() fires them ALL before signalling the
+   * controller — gives tools the chance to kill remote work that
+   * doesn't naturally die when the SSH stream closes (e.g., daemonized
+   * `claude` invocations on a remote host).
+   *
+   * Each callback is fire-and-forget. Errors are swallowed and logged.
+   * Callbacks should return quickly (start the kill, don't await
+   * completion).
+   */
+  onCancelCallbacks: Set<() => void | Promise<void>>;
+  /**
    * Last-known graph location — populated by universalNode. Used in the
    * ACK payload so the interrupt endpoint can report what was running.
    */
@@ -180,11 +193,30 @@ export class RunControlRegistry {
       runId,
       controller: new AbortController(),
       neuronCalls: new Set(),
+      onCancelCallbacks: new Set(),
       startedAt: new Date(),
       workerId,
     };
     this.contexts.set(runId, ctx);
     return ctx;
+  }
+
+  /**
+   * Register a tool-supplied cancel callback. Returns an unregister
+   * function — callers MUST invoke it when the tool exits normally so the
+   * registry doesn't accumulate stale callbacks. Returns a no-op
+   * unregister if the run isn't registered (caller doesn't need to
+   * special-case missing-context).
+   */
+  registerOnCancel(runId: string | undefined, cb: () => void | Promise<void>): () => void {
+    if (!runId) return () => {};
+    const ctx = this.contexts.get(runId);
+    if (!ctx) return () => {};
+    ctx.onCancelCallbacks.add(cb);
+    return () => {
+      const c = this.contexts.get(runId);
+      c?.onCancelCallbacks.delete(cb);
+    };
   }
 
   /**
@@ -213,6 +245,7 @@ export class RunControlRegistry {
     const ctx = this.contexts.get(runId);
     if (!ctx) return;
     ctx.neuronCalls.clear();
+    ctx.onCancelCallbacks.clear();
     this.contexts.delete(runId);
   }
 
@@ -260,7 +293,23 @@ export class RunControlRegistry {
       try { ctx.controller.abort(); } catch { /* ignore */ }
     }
 
-    // 2. Cancel every in-flight neuron call. Snapshot the set first so
+    // 2. Fire tool-supplied cancel callbacks BEFORE walking neuron calls.
+    //    Tools (ssh_shell, etc) need a chance to start killing remote
+    //    work — the AbortController flip won't propagate to processes
+    //    running on a different host. Fire-and-forget; we don't await.
+    const callbacks = Array.from(ctx.onCancelCallbacks);
+    for (const cb of callbacks) {
+      try {
+        const r = cb();
+        if (r && typeof (r as Promise<void>).catch === 'function') {
+          (r as Promise<void>).catch(err => console.warn(`[RunControlRegistry] onCancel callback threw for run ${runId}:`, err));
+        }
+      } catch (err) {
+        console.warn(`[RunControlRegistry] onCancel callback threw for run ${runId}:`, err);
+      }
+    }
+
+    // 3. Cancel every in-flight neuron call. Snapshot the set first so
     //    iteration is safe even if a callsite removes itself synchronously.
     const calls = Array.from(ctx.neuronCalls);
     let cancelled = 0;
