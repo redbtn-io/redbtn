@@ -115,6 +115,15 @@ const graphSchema = new Schema({
   },
   neuronAssignments: { type: Map, of: String, default: {} },
   config: { type: graphConfigSchema, default: {} },
+  // Capabilities offered to peer agents in a conversation (e.g. provides.stt
+  // means this graph is electable as the conversation's STT engine).
+  provides: {
+    type: new Schema(
+      { stt: { type: Boolean }, tts: { type: Boolean } },
+      { _id: false }
+    ),
+    default: undefined,
+  },
   layout: { type: Map, of: nodePositionSchema, default: {} },
   thumbnail: { type: String, default: null },
   isPublic: { type: Boolean, default: false, index: true },

@@ -134,6 +134,21 @@ export interface GraphConfig {
   interfaces?: ('chat' | 'audio' | 'live' | 'images' | 'attachments')[];
   /** Output modalities — what the graph can produce */
   outputModalities?: ('text' | 'audio')[];
+  /**
+   * Capabilities this graph offers to OTHER agents in the same conversation.
+   * Distinct from `interfaces` (which is "how clients interact with me"):
+   * `provides` is "what services I expose to my peers in a multi-agent room."
+   *
+   * - `stt`: graph emits transcribed user audio as user:text events that
+   *   other agents in the conversation can consume. The conversation's
+   *   `audio.sttEngineId` may elect this graph as the room's STT engine.
+   * - `tts`: graph synthesizes assistant audio for messages from other
+   *   agents (future — wired but not yet routed to in v1).
+   */
+  provides?: {
+    stt?: boolean;
+    tts?: boolean;
+  };
   /** True for system-provided template graphs */
   isDefault: boolean;
   /** True for protected system graphs */
