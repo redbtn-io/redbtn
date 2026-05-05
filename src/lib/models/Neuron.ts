@@ -83,7 +83,14 @@ const neuronSchema = new mongoose.Schema<NeuronDocument>({
     required: true,
   },
   apiKey: {
-    type: String, // Encrypted or null
+    type: String, // Encrypted or null. Legacy — see secretName below.
+  },
+  /** Name of a secret in the user's `@redbtn/redsecrets` vault. When set,
+   *  NeuronRegistry resolves the actual key value at load time. Preferred
+   *  over inlined apiKey for new neurons. */
+  secretName: {
+    type: String,
+    trim: true,
   },
   temperature: {
     type: Number,

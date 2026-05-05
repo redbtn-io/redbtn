@@ -204,6 +204,15 @@ const sshShell: NativeToolDefinition = {
       fullCommand = `${envExports} && ${fullCommand}`;
     }
 
+    // Wrap the user command so we can (a) capture the remote PID for
+    // cancel-time force-kill and (b) put the process in its own process
+    // group via `set -m` so a single kill -<pid> takes the children too.
+    // `set -m` enables job control; `exec` replaces the wrapping bash
+    // with the user command, keeping the captured $$ valid. The marker
+    // is emitted on stderr and filtered out before output is returned.
+    const PID_MARKER = '__RDBTN_PID__=';
+    fullCommand = `set -m; echo ${PID_MARKER}$$ 1>&2; exec bash -c ${JSON.stringify(fullCommand)}`;
+
     return new Promise((resolve) => {
       const conn = new Client();
       let stdout = '';
@@ -211,6 +220,8 @@ const sshShell: NativeToolDefinition = {
       let exitCode: number | null = null;
       let timeoutTimer: NodeJS.Timeout | null = null;
       let settled = false;
+      let remotePid: number | null = null;
+      let unregisterCancel: (() => void) | null = null;
       const startTime = Date.now();
 
       const settle = (error: Error | null) => {
@@ -225,6 +236,11 @@ const sshShell: NativeToolDefinition = {
         if (statusInterval) {
           clearInterval(statusInterval);
           statusInterval = null;
+        }
+
+        if (unregisterCancel) {
+          try { unregisterCancel(); } catch (_) { /* ignore */ }
+          unregisterCancel = null;
         }
 
         try { conn.end(); } catch (_) { /* ignore */ }
@@ -373,6 +389,49 @@ const sshShell: NativeToolDefinition = {
             return settle(err);
           }
 
+          // Register cancel callback that kills the remote process group.
+          // Runs when runControlRegistry.cancel(runId) fires (interrupt
+          // arrives from /api/v1/runs/:runId/interrupt). Cooperative
+          // signal first; force-kill via a side-channel exec on the same
+          // SSH connection 1s later.
+          if (runId) {
+            // Lazy-import to avoid a hard module dep at the top — this
+            // module ships in environments without the registry too
+            // (e.g. unit tests of the inline path).
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { runControlRegistry } = require('../../run/RunControlRegistry');
+            unregisterCancel = runControlRegistry.registerOnCancel(runId, () => {
+              if (settled) return;
+              const pid = remotePid;
+              console.log(`[ssh_shell] Cancel callback firing — pid=${pid ?? 'unknown'} run=${runId}`);
+              // 1. Cooperative: signal the channel. Many sshd configs
+              //    ignore signal requests, but it's free to try.
+              try { stream.signal('KILL'); } catch (_) { /* ignore */ }
+              // 2. Force-kill via a side-channel exec on the SAME
+              //    connection. Kills the process group so any children
+              //    spawned by the user command die too. Only attempt if
+              //    we captured the PID; otherwise rely on conn.end()
+              //    in settle() to drop the channel.
+              if (pid && pid > 1) {
+                try {
+                  conn.exec(`kill -TERM -- -${pid} 2>/dev/null; sleep 1; kill -KILL -- -${pid} 2>/dev/null; true`, { pty: false }, (kerr, kstream) => {
+                    if (kerr) {
+                      console.warn(`[ssh_shell] kill side-channel exec failed: ${kerr.message}`);
+                      return;
+                    }
+                    kstream.on('close', () => console.log(`[ssh_shell] Remote pid ${pid} kill exited`));
+                    kstream.resume();
+                    kstream.stderr.resume();
+                  });
+                } catch (e: unknown) {
+                  console.warn('[ssh_shell] kill side-channel threw:', e instanceof Error ? e.message : String(e));
+                }
+              }
+              // 3. Settle locally with abort error.
+              setTimeout(() => settle(new Error('SSH command cancelled by run interrupt')), 50);
+            });
+          }
+
           stream.on('data', (data: Buffer) => {
             const chunk = data.toString('utf8');
             stdout += chunk;
@@ -407,7 +466,21 @@ const sshShell: NativeToolDefinition = {
           });
 
           stream.stderr.on('data', (data: Buffer) => {
-            const chunk = data.toString('utf8');
+            let chunk = data.toString('utf8');
+
+            // Strip + capture the PID marker emitted by the wrapper. The
+            // marker line is "__RDBTN_PID__=<n>\n" — extract the number,
+            // remove the line so callers don't see it in stderr output.
+            if (remotePid === null && chunk.includes(PID_MARKER)) {
+              const m = chunk.match(/__RDBTN_PID__=(\d+)\r?\n?/);
+              if (m) {
+                remotePid = parseInt(m[1], 10);
+                chunk = chunk.replace(/__RDBTN_PID__=\d+\r?\n?/, '');
+                if (runId) console.log(`[ssh_shell] Captured remote pid=${remotePid} run=${runId}`);
+              }
+            }
+
+            if (!chunk) return; // marker-only chunk
             stderr += chunk;
 
             if (stderr.length > MAX_BUFFER_BYTES) {
