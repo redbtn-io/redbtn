@@ -18,7 +18,6 @@ import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { AIMessage, BaseMessage } from '@langchain/core/messages';
 import { LRUCache } from 'lru-cache';
-import { createHash, createDecipheriv } from 'crypto';
 import { getDatabase } from '../memory/database';
 import Neuron from '../models/Neuron';
 import { createLogger } from '../utils/logger';
@@ -340,11 +339,8 @@ export class NeuronRegistry {
     });
     if (!doc) throw new NeuronNotFoundError(`Neuron '${neuronId}' not found`);
 
-    // Resolve apiKey in priority order:
-    //   1. `secretName` → vault lookup (preferred path going forward)
-    //   2. legacy inlined `apiKey` (encrypted) — kept so unmigrated
-    //      neurons still authenticate
-    //   3. undefined → LangChain falls through to platform env vars
+    // Resolve apiKey from secretName via the vault. Unset → undefined →
+    // LangChain falls through to platform env vars (OPENAI_API_KEY etc.).
     //
     // For system neurons (`userId: 'system'`), the secret resolves under
     // the *caller's* user ID — system neurons share configuration but
@@ -354,9 +350,6 @@ export class NeuronRegistry {
     if (docSecretName) {
       const ownerForSecret = doc.userId === 'system' ? userId : doc.userId;
       resolvedKey = await this.resolveSecret(docSecretName, ownerForSecret);
-    }
-    if (!resolvedKey && doc.apiKey) {
-      resolvedKey = this.decryptApiKey(doc.apiKey);
     }
 
     config = {
@@ -521,32 +514,6 @@ export class NeuronRegistry {
     } else {
       this.configCache.clear();
       log.info('Cleared entire cache');
-    }
-  }
-
-  private decryptApiKey(encrypted: string): string {
-    if (!encrypted) return '';
-    if (!encrypted.includes(':')) return encrypted;
-    const parts = encrypted.split(':');
-    if (parts.length !== 3) return encrypted;
-    const [ivBase64, authTagBase64, ciphertext] = parts;
-    try {
-      const keySource = process.env.ENCRYPTION_KEY || process.env.JWT_SECRET;
-      if (!keySource) {
-        log.warn('No encryption key available, returning encrypted value');
-        return encrypted;
-      }
-      const key = createHash('sha256').update(keySource).digest();
-      const iv = Buffer.from(ivBase64, 'base64');
-      const authTag = Buffer.from(authTagBase64, 'base64');
-      const decipher = createDecipheriv('aes-256-gcm', key, iv);
-      decipher.setAuthTag(authTag);
-      let decrypted = decipher.update(ciphertext, 'base64', 'utf8');
-      decrypted += decipher.final('utf8');
-      return decrypted;
-    } catch (_error) {
-      log.warn('Failed to decrypt API key, returning as-is');
-      return encrypted;
     }
   }
 
