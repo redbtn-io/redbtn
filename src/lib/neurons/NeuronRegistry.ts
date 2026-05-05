@@ -339,13 +339,34 @@ export class NeuronRegistry {
       $or: [{ userId }, { userId: 'system' }],
     });
     if (!doc) throw new NeuronNotFoundError(`Neuron '${neuronId}' not found`);
+
+    // Resolve apiKey in priority order:
+    //   1. `secretName` → vault lookup (preferred path going forward)
+    //   2. legacy inlined `apiKey` (encrypted) — kept so unmigrated
+    //      neurons still authenticate
+    //   3. undefined → LangChain falls through to platform env vars
+    //
+    // For system neurons (`userId: 'system'`), the secret resolves under
+    // the *caller's* user ID — system neurons share configuration but
+    // each caller pays from their own vault entry.
+    let resolvedKey: string | undefined;
+    const docSecretName = (doc as any).secretName as string | undefined;
+    if (docSecretName) {
+      const ownerForSecret = doc.userId === 'system' ? userId : doc.userId;
+      resolvedKey = await this.resolveSecret(docSecretName, ownerForSecret);
+    }
+    if (!resolvedKey && doc.apiKey) {
+      resolvedKey = this.decryptApiKey(doc.apiKey);
+    }
+
     config = {
       id: doc.neuronId,
       name: doc.name,
       provider: doc.provider,
       endpoint: doc.endpoint,
       model: doc.model,
-      apiKey: doc.apiKey ? this.decryptApiKey(doc.apiKey) : undefined,
+      apiKey: resolvedKey,
+      secretName: docSecretName,
       temperature: doc.temperature,
       maxTokens: doc.maxTokens,
       topP: doc.topP,
@@ -356,6 +377,43 @@ export class NeuronRegistry {
     };
     this.configCache.set(cacheKey, config);
     return config;
+  }
+
+  /**
+   * Resolve a secret name to its decrypted value via `@redbtn/redsecrets`.
+   * Lazily imports the package so the engine tarball stays usable in
+   * environments where redsecrets isn't installed (returns undefined and
+   * falls through to the legacy / platform path).
+   */
+  private async resolveSecret(name: string, userId: string): Promise<string | undefined> {
+    try {
+      const mongoose = (await import('mongoose')).default;
+      const db = mongoose.connection?.db;
+      if (!db) {
+        console.warn(`[NeuronRegistry] Cannot resolve secret '${name}' — mongoose not connected`);
+        return undefined;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { repository: secretsRepo } = await import('@redbtn/redsecrets' as any);
+      const batch = await secretsRepo.resolve(
+        db,
+        {
+          names: [name],
+          appName: 'redbtn',
+          scope: 'user',
+          scopeId: userId,
+        },
+        'secrets',
+      );
+      const value = batch?.[name];
+      return typeof value === 'string' && value.length > 0 ? value : undefined;
+    } catch (err) {
+      // Don't throw — fall through. The neuron will end up using the
+      // platform env key (or inlined legacy apiKey if present), which
+      // matches the documented graceful-degradation contract.
+      console.warn(`[NeuronRegistry] Failed to resolve secret '${name}' for user '${userId}':`, err);
+      return undefined;
+    }
   }
 
   createModel(config: NeuronConfig): BaseChatModel {
