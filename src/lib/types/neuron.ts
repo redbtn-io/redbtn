@@ -26,15 +26,13 @@ export interface NeuronConfig {
   provider: NeuronProvider;
   endpoint: string;
   model: string;
-  /** Resolved API key. Populated by NeuronRegistry from `secretName` (vault
-   *  lookup) or, for legacy unmigrated neurons, from the document's
-   *  encrypted `apiKey` field. Undefined → LangChain falls through to
-   *  platform-level env vars (OPENAI_API_KEY etc.). */
+  /** Resolved API key. Populated by NeuronRegistry from `secretName`
+   *  (vault lookup). Undefined → LangChain falls through to platform-
+   *  level env vars (OPENAI_API_KEY etc.). */
   apiKey?: string;
   /** Name of an entry in the user's secrets vault (`@redbtn/redsecrets`).
-   *  When set, NeuronRegistry resolves this at load time and populates
-   *  `apiKey` from the resolved value. Preferred over inlined apiKey
-   *  for new neurons. */
+   *  NeuronRegistry resolves this at load time and populates `apiKey`
+   *  from the resolved value. Unset → run on platform key. */
   secretName?: string;
   temperature?: number;
   maxTokens?: number;
@@ -66,14 +64,9 @@ export interface NeuronDocument {
   provider: NeuronProvider;
   endpoint: string;
   model: string;
-  /** @deprecated — new neurons should use `secretName` instead. Kept for
-   *  backward read compatibility on neurons created before the secrets
-   *  migration; NeuronRegistry decrypts and uses this if `secretName` is
-   *  unset. The webapp API no longer accepts inlined `apiKey` writes. */
-  apiKey?: string;
-  /** Name of an entry in the user's secrets vault. Preferred over
-   *  `apiKey`. NeuronRegistry resolves at load time via
-   *  `@redbtn/redsecrets`. */
+  /** Name of an entry in the user's secrets vault. NeuronRegistry
+   *  resolves at load time via `@redbtn/redsecrets`. Unset = run on
+   *  platform key (LangChain env fallback). */
   secretName?: string;
   temperature: number;
   maxTokens?: number;
