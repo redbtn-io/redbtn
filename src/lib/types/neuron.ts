@@ -26,7 +26,14 @@ export interface NeuronConfig {
   provider: NeuronProvider;
   endpoint: string;
   model: string;
+  /** Resolved API key. Populated by NeuronRegistry from `secretName`
+   *  (vault lookup). Undefined → LangChain falls through to platform-
+   *  level env vars (OPENAI_API_KEY etc.). */
   apiKey?: string;
+  /** Name of an entry in the user's secrets vault (`@redbtn/redsecrets`).
+   *  NeuronRegistry resolves this at load time and populates `apiKey`
+   *  from the resolved value. Unset → run on platform key. */
+  secretName?: string;
   temperature?: number;
   maxTokens?: number;
   topP?: number;
@@ -57,7 +64,10 @@ export interface NeuronDocument {
   provider: NeuronProvider;
   endpoint: string;
   model: string;
-  apiKey?: string;
+  /** Name of an entry in the user's secrets vault. NeuronRegistry
+   *  resolves at load time via `@redbtn/redsecrets`. Unset = run on
+   *  platform key (LangChain env fallback). */
+  secretName?: string;
   temperature: number;
   maxTokens?: number;
   topP?: number;

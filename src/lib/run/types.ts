@@ -461,6 +461,22 @@ export const RunKeys = {
   /** Event log list: `run:events:{runId}` - stores all events for replay */
   events: (runId: string) => `run:events:${runId}`,
   /**
+   * Shared state hash: `run:shared:{runId}`. Cross-branch state for
+   * parallel branches inside the same run. Backs the `state.shared`
+   * namespace exposed to graph configs (see `run/run-shared-state.ts`).
+   * Lives only for the run's lifetime (TTL matches run state TTL).
+   */
+  shared: (runId: string) => `run:shared:${runId}`,
+  /**
+   * Auto-mirrored state hash: `run:autostate:{runId}`. Implicit
+   * cross-branch overlay for parallel-context nodes — the engine
+   * dual-writes any `outputField` here when a node executes inside
+   * a parallel block, and overlays values back onto local state at
+   * the start of every step so peer writes are visible without the
+   * explicit `shared.<key>` prefix. See `run/run-auto-state.ts`.
+   */
+  autoState: (runId: string) => `run:autostate:${runId}`,
+  /**
    * Execution lock: `run:lock:{conversationId}` or `run:lock:{conversationId}:{agentId}`
    * Prevents multiple runs of the SAME agent in the same conversation.
    * Different agents can run concurrently in the same conversation (group chat).

@@ -123,6 +123,37 @@ export async function executeLoop(config: LoopStepConfig, state: any): Promise<P
     while (iteration < maxIterations && !exitConditionMet) {
         iteration++;
         console.log(`[LoopExecutor] ====== ITERATION ${iteration}/${maxIterations} ======`);
+
+        // Re-hydrate `state.shared` at the start of every iteration —
+        // EXPLICIT cross-branch namespace (PR #121 layer). Required
+        // for polling loops that read `state.shared.<key>`.
+        if (loopState.runPublisher) {
+            try {
+                loopState.shared = await loopState.runPublisher.getSharedState();
+            } catch (err) {
+                console.warn('[LoopExecutor] Failed to hydrate state.shared:', err);
+                loopState.shared = loopState.shared ?? {};
+            }
+        }
+
+        // Implicit auto-state overlay for parallel-context loops. A
+        // polling loop inside a parallel branch (e.g. claude-assistant's
+        // thinking-indicator) sees peer writes to plain `state.data.x`
+        // here without the config needing a `shared.` prefix. No-op
+        // outside parallel blocks.
+        if (loopState._parallelContext && loopState.runPublisher) {
+            try {
+                const autoState = await loopState.runPublisher.getAutoState();
+                if (autoState && Object.keys(autoState).length > 0) {
+                    // eslint-disable-next-line @typescript-eslint/no-require-imports
+                    const { applyAutoStateOnto } = require('../../../run/run-auto-state');
+                    applyAutoStateOnto(loopState, autoState);
+                }
+            } catch (err) {
+                console.warn('[LoopExecutor] Failed to overlay auto-state:', err);
+            }
+        }
+
         // Execute all steps in this iteration
         for (let stepIndex = 0; stepIndex < steps.length; stepIndex++) {
             const step = steps[stepIndex];

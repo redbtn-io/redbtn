@@ -20,6 +20,17 @@
  * @module lib/run/run-publisher
  */
 import type { Redis } from 'ioredis';
+import {
+  readSharedState,
+  readSharedStateField,
+  writeSharedState,
+  deleteSharedState,
+} from './run-shared-state';
+import {
+  readAutoState,
+  writeAutoState,
+  deleteAutoState,
+} from './run-auto-state';
 import { StreamPublisher, StreamSubscriber } from '@redbtn/redstream';
 import {
   type RunState,
@@ -256,6 +267,57 @@ export class RunPublisher {
   }
 
   /**
+   * Read the entire shared-state hash for this run. Returns `{}` when
+   * no branch has written anything yet. Cheap — single HGETALL.
+   *
+   * `state.shared` in graph configs is hydrated from this on every
+   * step boundary (see UniversalNode + LoopExecutor) so polling-style
+   * patterns naturally see writes from peer parallel branches.
+   */
+  async getSharedState(): Promise<Record<string, unknown>> {
+    return readSharedState(this.redis, this.runId);
+  }
+
+  /**
+   * Read a single shared-state field. Returns `undefined` when missing.
+   */
+  async getSharedField(key: string): Promise<unknown> {
+    return readSharedStateField(this.redis, this.runId, key);
+  }
+
+  /**
+   * Set a single shared-state field. Refreshes the hash's TTL on every
+   * write so an active run keeps its shared state alive. Routes here
+   * from transform `set` operations whose `outputField` starts with
+   * `shared.<key>` — see TransformExecutor.
+   */
+  async setSharedField(key: string, value: unknown): Promise<void> {
+    await writeSharedState(this.redis, this.runId, key, value);
+  }
+
+  /**
+   * Read the entire auto-state hash for this run. Each entry's key
+   * is a full state path (e.g. `data.thinking`). UniversalNode +
+   * LoopExecutor call this before each step / iteration when the
+   * current node is in parallel context, then overlay the result
+   * onto local state via `applyAutoStateOnto`.
+   */
+  async getAutoState(): Promise<Record<string, unknown>> {
+    return readAutoState(this.redis, this.runId);
+  }
+
+  /**
+   * Write a single (path, value) into the auto-state hash. Routes
+   * here from transformExecutor when a step in a parallel-context
+   * node has an `outputField` — the engine dual-writes to local
+   * state and here, so peer branches see the update at their next
+   * step boundary.
+   */
+  async setAutoStateField(path: string, value: unknown): Promise<void> {
+    await writeAutoState(this.redis, this.runId, path, value);
+  }
+
+  /**
    * Mark the run as completed and publish the `run_complete` event.
    *
    * @param output - Optional convenience fields (content/thinking/data) captured
@@ -287,6 +349,11 @@ export class RunPublisher {
     if (this.state!.conversationId) {
       await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
     }
+    // Drop the shared-state hash now that no parallel branches will
+    // run again. TTL would clean it up eventually, but explicit del
+    // keeps Redis tidy and reclaims the space immediately.
+    await deleteSharedState(this.redis, this.runId);
+    await deleteAutoState(this.redis, this.runId);
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       try {
@@ -389,6 +456,8 @@ export class RunPublisher {
     if (this.state!.conversationId) {
       await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
     }
+    await deleteSharedState(this.redis, this.runId);
+    await deleteAutoState(this.redis, this.runId);
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       try {
@@ -454,6 +523,8 @@ export class RunPublisher {
     if (this.state!.conversationId) {
       await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
     }
+    await deleteSharedState(this.redis, this.runId);
+    await deleteAutoState(this.redis, this.runId);
     // Forward to conversation stream if present so chat UI can render the
     // interrupt indicator and stop showing the spinner.
     if (this.convPublisher && this.convMessageId) {

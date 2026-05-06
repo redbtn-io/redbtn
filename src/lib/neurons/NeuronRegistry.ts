@@ -18,7 +18,6 @@ import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { AIMessage, BaseMessage } from '@langchain/core/messages';
 import { LRUCache } from 'lru-cache';
-import { createHash, createDecipheriv } from 'crypto';
 import { getDatabase } from '../memory/database';
 import Neuron from '../models/Neuron';
 import { createLogger } from '../utils/logger';
@@ -339,13 +338,28 @@ export class NeuronRegistry {
       $or: [{ userId }, { userId: 'system' }],
     });
     if (!doc) throw new NeuronNotFoundError(`Neuron '${neuronId}' not found`);
+
+    // Resolve apiKey from secretName via the vault. Unset → undefined →
+    // LangChain falls through to platform env vars (OPENAI_API_KEY etc.).
+    //
+    // For system neurons (`userId: 'system'`), the secret resolves under
+    // the *caller's* user ID — system neurons share configuration but
+    // each caller pays from their own vault entry.
+    let resolvedKey: string | undefined;
+    const docSecretName = (doc as any).secretName as string | undefined;
+    if (docSecretName) {
+      const ownerForSecret = doc.userId === 'system' ? userId : doc.userId;
+      resolvedKey = await this.resolveSecret(docSecretName, ownerForSecret);
+    }
+
     config = {
       id: doc.neuronId,
       name: doc.name,
       provider: doc.provider,
       endpoint: doc.endpoint,
       model: doc.model,
-      apiKey: doc.apiKey ? this.decryptApiKey(doc.apiKey) : undefined,
+      apiKey: resolvedKey,
+      secretName: docSecretName,
       temperature: doc.temperature,
       maxTokens: doc.maxTokens,
       topP: doc.topP,
@@ -356,6 +370,43 @@ export class NeuronRegistry {
     };
     this.configCache.set(cacheKey, config);
     return config;
+  }
+
+  /**
+   * Resolve a secret name to its decrypted value via `@redbtn/redsecrets`.
+   * Lazily imports the package so the engine tarball stays usable in
+   * environments where redsecrets isn't installed (returns undefined and
+   * falls through to the legacy / platform path).
+   */
+  private async resolveSecret(name: string, userId: string): Promise<string | undefined> {
+    try {
+      const mongoose = (await import('mongoose')).default;
+      const db = mongoose.connection?.db;
+      if (!db) {
+        console.warn(`[NeuronRegistry] Cannot resolve secret '${name}' — mongoose not connected`);
+        return undefined;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { repository: secretsRepo } = await import('@redbtn/redsecrets' as any);
+      const batch = await secretsRepo.resolve(
+        db,
+        {
+          names: [name],
+          appName: 'redbtn',
+          scope: 'user',
+          scopeId: userId,
+        },
+        'secrets',
+      );
+      const value = batch?.[name];
+      return typeof value === 'string' && value.length > 0 ? value : undefined;
+    } catch (err) {
+      // Don't throw — fall through. The neuron will end up using the
+      // platform env key (or inlined legacy apiKey if present), which
+      // matches the documented graceful-degradation contract.
+      console.warn(`[NeuronRegistry] Failed to resolve secret '${name}' for user '${userId}':`, err);
+      return undefined;
+    }
   }
 
   createModel(config: NeuronConfig): BaseChatModel {
@@ -463,32 +514,6 @@ export class NeuronRegistry {
     } else {
       this.configCache.clear();
       log.info('Cleared entire cache');
-    }
-  }
-
-  private decryptApiKey(encrypted: string): string {
-    if (!encrypted) return '';
-    if (!encrypted.includes(':')) return encrypted;
-    const parts = encrypted.split(':');
-    if (parts.length !== 3) return encrypted;
-    const [ivBase64, authTagBase64, ciphertext] = parts;
-    try {
-      const keySource = process.env.ENCRYPTION_KEY || process.env.JWT_SECRET;
-      if (!keySource) {
-        log.warn('No encryption key available, returning encrypted value');
-        return encrypted;
-      }
-      const key = createHash('sha256').update(keySource).digest();
-      const iv = Buffer.from(ivBase64, 'base64');
-      const authTag = Buffer.from(authTagBase64, 'base64');
-      const decipher = createDecipheriv('aes-256-gcm', key, iv);
-      decipher.setAuthTag(authTag);
-      let decrypted = decipher.update(ciphertext, 'base64', 'utf8');
-      decrypted += decipher.final('utf8');
-      return decrypted;
-    } catch (_error) {
-      log.warn('Failed to decrypt API key, returning as-is');
-      return encrypted;
     }
   }
 

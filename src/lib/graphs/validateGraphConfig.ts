@@ -85,6 +85,18 @@ export interface ValidateGraphOptions {
    */
   toolCheck?: ToolExistenceCheck;
   /**
+   * Optional resolver that returns the underlying node config (with
+   * `steps[]`) for a given `nodeId` from the registry. When provided,
+   * the validator runs the parallel-write conflict pass: detects state
+   * fields written by 2+ branches inside the same parallel block and
+   * emits a `PARALLEL_WRITE_CONFLICT` warning per collision. Without
+   * this resolver, the analysis is skipped (no false positives from
+   * incomplete information).
+   */
+  nodeResolver?: (
+    nodeId: string,
+  ) => Promise<{ steps?: unknown[] } | null | undefined> | { steps?: unknown[] } | null | undefined;
+  /**
    * Soft cap on template-chain depth for warnings. A reference like
    * `{{state.a.b.c.d.e.f}}` has depth 6 (counting `state.`).
    * Default: 5.
@@ -822,9 +834,229 @@ export async function validateGraphConfig(
     });
   }
 
+  // Parallel-write conflict pass — only runs when caller supplies a
+  // nodeResolver so we can see each graph node's underlying steps[].
+  // Webapp wires this via graph-compile-log.ts; agents calling the
+  // validate_graph_config tool from inside a graph also get it.
+  if (options?.nodeResolver) {
+    try {
+      const issues = await detectParallelWriteConflicts(
+        nodes as GraphNodeConfig[],
+        edges as GraphEdgeConfig[],
+        parallelBlocks,
+        joinBlocks,
+        options.nodeResolver,
+      );
+      for (const issue of issues) {
+        if (issue.severity === 'error') errors.push(issue);
+        else warnings.push(issue);
+      }
+    } catch (e) {
+      // Conservative: a crash in this analyzer must NOT fail the whole
+      // validation. Compile-log still records errors/warnings collected
+      // up to this point; the parallel-write pass is purely additive.
+      console.warn('[validateGraphConfig] parallel-write pass crashed:', e);
+    }
+  }
+
   return {
     valid: errors.length === 0,
     errors,
     warnings,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Parallel-write conflict detection
+// ---------------------------------------------------------------------------
+//
+// LangGraph's parallel-branch isolation means each branch sees a snapshot
+// taken at the fan-out point and writes are merged at the join. If two
+// parallel branches write to the same state field without a reducer, the
+// last-write-wins behavior at merge time is non-deterministic — and almost
+// always a bug the author didn't notice.
+//
+// This pass walks each parallel block, traces each branch from its target
+// to the join (or graph terminal), collects the set of state fields each
+// branch writes via `outputField` on neuron / tool / transform / graph
+// steps (recursing into loop bodies), and flags any field written by 2+
+// branches.
+//
+// Fields under `shared.*` and `globalState.*` are exempt — those have
+// well-defined cross-branch semantics (Redis hash and Mongo collection
+// respectively) and ARE the recommended way to coordinate parallel
+// branches. Highlighting them as conflicts would defeat their purpose.
+
+const SAFE_CROSS_BRANCH_PREFIXES = ['shared.', 'globalState.'];
+
+async function detectParallelWriteConflicts(
+  nodes: GraphNodeConfig[],
+  edges: GraphEdgeConfig[],
+  parallelBlocks: Array<{ edgeIndex: number; sources: Set<string> }>,
+  joinBlocks: Array<{ edgeIndex: number; sources: Set<string> }>,
+  nodeResolver: NonNullable<ValidateGraphOptions['nodeResolver']>,
+): Promise<ValidationIssue[]> {
+  if (parallelBlocks.length === 0) return [];
+
+  const issues: ValidationIssue[] = [];
+  const nodesByGraphId = new Map<string, GraphNodeConfig>();
+  for (const n of nodes) nodesByGraphId.set(n.id, n);
+
+  // Cache resolved node steps so a node referenced by multiple graph
+  // entries (or multiple branches) only round-trips once per validate call.
+  const stepCache = new Map<string, unknown[]>();
+  const resolveSteps = async (registryNodeId: string): Promise<unknown[]> => {
+    if (stepCache.has(registryNodeId)) return stepCache.get(registryNodeId)!;
+    const doc = await nodeResolver(registryNodeId);
+    const steps = (doc?.steps as unknown[] | undefined) ?? [];
+    stepCache.set(registryNodeId, steps);
+    return steps;
+  };
+
+  for (const block of parallelBlocks) {
+    // Pair each block with its closest join: the first joinBlock whose
+    // sources are a subset of nodes reachable from this block's targets.
+    // Falls back to "any join in the graph" if no perfect match — that's
+    // already an existing-block error caught upstream, but we still want
+    // a useful boundary set.
+    const allJoinSources = new Set<string>();
+    for (const j of joinBlocks) for (const s of j.sources) allJoinSources.add(s);
+
+    // For each branch starting node, collect every reachable graph-node
+    // id stopping at any join source (those mark the branch's terminator).
+    const branchFields: Array<{
+      branchTarget: string;
+      // outputField → set of graph-node ids in this branch that write it
+      fields: Map<string, Set<string>>;
+    }> = [];
+
+    for (const target of block.sources) {
+      const reachable = walkBranch(target, edges, allJoinSources);
+      const fields = new Map<string, Set<string>>();
+      for (const graphNodeId of reachable) {
+        const graphNode = nodesByGraphId.get(graphNodeId);
+        if (!graphNode) continue;
+        // The graph node references a registry node by `config.nodeId`.
+        const registryNodeId = (graphNode.config as Record<string, unknown> | undefined)?.nodeId as
+          | string
+          | undefined;
+        if (!registryNodeId) continue;
+        let steps: unknown[];
+        try {
+          steps = await resolveSteps(registryNodeId);
+        } catch {
+          // Resolver hiccup on this one node — keep going; we'll just
+          // miss conflicts that involved its writes.
+          continue;
+        }
+        for (const fld of collectOutputFields(steps)) {
+          if (!fields.has(fld)) fields.set(fld, new Set());
+          fields.get(fld)!.add(graphNodeId);
+        }
+      }
+      branchFields.push({ branchTarget: target, fields });
+    }
+
+    // Aggregate: for each outputField, list which branches write it.
+    const fieldOwners = new Map<string, Set<string>>();
+    const fieldWriters = new Map<string, Set<string>>(); // field → graph node ids
+    for (const { branchTarget, fields } of branchFields) {
+      for (const [field, writerNodeIds] of fields) {
+        if (!fieldOwners.has(field)) fieldOwners.set(field, new Set());
+        if (!fieldWriters.has(field)) fieldWriters.set(field, new Set());
+        fieldOwners.get(field)!.add(branchTarget);
+        for (const w of writerNodeIds) fieldWriters.get(field)!.add(w);
+      }
+    }
+
+    for (const [field, branches] of fieldOwners) {
+      if (branches.size < 2) continue;
+      if (SAFE_CROSS_BRANCH_PREFIXES.some(p => field.startsWith(p))) continue;
+      // Ignore fields that only LangGraph itself writes (these are
+      // engine-internal and have proper reducers configured).
+      if (field === 'messages' || field === 'systemPrefix') continue;
+      const writers = fieldWriters.get(field);
+      const writerList = writers ? [...writers].join(', ') : '';
+      issues.push({
+        severity: 'warning',
+        code: 'PARALLEL_WRITE_CONFLICT',
+        edgeIndex: block.edgeIndex,
+        message:
+          `Parallel edge[${block.edgeIndex}] has multiple branches writing to '${field}' (writers: ${writerList}). ` +
+          `At the join, last-write-wins applies and the result is non-deterministic. ` +
+          `Use 'shared.${field.split('.').pop()}' for run-scoped cross-branch coordination, ` +
+          `or 'globalState.<ns>.<key>' for cross-run state. ` +
+          `If only one branch writes and the others read, this warning is a false positive — ignore it.`,
+      });
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Walk forward from a graph node, following sequential `to` and
+ * conditional `targets:` edges, until reaching either a join source
+ * or an already-visited node (cycle break). Returns the set of graph
+ * node ids reachable along this branch — used as the set we'll
+ * inspect for outputField writes.
+ *
+ * Loop fan-outs (parallel:[...]) inside a branch are followed too,
+ * since each of their downstream targets still belongs to this branch.
+ */
+function walkBranch(
+  start: string,
+  edges: GraphEdgeConfig[],
+  joinSources: Set<string>,
+): Set<string> {
+  const reachable = new Set<string>();
+  const queue: string[] = [start];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (reachable.has(current)) continue;
+    reachable.add(current);
+    if (current === '__end__' || current === '__start__') continue;
+    // Stop at the join boundary — anything downstream of the join is
+    // post-merge sequential code, not part of THIS branch.
+    if (joinSources.has(current) && current !== start) continue;
+
+    for (const edge of edges) {
+      if (edge.from !== current) continue;
+      if (Array.isArray(edge.join)) continue; // join edges have no `from`
+      if (edge.to) queue.push(edge.to);
+      if (Array.isArray(edge.parallel)) {
+        for (const t of edge.parallel) queue.push(t);
+      }
+      if (edge.targets) {
+        for (const t of Object.values(edge.targets)) queue.push(t as string);
+      }
+      if (edge.fallback) queue.push(edge.fallback);
+    }
+  }
+  return reachable;
+}
+
+/**
+ * Recursively collect every `outputField` written by a steps[] tree.
+ * Recurses into `loop` step bodies. Skips empty / non-string values.
+ */
+function collectOutputFields(steps: unknown[]): string[] {
+  const out: string[] = [];
+  if (!Array.isArray(steps)) return out;
+  for (const step of steps) {
+    if (!step || typeof step !== 'object') continue;
+    const s = step as Record<string, unknown>;
+    const cfg = (s.config as Record<string, unknown> | undefined) ?? undefined;
+    const outputField = cfg?.outputField;
+    if (typeof outputField === 'string' && outputField.length > 0) {
+      out.push(outputField);
+    }
+    // For transform `set` ops with no outputField, the result merges
+    // into top-level state — not tracked as a discrete field write
+    // (analysis would require evaluating the value template). Skip.
+    if (s.type === 'loop' && cfg && Array.isArray(cfg.steps)) {
+      out.push(...collectOutputFields(cfg.steps as unknown[]));
+    }
+  }
+  return out;
 }
