@@ -180,6 +180,13 @@ export async function executeLoop(config: LoopStepConfig, state: any): Promise<P
             }
             catch (error: any) {
                 console.error(`[LoopExecutor] Iteration ${iteration}, Step ${stepNumber} (${step.type}) failed:`, error.message);
+                // Preserve RunInterruptedError as-is so universalNode's catch
+                // can route it to publisher.interrupt() instead of treating
+                // it as a generic step error and falling through to the
+                // error_handler. Wrapping it in a plain Error here was the
+                // reason supersession-interrupts inside indicator loops were
+                // surfacing as graph errors instead of clean cancellations.
+                if (error?.name === 'RunInterruptedError') throw error;
                 throw new Error(`Loop iteration ${iteration}, step ${stepNumber} (${step.type}) failed: ${error.message}`);
             }
         }

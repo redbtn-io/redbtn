@@ -56,7 +56,27 @@ function createConfigurableNode(
       },
       _parallelContext: inParallelContext,
     };
-    return await universalNode(enhancedState);
+    // Defensive: attach a handler immediately so a `RunInterruptedError`
+    // thrown by `checkAbort()` (e.g. when concurrency:interrupt
+    // supersedes a sibling branch mid-fan-out) cannot surface as an
+    // unhandled rejection if LangGraph's scheduler defers the await
+    // across a microtask boundary. The await below still observes the
+    // rejection and propagates it to LangGraph normally — this catch
+    // is purely a "handler exists" marker for the runtime.
+    //
+    // Why this matters: prior to this guard, supersession-interrupts
+    // surfaced as `unhandledRejection` at the worker process level →
+    // `process.exit(1)` → BullMQ replayed the run → user saw their
+    // Discord message answered multiple times.
+    const promise = universalNode(enhancedState);
+    promise.catch((err: any) => {
+      if (err?.name === 'RunInterruptedError') return;
+      // Re-throws of non-interrupt errors are observed by the await
+      // below; we still want them to surface there. This branch is a
+      // no-op for them — the rejection is "handled" once any handler
+      // is attached, regardless of what the handler does.
+    });
+    return await promise;
   };
 }
 
