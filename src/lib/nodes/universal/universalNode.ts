@@ -314,19 +314,38 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
             const nestedUpdates = convertFlatToNested(stateUpdates);
             const currentState = deepMergeObjects(state, nestedUpdates);
 
-            // Hydrate `state.shared` from Redis before each step. This is
-            // what makes parallel-branch coordination work without forcing
-            // configs to bolt on global-state hacks: every read of
-            // `state.shared.x` in templates / conditions reflects what
-            // any other branch in the same run wrote between steps.
-            // Cheap when the run has no shared writes yet (single empty
-            // HGETALL). See run/run-shared-state.ts for context.
+            // Hydrate `state.shared` from Redis before each step. This
+            // is what makes EXPLICIT cross-branch coordination work for
+            // configs that use the `state.shared.<key>` namespace (the
+            // initial PR #121 layer). Cheap when no shared writes —
+            // single empty HGETALL. See run/run-shared-state.ts.
             if (state.runPublisher) {
                 try {
                     currentState.shared = await state.runPublisher.getSharedState();
                 } catch (err) {
                     console.warn('[UniversalNode] Failed to hydrate state.shared:', err);
                     currentState.shared = currentState.shared ?? {};
+                }
+            }
+
+            // IMPLICIT auto-state overlay (the layer that makes parallel
+            // branches "just work" without the `shared.` prefix). When
+            // the compiler stamped `_parallelContext = true` on the wrapper
+            // for this graph node, fold every entry of the auto-state
+            // hash onto local state via setNestedProperty. Reads of
+            // `state.data.x` then reflect peer-branch writes naturally.
+            // Outside parallel blocks the flag is unset and nothing
+            // hits Redis here.
+            if (currentState._parallelContext && state.runPublisher) {
+                try {
+                    const autoState = await state.runPublisher.getAutoState();
+                    if (autoState && Object.keys(autoState).length > 0) {
+                        // eslint-disable-next-line @typescript-eslint/no-require-imports
+                        const { applyAutoStateOnto } = require('../../run/run-auto-state');
+                        applyAutoStateOnto(currentState, autoState);
+                    }
+                } catch (err) {
+                    console.warn('[UniversalNode] Failed to overlay auto-state:', err);
                 }
             }
 
