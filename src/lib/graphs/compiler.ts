@@ -8,6 +8,7 @@
 
 import { StateGraph, END, Send } from '@langchain/langgraph';
 import { GraphConfig, GraphEdgeConfig, CompiledGraph } from '../types/graph';
+import { computeParallelContextNodes } from './parallel-context';
 
 // These imports resolve from the dist/ directory at runtime — they are
 // hand-maintained modules that have no source counterpart in src/.
@@ -30,11 +31,22 @@ const _sharedCheckpointer = createMongoCheckpointer();
  * @param graphNodeId The graph node ID (e.g., "context-1768684860197-u6xweb") — used for event publishing
  * @param config Optional additional configuration for the node
  */
-function createConfigurableNode(graphNodeId: string, config: Record<string, unknown> = {}) {
+function createConfigurableNode(
+  graphNodeId: string,
+  config: Record<string, unknown> = {},
+  inParallelContext = false,
+) {
   return async (state: any) => {
-    // Inject node config into state so the node can access it
-    // - graphNodeId: Used for event publishing (the unique node instance in this graph)
-    // - nodeId: Used for registry lookup (explicit config.nodeId or falls back to graphNodeId)
+    // Inject node config into state so the node can access it.
+    // - graphNodeId: Used for event publishing
+    // - nodeId: Registry lookup
+    // - _parallelContext: Set when this graph node lives inside a
+    //   `parallel:` block. universalNode hydrates run-shared state
+    //   onto the local state object before each step (so reads see
+    //   peer-branch writes), and transformExecutor auto-mirrors
+    //   `outputField` writes to the shared layer (so peers see ours).
+    //   Outside parallel blocks the flag stays unset and behavior is
+    //   identical to pre-PR-#125.
     const enhancedState = {
       ...state,
       nodeConfig: {
@@ -42,6 +54,7 @@ function createConfigurableNode(graphNodeId: string, config: Record<string, unkn
         graphNodeId,
         nodeId: (config.nodeId as string) || graphNodeId,
       },
+      _parallelContext: inParallelContext,
     };
     return await universalNode(enhancedState);
   };
@@ -63,6 +76,19 @@ export function compileGraphFromConfig(config: GraphConfig): CompiledGraph {
 
   // Step 2: Create StateGraph builder with RedGraphState annotations
   const builder = new StateGraph(RedGraphState);
+
+  // Step 2.1: Identify nodes that live inside any `parallel:` block.
+  // Stamped onto each node's runtime wrapper so universalNode flips
+  // `state._parallelContext = true` for those — that's the trigger
+  // for cross-branch coordination (auto-mirror of writes, overlay of
+  // peer writes onto local state). Outside parallel blocks the flag
+  // stays unset and behavior is identical to pre-PR-#125.
+  const parallelContextNodes = computeParallelContextNodes(config);
+  if (parallelContextNodes.size > 0) {
+    console.log(
+      `[GraphCompiler]   Parallel-context nodes (${parallelContextNodes.size}): ${[...parallelContextNodes].join(', ')}`,
+    );
+  }
 
   // Step 2.5: Detect nodes that will be wrapped into subgraph chains
   // These nodes should NOT be added to the main builder (they'll be in subgraphs)
@@ -89,8 +115,15 @@ export function compileGraphFromConfig(config: GraphConfig): CompiledGraph {
       console.log(`[GraphCompiler]   Skipping node: ${node.id} (will be in subgraph chain)`);
       continue;
     }
-    console.log(`[GraphCompiler]   Adding node: ${node.id} (nodeId: ${node.config?.nodeId || node.id})`);
-    const wrappedFn = createConfigurableNode(node.id, (node.config as Record<string, unknown>) || {});
+    const inParallel = parallelContextNodes.has(node.id);
+    console.log(
+      `[GraphCompiler]   Adding node: ${node.id} (nodeId: ${node.config?.nodeId || node.id})${inParallel ? ' [parallel]' : ''}`,
+    );
+    const wrappedFn = createConfigurableNode(
+      node.id,
+      (node.config as Record<string, unknown>) || {},
+      inParallel,
+    );
     builder.addNode(node.id, wrappedFn);
   }
 
