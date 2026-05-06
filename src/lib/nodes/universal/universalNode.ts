@@ -314,6 +314,22 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
             const nestedUpdates = convertFlatToNested(stateUpdates);
             const currentState = deepMergeObjects(state, nestedUpdates);
 
+            // Hydrate `state.shared` from Redis before each step. This is
+            // what makes parallel-branch coordination work without forcing
+            // configs to bolt on global-state hacks: every read of
+            // `state.shared.x` in templates / conditions reflects what
+            // any other branch in the same run wrote between steps.
+            // Cheap when the run has no shared writes yet (single empty
+            // HGETALL). See run/run-shared-state.ts for context.
+            if (state.runPublisher) {
+                try {
+                    currentState.shared = await state.runPublisher.getSharedState();
+                } catch (err) {
+                    console.warn('[UniversalNode] Failed to hydrate state.shared:', err);
+                    currentState.shared = currentState.shared ?? {};
+                }
+            }
+
             // Pass state (which contains infrastructure) to step executor
             const stepUpdate = await executeStep(step, currentState);
 
