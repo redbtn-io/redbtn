@@ -128,6 +128,33 @@ export async function executeTransform(config: TransformStepConfig, state: any):
                 throw new Error(`Unknown transform operation: ${(config as any).operation}`);
         }
 
+        // Run-shared State Detection:
+        // If outputField starts with `shared.`, route to the run-scoped
+        // Redis hash backing `state.shared`. Designed for parallel-
+        // branch coordination inside a single run — see
+        // lib/run/run-shared-state.ts for the full picture.
+        // Example: outputField='shared.thinking' → HSET on RunKeys.shared.
+        if (config.outputField && config.outputField.startsWith('shared.')) {
+            const key = config.outputField.slice('shared.'.length);
+            if (!key) {
+                throw new Error(`Invalid shared path: ${config.outputField}. Expected format: shared.<key>`);
+            }
+            const runPublisher = state.runPublisher;
+            if (!runPublisher) {
+                // Engine paths that don't have a RunPublisher attached
+                // (rare) shouldn't crash. Warn and fall through to a
+                // normal local-state write so behavior degrades cleanly.
+                console.warn(`[TransformExecutor] No runPublisher on state — falling back to local set for ${config.outputField}`);
+                return { [config.outputField]: result };
+            }
+            await runPublisher.setSharedField(key, result);
+            if (DEBUG) console.log(`[TransformExecutor] Wrote shared.${key} via runPublisher`);
+            return {
+                _sharedStateSet: true,
+                _sharedStateKey: key,
+            };
+        }
+
         // Smart Global State Detection:
         // If outputField starts with 'globalState.', automatically route to global state storage
         // Example: outputField='globalState.JOEL.counter' -> namespace='JOEL', key='counter'

@@ -123,6 +123,22 @@ export async function executeLoop(config: LoopStepConfig, state: any): Promise<P
     while (iteration < maxIterations && !exitConditionMet) {
         iteration++;
         console.log(`[LoopExecutor] ====== ITERATION ${iteration}/${maxIterations} ======`);
+
+        // Re-hydrate `state.shared` at the start of every iteration. This
+        // is the load-bearing piece for polling-style loops: a sibling
+        // parallel branch's writes to `state.shared.<key>` are surfaced
+        // here so the loop's exit condition can act on them. Without
+        // this, the loop would only see whatever shared state existed
+        // when the parent universal node started executing.
+        if (loopState.runPublisher) {
+            try {
+                loopState.shared = await loopState.runPublisher.getSharedState();
+            } catch (err) {
+                console.warn('[LoopExecutor] Failed to hydrate state.shared:', err);
+                loopState.shared = loopState.shared ?? {};
+            }
+        }
+
         // Execute all steps in this iteration
         for (let stepIndex = 0; stepIndex < steps.length; stepIndex++) {
             const step = steps[stepIndex];

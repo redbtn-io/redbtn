@@ -20,6 +20,12 @@
  * @module lib/run/run-publisher
  */
 import type { Redis } from 'ioredis';
+import {
+  readSharedState,
+  readSharedStateField,
+  writeSharedState,
+  deleteSharedState,
+} from './run-shared-state';
 import { StreamPublisher, StreamSubscriber } from '@redbtn/redstream';
 import {
   type RunState,
@@ -256,6 +262,35 @@ export class RunPublisher {
   }
 
   /**
+   * Read the entire shared-state hash for this run. Returns `{}` when
+   * no branch has written anything yet. Cheap — single HGETALL.
+   *
+   * `state.shared` in graph configs is hydrated from this on every
+   * step boundary (see UniversalNode + LoopExecutor) so polling-style
+   * patterns naturally see writes from peer parallel branches.
+   */
+  async getSharedState(): Promise<Record<string, unknown>> {
+    return readSharedState(this.redis, this.runId);
+  }
+
+  /**
+   * Read a single shared-state field. Returns `undefined` when missing.
+   */
+  async getSharedField(key: string): Promise<unknown> {
+    return readSharedStateField(this.redis, this.runId, key);
+  }
+
+  /**
+   * Set a single shared-state field. Refreshes the hash's TTL on every
+   * write so an active run keeps its shared state alive. Routes here
+   * from transform `set` operations whose `outputField` starts with
+   * `shared.<key>` — see TransformExecutor.
+   */
+  async setSharedField(key: string, value: unknown): Promise<void> {
+    await writeSharedState(this.redis, this.runId, key, value);
+  }
+
+  /**
    * Mark the run as completed and publish the `run_complete` event.
    *
    * @param output - Optional convenience fields (content/thinking/data) captured
@@ -287,6 +322,10 @@ export class RunPublisher {
     if (this.state!.conversationId) {
       await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
     }
+    // Drop the shared-state hash now that no parallel branches will
+    // run again. TTL would clean it up eventually, but explicit del
+    // keeps Redis tidy and reclaims the space immediately.
+    await deleteSharedState(this.redis, this.runId);
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       try {
@@ -389,6 +428,7 @@ export class RunPublisher {
     if (this.state!.conversationId) {
       await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
     }
+    await deleteSharedState(this.redis, this.runId);
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       try {
@@ -454,6 +494,7 @@ export class RunPublisher {
     if (this.state!.conversationId) {
       await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
     }
+    await deleteSharedState(this.redis, this.runId);
     // Forward to conversation stream if present so chat UI can render the
     // interrupt indicator and stop showing the spinner.
     if (this.convPublisher && this.convMessageId) {
