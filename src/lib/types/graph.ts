@@ -117,8 +117,34 @@ export interface GraphConfig {
   graphId: string;
   /** Owner user ID: "system" for defaults, user ID for custom graphs */
   userId: string;
-  /** Input schema (defines expected input structure) */
+  /**
+   * Input schema (JSON Schema describing the graph's expected input state).
+   *
+   * Used at runtime to validate incoming inputs and — when
+   * `publishAsTool` is true — also to generate the LLM-facing tool schema
+   * for graph-as-tool dispatch from a neuron step's attached tools.
+   */
   inputSchema?: Record<string, any>;
+  /**
+   * If true, this graph can be referenced as a tool from a neuron step
+   * (e.g. `tools: ['graph:my-research']`).
+   *
+   * The engine generates the LLM-facing tool schema from `inputSchema` and
+   * the description from `toolDescription`. When the LLM invokes the tool,
+   * the engine dispatches through the existing graph-step executor and
+   * returns the subgraph's terminal state to the calling LLM as the
+   * tool_result.
+   *
+   * Default: false (graph is callable as a subgraph but not as an LLM tool).
+   */
+  publishAsTool?: boolean;
+  /**
+   * Description shown to the LLM when this graph is bound as a tool.
+   *
+   * Required when `publishAsTool` is true. If omitted, the resolver falls
+   * back to `name` and finally to `Subgraph: ${graphId}`.
+   */
+  toolDescription?: string;
   /** Default input values (for scheduled/automated workflows) */
   defaultInput?: Record<string, any>;
   /** Output configuration for the graph */

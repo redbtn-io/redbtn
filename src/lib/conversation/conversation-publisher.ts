@@ -222,6 +222,10 @@ export class ConversationPublisher {
     result?: unknown;
     metadata?: Record<string, unknown>;
     error?: string;
+    /** Source of the tool call. Defaults to 'step' for backward compat. */
+    triggeredBy?: 'step' | 'neuron';
+    /** Owning neuron step id when triggeredBy === 'neuron'. */
+    neuronStepId?: string;
     timestamp: number;
   }): Promise<void> {
     await this.publish({
