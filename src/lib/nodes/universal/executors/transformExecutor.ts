@@ -183,6 +183,33 @@ export async function executeTransform(config: TransformStepConfig, state: any):
             };
         }
 
+        // Auto-mirror in parallel context. When the wrapping graph node
+        // is inside a `parallel:` block (compiler stamps `_parallelContext`
+        // on state — see graphs/compiler.ts + graphs/parallel-context.ts),
+        // dual-write the outputField to the run-scoped auto-state hash.
+        // Peer branches' next step boundary will overlay the value back
+        // onto their local state via universalNode/loopExecutor hydration,
+        // so they see the write WITHOUT the config needing a `shared.`
+        // prefix. No-op outside parallel blocks.
+        //
+        // Skipped when outputField already starts with `shared.` /
+        // `globalState.` — those have explicit storage layers handled
+        // above and dual-writing would just thrash Redis.
+        if (
+            config.outputField &&
+            state._parallelContext &&
+            state.runPublisher &&
+            !config.outputField.startsWith('shared.') &&
+            !config.outputField.startsWith('globalState.')
+        ) {
+            try {
+                await state.runPublisher.setAutoStateField(config.outputField, result);
+                if (DEBUG) console.log(`[TransformExecutor] Auto-mirrored ${config.outputField} → autoState`);
+            } catch (err) {
+                console.warn(`[TransformExecutor] Auto-mirror failed for ${config.outputField}:`, err);
+            }
+        }
+
         // Return output field.
         // If an outputField is provided, keep the existing behavior and return
         // a single-field partial state. If no outputField is provided and the
