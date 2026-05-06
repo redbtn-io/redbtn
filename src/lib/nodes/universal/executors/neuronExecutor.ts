@@ -21,6 +21,8 @@ import { getParserRegistry } from './parserRegistry';
 import { getNativeRegistry } from '../../../tools/native-registry';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
 import { HumanMessage } from '@langchain/core/messages';
+import { resolveToolStrategy, type ToolStrategy } from '../../../neurons/capability-matrix';
+import { resolveTools, toBindToolsPayload, type ResolvedTool } from '../../../tools/tool-resolver';
 
 /**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
@@ -345,6 +347,90 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
 
     // Check if this is an Ollama model for special handling
     const isOllamaModel = model.constructor.name === 'ChatOllama';
+
+    // -------------------------------------------------------------------------
+    // Neuron-attached tools — capability-aware strategy routing
+    //
+    // When `config.tools` is non-empty, the executor runs a tool-use loop
+    // instead of a single LLM call. The strategy is resolved from
+    // `config.toolStrategy` (defaults to 'auto' -> capability matrix).
+    //
+    // Backward-compat: when `config.tools` is empty/missing, we fall through
+    // to the existing plain-LLM / structuredOutput path unchanged.
+    // -------------------------------------------------------------------------
+    const attachedTools = Array.isArray(config.tools) ? config.tools : [];
+    if (attachedTools.length > 0) {
+      // Mutually exclusive: structured-output + tools is a config error
+      if (config.structuredOutput && config.toolStrategy !== 'structured-output') {
+        // 'structured-output' strategy is allowed (it just ignores tools), but
+        // any other combo with structuredOutput defined is invalid.
+        if (!config.toolStrategy || config.toolStrategy === 'auto'
+            || config.toolStrategy === 'native' || config.toolStrategy === 'prompt-injection') {
+          throw new Error(
+            'Neuron step config error: `tools` and `structuredOutput` are mutually exclusive. ' +
+            'Either drop `structuredOutput` or set `toolStrategy: "structured-output"` to ignore the attached tools.'
+          );
+        }
+      }
+
+      // Resolve strategy from the model's neuron config
+      let neuronCfg: any;
+      try {
+        neuronCfg = await neuronRegistry.getConfig(neuronId, userId);
+      } catch (cfgErr) {
+        console.warn('[NeuronExecutor] Could not load neuron config for capability matrix; falling back to "none":', cfgErr);
+        neuronCfg = null;
+      }
+      const strategy: ToolStrategy = neuronCfg
+        ? resolveToolStrategy(neuronCfg.provider, neuronCfg.model, config.toolStrategy)
+        : (config.toolStrategy && config.toolStrategy !== 'auto' ? config.toolStrategy as ToolStrategy : 'none');
+
+      console.log('[NeuronExecutor] Tool strategy resolved:', {
+        neuronId,
+        provider: neuronCfg?.provider,
+        model: neuronCfg?.model,
+        override: config.toolStrategy,
+        resolved: strategy,
+        toolCount: attachedTools.length,
+      });
+
+      if (strategy === 'native') {
+        // Resolve all tools through native/MCP/graph registries
+        const resolved = await resolveTools(attachedTools, state);
+        const finalContent = await runNativeToolUseLoop({
+          config,
+          state,
+          model,
+          baseMessages: await buildBaseMessagesForToolLoop(config, state),
+          resolvedTools: resolved,
+          neuronId,
+          userId,
+          callRunId,
+          abortSignal,
+          neuronRegistry,
+        });
+        return { [config.outputField]: finalContent };
+      }
+
+      if (strategy === 'prompt-injection') {
+        throw new Error(
+          'Neuron step config error: prompt-injection tool strategy is not yet implemented. ' +
+          'Use a tool-capable model (e.g. llama3.1+, qwen2.5+, mistral-nemo, gpt-4*, claude-*, gemini-1.5+) ' +
+          'or set `toolStrategy: "none"` to ignore attached tools for now.'
+        );
+      }
+
+      if (strategy === 'structured-output') {
+        // User explicitly opted into structured output despite attaching
+        // tools — fall through to the existing structuredOutput path. Tools
+        // are silently ignored (the LLM won't be told about them).
+        console.warn('[NeuronExecutor] toolStrategy: "structured-output" — attached tools are ignored.');
+        // fall through to existing logic below
+      } else if (strategy === 'none') {
+        console.warn('[NeuronExecutor] toolStrategy: "none" — attached tools are ignored. Falling through to plain LLM call.');
+        // fall through to existing logic below
+      }
+    }
 
     // For structured output, we need different handling based on provider
     let useNativeFormat = false;
@@ -899,5 +985,351 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     throw new Error(
       `Neuron step failed: ${error instanceof Error ? error.message : String(error)}`
     );
+  }
+}
+
+// =============================================================================
+// Neuron-attached tools — tool-use loop helpers
+// =============================================================================
+
+/**
+ * Build the initial message list for the tool-use loop.
+ *
+ * Reuses the existing template-rendering logic — system prompt, multimodal
+ * upgrade, messages-array mode, system prefix injection — but returns a
+ * plain message array suitable for repeated calls in the loop instead of
+ * mutating the executor's local `messages` variable.
+ */
+async function buildBaseMessagesForToolLoop(
+  config: NeuronStepConfig,
+  state: any,
+): Promise<any[]> {
+  const messagesFieldMatch = config.userPrompt.match(/^\{\{state\.([\w\.]+)\}\}$/);
+  let messages: any[];
+
+  if (messagesFieldMatch) {
+    const fieldName = messagesFieldMatch[1];
+    const messagesArray = getNestedProperty(state, fieldName);
+    if (!Array.isArray(messagesArray)) {
+      throw new Error(`Field ${fieldName} is not an array. Cannot use as messages.`);
+    }
+    messages = [...messagesArray];
+
+    if (config.systemPrompt || state.systemPrefix) {
+      let systemPrompt = config.systemPrompt
+        ? renderTemplate(config.systemPrompt, state)
+        : '';
+      if (state.systemPrefix) {
+        systemPrompt = systemPrompt
+          ? `${state.systemPrefix}\n\n${systemPrompt}`
+          : state.systemPrefix;
+      }
+      if (messages.length > 0 && messages[0].role === 'system') {
+        messages[0] = { role: 'system', content: systemPrompt };
+      } else {
+        messages.unshift({ role: 'system', content: systemPrompt });
+      }
+    }
+  } else {
+    let systemPrompt: string | undefined = config.systemPrompt
+      ? renderTemplate(config.systemPrompt, state)
+      : undefined;
+    if (state.systemPrefix) {
+      systemPrompt = systemPrompt
+        ? `${state.systemPrefix}\n\n${systemPrompt}`
+        : state.systemPrefix;
+    }
+    const userPrompt = renderTemplate(config.userPrompt, state);
+    messages = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    messages.push({ role: 'user', content: userPrompt });
+  }
+
+  return normalizeMessages(messages);
+}
+
+/**
+ * Inputs for the native tool-use loop.
+ */
+interface NativeToolUseLoopArgs {
+  config: NeuronStepConfig;
+  state: any;
+  /** The base LangChain model — bindTools will be called on it inside the loop */
+  model: any;
+  /** Initial conversation messages (system + user) */
+  baseMessages: any[];
+  /** Resolved tools (already passed through tool-resolver.resolveTools) */
+  resolvedTools: ResolvedTool[];
+  neuronId: string;
+  userId: string;
+  callRunId: string | undefined;
+  abortSignal: AbortSignal | undefined;
+  neuronRegistry: any;
+}
+
+/**
+ * Generate a unique tool-call id for RunPublisher events.
+ */
+function generateToolId(toolName: string, iteration: number): string {
+  return `tool_neuron_${toolName}_${Date.now()}_${iteration}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * Run the native tool-use loop.
+ *
+ * High level:
+ *   1. Bind resolved tools to the model.
+ *   2. Loop up to `maxToolIterations` times:
+ *      a. Invoke the (bound) model with the current message list.
+ *      b. If the response has no tool_calls, return its content as the final.
+ *      c. Otherwise, dispatch each tool_call through the resolver's invoke()
+ *         while emitting tool_start / tool_complete events with
+ *         `triggeredBy: 'neuron'`.
+ *      d. Append the assistant message (with tool_calls) and a `tool` role
+ *         message per result, then loop.
+ *   3. If the loop exhausts iterations, synthesize a wrap-up message.
+ */
+async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string> {
+  const {
+    config,
+    state,
+    model,
+    baseMessages,
+    resolvedTools,
+    neuronId,
+    userId,
+    callRunId,
+    abortSignal,
+    neuronRegistry,
+  } = args;
+
+  const runPublisher: any = state.runPublisher;
+  const maxIterations = typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0
+    ? config.maxToolIterations
+    : 5;
+  const neuronStepId = config.outputField;
+
+  // Bind the tools onto the model. LangChain's BaseChatModel.bindTools()
+  // returns a new runnable with the tools wired up; we use it for every
+  // invocation in the loop.
+  let boundModel: any;
+  try {
+    if (typeof model.bindTools !== 'function') {
+      throw new Error(`Model for neuron '${neuronId}' does not support bindTools()`);
+    }
+    boundModel = model.bindTools(toBindToolsPayload(resolvedTools));
+  } catch (bindErr: any) {
+    throw new Error(
+      `Failed to bind tools to model for neuron '${neuronId}': ${bindErr instanceof Error ? bindErr.message : String(bindErr)}`
+    );
+  }
+
+  // Working message list — grows as the loop appends assistant + tool messages.
+  const messages: any[] = [...baseMessages];
+
+  let lastToolResult: unknown = undefined;
+  let lastToolName: string | undefined;
+  let finalContent = '';
+
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    // Cooperative abort check between iterations
+    if (abortSignal?.aborted) {
+      const err: Error & { name: string } = new Error('Neuron tool-use loop aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
+
+    // Invoke the bound model. We use the non-streaming path here for
+    // simplicity and correctness: tool_calls are usually only complete on the
+    // final chunk anyway, and trying to stream + then re-prompt with
+    // tool_calls means re-buffering the whole assistant turn. This is the
+    // same approach used by langchain's standard agent loop.
+    let response: any;
+    try {
+      response = await neuronRegistry.callNeuron(neuronId, userId, messages, {
+        signal: abortSignal,
+        runId: callRunId,
+        stream: false,
+        modelOverride: boundModel,
+      });
+    } catch (invokeErr: any) {
+      throw new Error(
+        `LLM invocation failed during tool-use loop (iteration ${iteration + 1}): ${invokeErr instanceof Error ? invokeErr.message : String(invokeErr)}`
+      );
+    }
+
+    const toolCalls: any[] = Array.isArray(response?.tool_calls) ? response.tool_calls : [];
+    const responseContent: string = typeof response?.content === 'string'
+      ? response.content
+      : (Array.isArray(response?.content)
+          ? response.content.filter((p: any) => p?.type === 'text').map((p: any) => p.text || '').join('')
+          : String(response?.content ?? ''));
+
+    // No tool calls -> this is the final assistant message.
+    if (toolCalls.length === 0) {
+      finalContent = responseContent;
+      // Stream the final content to the user if requested. We do this once
+      // at the end (rather than incrementally) because the tool-use loop
+      // works against non-streamed invocations — but the final text still
+      // deserves a chunk event for UX.
+      if (config.stream && runPublisher && finalContent) {
+        try {
+          await runPublisher.chunk(finalContent);
+        } catch (chunkErr: any) {
+          console.warn('[NeuronExecutor] Failed to publish final chunk after tool-use loop:', chunkErr.message);
+        }
+      }
+      console.log(`[NeuronExecutor] Tool-use loop completed at iteration ${iteration + 1} with ${finalContent.length} chars`);
+      return finalContent;
+    }
+
+    // Append the assistant message (including tool_calls) so the next
+    // turn has the full context.
+    messages.push(response);
+
+    // Dispatch each tool call.
+    for (const toolCall of toolCalls) {
+      // Tool call shape: { id, name, args, type? } in LangChain core.
+      const toolName: string = toolCall?.name ?? toolCall?.function?.name ?? 'unknown_tool';
+      const rawArgs: any = toolCall?.args ?? toolCall?.function?.arguments ?? {};
+      const parsedArgs: Record<string, unknown> = typeof rawArgs === 'string'
+        ? safeParseJson(rawArgs)
+        : (rawArgs && typeof rawArgs === 'object' ? rawArgs : {});
+      const toolCallId: string | undefined = toolCall?.id;
+
+      const resolved = resolvedTools.find((t) => t.name === toolName);
+      const toolId = generateToolId(toolName, iteration);
+
+      // Cooperative abort check before dispatch
+      if (abortSignal?.aborted) {
+        const err: Error & { name: string } = new Error('Neuron tool-use loop aborted before tool dispatch');
+        err.name = 'AbortError';
+        throw err;
+      }
+
+      // Register an onCancel callback so an external interrupt can abort the
+      // in-flight tool dispatch. The dispatcher itself reads
+      // `ctx.abortSignal` (sourced from RunControlRegistry above), so this
+      // is defense-in-depth.
+      const ctxRunId = state?.runId || state?.data?.runId || null;
+      const runCtx = ctxRunId ? runControlRegistry.get(ctxRunId) : undefined;
+      let onCancelHandler: (() => void) | null = null;
+      const localAbort = new AbortController();
+      if (runCtx?.controller?.signal) {
+        if (runCtx.controller.signal.aborted) {
+          localAbort.abort();
+        } else {
+          onCancelHandler = () => {
+            try { localAbort.abort(); } catch { /* ignore */ }
+          };
+          runCtx.controller.signal.addEventListener('abort', onCancelHandler, { once: true });
+        }
+      }
+
+      // Emit tool_start
+      if (runPublisher) {
+        await runPublisher.toolStart(toolId, toolName, resolved?.source ?? 'native', {
+          input: parsedArgs,
+          triggeredBy: 'neuron',
+          neuronStepId,
+        });
+      }
+
+      let result: unknown;
+      let toolFailed = false;
+      try {
+        if (!resolved) {
+          throw new Error(`LLM emitted tool_call for unknown tool '${toolName}'`);
+        }
+        result = await resolved.invoke(parsedArgs, {
+          state,
+          runId: ctxRunId,
+          toolId,
+          abortSignal: localAbort.signal ?? null,
+          credentials: undefined,
+        });
+        lastToolResult = result;
+        lastToolName = toolName;
+      } catch (dispatchErr: any) {
+        toolFailed = true;
+        const errMsg = dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr);
+        if (runPublisher) {
+          await runPublisher.toolError(toolId, errMsg, { triggeredBy: 'neuron', neuronStepId });
+        }
+        // Honor errorHandling.onError on the neuron step
+        const onError = config.errorHandling?.onError ?? 'throw';
+        if (onError === 'throw') {
+          if (onCancelHandler && runCtx?.controller?.signal) {
+            try { runCtx.controller.signal.removeEventListener('abort', onCancelHandler); } catch { /* ignore */ }
+          }
+          throw new Error(`Tool '${toolName}' failed during neuron tool-use loop: ${errMsg}`);
+        }
+        // 'fallback' or 'skip' — append the error as the tool result so the
+        // LLM can react. Both behave the same here because we always need
+        // SOMETHING in the message thread for the assistant's tool_call.
+        result = { error: errMsg, _toolError: true };
+        lastToolResult = result;
+      } finally {
+        if (onCancelHandler && runCtx?.controller?.signal) {
+          try { runCtx.controller.signal.removeEventListener('abort', onCancelHandler); } catch { /* ignore */ }
+        }
+      }
+
+      if (!toolFailed && runPublisher) {
+        await runPublisher.toolComplete(toolId, result, {
+          neuronStep: neuronStepId,
+          iteration,
+        }, { triggeredBy: 'neuron', neuronStepId });
+      }
+
+      // Append a `tool` role message so the LLM sees the result on the
+      // next iteration. Different providers expect slightly different
+      // shapes; we send the most permissive form (LangChain core handles
+      // the per-provider translation).
+      messages.push({
+        role: 'tool',
+        tool_call_id: toolCallId,
+        name: toolName,
+        content: typeof result === 'string' ? result : safeStringify(result),
+      });
+    }
+  }
+
+  // Loop exhausted — synthesize a wrap-up message from the last tool result.
+  const wrapUp = `I attempted multiple tool calls (max ${maxIterations}) but did not reach a final answer. ` +
+    (lastToolName
+      ? `Last tool: ${lastToolName}. Last result: ${safeStringify(lastToolResult).slice(0, 500)}`
+      : 'No tools were dispatched.');
+  console.warn('[NeuronExecutor] Tool-use loop exhausted iteration cap:', { maxIterations, lastToolName });
+  if (config.stream && runPublisher) {
+    try {
+      await runPublisher.chunk(wrapUp);
+    } catch { /* ignore */ }
+  }
+  return wrapUp;
+}
+
+/**
+ * Parse a JSON string, returning an empty object on failure.
+ */
+function safeParseJson(s: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(s);
+    return (parsed && typeof parsed === 'object') ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Stringify a value, falling back to String(value) for circular refs.
+ */
+function safeStringify(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
   }
 }

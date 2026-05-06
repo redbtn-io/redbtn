@@ -751,25 +751,43 @@ export class RunPublisher {
     toolId: string,
     toolName: string,
     toolType: string,
-    options?: { input?: unknown },
+    options?: {
+      input?: unknown;
+      /** Source of this tool call. Defaults to `'step'` for backward compat. */
+      triggeredBy?: 'step' | 'neuron';
+      /** Owning neuron step id when triggeredBy === 'neuron'. */
+      neuronStepId?: string;
+    },
   ): Promise<void> {
     this.ensureInitialized();
     const tool = createToolExecution({ toolId, toolName, toolType });
     this.state!.tools.push(tool);
     await this.saveState();
     const ts = Date.now();
-    await this.publish({ type: 'tool_start', toolId, toolName, toolType, input: options?.input, timestamp: ts });
+    const triggeredBy = options?.triggeredBy ?? 'step';
+    const neuronStepId = options?.neuronStepId;
+    await this.publish({
+      type: 'tool_start',
+      toolId,
+      toolName,
+      toolType,
+      input: options?.input,
+      triggeredBy,
+      neuronStepId,
+      timestamp: ts,
+    });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
-        type: 'tool_start', toolId, toolName, toolType, input: options?.input, timestamp: ts,
+        type: 'tool_start', toolId, toolName, toolType, input: options?.input,
+        triggeredBy, neuronStepId, timestamp: ts,
       }).catch(() => {});
     }
     await this.persistLog({
       level: 'info',
       category: 'tool',
       message: `Tool started: ${toolName}`,
-      metadata: { toolId, toolName, toolType, input: options?.input },
+      metadata: { toolId, toolName, toolType, input: options?.input, triggeredBy, neuronStepId },
     });
   }
 
@@ -801,7 +819,12 @@ export class RunPublisher {
     });
   }
 
-  async toolComplete(toolId: string, result?: unknown, metadata?: Record<string, unknown>): Promise<void> {
+  async toolComplete(
+    toolId: string,
+    result?: unknown,
+    metadata?: Record<string, unknown>,
+    options?: { triggeredBy?: 'step' | 'neuron'; neuronStepId?: string },
+  ): Promise<void> {
     this.ensureInitialized();
     const tool = this.findTool(toolId);
     if (tool) {
@@ -812,12 +835,17 @@ export class RunPublisher {
     }
     await this.saveState();
     const ts = Date.now();
-    await this.publish({ type: 'tool_complete', toolId, result, metadata, timestamp: ts });
+    const triggeredBy = options?.triggeredBy ?? 'step';
+    const neuronStepId = options?.neuronStepId;
+    await this.publish({
+      type: 'tool_complete', toolId, result, metadata,
+      triggeredBy, neuronStepId, timestamp: ts,
+    });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_complete', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
-        result, metadata, timestamp: ts,
+        result, metadata, triggeredBy, neuronStepId, timestamp: ts,
       }).catch(() => {});
     }
     // Extract a useful preview of the tool result for persistent logging.
@@ -833,7 +861,11 @@ export class RunPublisher {
     });
   }
 
-  async toolError(toolId: string, error: string): Promise<void> {
+  async toolError(
+    toolId: string,
+    error: string,
+    options?: { triggeredBy?: 'step' | 'neuron'; neuronStepId?: string },
+  ): Promise<void> {
     this.ensureInitialized();
     const tool = this.findTool(toolId);
     if (tool) {
@@ -843,12 +875,17 @@ export class RunPublisher {
     }
     await this.saveState();
     const ts = Date.now();
-    await this.publish({ type: 'tool_error', toolId, error, timestamp: ts });
+    const triggeredBy = options?.triggeredBy ?? 'step';
+    const neuronStepId = options?.neuronStepId;
+    await this.publish({
+      type: 'tool_error', toolId, error,
+      triggeredBy, neuronStepId, timestamp: ts,
+    });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_error', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
-        error, timestamp: ts,
+        error, triggeredBy, neuronStepId, timestamp: ts,
       }).catch(() => {});
     }
     await this.persistLog({

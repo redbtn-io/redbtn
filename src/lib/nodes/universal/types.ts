@@ -169,7 +169,78 @@ export interface NeuronStepConfig {
     };
     /** Error handling configuration for this neuron step */
     errorHandling?: ErrorHandlingConfig;
+    /**
+     * Tools attached to this neuron step.
+     *
+     * The engine resolves each tool through the existing native registry,
+     * the user-supplied MCP registry, or the GraphRegistry (graph-as-tool),
+     * then binds them to the LLM call using the strategy chosen by
+     * `toolStrategy`.
+     *
+     * When non-empty AND the resolved strategy is `'native'`, the engine
+     * runs an inner tool-use loop until the LLM emits a final assistant
+     * message OR `maxToolIterations` is hit.
+     *
+     * Supported shorthand forms in the `string` variant:
+     *   - `'web_search'`            — native registry lookup
+     *   - `'mcp:my-server.lookup'`  — MCP registry lookup
+     *   - `'graph:my-subgraph'`     — graph-as-tool dispatch
+     *
+     * Mutually exclusive with `structuredOutput` — combining the two is a
+     * config error and the executor will throw.
+     */
+    tools?: ToolRef[];
+    /**
+     * Tool-binding strategy. Defaults to `'auto'`.
+     *
+     * - `'auto'`             — consult the capability matrix to pick the best
+     *                           strategy for this neuron's (provider, model)
+     *                           pair. Falls back to `'none'` if unknown.
+     * - `'native'`           — call `model.bindTools(tools)`. Used by OpenAI,
+     *                           Anthropic, Google, and tool-capable Ollama
+     *                           models. Engine runs the tool-use loop.
+     * - `'prompt-injection'` — inject a `<tools>` block into the system
+     *                           prompt and parse `<tool_call>` from the LLM's
+     *                           text output. Engine runs the tool-use loop.
+     *                           NOTE: Stubbed in this PR — will throw
+     *                           "not yet implemented".
+     * - `'structured-output'`— existing structuredOutput path. Mutually
+     *                           exclusive with `tools` — throws when combined.
+     * - `'none'`             — plain LLM call, attached tools are ignored
+     *                           (with a warning log).
+     */
+    toolStrategy?: 'auto' | 'native' | 'prompt-injection' | 'structured-output' | 'none';
+    /**
+     * Max iterations for the inner tool-use loop. Default: 5.
+     *
+     * When the LLM keeps emitting tool calls beyond this cap, the engine
+     * synthesizes a final assistant message from the last tool result and
+     * exits the loop.
+     */
+    maxToolIterations?: number;
 }
+
+/**
+ * Reference to a tool attachable to a neuron step.
+ *
+ * Shorthand string forms:
+ *   - `'web_search'`           — native registry
+ *   - `'mcp:server.toolName'`  — MCP registry
+ *   - `'graph:graphId'`        — graph-as-tool (graph must have `publishAsTool: true`)
+ *
+ * Object form lets you pin the source explicitly and override the
+ * description shown to the LLM.
+ */
+export type ToolRef =
+  | string
+  | {
+      /** Tool name (without prefix when `source` is set) */
+      name: string;
+      /** Override the tool description shown to the LLM */
+      description?: string;
+      /** Force a specific resolution path (skips prefix sniffing) */
+      source?: 'native' | 'mcp' | 'graph';
+    };
 
 /**
  * Tool Step - Call an MCP tool
