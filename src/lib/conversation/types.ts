@@ -121,6 +121,14 @@ export interface ConversationToolEvent {
     result?: unknown;
     metadata?: Record<string, unknown>;
     error?: string;
+    /**
+     * Source of the tool call.
+     *  - `'step'`   — explicit graph-level `tool` step (default)
+     *  - `'neuron'` — LLM invoked the tool through `bindTools` on a neuron step
+     */
+    triggeredBy?: 'step' | 'neuron';
+    /** Owning neuron step id when triggeredBy === 'neuron'. */
+    neuronStepId?: string;
     timestamp: number;
   };
   timestamp: number;

@@ -312,6 +312,20 @@ export interface ToolStartEvent extends BaseEvent {
   toolName: string;
   toolType: string;
   input?: unknown;
+  /**
+   * What triggered this tool call.
+   *  - `'step'`   — explicit graph-level `tool` step (default, backward-compatible)
+   *  - `'neuron'` — LLM invoked the tool through `bindTools` on a neuron step
+   *
+   * Defaults to `'step'` when omitted to preserve existing event semantics.
+   */
+  triggeredBy?: 'step' | 'neuron';
+  /**
+   * When `triggeredBy === 'neuron'`, identifies the neuron step's `outputField`
+   * (or step index) that owns this tool dispatch. Used by the UI to attribute
+   * the tool bubble to its parent neuron.
+   */
+  neuronStepId?: string;
 }
 
 export interface ToolProgressEvent extends BaseEvent {
@@ -327,12 +341,20 @@ export interface ToolCompleteEvent extends BaseEvent {
   toolId: string;
   result?: unknown;
   metadata?: Record<string, unknown>;
+  /** What triggered this tool call. See ToolStartEvent.triggeredBy. */
+  triggeredBy?: 'step' | 'neuron';
+  /** Owning neuron step id when triggeredBy === 'neuron'. */
+  neuronStepId?: string;
 }
 
 export interface ToolErrorEvent extends BaseEvent {
   type: 'tool_error';
   toolId: string;
   error: string;
+  /** What triggered this tool call. See ToolStartEvent.triggeredBy. */
+  triggeredBy?: 'step' | 'neuron';
+  /** Owning neuron step id when triggeredBy === 'neuron'. */
+  neuronStepId?: string;
 }
 
 /**
