@@ -1255,6 +1255,20 @@ export async function run(
     if (interruptSub) {
       try { await interruptSub.quit(); } catch { /* ignore */ }
     }
+    // Fire the run-level AbortController BEFORE unregistering. Indicator
+    // loops + other long-running Promises spawned in parallel branches
+    // hold references to this signal via getRunSignal() — when run()
+    // reaches its terminal state (success / fail / interrupt), those
+    // Promises are still live in the JS event loop because LangGraph
+    // returned without awaiting their parallel-branch completion.
+    // Without this abort, the loop's `delay` step keeps ticking past
+    // run cleanup, fires typing into Discord forever, and only stops
+    // on worker restart. The delay step's existing onAbort listener
+    // observes this signal and rejects cleanly.
+    try {
+      const ctx = runControlRegistry.get(runId);
+      ctx?.controller.abort('run-completed');
+    } catch { /* ignore */ }
     // Unregister AFTER the interrupt subscriber has stopped accepting
     // messages. If we unregistered first, an interrupt arriving in the gap
     // would find no context and ack:false even though the run was healthy.
