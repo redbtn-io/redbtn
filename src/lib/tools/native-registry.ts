@@ -228,6 +228,18 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   }
 
   try {
+    // Push Stream Event — ephemeral status events to a Stream session's UI
+    // (no conversation-history pollution, separate from terminal run results)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pushStreamEvent = require('./native/push-stream-event.js');
+    registry.register('push_stream_event', pushStreamEvent);
+    console.log('[NativeRegistry] Registered built-in tool: push_stream_event');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register push_stream_event:', msg);
+  }
+
+  try {
     // Upload Attachment — upload files to the attachment store and publish to run stream
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const uploadAttachment = require('./native/upload-attachment.js');
