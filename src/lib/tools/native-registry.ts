@@ -55,6 +55,19 @@ export interface NativeToolDefinition {
   server?: string;
   /** The actual tool implementation */
   handler: (args: AnyObject, context: NativeToolContext) => Promise<NativeMcpResult>;
+  /**
+   * Whether this tool may be invoked from outside a graph run — i.e. via
+   * `POST /api/v1/tools/:name` and from there as a remote MCP tool through
+   * mcp.redbtn.io. Defaults to false. Tools that need a real publisher,
+   * runId, abortSignal, in-process filesystem, or live SSH session should
+   * leave this false. Tools that are thin proxies in front of the webapp
+   * REST API (or pure stateless utilities) should set this true.
+   *
+   * Centrally enforced via the `MCP_EXPOSED_TOOLS` allowlist below — the
+   * `register()` method applies it at registration time, so tool authors
+   * do NOT need to touch their tool files when (un)exposing.
+   */
+  mcpExposed?: boolean;
 }
 
 export interface NativeToolInfo {
@@ -62,7 +75,150 @@ export interface NativeToolInfo {
   description: string;
   inputSchema: AnyObject;
   server: string;
+  /** Mirrors NativeToolDefinition.mcpExposed — surfaced so callers (the
+   *  webapp's `/api/v1/tools` route) can filter the listing without
+   *  re-resolving each tool. */
+  mcpExposed: boolean;
 }
+
+/**
+ * Centralized allowlist of native tools that are safe to invoke from outside
+ * a graph run — i.e. through the webapp's `POST /api/v1/tools/:name` route
+ * and from there as remote MCP tools through `mcp.redbtn.io/redbtn`.
+ *
+ * What goes in here:
+ *   - tools that are thin proxies in front of webapp REST endpoints
+ *     (auth + permission checks happen on the webapp side, not in the tool),
+ *   - pure stateless utilities that don't touch run state.
+ *
+ * What stays OUT:
+ *   - tools that need a real publisher / runId / abortSignal,
+ *   - tools that read/write the worker's local filesystem,
+ *   - long-lived SSH sessions,
+ *   - the meta pack (list_available_tools, get_tool_schema, invoke_tool —
+ *     they enable infinite indirection from outside),
+ *   - worker-internal log / function-invoke tools.
+ *
+ * Adding a new tool: drop the name in here and ship. The webapp's
+ * `/api/v1/tools` route will pick it up automatically. No gateway or
+ * webapp changes required.
+ */
+export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
+  // ── Conversations ──
+  'list_conversations',
+  'read_conversation',
+  'get_conversation',
+  'get_conversation_metadata',
+  'get_conversation_summary',
+  'get_messages',
+  'create_conversation',
+  'delete_conversation',
+  'set_conversation_title',
+  'add_participant',
+  'list_participants',
+  'list_threads',
+  'create_thread',
+
+  // ── Libraries / RAG ──
+  'list_libraries',
+  'create_library',
+  'update_library',
+  'delete_library',
+  'search_all_libraries',
+  'search_documents',
+  'add_document',
+  'get_document',
+  'list_documents',
+  'update_document',
+  'delete_document',
+  'reprocess_document',
+  'upload_to_library',
+  'upload_attachment',
+
+  // ── Global State ──
+  'list_namespaces',
+  'list_global_state',
+  'get_global_state',
+  'set_global_state',
+  'delete_global_state',
+  'delete_namespace',
+
+  // ── Automations ──
+  'list_automations',
+  'get_automation',
+  'enable_automation',
+  'disable_automation',
+  'trigger_automation',
+
+  // ── Graphs ──
+  'list_graphs',
+  'get_graph',
+  'create_graph',
+  'update_graph',
+  'delete_graph',
+  'fork_graph',
+  'publish_graph',
+  'get_graph_compile_log',
+  'validate_graph_config',
+  'invoke_graph',
+
+  // ── Nodes ──
+  'create_node',
+  'update_node',
+  'delete_node',
+  'fork_node',
+
+  // ── Neurons ──
+  'create_neuron',
+  'update_neuron',
+  'delete_neuron',
+  'fork_neuron',
+
+  // ── Streams ──
+  'create_stream',
+  'update_stream',
+  'delete_stream',
+  'start_stream_session',
+  'end_stream_session',
+  'get_stream_session',
+  'list_stream_sessions',
+
+  // ── Runs ──
+  'get_recent_runs',
+  'get_run',
+  'get_run_logs',
+  'cancel_run',
+
+  // ── Tasks ──
+  'task_create',
+  'task_complete',
+  'task_get',
+  'task_list',
+  'task_update',
+
+  // ── Stateless utilities ──
+  'now',
+  'generate_id',
+  'regex_match',
+  'strip_formatting',
+  'json_query',
+  'extract_thinking',
+  'count_tokens',
+  'fetch_url',
+  'scrape_url',
+  'web_search',
+  'parse_document',
+
+  // ── Messaging ──
+  'send_email',
+  'send_webhook',
+  'download_file',
+
+  // ── Voice ──
+  'synthesize_speech',
+  'transcribe_audio',
+  'tts_synthesize',
+]);
 
 export class NativeToolRegistry {
   private tools: Map<string, NativeToolDefinition> = new Map();
@@ -70,8 +226,18 @@ export class NativeToolRegistry {
   /**
    * Register a native tool definition.
    * The name must match what graphs use in their toolName step config.
+   *
+   * The MCP-exposure flag is sourced from `MCP_EXPOSED_TOOLS` (a per-name
+   * allowlist) at registration time, UNLESS the definition itself already
+   * sets `mcpExposed` explicitly. That lets tool authors override the
+   * default in either direction from their tool file when there's a
+   * tool-specific reason to do so — but the default path is the
+   * centralized list, which is what we audit.
    */
   register(name: string, definition: NativeToolDefinition): void {
+    if (definition.mcpExposed === undefined) {
+      definition.mcpExposed = MCP_EXPOSED_TOOLS.has(name);
+    }
     this.tools.set(name, definition);
   }
 
@@ -85,14 +251,22 @@ export class NativeToolRegistry {
 
   /**
    * List all registered native tools in MCP-compatible format.
+   * Pass `{ mcpExposedOnly: true }` to get only the tools that are safe
+   * to invoke from outside a graph run.
    */
-  listTools(): NativeToolInfo[] {
-    return Array.from(this.tools.entries()).map(([name, def]) => ({
-      name,
-      description: def.description,
-      inputSchema: def.inputSchema,
-      server: def.server || 'system',
-    }));
+  listTools(opts: { mcpExposedOnly?: boolean } = {}): NativeToolInfo[] {
+    const out: NativeToolInfo[] = [];
+    for (const [name, def] of this.tools.entries()) {
+      if (opts.mcpExposedOnly && !def.mcpExposed) continue;
+      out.push({
+        name,
+        description: def.description,
+        inputSchema: def.inputSchema,
+        server: def.server || 'system',
+        mcpExposed: def.mcpExposed === true,
+      });
+    }
+    return out;
   }
 
   /**
@@ -225,6 +399,18 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register push_message:', msg);
+  }
+
+  try {
+    // Push Stream Event — ephemeral status events to a Stream session's UI
+    // (no conversation-history pollution, separate from terminal run results)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pushStreamEvent = require('./native/push-stream-event.js');
+    registry.register('push_stream_event', pushStreamEvent);
+    console.log('[NativeRegistry] Registered built-in tool: push_stream_event');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register push_stream_event:', msg);
   }
 
   try {
