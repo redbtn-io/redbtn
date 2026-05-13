@@ -239,20 +239,23 @@ export class ConversationPublisher {
 
   /** Signal a run has completed in this conversation.
    *
-   *  ALSO does a backstop direct MongoDB write of the assistant message. The
-   *  archiver (BullMQ `conversation-archive` consumer) is the primary writer
-   *  for assistant messages — it builds them from `message_start` /
-   *  `content_chunk` / `run_complete` events. But if conv-event forwarding
-   *  was silently lossy mid-run (every `streamContent` call is fire-and-forget
-   *  with a swallowed `.catch`), the archiver never sees the message and the
-   *  conversation ends up with the user's send but no assistant reply.
+   *  ALSO does a backstop direct MongoDB write of the assistant message
+   *  (content + toolExecutions). The archiver is the primary writer; this
+   *  backstop only fills gaps when conv-event forwarding was silently lossy.
+   *  Idempotent via the `$ne: messageId` filter in `persistMessage` for the
+   *  initial $push, plus an in-place `$set` for toolExecutions that updates
+   *  the message regardless of which writer landed first.
    *
-   *  Backstop is idempotent — the same `$ne: messageId` filter from
-   *  `persistMessage` means duplicate writes (archiver + this) collapse to
-   *  one row. Failures are logged and non-fatal; the published event still
-   *  drives live SSE consumers.
+   *  `tools` is the run's full tool history (state.tools array). When the
+   *  archiver missed tool_event forwards, the persisted message has
+   *  toolExecutions: [] — this set updates it to the truth.
    */
-  async publishRunComplete(runId: string, messageId: string, finalContent?: string): Promise<void> {
+  async publishRunComplete(
+    runId: string,
+    messageId: string,
+    finalContent?: string,
+    tools?: unknown[],
+  ): Promise<void> {
     await this.publish({
       type: 'run_complete',
       runId,
@@ -267,6 +270,7 @@ export class ConversationPublisher {
           role: 'assistant',
           content: finalContent,
           metadata: { runId },
+          toolExecutions: Array.isArray(tools) ? tools : undefined,
         });
       } catch (err) {
         console.error('[ConversationPublisher] Backstop persistMessage failed:', err);
@@ -515,6 +519,11 @@ export class ConversationPublisher {
     content: string;
     thinking?: string;
     metadata?: Record<string, unknown>;
+    /** Optional run tool history to persist on the message. Backstop only —
+     *  if the archiver already wrote toolExecutions via tool_event forwards
+     *  the in-place $set below just overwrites with the same data (or the
+     *  more-complete data if forwarding lapsed). */
+    toolExecutions?: unknown[];
   }): Promise<void> {
     try {
       // Use mongoose to persist to the conversation
@@ -551,6 +560,9 @@ export class ConversationPublisher {
               content: params.content,
               ...(params.thinking ? { thinking: params.thinking } : {}),
               metadata: params.metadata,
+              ...(Array.isArray(params.toolExecutions) && params.toolExecutions.length > 0
+                ? { toolExecutions: params.toolExecutions }
+                : {}),
               timestamp: new Date(),
             },
           },
@@ -568,6 +580,23 @@ export class ConversationPublisher {
         filter,
         { $set: { lastMessageAt: new Date(), updatedAt: new Date() } },
       );
+
+      // Tools backfill: when toolExecutions is supplied, $set them on the
+      // matching message regardless of whether the $push above landed or
+      // was a no-op (archiver already wrote the message). This lets the
+      // backstop fill in tool history when conv-event forwarding dropped
+      // tool_event events mid-run — without overwriting the archiver's
+      // tools when they DID flow.
+      if (Array.isArray(params.toolExecutions) && params.toolExecutions.length > 0) {
+        try {
+          await db.collection('user_conversations').updateOne(
+            { ...filter, 'messages.id': params.messageId },
+            { $set: { 'messages.$.toolExecutions': params.toolExecutions } },
+          );
+        } catch (err) {
+          console.error('[ConversationPublisher] toolExecutions $set failed:', err);
+        }
+      }
 
       // Emit stored event
       await this.publish({
