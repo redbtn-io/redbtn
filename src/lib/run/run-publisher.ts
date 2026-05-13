@@ -371,6 +371,12 @@ export class RunPublisher {
           this.runId,
           this.convMessageId,
           this.state!.output.content || undefined,
+          // Pass the run's tool history for the persistence backstop. The
+          // archiver builds tool data from tool_event forwards; when those
+          // lapse silently the persisted assistant message has empty tools.
+          // This array goes into the message via persistMessage's in-place
+          // $set so the truth lands even when forwarding doesn't.
+          this.state!.tools,
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_complete failed:", err);
