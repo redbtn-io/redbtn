@@ -167,6 +167,7 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   // ── Nodes ──
   'create_node',
   'update_node',
+  'node_patch',
   'delete_node',
   'fork_node',
 
@@ -1605,6 +1606,17 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register update_node:', msg);
+  }
+
+  try {
+    // Node Patch — JSON-patch ops list on a node config, validates step shapes after
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const nodePatch = require('./native/node-patch.js');
+    registry.register('node_patch', nodePatch.default || nodePatch);
+    console.log('[NativeRegistry] Registered built-in tool: node_patch');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register node_patch:', msg);
   }
 
   try {
