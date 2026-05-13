@@ -140,6 +140,7 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   'list_global_state',
   'get_global_state',
   'set_global_state',
+  'state_patch',
   'delete_global_state',
   'delete_namespace',
 
@@ -514,6 +515,17 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register set_global_state:', msg);
+  }
+
+  try {
+    // State Patch — JSON-patch ops list on an existing value, no full rewrite
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const statePatch = require('./native/state-patch.js');
+    registry.register('state_patch', statePatch.default || statePatch);
+    console.log('[NativeRegistry] Registered built-in tool: state_patch');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register state_patch:', msg);
   }
 
   try {
