@@ -156,6 +156,7 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   'get_graph',
   'create_graph',
   'update_graph',
+  'graph_patch',
   'delete_graph',
   'fork_graph',
   'publish_graph',
@@ -1507,6 +1508,17 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register update_graph:', msg);
+  }
+
+  try {
+    // Graph Patch — JSON-patch ops list on a graph config, validates after
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const graphPatch = require('./native/graph-patch.js');
+    registry.register('graph_patch', graphPatch.default || graphPatch);
+    console.log('[NativeRegistry] Registered built-in tool: graph_patch');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register graph_patch:', msg);
   }
 
   try {
