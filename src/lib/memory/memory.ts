@@ -262,22 +262,38 @@ export class MemoryManager {
   }
 
   /**
-   * Get all messages for a conversation from MongoDB (full history)
-   * For recent hot context, messages are served from Redis cache
+   * Get all messages for a conversation. Reads from MongoDB as the
+   * source of truth and refreshes the Redis hot cache opportunistically.
+   *
+   * History note: previously this returned the Redis hot cache as long as
+   * it had ANY entries (`length > 0`), only falling back to Mongo on a
+   * total miss. That made the cache a write-through ONLY for
+   * `addMessage`. Every OTHER message-write path in the codebase
+   * (`dispatch.storeUserMessage`, the `conversation-archive` BullMQ
+   * worker writing assistant messages, direct `$push` updateOne calls
+   * elsewhere) wrote to Mongo without touching this cache — so the
+   * cache froze at whatever snapshot the first read produced, and
+   * `get_context_history` would silently return a stale slice. A conv
+   * with 15 persisted messages was returning 1 message of context.
+   *
+   * The cache is still maintained for fast subsequent reads, but it is
+   * never used as the *authoritative* source. If Mongo returns 0 rows
+   * we don't fall back to the cache — the cache is at most a snapshot
+   * of an older Mongo state, so an "empty in Mongo" must mean "empty"
+   * (e.g. a freshly created conv).
    */
   async getMessages(conversationId: string): Promise<ConversationMessage[]> {
-    // Try Redis first (hot cache - last 100 messages)
     const key = `conversations:${conversationId}:messages`;
-    const messagesJson = await this.redis.lrange(key, 0, -1);
-    
-    if (messagesJson.length > 0) {
-      return messagesJson.map((json: string) => JSON.parse(json));
-    }
-    
-    // If not in Redis, try to fetch from user_conversations.messages[] and populate Redis
+
     try {
       const db = this.getMongoDb();
-      if (!db) return [];
+      if (!db) {
+        // No DB available — fall back to whatever the cache has so we
+        // don't lose context entirely in dev/test setups without Mongo.
+        const messagesJson = await this.redis.lrange(key, 0, -1);
+        return messagesJson.map((json: string) => JSON.parse(json));
+      }
+
       const filter = this.buildConversationFilter(conversationId);
       // $slice: -N returns the last N array elements (chronological tail)
       const doc = await db.collection('user_conversations').findOne(
@@ -286,35 +302,46 @@ export class MemoryManager {
       );
       const embedded: Array<Record<string, any>> = Array.isArray(doc?.messages) ? doc.messages : [];
 
-      if (embedded.length > 0) {
-        const dbMessages: ConversationMessage[] = embedded.map((m) => ({
-          id: (m.id ?? m.messageId) as string | undefined,
-          role: m.role,
-          content: m.content ?? '',
-          timestamp: m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp) || Date.now(),
-          thinking: typeof m.thinking === 'string' ? m.thinking : undefined,
-          toolExecutions: Array.isArray(m.toolExecutions) ? m.toolExecutions : [],
-        }));
+      const dbMessages: ConversationMessage[] = embedded.map((m) => ({
+        id: (m.id ?? m.messageId) as string | undefined,
+        role: m.role,
+        content: m.content ?? '',
+        timestamp: m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp) || Date.now(),
+        thinking: typeof m.thinking === 'string' ? m.thinking : undefined,
+        toolExecutions: Array.isArray(m.toolExecutions) ? m.toolExecutions : [],
+      }));
 
-        // Populate Redis cache
-        const pipeline = this.redis.pipeline();
-        for (const convMsg of dbMessages) {
-          pipeline.rpush(key, JSON.stringify(convMsg));
-          if (convMsg.id) {
-            pipeline.sadd(`${key}:ids`, convMsg.id);
+      // Refresh the Redis cache opportunistically so subsequent
+      // addMessage callers' dedup-by-id checks remain correct. Do
+      // not await — staleness here is harmless (we just re-read Mongo
+      // next time).
+      void (async () => {
+        try {
+          const pipeline = this.redis.pipeline();
+          pipeline.del(key);
+          pipeline.del(`${key}:ids`);
+          for (const convMsg of dbMessages) {
+            pipeline.rpush(key, JSON.stringify(convMsg));
+            if (convMsg.id) {
+              pipeline.sadd(`${key}:ids`, convMsg.id);
+            }
           }
-        }
-        pipeline.expire(`${key}:ids`, this.MESSAGE_ID_INDEX_TTL);
-        await pipeline.exec();
+          pipeline.expire(`${key}:ids`, this.MESSAGE_ID_INDEX_TTL);
+          await pipeline.exec();
+        } catch { /* opportunistic */ }
+      })();
 
-        console.log(`[Memory] Populated Redis cache with ${dbMessages.length} messages from user_conversations for ${conversationId}`);
-        return dbMessages;
-      }
+      return dbMessages;
     } catch (error) {
       console.warn('[Memory] Failed to fetch from MongoDB:', error instanceof Error ? error.message : String(error));
+      // Last-resort fallback to whatever the cache has
+      try {
+        const messagesJson = await this.redis.lrange(key, 0, -1);
+        return messagesJson.map((json: string) => JSON.parse(json));
+      } catch {
+        return [];
+      }
     }
-
-    return [];
   }
 
   /**
