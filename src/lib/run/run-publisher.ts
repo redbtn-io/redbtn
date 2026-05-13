@@ -209,6 +209,16 @@ export class RunPublisher {
     input: Record<string, unknown>,
     conversationId?: string,
     triggerType?: string,
+    /**
+     * Externally-minted message id for the assistant message this run will
+     * produce. When supplied, the conversation publisher uses this id on every
+     * event (run_start / chunks / run_complete) instead of generating its own.
+     * Allows dispatch endpoints to pre-allocate the messageId and return it to
+     * the client in the same response that submits the run — so optimistic UI
+     * can pre-create the assistant bubble with the matching id before any SSE
+     * event arrives.
+     */
+    convMessageId?: string,
   ): Promise<void> {
     if (this.initialized) {
       throw new Error(`RunPublisher already initialized for run ${this.runId}`);
@@ -240,10 +250,10 @@ export class RunPublisher {
           userId: this.userId,
         });
         // Unified message id format for both graph runs and streams:
-        // `msg_<ts>_<rand>`. Previously graph messages used `msg_run_<runId>`
-        // which mixed an identifier with a derivation rule and forced clients
-        // to know the convention. Now every message id is just a unique id.
-        this.convMessageId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        // `msg_<ts>_<rand>`. Honour an externally-provided id (dispatch
+        // pre-allocates one so the response and SSE events agree) and only
+        // mint a fresh one when the caller didn't supply.
+        this.convMessageId = convMessageId || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         await this.convPublisher.publishRunStart(this.runId, this.convMessageId, graphId, graphName);
         if (DEBUG) console.log(`[RunPublisher] Conversation forwarding enabled for ${conversationId}`);
       } catch (err) {
