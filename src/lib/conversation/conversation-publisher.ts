@@ -237,7 +237,21 @@ export class ConversationPublisher {
     });
   }
 
-  /** Signal a run has completed in this conversation */
+  /** Signal a run has completed in this conversation.
+   *
+   *  ALSO does a backstop direct MongoDB write of the assistant message. The
+   *  archiver (BullMQ `conversation-archive` consumer) is the primary writer
+   *  for assistant messages — it builds them from `message_start` /
+   *  `content_chunk` / `run_complete` events. But if conv-event forwarding
+   *  was silently lossy mid-run (every `streamContent` call is fire-and-forget
+   *  with a swallowed `.catch`), the archiver never sees the message and the
+   *  conversation ends up with the user's send but no assistant reply.
+   *
+   *  Backstop is idempotent — the same `$ne: messageId` filter from
+   *  `persistMessage` means duplicate writes (archiver + this) collapse to
+   *  one row. Failures are logged and non-fatal; the published event still
+   *  drives live SSE consumers.
+   */
   async publishRunComplete(runId: string, messageId: string, finalContent?: string): Promise<void> {
     await this.publish({
       type: 'run_complete',
@@ -246,6 +260,18 @@ export class ConversationPublisher {
       finalContent,
       timestamp: Date.now(),
     });
+    if (finalContent && messageId) {
+      try {
+        await this.persistMessage({
+          messageId,
+          role: 'assistant',
+          content: finalContent,
+          metadata: { runId },
+        });
+      } catch (err) {
+        console.error('[ConversationPublisher] Backstop persistMessage failed:', err);
+      }
+    }
   }
 
   /** Signal a run has failed in this conversation */

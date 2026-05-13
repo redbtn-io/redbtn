@@ -373,7 +373,7 @@ export class RunPublisher {
           this.state!.output.content || undefined,
         );
       } catch (err) {
-        if (DEBUG) console.warn('[RunPublisher] Conv forward run_complete failed:', err);
+        console.warn("[RunPublisher] Conv forward run_complete failed:", err);
       }
     }
 
@@ -473,7 +473,7 @@ export class RunPublisher {
       try {
         await this.convPublisher.publishRunError(this.runId, this.convMessageId, error);
       } catch (err) {
-        if (DEBUG) console.warn('[RunPublisher] Conv forward run_error failed:', err);
+        console.warn("[RunPublisher] Conv forward run_error failed:", err);
       }
     }
     // Cap stack trace size to keep pub/sub + archive-queue payloads small.
@@ -545,7 +545,7 @@ export class RunPublisher {
           reason ? `Run interrupted: ${reason}` : 'Run interrupted',
         );
       } catch (err) {
-        if (DEBUG) console.warn('[RunPublisher] Conv forward run_interrupted failed:', err);
+        console.warn("[RunPublisher] Conv forward run_interrupted failed:", err);
       }
     }
     const ts = Date.now();
@@ -732,7 +732,7 @@ export class RunPublisher {
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       this.convPublisher.streamContent(this.runId, this.convMessageId, content).catch((err) => {
-        if (DEBUG) console.warn('[RunPublisher] Conv forward content_chunk failed:', err);
+        console.warn("[RunPublisher] Conv forward content_chunk failed:", err);
       });
     }
   }
@@ -744,7 +744,7 @@ export class RunPublisher {
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       this.convPublisher.streamThinking(this.runId, this.convMessageId, content).catch((err) => {
-        if (DEBUG) console.warn('[RunPublisher] Conv forward thinking_chunk failed:', err);
+        console.warn("[RunPublisher] Conv forward thinking_chunk failed:", err);
       });
     }
   }
@@ -805,7 +805,7 @@ export class RunPublisher {
     // correct in-flight message (W-4 fix).
     if (this.convPublisher) {
       this.convPublisher.publishAttachment(this.runId, event, this.convMessageId ?? undefined).catch((err) => {
-        if (DEBUG) console.warn('[RunPublisher] Conv forward attachment failed:', err);
+        console.warn("[RunPublisher] Conv forward attachment failed:", err);
       });
     }
     await this.persistLog({
