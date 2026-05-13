@@ -86,6 +86,12 @@ export interface RunOptions {
   conversationId?: string;
   threadId?: string;
   runId?: string;
+  /**
+   * Pre-allocated id for the assistant message this run will produce on the
+   * conversation. Threaded through to RunPublisher.init so dispatch responses
+   * and downstream SSE events share the same messageId.
+   */
+  messageId?: string;
   stream?: boolean;
   source?: {
     device?: 'phone' | 'speaker' | 'web';
@@ -1122,7 +1128,7 @@ export async function run(
 
   console.log(`[run] ${new Date().toISOString()} Calling publisher.init() for run ${runId}`);
   try {
-    await publisher.init(actualGraphId, graphName, input, options.conversationId, triggerType);
+    await publisher.init(actualGraphId, graphName, input, options.conversationId, triggerType, options.messageId);
   } catch (err) {
     // publisher.init() bootstraps Redis state + emits run_start. If it fails,
     // the publisher isn't usable for `fail()` — emit a terminal error via the
