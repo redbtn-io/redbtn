@@ -18,6 +18,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { isSystemResource } from '../../system-resource';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -119,7 +120,7 @@ const deleteNeuronTool: NativeToolDefinition = {
       }
       const peek = (await peekResp.json()) as AnyObject;
       const neuron = (peek?.neuron ?? peek) as AnyObject;
-      const isSystem = neuron?.isSystem === true || neuron?.userId === 'system';
+      const isSystem = isSystemResource(neuron);
       if (isSystem) {
         return {
           content: [

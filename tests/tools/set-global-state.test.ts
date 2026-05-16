@@ -239,4 +239,32 @@ describe('set_global_state — upstream error', () => {
     const body = JSON.parse(r.content[0].text);
     expect(body.error).toMatch(/ENETUNREACH/);
   });
+
+  test('422 schema validation error surfaces structured details', async () => {
+    process.env.WEBAPP_URL = 'http://test-webapp.example';
+    const schemaError = {
+      error: { message: 'Schema validation failed', code: 'schema_validation_failed' },
+      expectedSchema: { type: 'object', properties: { name: { type: 'string' } } },
+      validationErrors: [{ path: '/name', message: 'must be string' }],
+    };
+
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify(schemaError), {
+        status: 422,
+        statusText: 'Unprocessable Entity',
+      }),
+    ) as unknown as typeof globalThis.fetch;
+
+    const r = await setGlobalStateTool.handler(
+      { namespace: 'ns', key: 'k', value: 123 }, // Invalid: should be string
+      makeMockContext(),
+    );
+    expect(r.isError).toBe(true);
+    const body = JSON.parse(r.content[0].text);
+    expect(body.status).toBe(422);
+    expect(body.error).toMatch(/Schema validation failed/);
+    expect(body.details).toBeDefined();
+    expect(body.details.expectedSchema).toBeDefined();
+    expect(body.details.validationErrors).toBeDefined();
+  });
 });

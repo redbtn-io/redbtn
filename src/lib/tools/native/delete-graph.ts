@@ -22,6 +22,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { isSystemResource } from '../../system-resource';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -123,7 +124,7 @@ const deleteGraphTool: NativeToolDefinition = {
       }
       const peek = (await peekResp.json()) as AnyObject;
       const graph = (peek?.graph ?? peek) as AnyObject;
-      const isSystem = graph?.isSystem === true || graph?.userId === 'system';
+      const isSystem = isSystemResource(graph);
       if (isSystem) {
         return {
           content: [

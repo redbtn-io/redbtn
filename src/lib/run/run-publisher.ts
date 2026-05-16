@@ -477,7 +477,14 @@ export class RunPublisher {
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       try {
-        await this.convPublisher.publishRunError(this.runId, this.convMessageId, error);
+        // Pass tools so the assistant message gets the tool history that
+        // ran before the failure. Same backstop semantics as complete().
+        await this.convPublisher.publishRunError(
+          this.runId,
+          this.convMessageId,
+          error,
+          this.state!.tools,
+        );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_error failed:", err);
       }
@@ -545,10 +552,13 @@ export class RunPublisher {
     // interrupt indicator and stop showing the spinner.
     if (this.convPublisher && this.convMessageId) {
       try {
+        // Pass tools so the assistant message gets the tool history that
+        // ran before the interrupt. Same backstop semantics as complete().
         await this.convPublisher.publishRunError(
           this.runId,
           this.convMessageId,
           reason ? `Run interrupted: ${reason}` : 'Run interrupted',
+          this.state!.tools,
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_interrupted failed:", err);

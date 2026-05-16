@@ -23,6 +23,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { isSystemResource } from '../../system-resource';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -124,7 +125,7 @@ const deleteStreamTool: NativeToolDefinition = {
       }
       const peek = (await peekResp.json()) as AnyObject;
       const stream = (peek?.stream ?? peek) as AnyObject;
-      const isSystem = stream?.isSystem === true || stream?.userId === 'system';
+      const isSystem = isSystemResource(stream);
       if (isSystem) {
         return {
           content: [
