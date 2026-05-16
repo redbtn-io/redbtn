@@ -139,6 +139,7 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   'list_namespaces',
   'list_global_state',
   'get_global_state',
+  'get_global_schema',
   'set_global_state',
   'state_patch',
   'delete_global_state',
@@ -506,6 +507,17 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register get_global_state:', msg);
+  }
+
+  try {
+    // Get Global Schema — read schema metadata from a namespace
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getGlobalSchema = require('./native/get-global-schema.js');
+    registry.register('get_global_schema', getGlobalSchema.default || getGlobalSchema);
+    console.log('[NativeRegistry] Registered built-in tool: get_global_schema');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_global_schema:', msg);
   }
 
   try {

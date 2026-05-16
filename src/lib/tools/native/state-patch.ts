@@ -18,6 +18,8 @@
  *
  * Output: the new full value after the patch is applied, so the caller
  *         can verify the result (matches the webapp endpoint's contract).
+ *         On 422 schema validation failure, returns structured error with
+ *         `expectedSchema` and `validationErrors` fields for repair/retry.
  *
  * Auth: same Bearer / X-Internal-Key fallback pattern as other state tools.
  *
@@ -27,7 +29,9 @@
  *   - Path syntax: RFC 6901 JSON Pointer; `/` separates segments and the
  *     escapes `~0` (`~`) and `~1` (`/`) apply.
  *   - Returns 404 if the key doesn't exist (use `set_global_state` first).
- *   - Returns 422 if the path references a structure of the wrong type.
+ *   - Returns 422 if the path references a structure of the wrong type,
+ *     or if the namespace has schema validation enabled and the result
+ *     fails validation.
  */
 
 import type {
@@ -94,7 +98,8 @@ const statePatchTool: NativeToolDefinition = {
     'element 0 of `foo`, then its `bar` field). Supported ops: ' +
     '`set` (replace at path), `append` (push to array at path), `prepend` (unshift to array at path), ' +
     '`merge` (shallow-merge object into existing object at path), `remove` (delete element/key at path), ' +
-    '`inc` (numeric increment). Returns the full updated value on success so the caller can verify.',
+    '`inc` (numeric increment). Returns the full updated value on success so the caller can verify. ' +
+    'If the namespace has a schema, validation errors (422) include expectedSchema and validationErrors fields.',
   server: 'state',
   inputSchema: {
     type: 'object',

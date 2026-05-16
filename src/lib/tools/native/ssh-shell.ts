@@ -211,7 +211,17 @@ const sshShell: NativeToolDefinition = {
     // with the user command, keeping the captured $$ valid. The marker
     // is emitted on stderr and filtered out before output is returned.
     const PID_MARKER = '__RDBTN_PID__=';
-    fullCommand = `set -m; echo ${PID_MARKER}$$ 1>&2; exec bash -c ${JSON.stringify(fullCommand)}`;
+    // Bash-safe single-quote wrap for the `bash -c` arg. JSON.stringify
+    // produced a double-quoted arg, which left backticks (`) and `$`
+    // exposed to the outer bash — so any prompt containing triple-backtick
+    // code fences, command-substitution syntax, or $VAR references blew up
+    // with `unexpected EOF while looking for matching ``` ` ``` ` (exitCode 2).
+    // Single-quoting makes the entire arg literal; the `'\''` dance is the
+    // canonical bash trick for embedding a literal single quote inside a
+    // single-quoted region. The inner command's own quoting is unaffected
+    // because the OUTER bash never reinterprets it.
+    const bashCQuoted = `'${fullCommand.replace(/'/g, "'\\''")}'`;
+    fullCommand = `set -m; echo ${PID_MARKER}$$ 1>&2; exec bash -c ${bashCQuoted}`;
 
     return new Promise((resolve) => {
       const conn = new Client();

@@ -61,6 +61,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { isSystemResource } from '../../system-resource';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -100,7 +101,7 @@ function resolveGraphRole(
   if (graph?.isPublic === true) {
     return 'viewer';
   }
-  if (graph?.isSystem === true || graph?.userId === 'system') {
+  if (isSystemResource(graph)) {
     return 'viewer';
   }
   return null;

@@ -263,12 +263,18 @@ export class ConversationPublisher {
       finalContent,
       timestamp: Date.now(),
     });
-    if (finalContent && messageId) {
+    // Persist whenever we have a messageId — runs can complete with empty
+    // finalContent (tool-only outputs, voice paths, edge cases) and the
+    // tools still need to land on the Mongo message. The archiver's $push
+    // is a no-op when it already wrote the row; the in-place $set on
+    // `messages.$.toolExecutions` lands either way. Without this gap-fix,
+    // tool history was lost permanently on empty-content completions.
+    if (messageId) {
       try {
         await this.persistMessage({
           messageId,
           role: 'assistant',
-          content: finalContent,
+          content: finalContent || '',
           metadata: { runId },
           toolExecutions: Array.isArray(tools) ? tools : undefined,
         });
@@ -278,8 +284,19 @@ export class ConversationPublisher {
     }
   }
 
-  /** Signal a run has failed in this conversation */
-  async publishRunError(runId: string, messageId: string, error: string): Promise<void> {
+  /** Signal a run has failed in this conversation.
+   *
+   *  When `tools` is provided we ALSO persist them as a backstop on the
+   *  assistant message. Failed runs frequently ran tools before the failure
+   *  and that history was previously lost — only completed runs persisted
+   *  tool data. Same in-place $set semantics as `publishRunComplete`.
+   */
+  async publishRunError(
+    runId: string,
+    messageId: string,
+    error: string,
+    tools?: unknown[],
+  ): Promise<void> {
     await this.publish({
       type: 'run_error',
       runId,
@@ -287,6 +304,19 @@ export class ConversationPublisher {
       error,
       timestamp: Date.now(),
     });
+    if (messageId && Array.isArray(tools) && tools.length > 0) {
+      try {
+        await this.persistMessage({
+          messageId,
+          role: 'assistant',
+          content: '',
+          metadata: { runId, runError: error },
+          toolExecutions: tools,
+        });
+      } catch (err) {
+        console.error('[ConversationPublisher] Failed/interrupted backstop persistMessage failed:', err);
+      }
+    }
   }
 
   /**

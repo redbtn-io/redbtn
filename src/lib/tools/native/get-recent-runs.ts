@@ -35,6 +35,7 @@
 
 import mongoose from 'mongoose';
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
+import { isSystemResource } from '../../system-resource';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -100,7 +101,7 @@ function resolveRole(resource: AnyObject, userId: string): 'owner' | 'member' | 
   if (resource?.isPublic === true) {
     return 'viewer';
   }
-  if (resource?.isSystem === true || resource?.userId === 'system') {
+  if (isSystemResource(resource)) {
     return 'viewer';
   }
   return null;
