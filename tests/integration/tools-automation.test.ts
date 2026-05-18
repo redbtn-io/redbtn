@@ -4,20 +4,22 @@
  * Per TOOL-HANDOFF.md §6.2 — "one integration test per pack that runs a small
  * graph using the new tools end-to-end."
  *
- * The five tools in this pack form a coherent agent lifecycle:
+ * The six tools in this pack form a coherent agent lifecycle:
  *
  *    list_automations    — discover what automations exist
  *    get_automation      — inspect a specific automation
+ *    update_automation   — patch an automation's config in place
  *    enable_automation   — re-activate one if it's paused
  *    trigger_automation  — kick off a run (optionally wait for it)
  *    disable_automation  — pause one when an error condition is detected
  *
- * All five tools are plain HTTP API proxies, so we mock at the fetch layer
+ * All six tools are plain HTTP API proxies, so we mock at the fetch layer
  * with a single shared mock that routes by URL pattern. This validates:
- *   1. NativeToolRegistry singleton has all 5 tools registered.
- *   2. A simulated agent flow chains them together end-to-end:
- *      list → get → enable → trigger (wait) → disable.
- *   3. The shared `automation` server label is consistent.
+ *   1. NativeToolRegistry singleton has all 6 tools registered.
+ *   2. Each tool is MCP-exposed (present in MCP_EXPOSED_TOOLS).
+ *   3. A simulated agent flow chains them together end-to-end:
+ *      list → get → update → enable → trigger (wait) → disable.
+ *   4. The shared `automation` server label is consistent.
  */
 
 import {
@@ -31,6 +33,7 @@ import {
 } from 'vitest';
 import {
   getNativeRegistry,
+  MCP_EXPOSED_TOOLS,
   type NativeToolContext,
 } from '../../src/lib/tools/native-registry';
 
@@ -44,6 +47,7 @@ import listAutomationsTool from '../../src/lib/tools/native/list-automations';
 import getAutomationTool from '../../src/lib/tools/native/get-automation';
 import enableAutomationTool from '../../src/lib/tools/native/enable-automation';
 import disableAutomationTool from '../../src/lib/tools/native/disable-automation';
+import updateAutomationTool from '../../src/lib/tools/native/update-automation';
 
 const WEBAPP = 'http://test-webapp.example';
 
@@ -72,30 +76,51 @@ describe('automation pack integration — registration + chained execution', () 
       registry.register('enable_automation', enableAutomationTool);
     if (!registry.has('disable_automation'))
       registry.register('disable_automation', disableAutomationTool);
+    if (!registry.has('update_automation'))
+      registry.register('update_automation', updateAutomationTool);
   });
 
-  test('NativeToolRegistry has all 5 automation-pack tools registered', () => {
+  const PACK_TOOLS = [
+    'trigger_automation',
+    'list_automations',
+    'get_automation',
+    'enable_automation',
+    'disable_automation',
+    'update_automation',
+  ];
+
+  test('NativeToolRegistry has all 6 automation-pack tools registered', () => {
     const registry = getNativeRegistry();
-    for (const name of [
-      'trigger_automation',
-      'list_automations',
-      'get_automation',
-      'enable_automation',
-      'disable_automation',
-    ]) {
+    for (const name of PACK_TOOLS) {
       expect(registry.has(name)).toBe(true);
     }
 
-    // All five share the 'automation' server label
-    for (const name of [
-      'trigger_automation',
-      'list_automations',
-      'get_automation',
-      'enable_automation',
-      'disable_automation',
-    ]) {
+    // All six share the 'automation' server label
+    for (const name of PACK_TOOLS) {
       expect(registry.get(name)?.server).toBe('automation');
     }
+  });
+
+  test('update_automation appears in the registry listing', () => {
+    const registry = getNativeRegistry();
+    const listed = registry.listTools().find((t) => t.name === 'update_automation');
+    expect(listed).toBeDefined();
+    expect(listed?.server).toBe('automation');
+  });
+
+  test('all 6 automation-pack tools are MCP-exposed', () => {
+    const registry = getNativeRegistry();
+    for (const name of PACK_TOOLS) {
+      // Allowlisted centrally in MCP_EXPOSED_TOOLS …
+      expect(MCP_EXPOSED_TOOLS.has(name)).toBe(true);
+      // … and the registry stamps the flag onto the definition at register().
+      expect(registry.get(name)?.mcpExposed).toBe(true);
+    }
+    // update_automation shows up in the MCP-exposed-only listing.
+    const mcpNames = registry
+      .listTools({ mcpExposedOnly: true })
+      .map((t) => t.name);
+    expect(mcpNames).toContain('update_automation');
   });
 
   describe('end-to-end agent flow: list → get → enable → trigger → disable', () => {
@@ -174,6 +199,27 @@ describe('automation pack integration — registration + chained execution', () 
                 isEnabled: enabledFlag,
                 status: enabledFlag ? 'active' : 'paused',
                 stats: { runCount: 5 },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+
+        // 2b. update_automation → PATCH /api/v1/automations/:id
+        if (
+          method === 'PATCH' &&
+          /\/api\/v1\/automations\/auto_briefing$/.test(url)
+        ) {
+          const patch = init?.body ? JSON.parse(init.body as string) : {};
+          return new Response(
+            JSON.stringify({
+              success: true,
+              automation: {
+                automationId: 'auto_briefing',
+                concurrency: patch.concurrency ?? 'skip',
+                scheduleMode: patch.scheduleMode ?? 'cron',
+                triggers: patch.triggers ?? [{ type: 'manual', config: {} }],
+                isEnabled: enabledFlag,
               },
             }),
             { status: 200 },
@@ -290,6 +336,25 @@ describe('automation pack integration — registration + chained execution', () 
       expect(getBody.automation.automationId).toBe('auto_briefing');
       expect(getBody.automation.defaultInput).toEqual({ topic: 'news' });
       expect(getBody.automation.secretNames).toEqual(['OPENAI_API_KEY']);
+
+      // ── 2b. update_automation — patch its config in place ────────────────
+      const updateResult = await registry.callTool(
+        'update_automation',
+        {
+          automationId: chosen.automationId,
+          concurrency: 'queue',
+          scheduleMode: 'cron',
+          triggers: [{ type: 'schedule', config: { cron: '0 8 * * *' } }],
+        },
+        ctx,
+      );
+      expect(updateResult.isError).toBeFalsy();
+      const updateBody = JSON.parse(updateResult.content[0].text);
+      expect(updateBody.ok).toBe(true);
+      expect(updateBody.patched).toEqual(
+        expect.arrayContaining(['concurrency', 'scheduleMode', 'triggers']),
+      );
+      expect(updateBody.automation.concurrency).toBe('queue');
 
       // ── 3. enable_automation — re-activate it ────────────────────────────
       const enableResult = await registry.callTool(
