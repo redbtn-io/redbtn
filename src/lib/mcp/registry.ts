@@ -17,6 +17,8 @@ export interface ServerRegistration {
 export interface ServerConfig {
   name: string;
   url: string;  // e.g., 'http://localhost:3001/mcp'
+  /** Optional HTTP headers forwarded on every request to this server (e.g. Authorization). */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -39,14 +41,14 @@ export class McpRegistry {
    * Register a server and connect to it
    */
   async registerServer(config: ServerConfig): Promise<void> {
-    const { name, url } = config;
+    const { name, url, headers } = config;
 
     if (this.clients.has(name)) {
       console.log(`[Registry] Server ${name} already registered`);
       return;
     }
 
-    const client = new McpClientSSE(url, name);
+    const client = new McpClientSSE(url, name, headers);
 
     try {
       // Connect and initialize
