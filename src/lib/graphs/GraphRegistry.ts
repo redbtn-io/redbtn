@@ -18,6 +18,7 @@ import { getDatabase } from '../memory/database';
 import { Graph } from '../models/Graph';
 import { compileGraphFromConfig, GraphCompilationError } from './compiler';
 import { GraphConfig, CompiledGraph } from '../types/graph';
+import { SYSTEM_USER_IDS, isSystemUserId } from '../system-users';
 import type { RedConfig } from '../../index';
 
 type PartialRedConfig = Pick<RedConfig, 'databaseUrl'> & Partial<Omit<RedConfig, 'databaseUrl'>>;
@@ -87,7 +88,7 @@ export class GraphRegistry {
     }
     const doc = await Graph.findOne({
       graphId,
-      $or: [{ userId }, { userId: 'system' }],
+      $or: [{ userId }, { userId: { $in: SYSTEM_USER_IDS } }],
     });
     if (!doc) throw new GraphNotFoundError(`Graph '${graphId}' not found for user ${userId}`);
     const rawConfig = doc.toObject();
@@ -109,7 +110,7 @@ export class GraphRegistry {
 
   private async validateAccess(graphConfig: GraphConfig, userId: string): Promise<void> {
     if (graphConfig.userId === userId) return;
-    if (graphConfig.userId === 'system') {
+    if (isSystemUserId(graphConfig.userId)) {
       const userTier = await this.getUserTier(userId);
       if (userTier > graphConfig.tier) {
         throw new GraphAccessDeniedError(
@@ -146,7 +147,7 @@ export class GraphRegistry {
     const docs = await Graph.find({
       $or: [
         { userId },
-        { userId: 'system', tier: { $gte: userTier } },
+        { userId: { $in: SYSTEM_USER_IDS }, tier: { $gte: userTier } },
       ],
     });
     return docs.map((doc: any) => doc.toObject());
@@ -154,7 +155,7 @@ export class GraphRegistry {
 
   private async updateUsageStats(graphId: string, userId: string): Promise<void> {
     await Graph.updateOne(
-      { graphId, $or: [{ userId }, { userId: 'system' }] },
+      { graphId, $or: [{ userId }, { userId: { $in: SYSTEM_USER_IDS } }] },
       { $inc: { usageCount: 1 }, $set: { lastUsedAt: new Date() } }
     ).exec();
   }

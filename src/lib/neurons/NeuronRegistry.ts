@@ -23,6 +23,7 @@ import Neuron from '../models/Neuron';
 import { createLogger } from '../utils/logger';
 import { NeuronConfig } from '../types/neuron';
 import { runControlRegistry, NeuronCall } from '../run/RunControlRegistry';
+import { SYSTEM_USER_IDS, isSystemUserId } from '../system-users';
 import type { RedConfig } from '../../index';
 
 type PartialRedConfig = Pick<RedConfig, 'databaseUrl'> & Partial<Omit<RedConfig, 'databaseUrl'>>;
@@ -335,20 +336,20 @@ export class NeuronRegistry {
     if (config) return config;
     const doc = await Neuron.findOne({
       neuronId,
-      $or: [{ userId }, { userId: 'system' }],
+      $or: [{ userId }, { userId: { $in: SYSTEM_USER_IDS } }],
     });
     if (!doc) throw new NeuronNotFoundError(`Neuron '${neuronId}' not found`);
 
     // Resolve apiKey from secretName via the vault. Unset → undefined →
     // LangChain falls through to platform env vars (OPENAI_API_KEY etc.).
     //
-    // For system neurons (`userId: 'system'`), the secret resolves under
-    // the *caller's* user ID — system neurons share configuration but
+    // For system neurons (`userId` is a system-user id), the secret resolves
+    // under the *caller's* user ID — system neurons share configuration but
     // each caller pays from their own vault entry.
     let resolvedKey: string | undefined;
     const docSecretName = (doc as any).secretName as string | undefined;
     if (docSecretName) {
-      const ownerForSecret = doc.userId === 'system' ? userId : doc.userId;
+      const ownerForSecret = isSystemUserId(doc.userId) ? userId : doc.userId;
       resolvedKey = await this.resolveSecret(docSecretName, ownerForSecret);
     }
 
@@ -463,7 +464,7 @@ export class NeuronRegistry {
 
   private async validateAccess(config: NeuronConfig, userId: string): Promise<void> {
     if (config.userId === userId) return;
-    if (config.userId === 'system') {
+    if (isSystemUserId(config.userId)) {
       const userTier = await this.getUserTier(userId);
       if (userTier > config.tier) {
         throw new NeuronAccessDeniedError(
@@ -484,7 +485,7 @@ export class NeuronRegistry {
     const docs = await Neuron.find({
       $or: [
         { userId },
-        { userId: 'system', tier: { $gte: userTier } },
+        { userId: { $in: SYSTEM_USER_IDS }, tier: { $gte: userTier } },
       ],
     }).sort({ tier: 1, neuronId: 1 });
     return docs.map((doc) => ({
