@@ -42,6 +42,24 @@ const MAX_RETURN_BYTES = Infinity;
 const MAX_STDERR_BYTES = Infinity;
 const MAX_BUFFER_BYTES = Infinity;
 
+/**
+ * Bash-safe single-quote escape. Wraps the input in `'...'` and turns each
+ * embedded `'` into `'\''` (close-quote, escaped quote, re-open-quote).
+ *
+ * `JSON.stringify` is NOT a substitute — JSON-string syntax is double-quoted
+ * and only escapes `"`, `\`, and control chars. Backticks, `$`, `!`, `\n`,
+ * etc. survive intact, and inside `bash -c "..."` they remain active for
+ * command substitution and variable expansion. A worker prompt containing
+ * ```` ```json ```` would make bash misparse the wrapped command — the bug
+ * that caused empty `cliResult` outputs and apparent hangs on 2026-05-19.
+ *
+ * Inside `'...'`, every byte except `'` itself is literal — bulletproof.
+ * Same idiom as `shQuote` in `grep-files.ts`.
+ */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
@@ -194,12 +212,12 @@ const sshShell: NativeToolDefinition = {
     let fullCommand = command;
 
     if (workingDir) {
-      fullCommand = `cd ${JSON.stringify(workingDir)} && ${command}`;
+      fullCommand = `cd ${shQuote(workingDir)} && ${command}`;
     }
 
     if (env && Object.keys(env).length > 0) {
       const envExports = Object.entries(env)
-        .map(([k, v]) => `export ${k}=${JSON.stringify(String(v))}`)
+        .map(([k, v]) => `export ${k}=${shQuote(String(v))}`)
         .join(' && ');
       fullCommand = `${envExports} && ${fullCommand}`;
     }
@@ -210,8 +228,11 @@ const sshShell: NativeToolDefinition = {
     // `set -m` enables job control; `exec` replaces the wrapping bash
     // with the user command, keeping the captured $$ valid. The marker
     // is emitted on stderr and filtered out before output is returned.
+    // shQuote (NOT JSON.stringify) — the inner command rides inside
+    // single-quoted bash so backticks, $, `!`, and friends in any prompt
+    // stay literal.
     const PID_MARKER = '__RDBTN_PID__=';
-    fullCommand = `set -m; echo ${PID_MARKER}$$ 1>&2; exec bash -c ${JSON.stringify(fullCommand)}`;
+    fullCommand = `set -m; echo ${PID_MARKER}$$ 1>&2; exec bash -c ${shQuote(fullCommand)}`;
 
     return new Promise((resolve) => {
       const conn = new Client();
