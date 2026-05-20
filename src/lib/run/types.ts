@@ -6,6 +6,10 @@
  *
  * @module lib/run/types
  */
+import type {
+  ChatComponentSpec,
+  ChatComponentType,
+} from '../chat-components/component-spec-schema';
 
 /**
  * Status of a run execution
@@ -416,6 +420,29 @@ export interface AttachmentEvent extends BaseEvent {
 }
 
 /**
+ * Component event — an interactive chat component spec emitted by the agent.
+ *
+ * Sibling of `AttachmentEvent`. The `spec` payload is a validated
+ * `ChatComponentSpec` (see `lib/chat-components/component-spec-schema.ts`).
+ * `componentId` and `componentType` are pulled to the top level for routing
+ * convenience — subscribers can dispatch by `componentType` without parsing
+ * the full nested spec.
+ *
+ * Engine emit path: `emit_component` native tool (built in a later phase) calls
+ * `RunPublisher.publishComponent(spec)`. SSE/conversation forwarding lands in
+ * the `ciw-sse-routing` phase.
+ */
+export interface ComponentEvent extends BaseEvent {
+  type: 'component';
+  /** Stable instance id (mirrors spec.componentId for routing). */
+  componentId: string;
+  /** Allowlisted type (mirrors spec.type for routing). */
+  componentType: ChatComponentType;
+  /** Validated component spec — see ChatComponentSpec. */
+  spec: ChatComponentSpec;
+}
+
+/**
  * Union of all run events
  */
 export type RunEvent =
@@ -439,7 +466,8 @@ export type RunEvent =
   | ToolErrorEvent
   | AudioChunkEvent
   | InitEvent
-  | AttachmentEvent;
+  | AttachmentEvent
+  | ComponentEvent;
 
 /**
  * Event type discriminator

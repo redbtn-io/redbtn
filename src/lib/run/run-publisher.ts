@@ -45,6 +45,10 @@ import {
   createNodeProgress,
   createToolExecution,
 } from './types';
+import {
+  validateChatComponentSpec,
+  type ChatComponentSpec,
+} from '../chat-components/component-spec-schema';
 import type { RedLog } from '@redbtn/redlog';
 import { ConversationPublisher, createConversationPublisher } from '../conversation';
 
@@ -826,6 +830,55 @@ export class RunPublisher {
         size: params.size,
         fileId: params.fileId,
         url: params.url,
+      },
+    });
+  }
+
+  // ===========================================================================
+  // Component Events (chat-interactive-widgets)
+  // ===========================================================================
+
+  /**
+   * Publish a `component` run event carrying a validated ChatComponentSpec.
+   *
+   * Called by the `emit_component` native tool (built in a later phase) once it
+   * has constructed the spec. Defense-in-depth: re-validates the spec against
+   * the frozen schema before publishing; an invalid spec throws and is NOT
+   * published. This guarantees only schema-conformant ChatComponentSpec values
+   * ever reach the run stream.
+   *
+   * Conversation SSE forwarding and message-level persistence land in the
+   * `ciw-sse-routing` phase — this method is the run-stream-only publish path.
+   */
+  async publishComponent(spec: ChatComponentSpec): Promise<void> {
+    this.ensureInitialized();
+    const validation = validateChatComponentSpec(spec);
+    if (!validation.ok) {
+      throw new Error(
+        `publishComponent: invalid ChatComponentSpec — ${validation.errors.join('; ')}`,
+      );
+    }
+    const safeSpec = validation.value;
+    const event = {
+      type: 'component' as const,
+      componentId: safeSpec.componentId,
+      componentType: safeSpec.type,
+      spec: safeSpec,
+      timestamp: Date.now(),
+    };
+    await this.publish(event);
+    await this.persistLog({
+      level: 'info',
+      category: 'component',
+      message: `Component emitted: ${safeSpec.type} (${safeSpec.componentId})`,
+      metadata: {
+        componentId: safeSpec.componentId,
+        componentType: safeSpec.type,
+        runId: safeSpec.provenance.runId,
+        messageId: safeSpec.provenance.messageId,
+        nodeId: safeSpec.provenance.nodeId,
+        hasBinding: Boolean(safeSpec.binding),
+        interactionChannel: safeSpec.interaction?.channel,
       },
     });
   }
