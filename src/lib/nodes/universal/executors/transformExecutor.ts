@@ -9,6 +9,7 @@ import { extractJSON } from '../../../utils/json-extractor';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { getGlobalStateClient } = require('../../../globalState') as { getGlobalStateClient: (opts?: any) => any };
 import type { TransformStepConfig } from '../types';
+import { executeBuildMessagesOperation as buildMessagesOpExternal } from './buildMessagesOperation';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -621,35 +622,8 @@ function executeConcatOperation(config: TransformStepConfig, inputData: any, sta
  * @param state - Current graph state
  * @returns Array of message objects with role and content
  */
-function executeBuildMessagesOperation(config: TransformStepConfig, state: any): Array<{ role: string; content: string }> {
-    // Mode 1: Use existing field if specified
-    if (config.useExistingField) {
-        const existingMessages = getNestedProperty(state, config.useExistingField);
-        if (existingMessages !== undefined) {
-            if (!Array.isArray(existingMessages)) {
-                throw new Error(`useExistingField ${config.useExistingField} is not an array`);
-            }
-            return existingMessages;
-        }
-        // If useExistingField is set but field doesn't exist, fall through to build from messages
-    }
-    // Mode 2: Build from messages array
-    if (!config.messages || config.messages.length === 0) {
-        throw new Error('build-messages operation requires either messages array or useExistingField');
-    }
-    const builtMessages: Array<{ role: string; content: string }> = [];
-    for (const message of config.messages) {
-        if (!message.role || !message.content) {
-            throw new Error('Each message must have role and content properties');
-        }
-        // Render content template
-        const renderedContent = renderTemplate(message.content, state);
-        builtMessages.push({
-            role: message.role,
-            content: renderedContent,
-        });
-    }
-    return builtMessages;
+function executeBuildMessagesOperation(config: TransformStepConfig, state: any): Array<{ role: string; content: string | unknown[] }> {
+    return buildMessagesOpExternal(config, state, { renderTemplate, getNestedProperty });
 }
 
 /**

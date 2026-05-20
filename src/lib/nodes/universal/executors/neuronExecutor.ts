@@ -46,58 +46,11 @@ const STREAM_START_TIMEOUT = 180000;
 // Default inactivity timeout once streaming has begun (120 seconds without any token = stall)
 const DEFAULT_STREAM_INACTIVITY_TIMEOUT = 120000;
 
-/**
- * Normalize messages to ensure valid LLM conversation format.
- *
- * Issues this fixes:
- * 1. Consecutive same-role messages (user, user) - merges them
- * 2. Multiple system messages - merges all into the first system message
- * 3. System messages not at the start - moves their content to the first system
- *
- * Many LLM APIs (including Ollama) hang or error with these malformed inputs.
- */
-function normalizeMessages(messages: any[]): any[] {
-  if (!messages || messages.length === 0) return messages;
-
-  // First pass: collect all system message content
-  let systemContent = '';
-  const nonSystemMessages: any[] = [];
-
-  for (const msg of messages) {
-    if (msg.role === 'system') {
-      if (systemContent) {
-        systemContent += '\n\n' + msg.content;
-        console.log('[NeuronExecutor] Merged additional system message into first');
-      } else {
-        systemContent = msg.content;
-      }
-    } else {
-      nonSystemMessages.push({ ...msg });
-    }
-  }
-
-  // Second pass: merge consecutive same-role messages
-  const normalized: any[] = [];
-
-  // Add consolidated system message first
-  if (systemContent) {
-    normalized.push({ role: 'system', content: systemContent });
-  }
-
-  // Add non-system messages, merging consecutive same roles
-  for (const msg of nonSystemMessages) {
-    const lastMsg = normalized[normalized.length - 1];
-    // If same role as previous, merge content
-    if (lastMsg && lastMsg.role === msg.role) {
-      lastMsg.content = `${lastMsg.content}\n\n${msg.content}`;
-      console.log(`[NeuronExecutor] Merged consecutive ${msg.role} messages`);
-    } else {
-      normalized.push({ ...msg });
-    }
-  }
-
-  return normalized;
-}
+// Multimodal-safe message normalization. Extracted to a standalone module
+// so it can be unit-tested without dragging in templateRenderer's runtime-
+// only require graph. The named re-export keeps the public surface.
+import { mergeMessageContent, normalizeMessages } from './normalizeMessages';
+export { mergeMessageContent, normalizeMessages };
 
 /**
  * Resolve a config value that might be a template string like "{{parameters.temperature}}"
@@ -134,88 +87,14 @@ function resolveConfigValue(value: any, state: any): any {
   return value;
 }
 
-/**
- * Attachment reference shape (mirrors the Discord bot payload + trigger metadata)
- */
-interface AttachmentRef {
-  kind?: 'image' | 'video' | 'audio' | 'document' | 'file';
-  mimeType?: string;
-  url?: string;
-  filename?: string;
-  size?: number;
-}
-
-/**
- * Build a multimodal HumanMessage that may include audio and/or image content parts.
- *
- * Audio: pulled from state.data.input.audioData (base64 WAV from Discord raw audio mode)
- * Images: pulled from state.data.input.attachments or state.data._trigger.metadata.attachments
- *
- * Returns null when no multimodal content is found so the caller can fall back
- * to a plain string message.
- *
- * @langchain/google-genai v2.1.26 supports:
- *   { type: "media", mimeType: "audio/wav", data: base64 }  -> inlineData
- *   { type: "image_url", image_url: { url: "https://..." } } -> fileData / inlineData
- */
-function buildMultimodalMessage(
-  config: NeuronStepConfig,
-  textContent: string,
-  state: any
-): HumanMessage | null {
-  const wantsAudio = config.audioInput || config.multimodal;
-  const wantsImages = config.imageInput || config.multimodal;
-
-  if (!wantsAudio && !wantsImages) return null;
-
-  const input = state.data?.input || {};
-  const triggerAttachments: AttachmentRef[] =
-    state.data?._trigger?.metadata?.attachments || input.attachments || [];
-
-  const contentParts: any[] = [];
-  let hasMultimodal = false;
-
-  // --- Audio input ---
-  if (wantsAudio && input.audioData) {
-    const mimeType: string = input.audioMimeType || 'audio/wav';
-    contentParts.push({
-      type: 'media',
-      mimeType,
-      data: input.audioData, // base64 encoded
-    });
-    hasMultimodal = true;
-    console.log(
-      `[NeuronExecutor] Multimodal: added audio content part (${mimeType}, ${input.audioData.length} base64 chars)`
-    );
-  }
-
-  // --- Image input from attachments ---
-  if (wantsImages && triggerAttachments.length > 0) {
-    for (const attachment of triggerAttachments) {
-      const mime = attachment.mimeType || '';
-      if (!mime.startsWith('image/') && attachment.kind !== 'image') continue;
-      if (!attachment.url) continue;
-
-      contentParts.push({
-        type: 'image_url',
-        image_url: { url: attachment.url },
-      });
-      hasMultimodal = true;
-      console.log(
-        `[NeuronExecutor] Multimodal: added image content part (${mime}, ${attachment.url.substring(0, 80)})`
-      );
-    }
-  }
-
-  if (!hasMultimodal) return null;
-
-  // Append the rendered text prompt as the last part
-  if (textContent) {
-    contentParts.push({ type: 'text', text: textContent });
-  }
-
-  return new HumanMessage({ content: contentParts });
-}
+// Multimodal HumanMessage builder lives in its own module so it can be
+// unit-tested without the runtime-only require graph this file inherits.
+// The named re-export keeps the existing call-site (line ~635) working,
+// and any future consumer can `import { buildMultimodalMessage } from
+// './multimodalMessage'` directly. See Phase 8 (media-wire-attachments-neuron).
+import { buildMultimodalMessage, type AttachmentRef } from './multimodalMessage';
+export { buildMultimodalMessage };
+export type { AttachmentRef };
 
 /**
  * Execute a neuron step (with error handling wrapper)
