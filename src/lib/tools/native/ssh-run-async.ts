@@ -117,6 +117,17 @@ function makeJobId(): string {
   return `job_${id}`;
 }
 
+/**
+ * Bash-safe single-quote escape (see ssh-shell.ts for the long-form rationale).
+ * `JSON.stringify` produces a *double-quoted* string and only escapes JSON-
+ * special chars, leaving backticks, `$`, `!`, etc. active under `bash -c "..."`.
+ * Inside `'...'` every byte except `'` itself is literal — bulletproof against
+ * any user-supplied command content.
+ */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 interface SshRunAsyncArgs {
   environmentId?: string;
   command?: string;
@@ -164,10 +175,13 @@ function resolveUserId(context: NativeToolContext): string {
  * Build the wrapper command we run on the remote. Quoting + redirection
  * details matter — see the module-level JSDoc for the full breakdown.
  *
- * Why all the JSON.stringify: it's a fast, stable way to produce a single
- * shell-safe single-quoted-or-double-quoted token. Bash treats double-quoted
- * strings with backslash-escaped chars sensibly, and Node's JSON.stringify
- * always escapes the inner double-quotes that would terminate the string.
+ * Why shQuote (and NOT JSON.stringify): JSON-string syntax is double-quoted
+ * and only escapes `"`, `\`, and control chars. Backticks, `$`, `!`, and
+ * other bash metacharacters survive intact, and inside the outer `bash -c
+ * "..."` they become active again — any user prompt with code fences or
+ * `$x` patterns would make the remote shell misparse the command (real
+ * incident 2026-05-19, hours of empty `cliResult` worker runs). `shQuote`
+ * single-quotes the arg, making every byte literal.
  *
  * Why we run it through `bash -c`: gives us subshell + backgrounding semantics
  * regardless of the user's login shell on the remote (some might be `sh`,
@@ -191,13 +205,13 @@ function buildWrapperCommand(
 
   if (env && Object.keys(env).length > 0) {
     const envExports = Object.entries(env)
-      .map(([k, v]) => `export ${k}=${JSON.stringify(String(v))}`)
+      .map(([k, v]) => `export ${k}=${shQuote(String(v))}`)
       .join(' && ');
     body = `${envExports} && ${body}`;
   }
 
   if (cwd) {
-    body = `cd ${JSON.stringify(cwd)} && ${body}`;
+    body = `cd ${shQuote(cwd)} && ${body}`;
   }
 
   // The async wrapper. Note the `& echo $!` is OUTSIDE the subshell — that's
@@ -210,9 +224,12 @@ function buildWrapperCommand(
   // table, but we're already inside a fire-and-forget `bash -c` so the parent
   // shell exits as soon as the backgrounded subshell is launched. No disown
   // needed.
-  const inner = `(nohup bash -c ${JSON.stringify(body)} > ${outFile} 2> ${errFile}; echo $? > ${exitFile}) & echo $!`;
+  // shQuote (NOT JSON.stringify) — bash -c receives a single-quoted string so
+  // any user prompt content stays literal (see ssh-shell.ts for the full
+  // rationale and bug history).
+  const inner = `(nohup bash -c ${shQuote(body)} > ${outFile} 2> ${errFile}; echo $? > ${exitFile}) & echo $!`;
 
-  return `bash -c ${JSON.stringify(inner)}`;
+  return `bash -c ${shQuote(inner)}`;
 }
 
 const sshRunAsync: NativeToolDefinition = {
