@@ -86,7 +86,7 @@ export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } fro
 
 // Export run utilities (used by SSE stream endpoints)
 export { RunKeys } from "./lib/run/types";
-export type { AudioChunkEvent, AttachmentEvent, AttachmentKind } from "./lib/run/types";
+export type { AudioChunkEvent, AttachmentEvent, AttachmentKind, ComponentEvent } from "./lib/run/types";
 export { getRunState, getActiveRunForConversation, publishRunError, publishRunInterrupt, ARCHIVE_QUEUE_NAMES } from "./lib/run/run-publisher";
 
 // Export unified run trigger types and enrichment pipeline (Phase 1)
@@ -112,6 +112,27 @@ export type { SynthesizeOptions, AudioStreamPipelineOptions, TranscribeOptions, 
 // Export conversation streaming
 export { ConversationPublisher, createConversationPublisher, ConversationKeys } from './lib/conversation';
 export type { ConversationEvent, ConversationAttachmentEvent } from './lib/conversation';
+
+// Export chat-component schema (chat-interactive-widgets epic)
+// Single source of truth — engine emit_component tool + webapp render boundary
+// both validate against the constants exported here.
+export {
+  CHAT_COMPONENT_TYPES,
+  CHAT_COMPONENT_INTERACTION_CHANNELS,
+  CHAT_COMPONENT_SPEC_SCHEMA,
+  chatComponentSpecZod,
+  validateChatComponentSpec,
+} from './lib/chat-components';
+export type {
+  ChatComponentType,
+  ChatComponentInteractionChannel,
+  ChatComponentBinding,
+  ChatComponentInteraction,
+  ChatComponentProvenance,
+  ChatComponentResponded,
+  ChatComponentSpec,
+  ValidateResult as ChatComponentSpecValidateResult,
+} from './lib/chat-components';
 
 // Export stream session pub/sub
 export { StreamEventPublisher, createStreamEventPublisher, StreamSessionKeys, StreamSessionConfig } from './lib/streams';

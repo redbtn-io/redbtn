@@ -115,6 +115,20 @@ export interface NeuronStepConfig {
      */
     imageInput?: boolean;
     /**
+     * Non-vision fallback ladder for image attachments. Consulted when the
+     * resolved neuron is NOT vision-capable (per the vision-matrix) but the
+     * user message carries image attachments. See Phase 10
+     * (media-nonvision-fallback) and explanations/MEDIA-MULTIMODAL-PATCH-PLAN.md.
+     *
+     *   - `'ocr'`       → run OCR on each image, inject `<image_text>...</image_text>` into the prompt
+     *   - `'describe'`  → invoke a system vision-fallback neuron to produce a textual description,
+     *                     inject as `<image_description>...</image_description>` (default)
+     *   - `'skip'`      → drop image attachments silently, proceed text-only
+     *
+     * @default 'describe'
+     */
+    imageFallback?: 'ocr' | 'describe' | 'skip';
+    /**
      * Request audio output from the model.
      *
      * NOTE: Audio output requires model-level support (e.g. Gemini Live API)
@@ -336,7 +350,12 @@ export interface TransformStepConfig {
      */
     messages?: Array<{
         role: string;
-        content: string;
+        /**
+         * Either a string (renderTemplate applies) OR a parts array
+         * forwarded untouched — used for multimodal user messages whose
+         * content is `[{ type:'image_url', ... }, { type:'text', ... }]`.
+         */
+        content: string | unknown[];
     }>;
     /**
      * For build-messages: State field containing pre-built messages array
