@@ -13,7 +13,7 @@ import type { ConditionalStepConfig } from './types';
 import type { LoopStepConfig } from './types';
 import type { ConnectionStepConfig } from './types';
 import type { GraphStepConfig } from './types';
-import { resolveValue } from './templateRenderer';
+import { resolveValue, renderTemplate } from './templateRenderer';
 import { runControlRegistry } from '../../run/RunControlRegistry';
 
 /**
@@ -54,13 +54,17 @@ const { executeGraph } = require('./executors/graphExecutor') as { executeGraph:
  * @returns Partial state update from this step
  * @throws Error if step type is unknown or execution fails
  */
-export async function executeStep(step: UniversalStep, state: any): Promise<Partial<any>> {
+export async function executeStep(
+  step: UniversalStep,
+  state: any,
+  parameters: Record<string, any> = {},
+): Promise<Partial<any>> {
     console.log(`[StepExecutor] ====== EXECUTING STEP: ${step.type} ======`);
     console.log(`[StepExecutor] Step config keys:`, Object.keys(step.config || {}));
     // Check optional condition
     if (step.condition) {
         console.log(`[StepExecutor] Checking condition: ${step.condition}`);
-        const shouldRun = evaluateStepCondition(step.condition, state);
+        const shouldRun = evaluateStepCondition(step.condition, { state, parameters });
         if (!shouldRun) {
             console.log(`[StepExecutor] Skipping step due to condition: ${step.condition}`);
             return {}; // Skip execution, return empty update
@@ -96,7 +100,7 @@ export async function executeStep(step: UniversalStep, state: any): Promise<Part
         }
         case 'loop': {
             console.log(`[StepExecutor] Calling executeLoop...`);
-            const result = await executeLoop(step.config as LoopStepConfig, state);
+            const result = await executeLoop(step.config as LoopStepConfig, state, parameters);
             console.log(`[StepExecutor] executeLoop completed in ${Date.now() - startTime}ms, result keys:`, Object.keys(result || {}));
             return result;
         }

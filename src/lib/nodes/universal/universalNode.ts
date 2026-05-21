@@ -350,7 +350,7 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
             }
 
             // Pass state (which contains infrastructure) to step executor
-            const stepUpdate = await executeStep(step, currentState);
+            const stepUpdate = await executeStep(step, currentState, nodeConfig.parameters);
 
             // Accumulate state updates at top level (still flat for now)
             Object.assign(stateUpdates, stepUpdate);
