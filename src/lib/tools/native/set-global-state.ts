@@ -192,14 +192,9 @@ const setGlobalStateTool: NativeToolDefinition = {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({
-                error:
-                  (typeof data === 'object' && data !== null
-                    ? extractErrorMessage(data as AnyObject)
-                    : null) ||
-                  `Global state API ${response.status} ${response.statusText}`,
+              text: JSON.stringify(data || {
+                error: `Global state API ${response.status} ${response.statusText}`,
                 status: response.status,
-                ...(typeof data === 'object' && data !== null ? { details: data } : {}),
               }),
             },
           ],

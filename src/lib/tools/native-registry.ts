@@ -150,6 +150,7 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   'get_automation',
   'enable_automation',
   'disable_automation',
+  'update_automation',
   'trigger_automation',
 
   // ── Graphs ──
@@ -1088,6 +1089,15 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
       disableAutomation.default || disableAutomation,
     );
     console.log('[NativeRegistry] Registered built-in tool: disable_automation');
+
+    // Update Automation — surgically patch config
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const updateAutomation = require('./native/update-automation.js');
+    registry.register(
+      'update_automation',
+      updateAutomation.default || updateAutomation,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: update_automation');
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register disable_automation:', msg);

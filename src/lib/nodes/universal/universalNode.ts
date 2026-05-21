@@ -33,7 +33,7 @@ const DEBUG = false;
  * The outer execution wrapper checks `error.name === 'RunInterruptedError'`
  * to route to publisher.interrupt() instead of publisher.fail().
  */
-class RunInterruptedError extends Error {
+export class RunInterruptedError extends Error {
     readonly name = 'RunInterruptedError';
     constructor(public readonly reason?: string) {
         super(reason ? `Run interrupted: ${reason}` : 'Run interrupted');
@@ -76,7 +76,7 @@ function getRunSignal(state: any): AbortSignal | undefined {
  * The signal is resolved via RunControlRegistry — see `getRunSignal()` for
  * why this is critical (state-stashed signals don't survive checkpoints).
  */
-function checkAbort(state: any): void {
+export function checkAbort(state: any): void {
     const signal = getRunSignal(state);
     if (signal?.aborted) {
         const reason = signal.reason as { reason?: string } | string | undefined;
