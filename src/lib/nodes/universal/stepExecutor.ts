@@ -22,7 +22,7 @@ import { runControlRegistry } from '../../run/RunControlRegistry';
  * checkpoint round-trips), with `state._abortController` as a fallback for
  * direct/test callers.
  */
-function getRunSignal(state: any): AbortSignal | undefined {
+export function getRunSignal(state: any): AbortSignal | undefined {
     const runId = state?.runId || state?.data?.runId;
     const ctx = runControlRegistry.get(runId);
     if (ctx) return ctx.controller.signal;
@@ -107,8 +107,10 @@ export async function executeStep(step: UniversalStep, state: any): Promise<Part
             return result;
         }
         case 'delay': {
-            const delayMs = (step.config as any)?.ms ?? 1000;
-            console.log(`[StepExecutor] Executing delay: ${delayMs}ms`);
+            const rawMs = (step.config as any)?.ms ?? 1000;
+            const renderedMs = renderTemplate(String(rawMs), { state, parameters });
+            const delayMs = parseInt(renderedMs, 10) || 1000;
+            console.log(`[StepExecutor] Executing delay: ${delayMs}ms (rendered from: ${rawMs})`);
             // Abort-aware delay: respect the run-level AbortSignal so a long
             // delay in a node step yields immediately on external interrupt
             // instead of blocking until the timeout fires. The thrown error

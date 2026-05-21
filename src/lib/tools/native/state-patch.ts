@@ -189,14 +189,9 @@ const statePatchTool: NativeToolDefinition = {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({
-                error:
-                  (typeof data === 'object' && data !== null
-                    ? extractErrorMessage(data as AnyObject)
-                    : null) ||
-                  `State patch API ${response.status} ${response.statusText}`,
+              text: JSON.stringify(data || {
+                error: `State patch API ${response.status} ${response.statusText}`,
                 status: response.status,
-                ...(typeof data === 'object' && data !== null ? { details: data } : {}),
               }),
             },
           ],

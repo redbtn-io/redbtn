@@ -161,21 +161,18 @@ const setGlobalStateTool: NativeToolDefinition = {
         body: JSON.stringify({ key, value, description, ttlSeconds }),
       });
 
+      const data = await response.json().catch(() => ({}));
+
       if (!response.ok) {
-        let body = '';
-        try {
-          body = await response.text();
-        } catch {
-          /* ignore */
-        }
+        // Surface the webapp's error envelope verbatim. For 422 schema validation errors,
+        // the webapp returns { error: { message, code }, expectedSchema, validationErrors }.
+        // Pass through structured to the caller so graphs can handle validation feedback.
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({
-                error:
-                  `Global state API ${response.status} ${response.statusText}` +
-                  (body ? `: ${body.slice(0, 200)}` : ''),
+              text: JSON.stringify(data || {
+                error: `Global state API ${response.status} ${response.statusText}`,
                 status: response.status,
               }),
             },
