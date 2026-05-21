@@ -40,7 +40,7 @@ const { executeTransform } = require('./executors/transformExecutor') as { execu
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { executeConditional } = require('./executors/conditionalExecutor') as { executeConditional: (config: ConditionalStepConfig, state: any) => Partial<any> };
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { executeLoop } = require('./executors/loopExecutor') as { executeLoop: (config: LoopStepConfig, state: any) => Promise<Partial<any>> };
+const { executeLoop } = require('./executors/loopExecutor') as { executeLoop: (config: LoopStepConfig, state: any, parameters?: Record<string, any>) => Promise<Partial<any>> };
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { executeConnection } = require('./executors/connectionExecutor') as { executeConnection: (config: ConnectionStepConfig, state: any) => Promise<Partial<any>> };
 // eslint-disable-next-line @typescript-eslint/no-require-imports
