@@ -11,6 +11,7 @@
  */
 import type { LoopStepConfig } from '../types';
 import { executeStep } from '../stepExecutor';
+import { checkAbort } from '../universalNode';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -153,6 +154,9 @@ export async function executeLoop(config: LoopStepConfig, state: any): Promise<P
                 console.warn('[LoopExecutor] Failed to overlay auto-state:', err);
             }
         }
+
+        // Check for run abort before starting iteration
+        checkAbort(loopState);
 
         // Execute all steps in this iteration
         for (let stepIndex = 0; stepIndex < steps.length; stepIndex++) {

@@ -16,6 +16,26 @@ export type NeuronProvider = 'ollama' | 'openai' | 'anthropic' | 'google' | 'cus
 export type NeuronRole = 'chat' | 'worker' | 'specialist';
 
 /**
+ * Per-modality capability flags. Each flag tells the engine whether the
+ * underlying model can natively consume that modality:
+ *
+ *   - `vision` — the model accepts image_url content parts and reasons over
+ *     them. Used by buildMultimodalMessage's gate and the non-vision
+ *     fallback ladder (OCR / describe-then-inject / skip).
+ *   - `audio`  — the model accepts inline audio content parts. Used today
+ *     by Gemini's audio-input path; placeholder for other providers as
+ *     they roll out audio support.
+ *
+ * Override semantics: when present (true OR false), the explicit value
+ * always wins. When absent, callers consult the static matrix
+ * (`vision-matrix.ts` / future `audio-matrix.ts`).
+ */
+export interface NeuronCapabilities {
+  vision?: boolean;
+  audio?: boolean;
+}
+
+/**
  * Runtime neuron configuration
  * Used internally by NeuronRegistry when creating model instances
  */
@@ -42,6 +62,11 @@ export interface NeuronConfig {
   userId?: string;
   /** When true, the worker generates TTS audio server-side during streaming */
   audioOptimized?: boolean;
+  /**
+   * Explicit per-modality capability overrides. When unset, the engine
+   * consults `vision-matrix.ts` (and audio-matrix.ts in a future phase).
+   */
+  capabilities?: NeuronCapabilities;
 }
 
 /**
@@ -79,4 +104,9 @@ export interface NeuronDocument {
   lastUsedAt?: Date;
   /** When true, the worker generates TTS audio server-side during streaming */
   audioOptimized?: boolean;
+  /**
+   * Explicit per-modality capability overrides on the persisted document.
+   * Resolved via vision-matrix when unset.
+   */
+  capabilities?: NeuronCapabilities;
 }

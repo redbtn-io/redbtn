@@ -174,6 +174,7 @@ const setGlobalStateTool: NativeToolDefinition = {
         body: JSON.stringify({ key, value, description, ttlSeconds }),
       });
 
+<<<<<<< HEAD
       const text = await response.text();
       let data: unknown = null;
       if (text.length > 0) {
@@ -183,6 +184,9 @@ const setGlobalStateTool: NativeToolDefinition = {
           data = { raw: text };
         }
       }
+=======
+      const data = await response.json().catch(() => ({}));
+>>>>>>> beta
 
       if (!response.ok) {
         // Surface the webapp's error envelope verbatim. For 422 schema validation errors,
@@ -192,12 +196,17 @@ const setGlobalStateTool: NativeToolDefinition = {
           content: [
             {
               type: 'text',
+<<<<<<< HEAD
               text: JSON.stringify({
                 error:
                   (typeof data === 'object' && data !== null
                     ? extractErrorMessage(data as AnyObject)
                     : null) ||
                   `Global state API ${response.status} ${response.statusText}`,
+=======
+              text: JSON.stringify(data || {
+                error: `Global state API ${response.status} ${response.statusText}`,
+>>>>>>> beta
                 status: response.status,
                 ...(typeof data === 'object' && data !== null ? { details: data } : {}),
               }),

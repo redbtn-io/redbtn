@@ -108,6 +108,16 @@ const NANOID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
  * Implementation matches `generate-id.ts` so output looks consistent across
  * the toolbox.
  */
+/**
+ * Wrap a string for safe interpolation into a remote bash command.
+ * See the same helper in ssh-shell.ts — single-quote everything; inside
+ * bash single quotes no character is interpreted, so backticks, $, and
+ * other metacharacters in user prompts stay literal.
+ */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 function makeJobId(): string {
   const bytes = randomBytes(8);
   let id = '';
@@ -191,13 +201,13 @@ function buildWrapperCommand(
 
   if (env && Object.keys(env).length > 0) {
     const envExports = Object.entries(env)
-      .map(([k, v]) => `export ${k}=${JSON.stringify(String(v))}`)
+      .map(([k, v]) => `export ${k}=${shQuote(String(v))}`)
       .join(' && ');
     body = `${envExports} && ${body}`;
   }
 
   if (cwd) {
-    body = `cd ${JSON.stringify(cwd)} && ${body}`;
+    body = `cd ${shQuote(cwd)} && ${body}`;
   }
 
   // The async wrapper. Note the `& echo $!` is OUTSIDE the subshell — that's
@@ -210,9 +220,11 @@ function buildWrapperCommand(
   // table, but we're already inside a fire-and-forget `bash -c` so the parent
   // shell exits as soon as the backgrounded subshell is launched. No disown
   // needed.
-  const inner = `(nohup bash -c ${JSON.stringify(body)} > ${outFile} 2> ${errFile}; echo $? > ${exitFile}) & echo $!`;
+  // shQuote (NOT JSON.stringify) — bash -c receives a single-quoted string
+  // so backticks, $, and friends in any user prompt stay literal.
+  const inner = `(nohup bash -c ${shQuote(body)} > ${outFile} 2> ${errFile}; echo $? > ${exitFile}) & echo $!`;
 
-  return `bash -c ${JSON.stringify(inner)}`;
+  return `bash -c ${shQuote(inner)}`;
 }
 
 const sshRunAsync: NativeToolDefinition = {
