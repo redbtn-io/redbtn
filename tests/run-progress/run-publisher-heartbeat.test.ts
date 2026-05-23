@@ -125,6 +125,45 @@ describe('RunPublisher progress heartbeat', () => {
     );
   });
 
+  it('refreshes lastProgressAt for graph lifecycle events', async () => {
+    const { redis, values } = makeRedis();
+    const publisher = new RunPublisher({
+      redis: redis as any,
+      runId: 'run-publisher-graph',
+      userId: 'user-1',
+    });
+
+    await publisher.init('graph-1', 'Graph 1', {});
+
+    vi.setSystemTime(new Date('2026-05-22T17:00:07.000Z'));
+    await publisher.graphStart(2, 'node-1');
+    expect(readRunState(values, 'run-publisher-graph').lastProgressAt).toBe('2026-05-22T17:00:07.000Z');
+
+    vi.setSystemTime(new Date('2026-05-22T17:00:27.000Z'));
+    await publisher.graphComplete('node-2', 2);
+    expect(readRunState(values, 'run-publisher-graph').lastProgressAt).toBe('2026-05-22T17:00:27.000Z');
+  });
+
+  it('refreshes lastProgressAt for node progress step events', async () => {
+    const { redis, values } = makeRedis();
+    const publisher = new RunPublisher({
+      redis: redis as any,
+      runId: 'run-publisher-node-progress',
+      userId: 'user-1',
+    });
+
+    await publisher.init('graph-1', 'Graph 1', {});
+    await publisher.nodeStart('node-1', 'universal', 'Node 1');
+
+    vi.setSystemTime(new Date('2026-05-22T17:00:12.000Z'));
+    await publisher.nodeProgress('node-1', 'step 1 start', { index: 0, total: 2 });
+    expect(readRunState(values, 'run-publisher-node-progress').lastProgressAt).toBe('2026-05-22T17:00:12.000Z');
+
+    vi.setSystemTime(new Date('2026-05-22T17:00:18.000Z'));
+    await publisher.nodeProgress('node-1', 'step 1 complete', { index: 0, total: 2 });
+    expect(readRunState(values, 'run-publisher-node-progress').lastProgressAt).toBe('2026-05-22T17:00:18.000Z');
+  });
+
   it('does not refresh lastProgressAt for status bookkeeping events', async () => {
     const { redis, values } = makeRedis();
     const automationRunsCollection = {

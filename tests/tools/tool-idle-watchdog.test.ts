@@ -100,4 +100,19 @@ describe('withToolIdleWatchdog', () => {
     await expect(promise).resolves.toBe('done');
     expect(abortController.signal.aborted).toBe(false);
   });
+
+  it('cleans up the idle timer when the operation rejects before timing out', async () => {
+    const abortController = new AbortController();
+    const promise = withToolIdleWatchdog(
+      async () => {
+        throw new Error('tool failed');
+      },
+      { idleTimeoutMs: 100, toolName: 'failing-tool', abortController },
+    );
+
+    await expect(promise).rejects.toThrow('tool failed');
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(abortController.signal.aborted).toBe(false);
+  });
 });
