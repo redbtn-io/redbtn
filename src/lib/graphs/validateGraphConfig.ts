@@ -726,12 +726,14 @@ export async function validateGraphConfig(
       // Delay step
       if (stepType === 'delay') {
         const ms = stepConfig.ms;
-        if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) {
+        const isValidNumber = typeof ms === 'number' && Number.isFinite(ms) && ms >= 0;
+        const isRuntimeResolvedString = typeof ms === 'string';
+        if (!isValidNumber && !isRuntimeResolvedString) {
           err({
             code: 'DELAY_BAD_MS',
             nodeId: node.id,
             stepIndex,
-            message: `Node '${node.id}' step[${stepIndex}] (delay) needs 'ms' >= 0 (got ${JSON.stringify(ms)})`,
+            message: `Node '${node.id}' step[${stepIndex}] (delay) needs 'ms' >= 0 or a runtime-resolved string (got ${JSON.stringify(ms)})`,
           });
         }
       }

@@ -636,6 +636,27 @@ describe('validateGraphConfig — step-level checks', () => {
     expect(findError(r, 'CONNECTION_MISSING_REF')).toBeDefined();
   });
 
+  test('delay step accepts runtime-resolved string ms values', async () => {
+    const r = await validateGraphConfig(
+      baseConfig({
+        nodes: [
+          {
+            id: 'n1',
+            config: {
+              nodeId: 'inline',
+              steps: [
+                { type: 'delay', config: { ms: '30' } },
+                { type: 'delay', config: { ms: '{{parameters.loopDelay}}' } },
+              ],
+            },
+          },
+          { id: 'n2', config: { nodeId: 'respond' } },
+        ],
+      }),
+    );
+    expect(findError(r, 'DELAY_BAD_MS')).toBeUndefined();
+  });
+
   test('delay step with bad ms → DELAY_BAD_MS', async () => {
     const r = await validateGraphConfig(
       baseConfig({
@@ -644,7 +665,7 @@ describe('validateGraphConfig — step-level checks', () => {
             id: 'n1',
             config: {
               nodeId: 'inline',
-              steps: [{ type: 'delay', config: { ms: -50 } }],
+              steps: [{ type: 'delay', config: { ms: {} } }],
             },
           },
           { id: 'n2', config: { nodeId: 'respond' } },
