@@ -37,10 +37,14 @@ interface IGlobalStateClient {
     prefetch(namespace: string): Promise<void>;
 }
 
-// This import resolves from the dist/ directory at runtime — it is a
-// hand-maintained module that has no source counterpart in src/.
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const { getGlobalStateClient } = require('../../globalState') as { getGlobalStateClient: (options?: Record<string, unknown>) => IGlobalStateClient };
+function getTemplateGlobalStateClient(): IGlobalStateClient {
+    // This import resolves from the dist/ directory at runtime — it is a
+    // hand-maintained module that has no source counterpart in src/. Keep it
+    // lazy so synchronous template resolution does not require global state.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { getGlobalStateClient } = require('../../globalState') as { getGlobalStateClient: (options?: Record<string, unknown>) => IGlobalStateClient };
+    return getGlobalStateClient();
+}
 
 /**
  * Render a template string by replacing {{state.field}} and {{parameters.field}} variables
@@ -316,7 +320,7 @@ export async function renderTemplateAsync(template: string, state: any): Promise
         return result;
     }
     // Fetch all values in parallel
-    const client = getGlobalStateClient();
+    const client = getTemplateGlobalStateClient();
     const replacements = await Promise.all(globalStateMatches.map(async (match) => {
         const fullMatch = match[0];
         const path = match[1];
@@ -379,6 +383,6 @@ export async function prefetchGlobalStateForTemplate(template: string): Promise<
         namespaces.add(match[1]);
     }
     if (namespaces.size === 0) return;
-    const client = getGlobalStateClient();
+    const client = getTemplateGlobalStateClient();
     await Promise.all(Array.from(namespaces).map(ns => client.prefetch(ns)));
 }

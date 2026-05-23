@@ -296,7 +296,7 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
             await eventPublisher.nodeProgress(graphNodeId, stepName, {
                 index: i,
                 total: steps.length,
-                data: { stepType: step.type }
+                data: { stepType: step.type, phase: 'start' }
             });
         }
 
@@ -361,6 +361,19 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
             const updatedFields = Object.keys(stepUpdate);
             if (DEBUG) {
                 console.log(`[UniversalNode] Step ${stepNumber} completed. Updated fields:`, updatedFields.join(', '));
+            }
+
+            if (eventPublisher) {
+                const stepName = (step as any).name || step.type;
+                await eventPublisher.nodeProgress(graphNodeId, stepName, {
+                    index: i,
+                    total: steps.length,
+                    data: {
+                        stepType: step.type,
+                        phase: 'complete',
+                        updatedFields,
+                    },
+                });
             }
 
             // Log the actual values for debugging routing issues

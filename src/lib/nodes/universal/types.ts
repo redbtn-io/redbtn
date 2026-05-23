@@ -296,6 +296,11 @@ export interface ToolStepConfig {
     retryOnError?: boolean;
     /** @deprecated Use errorHandling.retry instead */
     maxRetries?: number;
+    /**
+     * Tool idle watchdog window in milliseconds. This is not a total runtime
+     * cap; output/progress resets the timer. 0 disables the watchdog.
+     */
+    idleTimeoutMs?: number;
     /** Error handling configuration for this tool step */
     errorHandling?: ErrorHandlingConfig;
 }

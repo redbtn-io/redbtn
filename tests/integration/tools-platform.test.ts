@@ -105,17 +105,24 @@ describe('platform pack — registration', () => {
     }
   });
 
-  test('Phase A stubs (validate_graph_config, get_graph_compile_log) return NOT_IMPLEMENTED', async () => {
+  test('validator and compile-log tools expose their implemented contracts', async () => {
     const registry = getNativeRegistry();
     const ctx = makeMockContext();
 
     const v = await registry.callTool('validate_graph_config', { config: { name: 'X' } }, ctx);
-    expect(v.isError).toBe(true);
-    expect(JSON.parse(v.content[0].text).code).toBe('NOT_IMPLEMENTED');
+    expect(v.isError).toBeUndefined();
+    const validation = JSON.parse(v.content[0].text);
+    expect(validation.valid).toBe(false);
+    expect(validation.errors.some((issue: { code?: string }) => issue.code === 'MISSING_GRAPH_ID')).toBe(true);
 
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ logs: [], lastCompiledAt: null }), {
+        status: 200,
+      }),
+    ) as unknown as typeof globalThis.fetch;
     const c = await registry.callTool('get_graph_compile_log', { graphId: 'g1' }, ctx);
-    expect(c.isError).toBe(true);
-    expect(JSON.parse(c.content[0].text).code).toBe('NOT_IMPLEMENTED');
+    expect(c.isError).toBeUndefined();
+    expect(JSON.parse(c.content[0].text)).toEqual({ logs: [], lastCompiledAt: null });
   });
 });
 

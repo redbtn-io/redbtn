@@ -167,13 +167,23 @@ const setGlobalStateTool: NativeToolDefinition = {
         // Surface the webapp's error envelope verbatim. For 422 schema validation errors,
         // the webapp returns { error: { message, code }, expectedSchema, validationErrors }.
         // Pass through structured to the caller so graphs can handle validation feedback.
+        const body = data && typeof data === 'object' && !Array.isArray(data)
+          ? data as AnyObject
+          : {};
+        const error = extractErrorMessage(body) ||
+          `Global state API ${response.status} ${response.statusText}`;
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(data || {
-                error: `Global state API ${response.status} ${response.statusText}`,
+              text: JSON.stringify({
+                ...body,
+                error,
                 status: response.status,
+                details: {
+                  expectedSchema: body.expectedSchema,
+                  validationErrors: body.validationErrors,
+                },
               }),
             },
           ],
@@ -203,6 +213,16 @@ const setGlobalStateTool: NativeToolDefinition = {
     }
   },
 };
+
+function extractErrorMessage(data: AnyObject): string | null {
+  if (typeof data.error === 'string') return data.error;
+  if (data.error && typeof data.error === 'object') {
+    const e = data.error as AnyObject;
+    if (typeof e.message === 'string') return e.message;
+  }
+  if (typeof data.message === 'string') return data.message;
+  return null;
+}
 
 export default setGlobalStateTool;
 module.exports = setGlobalStateTool;
