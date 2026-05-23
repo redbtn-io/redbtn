@@ -373,6 +373,7 @@ export function buildEnv(overrides: Partial<IEnvironment> = {}): IEnvironment {
     workingDir: '/tmp',
     idleTimeoutMs: 5_000,
     maxLifetimeMs: 60_000,
+    maxDegradedMs: 30_000,
     reconnect: {
       maxAttempts: 3,
       backoffMs: 50,

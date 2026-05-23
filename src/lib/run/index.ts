@@ -102,3 +102,10 @@ export {
   type CancelNoAck,
   type CancelResult,
 } from './RunControlRegistry';
+
+export {
+  touchRunProgress,
+  type AutomationRunsCollection,
+  type TouchRunProgressOptions,
+  type TouchRunProgressResult,
+} from './progress-heartbeat';

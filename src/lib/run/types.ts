@@ -123,6 +123,12 @@ export interface RunState {
   conversationId?: string;
   status: RunStatus;
   startedAt: number;
+  /**
+   * ISO timestamp for the last observed forward progress. This is updated by
+   * the shared progress heartbeat and is intentionally independent of total
+   * runtime: long-running work stays alive by keeping this fresh.
+   */
+  lastProgressAt?: string;
   completedAt?: number;
   error?: string;
   currentStatus?: CurrentStatus;
@@ -564,6 +570,7 @@ export function createInitialRunState(params: {
     conversationId: params.conversationId,
     status: 'pending',
     startedAt: Date.now(),
+    lastProgressAt: new Date().toISOString(),
     input: params.input,
     output: {
       content: '',

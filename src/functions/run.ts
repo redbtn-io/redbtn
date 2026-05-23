@@ -19,7 +19,8 @@ import { ConnectionManager, type UserConnection, type ConnectionProvider } from 
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
 import { SYSTEM_TEMPLATES } from '../lib/types/graph';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const IORedis = require('ioredis');
+const IORedisModule = require('ioredis');
+const IORedis = IORedisModule.default || IORedisModule;
 
 /**
  * Per-process worker identifier — used in interrupt ACK payloads so the
@@ -53,6 +54,35 @@ export class RunInterruptedError extends Error {
   readonly name = 'RunInterruptedError';
   constructor(public readonly reason?: string) {
     super(reason ? `Run interrupted: ${reason}` : 'Run interrupted');
+  }
+}
+
+export class RunProgressWatchdogError extends Error {
+  readonly name = 'RunProgressWatchdogError';
+  readonly code = 'RUN_PROGRESS_STALE';
+
+  constructor(
+    public readonly runId: string,
+    public readonly lastProgressAt: string | undefined,
+    public readonly idleMs: number,
+  ) {
+    super(
+      lastProgressAt
+        ? `Run ${runId} made no progress for ${idleMs}ms (lastProgressAt=${lastProgressAt})`
+        : `Run ${runId} has no progress heartbeat`,
+    );
+  }
+}
+
+export class RunConfigTimeoutError extends Error {
+  readonly name = 'RunConfigTimeoutError';
+  readonly code = 'RUN_CONFIG_TIMEOUT';
+
+  constructor(
+    public readonly runId: string,
+    public readonly timeoutMs: number,
+  ) {
+    super(`Run ${runId} exceeded configured timeout of ${timeoutMs}ms`);
   }
 }
 
@@ -166,6 +196,9 @@ export interface StreamingRunResult {
 // =============================================================================
 
 const DEFAULT_GRAPH_ID = SYSTEM_TEMPLATES.DEFAULT;
+const DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_RUN_PROGRESS_WATCHDOG_INTERVAL_MS = 30 * 1000;
+const DEFAULT_RUN_CONFIG_TIMEOUT_MS = 300 * 1000;
 
 function generateRunId(): string {
   return `run_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
@@ -300,6 +333,210 @@ function stripNonSerializable(obj: Record<string, unknown>): Record<string, unkn
     out[k] = v;
   }
   return out;
+}
+
+function readPositiveMs(raw: unknown, fallback: number): number {
+  const value = typeof raw === 'number' ? raw : Number(raw);
+  if (Number.isFinite(value) && value > 0) return value;
+  return fallback;
+}
+
+function getRunProgressIdleTimeoutMs(compiledGraph: any): number {
+  return readPositiveMs(
+    compiledGraph?.config?.progressIdleTimeoutMs
+      ?? compiledGraph?.config?.runProgressIdleTimeoutMs
+      ?? process.env.RUN_PROGRESS_IDLE_TIMEOUT_MS,
+    DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS,
+  );
+}
+
+function getRunProgressWatchdogIntervalMs(idleTimeoutMs: number): number {
+  return Math.min(
+    readPositiveMs(process.env.RUN_PROGRESS_WATCHDOG_INTERVAL_MS, DEFAULT_RUN_PROGRESS_WATCHDOG_INTERVAL_MS),
+    Math.max(1000, Math.floor(idleTimeoutMs / 4)),
+  );
+}
+
+function getRunConfigTimeoutMs(compiledGraph: any): number {
+  const configuredSeconds = compiledGraph?.config?.timeout;
+  if (configuredSeconds !== undefined && configuredSeconds !== null) {
+    const seconds = typeof configuredSeconds === 'number' ? configuredSeconds : Number(configuredSeconds);
+    if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+  }
+  return readPositiveMs(process.env.RUN_CONFIG_TIMEOUT_MS, DEFAULT_RUN_CONFIG_TIMEOUT_MS);
+}
+
+async function getLastProgressAt(publisher: RunPublisher): Promise<string | undefined> {
+  try {
+    const state = await publisher.getState();
+    return state?.lastProgressAt || publisher.getCachedState()?.lastProgressAt;
+  } catch {
+    return publisher.getCachedState()?.lastProgressAt;
+  }
+}
+
+function abortRunForTerminalError(runId: string, abortController: AbortController, message: string): void {
+  try {
+    const ctx = runControlRegistry.get(runId);
+    ctx?.controller.abort({ reason: message });
+  } catch { /* ignore */ }
+  try { abortController.abort({ reason: message } as any); } catch {
+    try { abortController.abort(); } catch { /* ignore */ }
+  }
+}
+
+function startRunProgressWatchdog(args: {
+  runId: string;
+  publisher: RunPublisher;
+  abortController: AbortController;
+  idleTimeoutMs: number;
+  intervalMs?: number;
+}): { promise: Promise<never>; stop: () => void } {
+  const intervalMs = args.intervalMs ?? getRunProgressWatchdogIntervalMs(args.idleTimeoutMs);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
+
+  const stop = () => {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  const promise = new Promise<never>((_resolve, reject) => {
+    const schedule = () => {
+      if (stopped) return;
+      timer = setTimeout(check, intervalMs);
+      timer.unref?.();
+    };
+
+    const check = async () => {
+      if (stopped) return;
+      const lastProgressAt = await getLastProgressAt(args.publisher);
+      const lastProgressMs = lastProgressAt ? Date.parse(lastProgressAt) : NaN;
+      const stale =
+        !Number.isFinite(lastProgressMs)
+        || Date.now() - lastProgressMs >= args.idleTimeoutMs;
+      if (stale) {
+        const error = new RunProgressWatchdogError(args.runId, lastProgressAt, args.idleTimeoutMs);
+        abortRunForTerminalError(args.runId, args.abortController, error.message);
+        stop();
+        reject(error);
+        return;
+      }
+      schedule();
+    };
+
+    schedule();
+  });
+
+  return { promise, stop };
+}
+
+function startRunConfigTimeout(args: {
+  runId: string;
+  abortController: AbortController;
+  configTimeoutMs: number;
+}): { promise: Promise<never>; stop: () => void } {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
+
+  const stop = () => {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  const promise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      if (stopped) return;
+      const error = new RunConfigTimeoutError(args.runId, args.configTimeoutMs);
+      abortRunForTerminalError(args.runId, args.abortController, error.message);
+      stop();
+      reject(error);
+    }, args.configTimeoutMs);
+    timer.unref?.();
+  });
+
+  return { promise, stop };
+}
+
+async function failRunFromWatchdog(
+  publisher: RunPublisher,
+  error: RunProgressWatchdogError | RunConfigTimeoutError,
+): Promise<RunResult> {
+  const stack = error.stack;
+  try {
+    await publisher.fail(error.message, stack);
+  } catch (publishErr) {
+    console.error('[run:watchdog] publisher.fail() failed:', publishErr);
+    try {
+      await publishRunError(
+        (publisher as any).redis,
+        publisher.id,
+        error.message,
+        { errorStack: stack, userId: publisher.user },
+      );
+    } catch { /* give up — we tried */ }
+  }
+  const state = await publisher.getState();
+  return {
+    runId: publisher.id,
+    graphId: state?.graphId || '',
+    graphName: state?.graphName || '',
+    status: 'error',
+    content: '',
+    thinking: '',
+    data: {},
+    error: error.message,
+    metadata: {
+      startedAt: state?.startedAt || Date.now(),
+      completedAt: Date.now(),
+      duration: state?.startedAt ? Date.now() - state.startedAt : 0,
+      nodesExecuted: state?.graph.nodesExecuted || 0,
+      executionPath: state?.graph.executionPath || [],
+    },
+    graphTrace: {
+      executionPath: state?.graph.executionPath || [],
+      nodeProgress: Object.fromEntries(
+        Object.entries(state?.graph.nodeProgress || {}).map(([nodeId, progress]: [string, any]) => [
+          nodeId,
+          { status: progress.status, nodeName: progress.nodeName, nodeType: progress.nodeType, startedAt: progress.startedAt, completedAt: progress.completedAt, error: progress.error },
+        ])
+      ),
+      startTime: state?.startedAt,
+      endTime: Date.now(),
+    },
+    tools: state?.tools || [],
+  };
+}
+
+async function executeWithRunProgressWatchdog(
+  operation: () => Promise<RunResult>,
+  args: {
+    runId: string;
+    publisher: RunPublisher;
+    abortController: AbortController;
+    idleTimeoutMs: number;
+    configTimeoutMs: number;
+  },
+): Promise<RunResult> {
+  const progressWatchdog = startRunProgressWatchdog(args);
+  const configTimeout = startRunConfigTimeout(args);
+  try {
+    return await Promise.race([operation(), progressWatchdog.promise, configTimeout.promise]);
+  } catch (err) {
+    if (err instanceof RunProgressWatchdogError || err instanceof RunConfigTimeoutError) {
+      return failRunFromWatchdog(args.publisher, err);
+    }
+    throw err;
+  } finally {
+    progressWatchdog.stop();
+    configTimeout.stop();
+  }
 }
 
 /**
@@ -926,6 +1163,9 @@ async function subscribeForInterrupt(
   controller: AbortController,
   publisherRedis?: any,
 ): Promise<{ quit: () => Promise<void> }> {
+  if (process.env.RUN_DISABLE_INTERRUPT_SUBSCRIBER === 'true') {
+    return { quit: async () => { /* disabled for tests/local harnesses */ } };
+  }
   const url = process.env.REDIS_URL || 'redis://localhost:6379';
   // Dedicated subscriber connection — required for ioredis subscribe mode.
   const sub = new IORedis(url, { maxRetriesPerRequest: null, enableReadyCheck: false });
@@ -1287,7 +1527,16 @@ export async function run(
     const completion = (async () => {
       try {
         console.log(`[run] ${new Date().toISOString()} Starting execution for run ${runId}`);
-        return await executeStreaming(red, compiledGraph, initialState, publisher, userSettings);
+        return await executeWithRunProgressWatchdog(
+          () => executeStreaming(red, compiledGraph, initialState, publisher, userSettings),
+          {
+            runId,
+            publisher,
+            abortController,
+            idleTimeoutMs: getRunProgressIdleTimeoutMs(compiledGraph),
+            configTimeoutMs: getRunConfigTimeoutMs(compiledGraph),
+          },
+        );
       } finally {
         await cleanup();
       }
@@ -1295,7 +1544,16 @@ export async function run(
     return { runId, publisher, completion };
   } else {
     try {
-      return await executeNonStreaming(red, compiledGraph, initialState, publisher, userSettings);
+      return await executeWithRunProgressWatchdog(
+        () => executeNonStreaming(red, compiledGraph, initialState, publisher, userSettings),
+        {
+          runId,
+          publisher,
+          abortController,
+          idleTimeoutMs: getRunProgressIdleTimeoutMs(compiledGraph),
+          configTimeoutMs: getRunConfigTimeoutMs(compiledGraph),
+        },
+      );
     } finally {
       await cleanup();
     }

@@ -23,6 +23,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   EnvironmentClosedError,
   EnvironmentBufferOverflowError,
+  EnvironmentTimeoutError,
   BUFFER_MAX_BYTES,
   BUFFER_MAX_COMMANDS,
 } from '../../src/lib/environments/types';
@@ -172,6 +173,163 @@ describe('EnvironmentSession — single drop + reconnect', () => {
     // Should have seen the command execute on both clients.
     expect(events.filter((e) => e.startsWith('replay:')).length).toBeGreaterThan(0);
   }, 5_000);
+
+  it('does not replay in-flight exec when degraded failure is a definitive timeout', async () => {
+    const events: string[] = [];
+    const { session, clients } = buildReconnectableSession({
+      attemptFns: [
+        (c) => {
+          c.behaviour.onExec = (cmd, _ch) => {
+            events.push(`live:${cmd}`);
+            setTimeout(() => c.emit('close'), 5);
+          };
+        },
+        (c) => {
+          c.behaviour.onExec = (cmd, ch) => {
+            events.push(`replay:${cmd}`);
+            ch.pushStdout('should-not-run');
+            ch.finish(0);
+          };
+        },
+      ],
+      envOverrides: {
+        reconnect: { maxAttempts: 1, backoffMs: 40, maxBackoffMs: 40 },
+      },
+    });
+
+    await session.open();
+    await expect(session.exec('will-timeout', { timeout: 15 }))
+      .rejects.toBeInstanceOf(EnvironmentTimeoutError);
+
+    await sleep(120);
+    expect(session.state).toBe('open');
+    expect(clients.length).toBe(2);
+    expect(events.some((event) => event.startsWith('replay:'))).toBe(false);
+  }, 5_000);
+
+  it('does not replay in-flight exec when degraded failure is an idle hang error', async () => {
+    const events: string[] = [];
+    const idleError = Object.assign(new Error('tool made no progress'), {
+      name: 'ToolHangError',
+      code: 'TOOL_IDLE_TIMEOUT',
+    });
+    const { session, clients } = buildReconnectableSession({
+      attemptFns: [
+        (c) => {
+          c.behaviour.onExec = (cmd, ch) => {
+            events.push(`live:${cmd}`);
+            setTimeout(() => c.emit('close'), 5);
+            setTimeout(() => ch.fail(idleError), 10);
+          };
+        },
+        (c) => {
+          c.behaviour.onExec = (cmd, ch) => {
+            events.push(`replay:${cmd}`);
+            ch.pushStdout('should-not-run');
+            ch.finish(0);
+          };
+        },
+      ],
+      envOverrides: {
+        reconnect: { maxAttempts: 1, backoffMs: 40, maxBackoffMs: 40 },
+      },
+    });
+
+    await session.open();
+    await expect(session.exec('will-idle-hang')).rejects.toMatchObject({
+      name: 'ToolHangError',
+      code: 'TOOL_IDLE_TIMEOUT',
+    });
+
+    await sleep(120);
+    expect(session.state).toBe('open');
+    expect(clients.length).toBe(2);
+    expect(events.some((event) => event.startsWith('replay:'))).toBe(false);
+  }, 5_000);
+});
+
+// ---------------------------------------------------------------------------
+// Degraded ceiling
+// ---------------------------------------------------------------------------
+
+describe('EnvironmentSession — degraded ceiling', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function flushImmediates(times = 5): Promise<void> {
+    for (let i = 0; i < times; i += 1) {
+      await Promise.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
+
+  it('self-terminates degraded sessions at the ceiling and rejects pending operations', async () => {
+    const { session, clients } = buildReconnectableSession({
+      attemptFns: [
+        (c) => { c.behaviour.onExec = (_cmd, ch) => ch.finish(0); },
+        (c) => { c.behaviour.onConnect = () => new Promise(() => {}); },
+      ],
+      envOverrides: {
+        idleTimeoutMs: 0,
+        maxLifetimeMs: 0,
+        maxDegradedMs: 100,
+        reconnect: { maxAttempts: 99, backoffMs: 1000, maxBackoffMs: 1000 },
+      },
+    });
+
+    await session.open();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    clients[0].simulateDrop();
+    expect(session.state).toBe('degraded');
+
+    const queued = session.exec('queued-during-degraded');
+    const rejected = expect(queued).rejects.toBeInstanceOf(EnvironmentClosedError);
+
+    await vi.advanceTimersByTimeAsync(99);
+    expect(session.state).toBe('degraded');
+
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+    expect(session.state).toBe('closed');
+  });
+
+  it('clears the degraded ceiling when reconnect succeeds before expiry', async () => {
+    const { session, clients } = buildReconnectableSession({
+      attemptFns: [
+        (c) => { c.behaviour.onExec = (_cmd, ch) => ch.finish(0); },
+        (c) => {
+          c.behaviour.onExec = (_cmd, ch) => {
+            ch.pushStdout('recovered');
+            ch.finish(0);
+          };
+        },
+      ],
+      envOverrides: {
+        idleTimeoutMs: 0,
+        maxLifetimeMs: 0,
+        maxDegradedMs: 100,
+        reconnect: { maxAttempts: 3, backoffMs: 20, maxBackoffMs: 20 },
+      },
+    });
+
+    await session.open();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    clients[0].simulateDrop();
+    expect(session.state).toBe('degraded');
+
+    const queued = session.exec('queued-during-degraded');
+    await vi.advanceTimersByTimeAsync(20);
+    await flushImmediates();
+    await vi.advanceTimersByTimeAsync(100);
+
+    await expect(queued).resolves.toMatchObject({ stdout: 'recovered' });
+    expect(session.state).toBe('open');
+    expect(clients.length).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(session.state).toBe('open');
+  });
 });
 
 // ---------------------------------------------------------------------------

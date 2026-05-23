@@ -31,6 +31,10 @@ import {
   writeAutoState,
   deleteAutoState,
 } from './run-auto-state';
+import {
+  touchRunProgress,
+  type AutomationRunsCollection,
+} from './progress-heartbeat';
 import { StreamPublisher, StreamSubscriber } from '@redbtn/redstream';
 import {
   type RunState,
@@ -115,6 +119,10 @@ export interface RunPublisherOptions {
   runId: string;
   /** User executing the run */
   userId: string;
+  /** Optional AutomationRun.runId to mirror progress heartbeat into Mongo. */
+  automationRunId?: string;
+  /** Optional automationruns collection handle for Mongo heartbeat mirroring. */
+  automationRunsCollection?: AutomationRunsCollection;
   /** TTL for run state in seconds (default: 1 hour) */
   stateTtl?: number;
   /** RedLog instance for structured logging */
@@ -140,6 +148,8 @@ export class RunPublisher {
   private readonly redis: Redis;
   private readonly runId: string;
   private readonly userId: string;
+  private readonly automationRunId?: string;
+  private readonly automationRunsCollection?: AutomationRunsCollection;
   private readonly stateTtl: number;
   private readonly redlog?: RedLog;
   private state: RunState | null = null;
@@ -153,6 +163,8 @@ export class RunPublisher {
     this.redis = options.redis;
     this.runId = options.runId;
     this.userId = options.userId;
+    this.automationRunId = options.automationRunId;
+    this.automationRunsCollection = options.automationRunsCollection;
     this.stateTtl = options.stateTtl ?? RunConfig.STATE_TTL_SECONDS;
     this.redlog = options.log;
   }
@@ -1065,6 +1077,18 @@ export class RunPublisher {
     const eventsKey = RunKeys.events(this.runId);
     const pub = new StreamPublisher({ redis: this.redis, channel, eventsKey, ttl: this.stateTtl });
     await pub.publish(event as any);
+    if (isProgressEvent(event)) {
+      const heartbeat = await touchRunProgress({
+        redis: this.redis,
+        runId: this.runId,
+        automationRunId: this.automationRunId,
+        automationRunsCollection: this.automationRunsCollection,
+        stateTtlSeconds: this.stateTtl,
+      });
+      if (this.state && heartbeat.redisUpdated) {
+        this.state.lastProgressAt = heartbeat.lastProgressAt;
+      }
+    }
     // Fire-and-forget archive job — non-blocking, non-fatal
     this._enqueueArchive(event).catch(() => {});
   }
@@ -1160,6 +1184,35 @@ export class RunPublisher {
 
 export function createRunPublisher(options: RunPublisherOptions): RunPublisher {
   return new RunPublisher(options);
+}
+
+function isProgressEvent(event: RunEvent): boolean {
+  switch (event.type) {
+    case 'graph_start':
+    case 'graph_complete':
+    case 'graph_error':
+    case 'node_start':
+    case 'node_progress':
+    case 'node_complete':
+    case 'node_error':
+    case 'chunk':
+    case 'thinking_complete':
+    case 'audio_chunk':
+    case 'attachment':
+    case 'tool_start':
+    case 'tool_progress':
+    case 'tool_complete':
+    case 'tool_error':
+    case 'run_complete':
+    case 'run_error':
+    case 'run_failed':
+    case 'run_interrupted':
+      return true;
+    case 'run_start':
+    case 'status':
+    case 'init':
+      return false;
+  }
 }
 
 /**
