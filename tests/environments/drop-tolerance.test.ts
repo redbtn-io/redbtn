@@ -434,7 +434,7 @@ describe('EnvironmentSession — reconnect backoff', () => {
   }, 5_000);
 
   it('backoff caps at maxBackoffMs', async () => {
-    const attemptStarts: number[] = [];
+    const timeoutSpy = vi.spyOn(globalThis, 'setTimeout');
     const baseClient = (() => {
       const c = new MockSshClient();
       c.behaviour.onExec = (_cmd, ch) => ch.finish(0);
@@ -454,7 +454,6 @@ describe('EnvironmentSession — reconnect backoff', () => {
           calls += 1;
           return baseClient as any;
         }
-        attemptStarts.push(Date.now());
         const c = new MockSshClient();
         c.behaviour.onConnect = () => Promise.reject(new Error('down'));
         calls += 1;
@@ -468,15 +467,10 @@ describe('EnvironmentSession — reconnect backoff', () => {
     // 100 + 200 + 200 + 200 + 200 + 200 = 1100ms total.
     await sleep(1500);
 
-    // Compute gaps from attempt 2 onwards — they should all be capped at
-    // ~200ms (maxBackoffMs).
-    if (attemptStarts.length >= 4) {
-      const gap2 = attemptStarts[2] - attemptStarts[1];
-      const gap3 = attemptStarts[3] - attemptStarts[2];
-      // Both should be near 200ms (allow 50ms slack).
-      expect(gap2).toBeLessThan(300);
-      expect(gap3).toBeLessThan(300);
-    }
+    const reconnectDelays = timeoutSpy.mock.calls
+      .map(([, delay]) => delay)
+      .filter((delay): delay is number => typeof delay === 'number' && delay >= 100 && delay <= 1_000);
+    expect(reconnectDelays).toEqual(expect.arrayContaining([100, 200, 200, 200]));
   }, 8_000);
 });
 
