@@ -75,4 +75,11 @@ describe('stepExecutor delay', () => {
       1000,
     );
   });
+
+  it('falls back to 1000ms when ms is missing', async () => {
+    await expectDelayToResolveAfter(
+      { type: 'delay', config: {} } as UniversalStep,
+      1000,
+    );
+  });
 });

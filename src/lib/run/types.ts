@@ -342,6 +342,18 @@ export interface ToolProgressEvent extends BaseEvent {
   data?: Record<string, unknown>;
 }
 
+export interface ToolOutputEvent extends BaseEvent {
+  type: 'tool_output';
+  toolId?: string;
+  nodeId?: string;
+  data: {
+    chunk?: string;
+    stream?: 'stdout' | 'stderr' | string;
+    totalBytes?: number;
+    [key: string]: unknown;
+  };
+}
+
 export interface ToolCompleteEvent extends BaseEvent {
   type: 'tool_complete';
   toolId: string;
@@ -441,6 +453,7 @@ export type RunEvent =
   | ThinkingCompleteEvent
   | ToolStartEvent
   | ToolProgressEvent
+  | ToolOutputEvent
   | ToolCompleteEvent
   | ToolErrorEvent
   | AudioChunkEvent
@@ -539,6 +552,21 @@ export const RunKeys = {
 export const RunConfig = {
   /** Default TTL for run state in Redis (1 hour) */
   STATE_TTL_SECONDS: 60 * 60,
+  /**
+   * Default run-progress stale window (30 minutes).
+   *
+   * A run is considered alive when its lastProgressAt heartbeat is newer than
+   * this window. This is deliberately independent of total runtime: legitimate
+   * long-running work can run for hours as long as progress keeps advancing.
+   */
+  RUN_PROGRESS_STALE_MS: 30 * 60 * 1000,
+  /**
+   * Minimum interval between AutomationRun.lastProgressAt Mongo writes.
+   * Redis run state is still refreshed on every progress event; this only
+   * coalesces the durable mirror so chatty streaming tools do not write to
+   * Mongo on every chunk.
+   */
+  AUTOMATION_RUN_HEARTBEAT_THROTTLE_MS: 15 * 1000,
   /** Default timeout waiting for client ready signal (30 seconds) */
   READY_TIMEOUT_MS: 30000,
   /** Default lock TTL (5 minutes) - prevents zombie locks */

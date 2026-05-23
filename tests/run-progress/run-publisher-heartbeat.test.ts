@@ -135,4 +135,34 @@ describe('RunPublisher progress heartbeat', () => {
     expect(readRunState(values, 'run-publisher-tool').lastProgressAt).toBe('2026-05-22T17:02:30.000Z');
     expect(automationRunsCollection.updateOne).toHaveBeenCalledTimes(2);
   });
+
+  it('refreshes lastProgressAt for raw tool output events', async () => {
+    const { redis, values } = makeRedis();
+    const automationRunsCollection = {
+      updateOne: vi.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
+    };
+    const publisher = new RunPublisher({
+      redis: redis as any,
+      runId: 'run-publisher-tool-output',
+      userId: 'user-1',
+      automationRunId: 'run-publisher-tool-output',
+      automationRunsCollection,
+    });
+
+    await publisher.init('graph-1', 'Graph 1', {});
+    vi.setSystemTime(new Date('2026-05-22T17:03:00.000Z'));
+    await publisher.publish({
+      type: 'tool_output',
+      toolId: 'tool-1',
+      nodeId: 'node-1',
+      data: { chunk: 'hello', stream: 'stdout', totalBytes: 5 },
+      timestamp: Date.now(),
+    });
+
+    expect(readRunState(values, 'run-publisher-tool-output').lastProgressAt).toBe('2026-05-22T17:03:00.000Z');
+    expect(automationRunsCollection.updateOne).toHaveBeenCalledWith(
+      { runId: 'run-publisher-tool-output' },
+      { $set: { lastProgressAt: new Date('2026-05-22T17:03:00.000Z') } },
+    );
+  });
 });

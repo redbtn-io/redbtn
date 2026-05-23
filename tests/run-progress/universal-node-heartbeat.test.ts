@@ -98,7 +98,7 @@ describe('universalNode progress heartbeat', () => {
     });
 
     expect(result).toEqual({ nodeCounter: 2 });
-    expect(automationRunsCollection.updateOne).toHaveBeenCalledTimes(6);
+    expect(automationRunsCollection.updateOne).toHaveBeenCalledTimes(1);
     expect(JSON.parse(values.get(RunKeys.state('run-universal-sequential'))!).lastProgressAt).toBeTruthy();
 
     const nodeProgressEvents = getRunEvents(lists, 'run-universal-sequential').filter((event) => event.type === 'node_progress');
@@ -136,7 +136,7 @@ describe('universalNode progress heartbeat', () => {
     });
 
     expect(result).toEqual({ nodeCounter: 2 });
-    expect(automationRunsCollection.updateOne).toHaveBeenCalledTimes(4);
+    expect(automationRunsCollection.updateOne).toHaveBeenCalledTimes(1);
 
     const nodeProgressEvents = getRunEvents(lists, 'run-universal-skipped').filter((event) => event.type === 'node_progress');
     expect(nodeProgressEvents).toHaveLength(2);

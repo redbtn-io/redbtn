@@ -13,7 +13,7 @@
  * @module functions/run
  */
 import type { Red } from '../index';
-import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys } from '../lib/run';
+import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys, RunConfig } from '../lib/run';
 import { runControlRegistry, type CancelResult } from '../lib/run/RunControlRegistry';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
@@ -117,6 +117,12 @@ export interface RunOptions {
   threadId?: string;
   runId?: string;
   /**
+   * AutomationRun.runId for durable progress-heartbeat mirroring. When set,
+   * RunPublisher mirrors lastProgressAt into the automationruns collection
+   * while keeping Redis as the hot liveness source.
+   */
+  automationRunId?: string;
+  /**
    * Pre-allocated id for the assistant message this run will produce on the
    * conversation. Threaded through to RunPublisher.init so dispatch responses
    * and downstream SSE events share the same messageId.
@@ -196,7 +202,7 @@ export interface StreamingRunResult {
 // =============================================================================
 
 const DEFAULT_GRAPH_ID = SYSTEM_TEMPLATES.DEFAULT;
-const DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS = RunConfig.RUN_PROGRESS_STALE_MS;
 const DEFAULT_RUN_PROGRESS_WATCHDOG_INTERVAL_MS = 30 * 1000;
 const DEFAULT_RUN_CONFIG_TIMEOUT_MS = 300 * 1000;
 
@@ -1162,17 +1168,18 @@ async function subscribeForInterrupt(
   runId: string,
   controller: AbortController,
   publisherRedis?: any,
+  RedisCtor: typeof IORedis = IORedis,
 ): Promise<{ quit: () => Promise<void> }> {
   if (process.env.RUN_DISABLE_INTERRUPT_SUBSCRIBER === 'true') {
     return { quit: async () => { /* disabled for tests/local harnesses */ } };
   }
   const url = process.env.REDIS_URL || 'redis://localhost:6379';
   // Dedicated subscriber connection — required for ioredis subscribe mode.
-  const sub = new IORedis(url, { maxRetriesPerRequest: null, enableReadyCheck: false });
+  const sub = new RedisCtor(url, { maxRetriesPerRequest: null, enableReadyCheck: false });
   // Dedicated publisher connection for the ACK channel. We don't reuse `sub`
   // (it's in subscriber mode) and don't reuse the engine's main client
   // because ioredis can be in subscriber mode there too. Cheap and isolated.
-  const ackPub = new IORedis(url, { maxRetriesPerRequest: null, enableReadyCheck: false });
+  const ackPub = new RedisCtor(url, { maxRetriesPerRequest: null, enableReadyCheck: false });
   const channel = RunKeys.interrupt(runId);
   const ackChannel = RunKeys.interruptAck(runId);
   try {
@@ -1278,6 +1285,10 @@ async function subscribeForInterrupt(
   };
 }
 
+export const __test__ = {
+  subscribeForInterrupt,
+};
+
 // =============================================================================
 // Main Entry Point
 // =============================================================================
@@ -1360,7 +1371,27 @@ export async function run(
   }
   console.log(`[run] Acquired lock for conversation ${lockKey}${agentId ? ` agent=${agentId}` : ''}`);
 
-  const publisher = createRunPublisher({ redis, runId, userId, log: red.redlog });
+  let automationRunsCollection: { updateOne: (filter: Record<string, unknown>, update: Record<string, unknown>) => Promise<{ matchedCount?: number; modifiedCount?: number }> } | undefined;
+  if (options.automationRunId) {
+    try {
+      const mongoose = await import('mongoose');
+      const db = mongoose.default.connection?.db;
+      if (db) {
+        automationRunsCollection = db.collection('automationruns');
+      }
+    } catch (err) {
+      console.warn(`[run] Unable to initialize automationrun heartbeat mirror for ${options.automationRunId}:`, err);
+    }
+  }
+
+  const publisher = createRunPublisher({
+    redis,
+    runId,
+    userId,
+    log: red.redlog,
+    automationRunId: options.automationRunId,
+    automationRunsCollection,
+  });
 
   // W-3: extract triggerType from the already-enriched input so that publisher.init()
   // can guarantee it ends up in this.state.input._trigger even for direct run() callers.

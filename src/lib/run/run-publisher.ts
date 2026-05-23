@@ -1201,6 +1201,7 @@ function isProgressEvent(event: RunEvent): boolean {
     case 'attachment':
     case 'tool_start':
     case 'tool_progress':
+    case 'tool_output':
     case 'tool_complete':
     case 'tool_error':
     case 'run_complete':

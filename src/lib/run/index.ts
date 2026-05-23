@@ -38,6 +38,7 @@ export {
   type ThinkingCompleteEvent,
   type ToolStartEvent,
   type ToolProgressEvent,
+  type ToolOutputEvent,
   type ToolCompleteEvent,
   type ToolErrorEvent,
   type AudioChunkEvent,
@@ -104,8 +105,12 @@ export {
 } from './RunControlRegistry';
 
 export {
+  readRunProgress,
+  isRunProgressStale,
   touchRunProgress,
   type AutomationRunsCollection,
+  type ReadRunProgressOptions,
+  type RunProgressSnapshot,
   type TouchRunProgressOptions,
   type TouchRunProgressResult,
 } from './progress-heartbeat';
