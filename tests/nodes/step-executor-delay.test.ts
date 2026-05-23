@@ -68,4 +68,11 @@ describe('stepExecutor delay', () => {
       { loopDelay: 'not-a-number' },
     );
   });
+
+  it('falls back to 1000ms for an invalid literal ms value', async () => {
+    await expectDelayToResolveAfter(
+      { type: 'delay', config: { ms: {} } } as UniversalStep,
+      1000,
+    );
+  });
 });
