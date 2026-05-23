@@ -391,6 +391,7 @@ describe('EnvironmentSession — reconnect exhaustion', () => {
 
 describe('EnvironmentSession — reconnect backoff', () => {
   it('uses exponential backoff between attempts', async () => {
+    const timeoutSpy = vi.spyOn(globalThis, 'setTimeout');
     const attemptStarts: number[] = [];
     const baseClient = (() => {
       const c = new MockSshClient();
@@ -420,29 +421,16 @@ describe('EnvironmentSession — reconnect backoff', () => {
     });
 
     await session.open();
-    const dropAt = Date.now();
     baseClient.simulateDrop();
     await flushAsync();
     // Wait long enough for all 4 attempts: 50 + 100 + 200 + 400 = 750ms.
     await sleep(900);
 
-    // Expect at least 4 attempts.
     expect(attemptStarts.length).toBeGreaterThanOrEqual(3);
-    // Compute gap between consecutive attempts. Each gap should be roughly
-    // 2x the previous (with mock-overhead noise). We just check the gaps
-    // are non-decreasing with a tolerance.
-    const gaps: number[] = [];
-    let prev = dropAt;
-    for (const t of attemptStarts) {
-      gaps.push(t - prev);
-      prev = t;
-    }
-    // First gap should be ~50ms.
-    expect(gaps[0]).toBeGreaterThanOrEqual(40);
-    // Each subsequent gap should be >= 1.5x the previous (allowing for slop).
-    for (let i = 1; i < gaps.length; i++) {
-      expect(gaps[i]).toBeGreaterThanOrEqual(gaps[i - 1] * 1.5 - 25);
-    }
+    const reconnectDelays = timeoutSpy.mock.calls
+      .map(([, delay]) => delay)
+      .filter((delay): delay is number => typeof delay === 'number' && delay >= 50 && delay <= 1_000);
+    expect(reconnectDelays).toEqual(expect.arrayContaining([50, 100, 200, 400]));
   }, 5_000);
 
   it('backoff caps at maxBackoffMs', async () => {
