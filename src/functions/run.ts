@@ -1372,16 +1372,18 @@ export async function run(
   console.log(`[run] Acquired lock for conversation ${lockKey}${agentId ? ` agent=${agentId}` : ''}`);
 
   let automationRunsCollection: { updateOne: (filter: Record<string, unknown>, update: Record<string, unknown>) => Promise<{ matchedCount?: number; modifiedCount?: number }> } | undefined;
-  if (options.automationRunId) {
-    try {
-      const mongoose = await import('mongoose');
-      const db = mongoose.default.connection?.db;
-      if (db) {
+  let generationsCollection: { updateOne: (filter: Record<string, unknown>, update: Record<string, unknown>) => Promise<{ matchedCount?: number; modifiedCount?: number }> } | undefined;
+  try {
+    const mongoose = await import('mongoose');
+    const db = mongoose.default.connection?.db;
+    if (db) {
+      generationsCollection = db.collection('generations');
+      if (options.automationRunId) {
         automationRunsCollection = db.collection('automationruns');
       }
-    } catch (err) {
-      console.warn(`[run] Unable to initialize automationrun heartbeat mirror for ${options.automationRunId}:`, err);
     }
+  } catch (err) {
+    console.warn(`[run] Unable to initialize Mongo heartbeat mirrors for ${runId}:`, err);
   }
 
   const publisher = createRunPublisher({
@@ -1391,6 +1393,8 @@ export async function run(
     log: red.redlog,
     automationRunId: options.automationRunId,
     automationRunsCollection,
+    generationId: runId,
+    generationsCollection,
   });
 
   // W-3: extract triggerType from the already-enriched input so that publisher.init()

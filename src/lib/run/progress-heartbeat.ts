@@ -1,7 +1,15 @@
 import type { Redis } from 'ioredis';
 import { RunConfig, RunKeys, type RunState } from './types';
+import { classifyRunProgressStaleness } from './progress-contract';
 
 export interface AutomationRunsCollection {
+  updateOne(
+    filter: Record<string, unknown>,
+    update: Record<string, unknown>,
+  ): Promise<{ matchedCount?: number; modifiedCount?: number }>;
+}
+
+export interface GenerationsCollection {
   updateOne(
     filter: Record<string, unknown>,
     update: Record<string, unknown>,
@@ -17,18 +25,27 @@ export interface TouchRunProgressOptions {
    */
   automationRunId?: string;
   automationRunsCollection?: AutomationRunsCollection;
+  /**
+   * Identifier for the generations document. Current run archive/recovery
+   * paths use runId as the lookup field.
+   */
+  generationId?: string;
+  generationsCollection?: GenerationsCollection;
   now?: Date;
   stateTtlSeconds?: number;
   automationRunThrottleMs?: number;
+  generationThrottleMs?: number;
 }
 
 export interface TouchRunProgressResult {
   lastProgressAt: string;
   redisUpdated: boolean;
   automationRunUpdated: boolean;
+  generationUpdated: boolean;
 }
 
 const automationRunHeartbeatWrites = new Map<string, number>();
+const generationHeartbeatWrites = new Map<string, number>();
 
 export interface ReadRunProgressOptions {
   redis: Pick<Redis, 'get'>;
@@ -51,12 +68,7 @@ export function isRunProgressStale(
   lastProgressAt: string | undefined,
   options: { now?: Date; staleAfterMs?: number } = {},
 ): boolean {
-  const lastProgressMs = lastProgressAt ? Date.parse(lastProgressAt) : NaN;
-  if (!Number.isFinite(lastProgressMs)) return true;
-
-  const nowMs = (options.now ?? new Date()).getTime();
-  const staleAfterMs = options.staleAfterMs ?? RunConfig.RUN_PROGRESS_STALE_MS;
-  return nowMs - lastProgressMs >= staleAfterMs;
+  return classifyRunProgressStaleness({ lastProgressAt }, options).isStale;
 }
 
 /**
@@ -85,7 +97,7 @@ export async function readRunProgress(
     const state = JSON.parse(rawState) as Partial<RunState>;
     const lastProgressAt =
       typeof state.lastProgressAt === 'string' ? state.lastProgressAt : undefined;
-    const lastProgressMs = lastProgressAt ? Date.parse(lastProgressAt) : NaN;
+    const staleness = classifyRunProgressStaleness({ lastProgressAt }, { now, staleAfterMs });
 
     return {
       runId: options.runId,
@@ -93,8 +105,8 @@ export async function readRunProgress(
       checkedAt: now.toISOString(),
       staleAfterMs,
       lastProgressAt,
-      lastProgressMs: Number.isFinite(lastProgressMs) ? lastProgressMs : undefined,
-      isStale: isRunProgressStale(lastProgressAt, { now, staleAfterMs }),
+      lastProgressMs: staleness.lastProgressMs,
+      isStale: staleness.isStale,
     };
   } catch (error) {
     console.warn(`[run-progress] Failed to read Redis heartbeat for ${options.runId}:`, error);
@@ -165,5 +177,30 @@ export async function touchRunProgress(
     }
   }
 
-  return { lastProgressAt, redisUpdated, automationRunUpdated };
+  let generationUpdated = false;
+  if (options.generationId && options.generationsCollection) {
+    const throttleMs = options.generationThrottleMs ?? RunConfig.AUTOMATION_RUN_HEARTBEAT_THROTTLE_MS;
+    const lastWriteMs = generationHeartbeatWrites.get(options.generationId) ?? 0;
+    const shouldWrite = throttleMs <= 0 || now.getTime() - lastWriteMs >= throttleMs;
+
+    if (shouldWrite) {
+      try {
+        const result = await options.generationsCollection.updateOne(
+          { runId: options.generationId },
+          { $set: { lastProgressAt: now } },
+        );
+        generationUpdated = (result.matchedCount ?? 0) > 0 || (result.modifiedCount ?? 0) > 0;
+        if (generationUpdated) {
+          generationHeartbeatWrites.set(options.generationId, now.getTime());
+        }
+      } catch (error) {
+        console.warn(
+          `[run-progress] Failed to update generation heartbeat for ${options.generationId}:`,
+          error,
+        );
+      }
+    }
+  }
+
+  return { lastProgressAt, redisUpdated, automationRunUpdated, generationUpdated };
 }

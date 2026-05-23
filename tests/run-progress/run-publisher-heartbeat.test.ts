@@ -66,12 +66,16 @@ describe('RunPublisher progress heartbeat', () => {
     const automationRunsCollection = {
       updateOne: vi.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
     };
+    const generationsCollection = {
+      updateOne: vi.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
+    };
     const publisher = new RunPublisher({
       redis: redis as any,
       runId: 'run-publisher-chunk',
       userId: 'user-1',
       automationRunId: 'run-publisher-chunk',
       automationRunsCollection,
+      generationsCollection,
     });
 
     await publisher.init('graph-1', 'Graph 1', {});
@@ -86,6 +90,38 @@ describe('RunPublisher progress heartbeat', () => {
     expect(automationRunsCollection.updateOne).toHaveBeenCalledWith(
       { runId: 'run-publisher-chunk' },
       { $set: { lastProgressAt: new Date('2026-05-22T17:00:05.000Z') } },
+    );
+    expect(generationsCollection.updateOne).toHaveBeenCalledWith(
+      { runId: 'run-publisher-chunk' },
+      { $set: { lastProgressAt: new Date('2026-05-22T17:00:05.000Z') } },
+    );
+  });
+
+  it('refreshes lastProgressAt for node start and node complete events', async () => {
+    const { redis, values } = makeRedis();
+    const generationsCollection = {
+      updateOne: vi.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
+    };
+    const publisher = new RunPublisher({
+      redis: redis as any,
+      runId: 'run-publisher-node',
+      userId: 'user-1',
+      generationsCollection,
+    });
+
+    await publisher.init('graph-1', 'Graph 1', {});
+
+    vi.setSystemTime(new Date('2026-05-22T17:00:10.000Z'));
+    await publisher.nodeStart('node-1', 'universal', 'Node 1');
+    expect(readRunState(values, 'run-publisher-node').lastProgressAt).toBe('2026-05-22T17:00:10.000Z');
+
+    vi.setSystemTime(new Date('2026-05-22T17:00:30.000Z'));
+    await publisher.nodeComplete('node-1');
+    expect(readRunState(values, 'run-publisher-node').lastProgressAt).toBe('2026-05-22T17:00:30.000Z');
+    expect(generationsCollection.updateOne).toHaveBeenCalledTimes(2);
+    expect(generationsCollection.updateOne).toHaveBeenLastCalledWith(
+      { runId: 'run-publisher-node' },
+      { $set: { lastProgressAt: new Date('2026-05-22T17:00:30.000Z') } },
     );
   });
 
@@ -134,6 +170,32 @@ describe('RunPublisher progress heartbeat', () => {
 
     expect(readRunState(values, 'run-publisher-tool').lastProgressAt).toBe('2026-05-22T17:02:30.000Z');
     expect(automationRunsCollection.updateOne).toHaveBeenCalledTimes(2);
+  });
+
+  it('refreshes lastProgressAt for tool progress events even without an automationrun mirror', async () => {
+    const { redis, values } = makeRedis();
+    const generationsCollection = {
+      updateOne: vi.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
+    };
+    const publisher = new RunPublisher({
+      redis: redis as any,
+      runId: 'run-publisher-tool-progress',
+      userId: 'user-1',
+      generationsCollection,
+    });
+
+    await publisher.init('graph-1', 'Graph 1', {});
+    vi.setSystemTime(new Date('2026-05-22T17:02:45.000Z'));
+    await publisher.toolStart('tool-1', 'ssh_shell', 'native');
+
+    vi.setSystemTime(new Date('2026-05-22T17:03:15.000Z'));
+    await publisher.toolProgress('tool-1', 'stdout', { data: { bytes: 64 } });
+
+    expect(readRunState(values, 'run-publisher-tool-progress').lastProgressAt).toBe('2026-05-22T17:03:15.000Z');
+    expect(generationsCollection.updateOne).toHaveBeenLastCalledWith(
+      { runId: 'run-publisher-tool-progress' },
+      { $set: { lastProgressAt: new Date('2026-05-22T17:03:15.000Z') } },
+    );
   });
 
   it('refreshes lastProgressAt for raw tool output events', async () => {

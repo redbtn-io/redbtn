@@ -246,6 +246,40 @@ describe('EnvironmentSession — single drop + reconnect', () => {
     expect(clients.length).toBe(2);
     expect(events.some((event) => event.startsWith('replay:'))).toBe(false);
   }, 5_000);
+
+  it('does not replay in-flight exec when degraded failure is a generic idle timeout', async () => {
+    const events: string[] = [];
+    const idleError = new Error('idle timeout waiting for command output');
+    const { session, clients } = buildReconnectableSession({
+      attemptFns: [
+        (c) => {
+          c.behaviour.onExec = (cmd, ch) => {
+            events.push(`live:${cmd}`);
+            setTimeout(() => c.emit('close'), 5);
+            setTimeout(() => ch.fail(idleError), 10);
+          };
+        },
+        (c) => {
+          c.behaviour.onExec = (cmd, ch) => {
+            events.push(`replay:${cmd}`);
+            ch.pushStdout('should-not-run');
+            ch.finish(0);
+          };
+        },
+      ],
+      envOverrides: {
+        reconnect: { maxAttempts: 1, backoffMs: 40, maxBackoffMs: 40 },
+      },
+    });
+
+    await session.open();
+    await expect(session.exec('will-idle-timeout')).rejects.toThrow('idle timeout');
+
+    await sleep(120);
+    expect(session.state).toBe('open');
+    expect(clients.length).toBe(2);
+    expect(events.some((event) => event.startsWith('replay:'))).toBe(false);
+  }, 5_000);
 });
 
 // ---------------------------------------------------------------------------

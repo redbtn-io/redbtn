@@ -66,6 +66,7 @@ describe('touchRunProgress', () => {
       lastProgressAt: now.toISOString(),
       redisUpdated: true,
       automationRunUpdated: true,
+      generationUpdated: false,
     });
     expect(setCalls).toHaveLength(1);
     expect(setCalls[0]).toMatchObject({
@@ -104,6 +105,87 @@ describe('touchRunProgress', () => {
     expect(result.automationRunUpdated).toBe(false);
     expect(automationRunsCollection.updateOne).not.toHaveBeenCalled();
     expect(JSON.parse(values.get(RunKeys.state(state.runId))!).lastProgressAt).toBe('2026-05-22T16:01:00.000Z');
+  });
+
+  it('writes the same heartbeat instant to Redis run state and generations', async () => {
+    const state = createInitialRunState({
+      runId: 'run-heartbeat-generation',
+      userId: 'user-1',
+      graphId: 'graph-1',
+      graphName: 'Graph 1',
+      input: {},
+    });
+    const { redis, values } = makeRedis(state);
+    const now = new Date('2026-05-22T16:01:30.000Z');
+    const generationsCollection = {
+      updateOne: vi.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
+    };
+
+    const result = await touchRunProgress({
+      redis: redis as any,
+      runId: state.runId,
+      generationId: state.runId,
+      generationsCollection,
+      now,
+    });
+
+    expect(result).toEqual({
+      lastProgressAt: now.toISOString(),
+      redisUpdated: true,
+      automationRunUpdated: false,
+      generationUpdated: true,
+    });
+    expect(JSON.parse(values.get(RunKeys.state(state.runId))!).lastProgressAt).toBe(now.toISOString());
+    expect(generationsCollection.updateOne).toHaveBeenCalledWith(
+      { runId: state.runId },
+      { $set: { lastProgressAt: now } },
+    );
+  });
+
+  it('throttles generations writes while keeping Redis heartbeats current', async () => {
+    const state = createInitialRunState({
+      runId: 'run-heartbeat-throttled-generation',
+      userId: 'user-1',
+      graphId: 'graph-1',
+      graphName: 'Graph 1',
+      input: {},
+    });
+    const { redis, values } = makeRedis(state);
+    const generationsCollection = {
+      updateOne: vi.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
+    };
+
+    const first = await touchRunProgress({
+      redis: redis as any,
+      runId: state.runId,
+      generationId: state.runId,
+      generationsCollection,
+      now: new Date('2026-05-22T16:01:40.000Z'),
+    });
+    const throttled = await touchRunProgress({
+      redis: redis as any,
+      runId: state.runId,
+      generationId: state.runId,
+      generationsCollection,
+      now: new Date('2026-05-22T16:01:45.000Z'),
+    });
+    const afterWindow = await touchRunProgress({
+      redis: redis as any,
+      runId: state.runId,
+      generationId: state.runId,
+      generationsCollection,
+      now: new Date('2026-05-22T16:01:55.000Z'),
+    });
+
+    expect(first.generationUpdated).toBe(true);
+    expect(throttled.generationUpdated).toBe(false);
+    expect(afterWindow.generationUpdated).toBe(true);
+    expect(generationsCollection.updateOne).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(values.get(RunKeys.state(state.runId))!).lastProgressAt).toBe('2026-05-22T16:01:55.000Z');
+    expect(generationsCollection.updateOne).toHaveBeenLastCalledWith(
+      { runId: state.runId },
+      { $set: { lastProgressAt: new Date('2026-05-22T16:01:55.000Z') } },
+    );
   });
 
   it('throttles automationruns writes while keeping Redis heartbeats current', async () => {

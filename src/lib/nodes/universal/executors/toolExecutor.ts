@@ -202,11 +202,15 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     // RunControlRegistry (survives checkpoint round-trips).
                     const mcpClient = state.mcpClient;
                     if (mcpClient) {
-                        return mcpClient.callTool(
+                        return callMcpToolWithIdleWatchdog(
+                            mcpClient,
                             toolName,
                             params,
-                            undefined,
+                            {},
                             getRunSignal(state),
+                            runPublisher || null,
+                            toolId,
+                            resolveMcpToolIdleTimeoutMs(config),
                         );
                     }
                     throw new Error(`Tool "${toolName}" not available in parser context`);

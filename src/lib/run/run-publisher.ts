@@ -34,6 +34,7 @@ import {
 import {
   touchRunProgress,
   type AutomationRunsCollection,
+  type GenerationsCollection,
 } from './progress-heartbeat';
 import { StreamPublisher, StreamSubscriber } from '@redbtn/redstream';
 import {
@@ -123,6 +124,10 @@ export interface RunPublisherOptions {
   automationRunId?: string;
   /** Optional automationruns collection handle for Mongo heartbeat mirroring. */
   automationRunsCollection?: AutomationRunsCollection;
+  /** Optional generation id to mirror progress heartbeat into Mongo. Defaults to runId. */
+  generationId?: string;
+  /** Optional generations collection handle for Mongo heartbeat mirroring. */
+  generationsCollection?: GenerationsCollection;
   /** TTL for run state in seconds (default: 1 hour) */
   stateTtl?: number;
   /** RedLog instance for structured logging */
@@ -150,6 +155,8 @@ export class RunPublisher {
   private readonly userId: string;
   private readonly automationRunId?: string;
   private readonly automationRunsCollection?: AutomationRunsCollection;
+  private readonly generationId: string;
+  private readonly generationsCollection?: GenerationsCollection;
   private readonly stateTtl: number;
   private readonly redlog?: RedLog;
   private state: RunState | null = null;
@@ -165,6 +172,8 @@ export class RunPublisher {
     this.userId = options.userId;
     this.automationRunId = options.automationRunId;
     this.automationRunsCollection = options.automationRunsCollection;
+    this.generationId = options.generationId ?? options.runId;
+    this.generationsCollection = options.generationsCollection;
     this.stateTtl = options.stateTtl ?? RunConfig.STATE_TTL_SECONDS;
     this.redlog = options.log;
   }
@@ -1083,6 +1092,8 @@ export class RunPublisher {
         runId: this.runId,
         automationRunId: this.automationRunId,
         automationRunsCollection: this.automationRunsCollection,
+        generationId: this.generationId,
+        generationsCollection: this.generationsCollection,
         stateTtlSeconds: this.stateTtl,
       });
       if (this.state && heartbeat.redisUpdated) {

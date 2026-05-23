@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MockSshChannel, MockSshClient } from '../environments/_helpers';
+import { flushAsync, MockSshChannel, MockSshClient } from '../environments/_helpers';
 import sshShellTool, { __setSshClientFactoryForTests } from '../../src/lib/tools/native/ssh-shell';
 
 function parseToolResult(result: { content: Array<{ text: string }> }) {
@@ -136,5 +136,48 @@ describe('ssh_shell inline output-idle watchdog', () => {
     expect(result.isError).toBeFalsy();
     expect(body.success).toBe(true);
     expect(body.stderr).toContain('err-4');
+  });
+
+  it('clears the inline idle timer and closes the connection on caller abort', async () => {
+    const abortController = new AbortController();
+    let primaryChannel: MockSshChannel | null = null;
+
+    useMockClientFactory((client) => {
+      client.behaviour.onExec = (command, channel) => {
+        if (command.startsWith('kill ')) {
+          channel.finish(0);
+          return;
+        }
+        primaryChannel = channel;
+        channel.pushStderr('__RDBTN_PID__=4245\n');
+      };
+    });
+
+    const resultPromise = sshShellTool.handler(
+      {
+        host: 'localhost',
+        user: 'alpha',
+        command: 'sleep 100',
+        timeout: 60,
+      },
+      { abortSignal: abortController.signal } as any,
+    );
+
+    await flushAsync();
+    expect(primaryChannel).not.toBeNull();
+
+    abortController.abort();
+    const result = await resultPromise;
+    const body = parseToolResult(result);
+
+    expect(result.isError).toBe(true);
+    expect(body.success).toBe(false);
+    expect(body.error).toContain('aborted by caller');
+    expect(clients[0].ended).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 90));
+
+    expect(primaryChannel?.signalled).toBeNull();
+    expect(clients[0].execCalls.some((cmd) => cmd.includes('kill -TERM -- -4245'))).toBe(false);
   });
 });
