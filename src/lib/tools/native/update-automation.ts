@@ -1,0 +1,136 @@
+/**
+ * Update Automation — Native Automation Tool
+ *
+ * Updates an existing automation via the webapp API
+ * (`PATCH /api/v1/automations/:automationId`).
+ *
+ * Spec: TOOL-HANDOFF.md §4.8
+ *   - inputs: automationId, name?, description?, tags?, triggers?, defaultInput?, inputMapping?, configOverrides?, concurrency?, scheduleMode?
+ *   - output: the updated automation doc
+ *
+ * Owner-only — server enforces via `verifyAutomationAccess(..., 'owner')`.
+ * Members and viewers receive 403.
+ *
+ * Use this to surgically patch an automation's config (e.g. changing a cron
+ * schedule or concurrency mode) without recreating it. Forbidden fields
+ * (automationId, userId, graphId) are ignored or rejected by the API.
+ */
+
+import type {
+  NativeToolDefinition,
+  NativeToolContext,
+  NativeMcpResult,
+} from '../native-registry';
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyObject = Record<string, any>;
+
+function getBaseUrl(): string {
+  return process.env.WEBAPP_URL || 'http://localhost:3000';
+}
+
+function buildHeaders(context: NativeToolContext): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+  const authToken =
+    (context?.state?.authToken as string | undefined) ||
+    (context?.state?.data?.authToken as string | undefined);
+  const userId =
+    (context?.state?.userId as string | undefined) ||
+    (context?.state?.data?.userId as string | undefined);
+  const internalKey = process.env.INTERNAL_SERVICE_KEY;
+
+  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+  if (userId) headers['X-User-Id'] = userId;
+  if (internalKey) headers['X-Internal-Key'] = internalKey;
+
+  return headers;
+}
+
+const updateAutomationTool: NativeToolDefinition = {
+  description:
+    "Surgically update an existing automation's configuration (name, description, tags, triggers, defaultInput, inputMapping, configOverrides, concurrency, scheduleMode). Owner-only.",
+  server: 'automation',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      automationId: {
+        type: 'string',
+        description: 'The automationId of the automation to update.',
+      },
+      name: { type: 'string' },
+      description: { type: 'string' },
+      tags: { type: 'array', items: { type: 'string' } },
+      triggers: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            type: { type: 'string', enum: ['webhook', 'schedule', 'manual', 'event'] },
+            config: { type: 'object', additionalProperties: true },
+            concurrency: { type: 'string', enum: ['allow', 'skip', 'queue', 'interrupt'] },
+          },
+          required: ['type'],
+        },
+      },
+      defaultInput: { type: 'object', additionalProperties: true },
+      inputMapping: { type: 'object', additionalProperties: true },
+      configOverrides: { type: 'object', additionalProperties: true },
+      concurrency: { type: 'string', enum: ['allow', 'skip', 'queue', 'interrupt'] },
+      scheduleMode: { type: 'string', enum: ['cron', 'interval'] },
+    },
+    required: ['automationId'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const { automationId, ...patch } = rawArgs as any;
+    
+    if (typeof automationId !== 'string' || !automationId.trim()) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'automationId is required', code: 'VALIDATION' }) }],
+        isError: true,
+      };
+    }
+
+    // Protection: don't even send forbidden fields if the LLM hallucinated them into the patch.
+    // The API enforces this too, but we catch it early for better feedback.
+    const forbidden = ['userId', 'graphId', 'createdAt', 'updatedAt'];
+    for (const key of forbidden) {
+      if (key in patch) delete patch[key];
+    }
+
+    const baseUrl = getBaseUrl();
+    const url = `${baseUrl}/api/v1/automations/${encodeURIComponent(automationId)}`;
+
+    try {
+      const response = await fetch(url, {
+        method: 'PATCH',
+        headers: buildHeaders(context),
+        body: JSON.stringify(patch),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify(data || { error: `Automation API ${response.status}`, status: response.status }) }],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ success: true, automation: data.automation || data }) }],
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: message, automationId }) }],
+        isError: true,
+      };
+    }
+  },
+};
+
+export default updateAutomationTool;
+module.exports = updateAutomationTool;

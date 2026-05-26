@@ -13,7 +13,7 @@ import type { ConditionalStepConfig } from './types';
 import type { LoopStepConfig } from './types';
 import type { ConnectionStepConfig } from './types';
 import type { GraphStepConfig } from './types';
-import { resolveValue } from './templateRenderer';
+import { resolveValue, renderTemplate } from './templateRenderer';
 import { runControlRegistry } from '../../run/RunControlRegistry';
 
 /**
@@ -29,6 +29,26 @@ export function getRunSignal(state: any): AbortSignal | undefined {
     return state?._abortController?.signal;
 }
 
+<<<<<<< HEAD
+// These imports resolve from the dist/ directory at runtime — they are
+// hand-maintained modules that have no source counterpart in src/.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { executeNeuron } = require('./executors/neuronExecutor') as { executeNeuron: (config: NeuronStepConfig, state: any) => Promise<Partial<any>> };
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { executeTool } = require('./executors/toolExecutor') as { executeTool: (config: ToolStepConfig, state: any) => Promise<Partial<any>> };
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { executeTransform } = require('./executors/transformExecutor') as { executeTransform: (config: TransformStepConfig, state: any) => Promise<Partial<any>> };
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { executeConditional } = require('./executors/conditionalExecutor') as { executeConditional: (config: ConditionalStepConfig, state: any) => Partial<any> };
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { executeLoop } = require('./executors/loopExecutor') as { executeLoop: (config: LoopStepConfig, state: any, parameters?: Record<string, any>) => Promise<Partial<any>> };
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { executeConnection } = require('./executors/connectionExecutor') as { executeConnection: (config: ConnectionStepConfig, state: any) => Promise<Partial<any>> };
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { executeGraph } = require('./executors/graphExecutor') as { executeGraph: (config: GraphStepConfig, state: any) => Promise<Partial<any>> };
+
+=======
+>>>>>>> origin/main
 /**
  * Execute a single step based on its type
  *
@@ -93,8 +113,11 @@ export async function executeStep(
         }
         case 'loop': {
             console.log(`[StepExecutor] Calling executeLoop...`);
+<<<<<<< HEAD
+=======
             // eslint-disable-next-line @typescript-eslint/no-require-imports
             const { executeLoop } = require('./executors/loopExecutor') as { executeLoop: (config: LoopStepConfig, state: any, parameters?: Record<string, any>) => Promise<Partial<any>> };
+>>>>>>> origin/main
             const result = await executeLoop(step.config as LoopStepConfig, state, parameters);
             console.log(`[StepExecutor] executeLoop completed in ${Date.now() - startTime}ms, result keys:`, Object.keys(result || {}));
             return result;
@@ -109,9 +132,15 @@ export async function executeStep(
         }
         case 'delay': {
             const rawMs = (step.config as any)?.ms ?? 1000;
+<<<<<<< HEAD
+            const renderedMs = renderTemplate(String(rawMs), { state, parameters });
+            const delayMs = parseInt(renderedMs, 10) || 1000;
+            console.log(`[StepExecutor] Executing delay: ${delayMs}ms (rendered from: ${rawMs})`);
+=======
             const resolvedMs = resolveValue(rawMs, { state, parameters });
             const delayMs = normalizeDelayMs(resolvedMs);
             console.log(`[StepExecutor] Executing delay: ${delayMs}ms (resolved from: ${rawMs})`);
+>>>>>>> origin/main
             // Abort-aware delay: respect the run-level AbortSignal so a long
             // delay in a node step yields immediately on external interrupt
             // instead of blocking until the timeout fires. The thrown error

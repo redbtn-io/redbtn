@@ -11,6 +11,7 @@
  */
 import type { LoopStepConfig } from '../types';
 import { executeStep } from '../stepExecutor';
+import { checkAbort } from '../universalNode';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -96,7 +97,11 @@ function resolveConfigValue(value: any, state: any): any {
  * @param state - Current state (includes data from previous steps)
  * @returns Partial state update with loop results
  */
-export async function executeLoop(config: LoopStepConfig, state: any): Promise<Partial<any>> {
+export async function executeLoop(
+  config: LoopStepConfig,
+  state: any,
+  parameters: Record<string, any> = {},
+): Promise<Partial<any>> {
     console.log('[LoopExecutor] ====== STARTING LOOP ======');
     console.log('[LoopExecutor] MaxIterations:', config.maxIterations);
     console.log('[LoopExecutor] ExitCondition:', config.exitCondition);
@@ -154,6 +159,9 @@ export async function executeLoop(config: LoopStepConfig, state: any): Promise<P
             }
         }
 
+        // Check for run abort before starting iteration
+        checkAbort(loopState);
+
         // Execute all steps in this iteration
         for (let stepIndex = 0; stepIndex < steps.length; stepIndex++) {
             const step = steps[stepIndex];
@@ -170,7 +178,7 @@ export async function executeLoop(config: LoopStepConfig, state: any): Promise<P
                     }
                 };
                 // Execute step
-                const stepUpdate = await executeStep(step, iterationState);
+                const stepUpdate = await executeStep(step, iterationState, parameters);
                 // Convert flat dot-notation keys to nested and deep merge
                 const nestedUpdate = convertFlatToNested(stepUpdate);
                 deepMergeInPlace(loopState, nestedUpdate);

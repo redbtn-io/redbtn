@@ -108,6 +108,16 @@ const NANOID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
  * Implementation matches `generate-id.ts` so output looks consistent across
  * the toolbox.
  */
+/**
+ * Wrap a string for safe interpolation into a remote bash command.
+ * See the same helper in ssh-shell.ts — single-quote everything; inside
+ * bash single quotes no character is interpreted, so backticks, $, and
+ * other metacharacters in user prompts stay literal.
+ */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 function makeJobId(): string {
   const bytes = randomBytes(8);
   let id = '';
@@ -115,17 +125,6 @@ function makeJobId(): string {
     id += NANOID_ALPHABET[bytes[i] & 0x3f];
   }
   return `job_${id}`;
-}
-
-/**
- * Bash-safe single-quote escape (see ssh-shell.ts for the long-form rationale).
- * `JSON.stringify` produces a *double-quoted* string and only escapes JSON-
- * special chars, leaving backticks, `$`, `!`, etc. active under `bash -c "..."`.
- * Inside `'...'` every byte except `'` itself is literal — bulletproof against
- * any user-supplied command content.
- */
-function shQuote(s: string): string {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 interface SshRunAsyncArgs {
@@ -175,13 +174,10 @@ function resolveUserId(context: NativeToolContext): string {
  * Build the wrapper command we run on the remote. Quoting + redirection
  * details matter — see the module-level JSDoc for the full breakdown.
  *
- * Why shQuote (and NOT JSON.stringify): JSON-string syntax is double-quoted
- * and only escapes `"`, `\`, and control chars. Backticks, `$`, `!`, and
- * other bash metacharacters survive intact, and inside the outer `bash -c
- * "..."` they become active again — any user prompt with code fences or
- * `$x` patterns would make the remote shell misparse the command (real
- * incident 2026-05-19, hours of empty `cliResult` worker runs). `shQuote`
- * single-quotes the arg, making every byte literal.
+ * Why all the JSON.stringify: it's a fast, stable way to produce a single
+ * shell-safe single-quoted-or-double-quoted token. Bash treats double-quoted
+ * strings with backslash-escaped chars sensibly, and Node's JSON.stringify
+ * always escapes the inner double-quotes that would terminate the string.
  *
  * Why we run it through `bash -c`: gives us subshell + backgrounding semantics
  * regardless of the user's login shell on the remote (some might be `sh`,
@@ -224,9 +220,8 @@ function buildWrapperCommand(
   // table, but we're already inside a fire-and-forget `bash -c` so the parent
   // shell exits as soon as the backgrounded subshell is launched. No disown
   // needed.
-  // shQuote (NOT JSON.stringify) — bash -c receives a single-quoted string so
-  // any user prompt content stays literal (see ssh-shell.ts for the full
-  // rationale and bug history).
+  // shQuote (NOT JSON.stringify) — bash -c receives a single-quoted string
+  // so backticks, $, and friends in any user prompt stay literal.
   const inner = `(nohup bash -c ${shQuote(body)} > ${outFile} 2> ${errFile}; echo $? > ${exitFile}) & echo $!`;
 
   return `bash -c ${shQuote(inner)}`;

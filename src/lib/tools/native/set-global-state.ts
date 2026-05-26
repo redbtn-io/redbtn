@@ -8,7 +8,7 @@
  *   - inputs: namespace (required), key (required), value (required, arbitrary JSON),
  *             description? (string, UI metadata),
  *             ttlSeconds? (number, server-enforced TTL)
- *   - output: { ok: true } on success, or structured error on 422 schema validation failure
+ *   - output: { ok: true }
  *
  * Auth: same Bearer / X-Internal-Key fallback pattern as other state tools.
  *
@@ -17,8 +17,6 @@
  *     with the caller as owner (see `ensureNamespaceForWrite`).
  *   - If the namespace exists but the caller lacks member+ access, the
  *     API returns 403 — that surfaces here as `isError: true`.
- *   - On 422 schema validation failure, returns structured error with
- *     `expectedSchema` and `validationErrors` fields for repair/retry.
  *   - Per the handoff spec, we do NOT use GlobalStateClient's in-memory
  *     cache. Each tool call is independent.
  */
@@ -62,20 +60,9 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
   return headers;
 }
 
-function extractErrorMessage(data: AnyObject): string | null {
-  if (typeof data.error === 'string') return data.error;
-  if (data.error && typeof data.error === 'object') {
-    const e = data.error as AnyObject;
-    if (typeof e.message === 'string') return e.message;
-  }
-  if (typeof data.message === 'string') return data.message;
-  return null;
-}
-
 const setGlobalStateTool: NativeToolDefinition = {
   description:
-    'Write a value into a global-state namespace. Use to persist data that survives across runs (e.g. a counter, a learned preference, a cached lookup). ' +
-    'If the namespace has a schema, validation errors (422) include expectedSchema and validationErrors fields for structured error handling.',
+    'Write a value into a global-state namespace. Use to persist data that survives across runs (e.g. a counter, a learned preference, a cached lookup).',
   server: 'state',
   inputSchema: {
     type: 'object',
@@ -174,37 +161,19 @@ const setGlobalStateTool: NativeToolDefinition = {
         body: JSON.stringify({ key, value, description, ttlSeconds }),
       });
 
-      const text = await response.text();
-      let data: unknown = null;
-      if (text.length > 0) {
-        try {
-          data = JSON.parse(text);
-        } catch {
-          data = { raw: text };
-        }
-      }
+      const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
         // Surface the webapp's error envelope verbatim. For 422 schema validation errors,
         // the webapp returns { error: { message, code }, expectedSchema, validationErrors }.
         // Pass through structured to the caller so graphs can handle validation feedback.
-        const body = data && typeof data === 'object' && !Array.isArray(data)
-          ? data as AnyObject
-          : {};
-        const error = extractErrorMessage(body) ||
-          `Global state API ${response.status} ${response.statusText}`;
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({
-                ...body,
-                error,
+              text: JSON.stringify(data || {
+                error: `Global state API ${response.status} ${response.statusText}`,
                 status: response.status,
-                details: {
-                  expectedSchema: body.expectedSchema,
-                  validationErrors: body.validationErrors,
-                },
               }),
             },
           ],

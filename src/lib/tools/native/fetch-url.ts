@@ -1,4 +1,6 @@
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
+import { isInternalHost } from './_internal-hosts';
+import { buildHeaders } from './_task-helpers';
 
 type AnyObject = Record<string, unknown>;
 
@@ -72,6 +74,32 @@ const fetchUrlTool: NativeToolDefinition = {
       const fetchHeaders: Record<string, string> = { ...headers };
       if (body && !fetchHeaders['Content-Type'] && !fetchHeaders['content-type']) {
         fetchHeaders['Content-Type'] = 'application/json';
+      }
+
+      // ── Internal-platform auth ───────────────────────────────────────────
+      // When the target is an allowlisted internal redbtn host, transparently
+      // attach the calling run owner's credentials (Bearer JWT / X-User-Id,
+      // resolved from the run context via the shared buildHeaders pattern) so
+      // the request is authorized as the run owner — agents can call platform
+      // APIs without minting a JWT or touching the DB.
+      //
+      // SECURITY: credentials are attached ONLY inside this branch. Every
+      // other host falls through untouched — the run owner's session must
+      // never leak to a third party. A header the caller set explicitly is
+      // never overwritten (case-insensitive check), so an explicit
+      // Authorization header always wins.
+      if (isInternalHost(url)) {
+        const hasHeader = (name: string): boolean => {
+          const lower = name.toLowerCase();
+          return Object.keys(fetchHeaders).some(h => h.toLowerCase() === lower);
+        };
+        const authHeaders = buildHeaders(context);
+        for (const key of ['Authorization', 'X-User-Id', 'X-Internal-Key'] as const) {
+          const value = authHeaders[key];
+          if (value && !hasHeader(key)) {
+            fetchHeaders[key] = value;
+          }
+        }
       }
 
       const MAX_RETRIES = 2;

@@ -150,6 +150,7 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   'get_automation',
   'enable_automation',
   'disable_automation',
+  'update_automation',
   'trigger_automation',
 
   // ── Graphs ──
@@ -1088,6 +1089,15 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
       disableAutomation.default || disableAutomation,
     );
     console.log('[NativeRegistry] Registered built-in tool: disable_automation');
+
+    // Update Automation — surgically patch config
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const updateAutomation = require('./native/update-automation.js');
+    registry.register(
+      'update_automation',
+      updateAutomation.default || updateAutomation,
+    );
+    console.log('[NativeRegistry] Registered built-in tool: update_automation');
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register disable_automation:', msg);
@@ -1785,5 +1795,53 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register invoke_tool:', msg);
+  }
+
+  // ─── RedRun integration tools ─────────────────────────────────────────────
+  // Four tools for managing RedRun workspaces from agents.
+  // Require env vars: REDRUN_API_URL, REDRUN_API_KEY (+ optional REDRUN_USER_ID).
+
+  try {
+    // redrun_get_env — GET workspace env map
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const redrunGetEnv = require('./native/redrun-get-env.js');
+    registry.register('redrun_get_env', redrunGetEnv.default || redrunGetEnv);
+    console.log('[NativeRegistry] Registered built-in tool: redrun_get_env');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register redrun_get_env:', msg);
+  }
+
+  try {
+    // redrun_set_env — PATCH workspace to add/update env keys
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const redrunSetEnv = require('./native/redrun-set-env.js');
+    registry.register('redrun_set_env', redrunSetEnv.default || redrunSetEnv);
+    console.log('[NativeRegistry] Registered built-in tool: redrun_set_env');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register redrun_set_env:', msg);
+  }
+
+  try {
+    // redrun_delete_env — PATCH workspace to remove env keys
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const redrunDeleteEnv = require('./native/redrun-delete-env.js');
+    registry.register('redrun_delete_env', redrunDeleteEnv.default || redrunDeleteEnv);
+    console.log('[NativeRegistry] Registered built-in tool: redrun_delete_env');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register redrun_delete_env:', msg);
+  }
+
+  try {
+    // redrun_deploy — git-sync + build + redeploy + poll
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const redrunDeploy = require('./native/redrun-deploy.js');
+    registry.register('redrun_deploy', redrunDeploy.default || redrunDeploy);
+    console.log('[NativeRegistry] Registered built-in tool: redrun_deploy');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register redrun_deploy:', msg);
   }
 }

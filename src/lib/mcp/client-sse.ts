@@ -16,11 +16,13 @@ export class McpClientSSE {
   private serverName: string;
   private sessionId: string;
   private requestId = 0;
+  private extraHeaders: Record<string, string>;
 
-  constructor(serverUrl: string, serverName: string) {
+  constructor(serverUrl: string, serverName: string, headers?: Record<string, string>) {
     this.serverUrl = serverUrl;
     this.serverName = serverName;
     this.sessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    this.extraHeaders = headers ?? {};
   }
 
   /**
@@ -29,7 +31,9 @@ export class McpClientSSE {
   async connect(): Promise<void> {
     // Test connection with health check
     try {
-      const response = await fetch(`${this.serverUrl}/health`);
+      const response = await fetch(`${this.serverUrl}/health`, {
+        headers: { ...this.extraHeaders },
+      });
       if (!response.ok) {
         throw new Error(`Server health check failed: ${response.status}`);
       }
@@ -143,6 +147,7 @@ export class McpClientSSE {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          ...this.extraHeaders,
         },
         body: JSON.stringify(request),
         signal,
@@ -182,6 +187,7 @@ export class McpClientSSE {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        ...this.extraHeaders,
       },
       body: JSON.stringify(notification),
     });

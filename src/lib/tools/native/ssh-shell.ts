@@ -41,13 +41,6 @@ import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvi
 const MAX_RETURN_BYTES = Infinity;
 const MAX_STDERR_BYTES = Infinity;
 const MAX_BUFFER_BYTES = Infinity;
-const DEFAULT_INLINE_OUTPUT_IDLE_TIMEOUT_MS = Number(process.env.SSH_SHELL_IDLE_TIMEOUT_MS || 30 * 60 * 1000);
-
-let sshClientFactory: () => Client = () => new Client();
-
-export function __setSshClientFactoryForTests(factory: (() => Client) | null): void {
-  sshClientFactory = factory || (() => new Client());
-}
 
 /**
  * Bash-safe single-quote escape. Wraps the input in `'...'` and turns each
@@ -56,17 +49,15 @@ export function __setSshClientFactoryForTests(factory: (() => Client) | null): v
  * `JSON.stringify` is NOT a substitute — JSON-string syntax is double-quoted
  * and only escapes `"`, `\`, and control chars. Backticks, `$`, `!`, `\n`,
  * etc. survive intact, and inside `bash -c "..."` they remain active for
- * command substitution and variable expansion. Same idiom as `shQuote` in
- * `grep-files.ts`. Inside `'...'`, every byte except `'` itself is literal.
+ * command substitution and variable expansion. A worker prompt containing
+ * ```` ```json ```` would make bash misparse the wrapped command — the bug
+ * that caused empty `cliResult` outputs and apparent hangs on 2026-05-19.
+ *
+ * Inside `'...'`, every byte except `'` itself is literal — bulletproof.
+ * Same idiom as `shQuote` in `grep-files.ts`.
  */
 function shQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-function normalizeInlineOutputIdleTimeout(timeout: unknown): number {
-  const resolved = typeof timeout === 'number' ? timeout : Number(timeout);
-  if (Number.isFinite(resolved) && resolved >= 0) return resolved;
-  return DEFAULT_INLINE_OUTPUT_IDLE_TIMEOUT_MS;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -139,8 +130,8 @@ const sshShell: NativeToolDefinition = {
       },
       timeout: {
         type: 'number',
-        description: 'Output idle timeout in milliseconds. The command is killed only after no stdout/stderr bytes arrive for this window. 0 disables the idle watchdog.',
-        default: DEFAULT_INLINE_OUTPUT_IDLE_TIMEOUT_MS,
+        description: 'Timeout in milliseconds. 0 means no timeout (default: 0).',
+        default: 0,
       },
       env: {
         type: 'object',
@@ -163,7 +154,7 @@ const sshShell: NativeToolDefinition = {
       password,
       command,
       workingDir,
-      timeout = DEFAULT_INLINE_OUTPUT_IDLE_TIMEOUT_MS,
+      timeout = 0,
       env = {},
     } = args;
 
@@ -237,33 +228,30 @@ const sshShell: NativeToolDefinition = {
     // `set -m` enables job control; `exec` replaces the wrapping bash
     // with the user command, keeping the captured $$ valid. The marker
     // is emitted on stderr and filtered out before output is returned.
-    const PID_MARKER = '__RDBTN_PID__=';
     // shQuote (NOT JSON.stringify) — the inner command rides inside
-    // single-quoted bash so backticks, $, !, and friends in any prompt
-    // stay literal. JSON.stringify produced a double-quoted arg and left
-    // those chars active to the outer bash, which broke on triple-backtick
-    // code fences with "unexpected EOF while looking for matching backtick".
+    // single-quoted bash so backticks, $, `!`, and friends in any prompt
+    // stay literal.
+    const PID_MARKER = '__RDBTN_PID__=';
     fullCommand = `set -m; echo ${PID_MARKER}$$ 1>&2; exec bash -c ${shQuote(fullCommand)}`;
-    const outputIdleTimeoutMs = normalizeInlineOutputIdleTimeout(timeout);
 
-    return new Promise((resolve, reject) => {
-      const conn = sshClientFactory();
+    return new Promise((resolve) => {
+      const conn = new Client();
       let stdout = '';
       let stderr = '';
       let exitCode: number | null = null;
-      let outputIdleTimer: NodeJS.Timeout | null = null;
+      let timeoutTimer: NodeJS.Timeout | null = null;
       let settled = false;
       let remotePid: number | null = null;
       let unregisterCancel: (() => void) | null = null;
       const startTime = Date.now();
 
-      const settle = (error: Error | null, options: { reject?: boolean } = {}) => {
+      const settle = (error: Error | null) => {
         if (settled) return;
         settled = true;
 
-        if (outputIdleTimer) {
-          clearTimeout(outputIdleTimer);
-          outputIdleTimer = null;
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+          timeoutTimer = null;
         }
 
         if (statusInterval) {
@@ -282,10 +270,6 @@ const sshShell: NativeToolDefinition = {
 
         if (error) {
           console.error(`[ssh_shell] Error after ${duration}ms: ${error.message}`);
-          if (options.reject) {
-            reject(error);
-            return;
-          }
           resolve({
             content: [{
               type: 'text',
@@ -336,6 +320,12 @@ const sshShell: NativeToolDefinition = {
           }],
         });
       };
+
+      if (timeout > 0) {
+        timeoutTimer = setTimeout(() => {
+          settle(new Error(`SSH command timed out after ${Math.round(timeout / 1000)}s`));
+        }, timeout);
+      }
 
       if (context?.abortSignal) {
         context.abortSignal.addEventListener('abort', () => {
@@ -420,40 +410,6 @@ const sshShell: NativeToolDefinition = {
             return settle(err);
           }
 
-          const killRemoteProcess = (reason: string) => {
-            if (settled) return;
-            const pid = remotePid;
-            console.log(`[ssh_shell] Killing remote command — ${reason}; pid=${pid ?? 'unknown'} run=${runId ?? 'none'}`);
-            try { stream.signal('KILL'); } catch (_) { /* ignore */ }
-            if (pid && pid > 1) {
-              try {
-                conn.exec(`kill -TERM -- -${pid} 2>/dev/null; sleep 1; kill -KILL -- -${pid} 2>/dev/null; true`, { pty: false }, (kerr, kstream) => {
-                  if (kerr) {
-                    console.warn(`[ssh_shell] kill side-channel exec failed: ${kerr.message}`);
-                    return;
-                  }
-                  kstream.on('close', () => console.log(`[ssh_shell] Remote pid ${pid} kill exited`));
-                  kstream.resume?.();
-                  kstream.stderr.resume?.();
-                });
-              } catch (e: unknown) {
-                console.warn('[ssh_shell] kill side-channel threw:', e instanceof Error ? e.message : String(e));
-              }
-            }
-          };
-
-          const armOutputIdleTimer = () => {
-            if (outputIdleTimeoutMs <= 0 || settled) return;
-            if (outputIdleTimer) clearTimeout(outputIdleTimer);
-            outputIdleTimer = setTimeout(() => {
-              killRemoteProcess(`no stdout/stderr for ${outputIdleTimeoutMs}ms`);
-              settle(new Error(`SSH command produced no output for ${Math.round(outputIdleTimeoutMs / 1000)}s`), { reject: true });
-            }, outputIdleTimeoutMs);
-            outputIdleTimer.unref?.();
-          };
-
-          armOutputIdleTimer();
-
           // Register cancel callback that kills the remote process group.
           // Runs when runControlRegistry.cancel(runId) fires (interrupt
           // arrives from /api/v1/runs/:runId/interrupt). Cooperative
@@ -467,13 +423,37 @@ const sshShell: NativeToolDefinition = {
             const { runControlRegistry } = require('../../run/RunControlRegistry');
             unregisterCancel = runControlRegistry.registerOnCancel(runId, () => {
               if (settled) return;
-              killRemoteProcess('run interrupt');
+              const pid = remotePid;
+              console.log(`[ssh_shell] Cancel callback firing — pid=${pid ?? 'unknown'} run=${runId}`);
+              // 1. Cooperative: signal the channel. Many sshd configs
+              //    ignore signal requests, but it's free to try.
+              try { stream.signal('KILL'); } catch (_) { /* ignore */ }
+              // 2. Force-kill via a side-channel exec on the SAME
+              //    connection. Kills the process group so any children
+              //    spawned by the user command die too. Only attempt if
+              //    we captured the PID; otherwise rely on conn.end()
+              //    in settle() to drop the channel.
+              if (pid && pid > 1) {
+                try {
+                  conn.exec(`kill -TERM -- -${pid} 2>/dev/null; sleep 1; kill -KILL -- -${pid} 2>/dev/null; true`, { pty: false }, (kerr, kstream) => {
+                    if (kerr) {
+                      console.warn(`[ssh_shell] kill side-channel exec failed: ${kerr.message}`);
+                      return;
+                    }
+                    kstream.on('close', () => console.log(`[ssh_shell] Remote pid ${pid} kill exited`));
+                    kstream.resume();
+                    kstream.stderr.resume();
+                  });
+                } catch (e: unknown) {
+                  console.warn('[ssh_shell] kill side-channel threw:', e instanceof Error ? e.message : String(e));
+                }
+              }
+              // 3. Settle locally with abort error.
               setTimeout(() => settle(new Error('SSH command cancelled by run interrupt')), 50);
             });
           }
 
           stream.on('data', (data: Buffer) => {
-            armOutputIdleTimer();
             const chunk = data.toString('utf8');
             stdout += chunk;
 
@@ -507,7 +487,6 @@ const sshShell: NativeToolDefinition = {
           });
 
           stream.stderr.on('data', (data: Buffer) => {
-            armOutputIdleTimer();
             let chunk = data.toString('utf8');
 
             // Strip + capture the PID marker emitted by the wrapper. The
@@ -786,8 +765,4 @@ async function executeViaEnvironment(args: ExecuteViaEnvironmentArgs): Promise<N
 
 export default sshShell;
 // Also export as module.exports for CJS require() compatibility (the .js files use require())
-try {
-  module.exports = sshShell;
-} catch {
-  // Vitest's ESM transform exposes module.exports as a read-only namespace.
-}
+module.exports = sshShell;

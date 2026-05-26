@@ -190,23 +190,13 @@ const statePatchTool: NativeToolDefinition = {
         // Surface the webapp's error envelope verbatim — webapp returns
         // `{ error: '...' }` (legacy) or `{ error: { message, type, code } }`
         // (newer). Either way we pass through to the caller.
-        const body = data && typeof data === 'object' && !Array.isArray(data)
-          ? data as AnyObject
-          : {};
-        const error = extractErrorMessage(body) ||
-          `State patch API ${response.status} ${response.statusText}`;
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({
-                ...body,
-                error,
+              text: JSON.stringify(data || {
+                error: `State patch API ${response.status} ${response.statusText}`,
                 status: response.status,
-                details: {
-                  expectedSchema: body.expectedSchema,
-                  validationErrors: body.validationErrors,
-                },
               }),
             },
           ],
