@@ -348,8 +348,12 @@ function readPositiveMs(raw: unknown, fallback: number): number {
 }
 
 function getRunProgressIdleTimeoutMs(compiledGraph: any): number {
+  // Same nesting issue as getRunConfigTimeoutMs — read both nested
+  // (`config.config.X`) and legacy top-level positions.
   return readPositiveMs(
-    compiledGraph?.config?.progressIdleTimeoutMs
+    compiledGraph?.config?.config?.progressIdleTimeoutMs
+      ?? compiledGraph?.config?.config?.runProgressIdleTimeoutMs
+      ?? compiledGraph?.config?.progressIdleTimeoutMs
       ?? compiledGraph?.config?.runProgressIdleTimeoutMs
       ?? process.env.RUN_PROGRESS_IDLE_TIMEOUT_MS,
     DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS,
@@ -364,7 +368,15 @@ function getRunProgressWatchdogIntervalMs(idleTimeoutMs: number): number {
 }
 
 function getRunConfigTimeoutMs(compiledGraph: any): number {
-  const configuredSeconds = compiledGraph?.config?.timeout;
+  // `compiledGraph.config` is the whole GraphConfig; per-graph timeout lives
+  // on its nested `config: GraphGlobalConfig` block. The original read used
+  // `compiledGraph.config.timeout` which is undefined on every graph in the
+  // wild — that fell through to the env / 5-minute default and silently
+  // capped every chat/agent/worker run at 300s. Read the nested path; also
+  // accept the legacy top-level position for forward-compat if anything is
+  // ever shaped that way.
+  const configuredSeconds =
+    compiledGraph?.config?.config?.timeout ?? compiledGraph?.config?.timeout;
   if (configuredSeconds !== undefined && configuredSeconds !== null) {
     const seconds = typeof configuredSeconds === 'number' ? configuredSeconds : Number(configuredSeconds);
     if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
