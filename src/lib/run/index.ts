@@ -38,6 +38,7 @@ export {
   type ThinkingCompleteEvent,
   type ToolStartEvent,
   type ToolProgressEvent,
+  type ToolOutputEvent,
   type ToolCompleteEvent,
   type ToolErrorEvent,
   type AudioChunkEvent,
@@ -102,3 +103,27 @@ export {
   type CancelNoAck,
   type CancelResult,
 } from './RunControlRegistry';
+
+export {
+  readRunProgress,
+  isRunProgressStale,
+  touchRunProgress,
+  type AutomationRunsCollection,
+  type GenerationsCollection,
+  type ReadRunProgressOptions,
+  type RunProgressSnapshot,
+  type TouchRunProgressOptions,
+  type TouchRunProgressResult,
+} from './progress-heartbeat';
+
+export {
+  classifyRunProgressStaleness,
+  normalizeLastProgressAt,
+  type AutomationRunProgressRecord,
+  type GenerationProgressRecord,
+  type RedisRunProgressRecord,
+  type RunProgressHeartbeat,
+  type RunProgressReadableRecord,
+  type RunProgressStalenessOptions,
+  type RunProgressStalenessResult,
+} from './progress-contract';

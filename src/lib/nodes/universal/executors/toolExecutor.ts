@@ -10,8 +10,13 @@ import { executeWithErrorHandling } from './errorHandler';
 import { getParserRegistry } from './parserRegistry';
 import { ParserExecutor } from './parserExecutor';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
+import { ToolHangError, withToolIdleWatchdog, type ToolIdleWatchdogHandle } from '../../../tools/tool-idle-watchdog';
+import { getNativeRegistry } from '../../../tools/native-registry';
 import type { ToolStepConfig } from '../types';
-const { getNativeRegistry } = require('../../../tools/native-registry.js');
+
+function getNativeRegistryLazy(): any {
+    return getNativeRegistry();
+}
 
 /**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
@@ -37,6 +42,12 @@ interface ResolvedToolCredentials {
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
+const DEFAULT_NATIVE_TOOL_IDLE_TIMEOUT_MS = Number(process.env.NATIVE_TOOL_IDLE_TIMEOUT_MS || 30 * 60 * 1000);
+const DEFAULT_MCP_TOOL_IDLE_TIMEOUT_MS = Number(
+    process.env.MCP_TOOL_IDLE_TIMEOUT_MS
+    || process.env.NATIVE_TOOL_IDLE_TIMEOUT_MS
+    || 30 * 60 * 1000
+);
 
 /**
  * Normalize tool step config by converting legacy inputMapping format to parameters format
@@ -180,7 +191,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
             const parserDef = await registry.getParser((config as any).streamParser);
             if (parserDef) {
                 // Build tool executor callback for parser tool steps (e.g. send-discord)
-                const nativeReg = getNativeRegistry();
+                const nativeReg = getNativeRegistryLazy();
                 const parserToolExecutor = async (toolName: string, params: Record<string, any>) => {
                     if (nativeReg.has(toolName)) {
                         const tool = nativeReg.get(toolName);
@@ -191,11 +202,15 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     // RunControlRegistry (survives checkpoint round-trips).
                     const mcpClient = state.mcpClient;
                     if (mcpClient) {
-                        return mcpClient.callTool(
+                        return callMcpToolWithIdleWatchdog(
+                            mcpClient,
                             toolName,
                             params,
-                            undefined,
+                            {},
                             getRunSignal(state),
+                            runPublisher || null,
+                            toolId,
+                            resolveMcpToolIdleTimeoutMs(config),
                         );
                     }
                     throw new Error(`Tool "${toolName}" not available in parser context`);
@@ -366,7 +381,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
         // -------------------------------------------------------------------------
         // Native tool fast path — check BEFORE MCP to avoid JSON-RPC overhead
         // -------------------------------------------------------------------------
-        const nativeRegistry = getNativeRegistry();
+        const nativeRegistry = getNativeRegistryLazy();
         if (nativeRegistry.has(config.toolName)) {
             console.log(`[ToolExecutor] Routing to native tool: ${config.toolName}`);
             if (runPublisher) {
@@ -374,7 +389,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
             }
 
             // Build onChunk callback for real-time stream parsing
-            const onChunk = (parserExecutor && (useRunPublisherForConv || (convPublisher && streamMessageId)))
+            const parserOnChunk = (parserExecutor && (useRunPublisherForConv || (convPublisher && streamMessageId)))
                 ? (chunk: any, streamType: string) => {
                     const sf: string = (config as any).streamFilter || 'stdout';
                     if (sf !== 'all' && sf !== streamType) return;
@@ -443,6 +458,9 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     }
                 }
                 : undefined;
+            const onChunk = (chunk: any, streamType: string) => {
+                if (parserOnChunk) return parserOnChunk(chunk, streamType);
+            };
 
             // Build context for the native tool handler
             // Signal resolved from RunControlRegistry — survives checkpoints.
@@ -472,7 +490,13 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                         }
                         await new Promise(resolve => setTimeout(resolve, attempt * 1000));
                     }
-                    const nativeResult = await nativeRegistry.callTool(config.toolName, renderedParams, nativeContext);
+                    const nativeResult = await callNativeToolWithIdleWatchdog(
+                        nativeRegistry,
+                        config.toolName,
+                        renderedParams,
+                        nativeContext,
+                        resolveNativeToolIdleTimeoutMs(config),
+                    );
                     // Extract result content using the same logic as the MCP path
                     let extractedNativeResult: any = nativeResult;
                     if (nativeResult && !nativeResult.isError && nativeResult.content && Array.isArray(nativeResult.content)) {
@@ -575,11 +599,15 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                 // are stripped between nodes — see RunControlRegistry.ts).
                 if (DEBUG)
                     console.log(`[ToolExecutor] Calling mcpClient.callTool: ${config.toolName}`);
-                const result = await mcpClient.callTool(
+                const result = await callMcpToolWithIdleWatchdog(
+                    mcpClient,
                     config.toolName,
                     renderedParams,
                     meta,
                     getRunSignal(state),
+                    runPublisher || null,
+                    toolId,
+                    resolveMcpToolIdleTimeoutMs(config),
                 );
                 if (DEBUG)
                     console.log(`[ToolExecutor] mcpClient.callTool returned for ${config.toolName}`);
@@ -706,6 +734,178 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
             outputField: config.outputField,
             error: errorMessage
         });
+        if (error instanceof ToolHangError) {
+            throw error;
+        }
         throw new Error(`Tool step failed: ${errorMessage}`);
     }
+}
+
+function resolveNativeToolIdleTimeoutMs(config: ToolStepConfig): number {
+    const raw = (config as any).idleTimeoutMs ?? (config as any).toolIdleTimeoutMs;
+    const resolved = typeof raw === 'number' ? raw : Number(raw);
+    if (Number.isFinite(resolved) && resolved >= 0) return resolved;
+    return DEFAULT_NATIVE_TOOL_IDLE_TIMEOUT_MS;
+}
+
+function resolveMcpToolIdleTimeoutMs(config: ToolStepConfig): number {
+    const raw = (config as any).idleTimeoutMs ?? (config as any).toolIdleTimeoutMs;
+    const resolved = typeof raw === 'number' ? raw : Number(raw);
+    if (Number.isFinite(resolved) && resolved >= 0) return resolved;
+    return DEFAULT_MCP_TOOL_IDLE_TIMEOUT_MS;
+}
+
+async function callNativeToolWithIdleWatchdog(
+    nativeRegistry: any,
+    toolName: string,
+    renderedParams: Record<string, any>,
+    nativeContext: any,
+    idleTimeoutMs: number,
+): Promise<any> {
+    const runSignal = nativeContext.abortSignal as AbortSignal | null;
+    const localAbortController = new AbortController();
+    let removeRunAbortListener: (() => void) | null = null;
+
+    if (runSignal?.aborted) {
+        localAbortController.abort(runSignal.reason);
+    } else if (runSignal) {
+        const onRunAbort = () => {
+            if (!localAbortController.signal.aborted) {
+                localAbortController.abort(runSignal.reason);
+            }
+        };
+        runSignal.addEventListener('abort', onRunAbort, { once: true });
+        removeRunAbortListener = () => runSignal.removeEventListener('abort', onRunAbort);
+    }
+
+    try {
+        return await withToolIdleWatchdog(
+            (watchdog) => nativeRegistry.callTool(
+                toolName,
+                renderedParams,
+                createProgressAwareNativeContext(nativeContext, watchdog, localAbortController.signal),
+            ),
+            {
+                idleTimeoutMs,
+                toolName,
+                abortController: localAbortController,
+            },
+        );
+    } finally {
+        removeRunAbortListener?.();
+    }
+}
+
+function createProgressAwareNativeContext(
+    nativeContext: any,
+    watchdog: ToolIdleWatchdogHandle,
+    abortSignal: AbortSignal,
+): any {
+    return {
+        ...nativeContext,
+        abortSignal,
+        publisher: wrapPublisherForProgress(nativeContext.publisher, watchdog),
+        onChunk: nativeContext.onChunk
+            ? (chunk: string, stream: 'stdout' | 'stderr') => {
+                watchdog.markProgress();
+                return nativeContext.onChunk(chunk, stream);
+            }
+            : undefined,
+    };
+}
+
+async function callMcpToolWithIdleWatchdog(
+    mcpClient: any,
+    toolName: string,
+    renderedParams: Record<string, any>,
+    meta: Record<string, any>,
+    runSignal: AbortSignal | undefined,
+    runPublisher: any,
+    toolId: string,
+    idleTimeoutMs: number,
+): Promise<any> {
+    const localAbortController = new AbortController();
+    let removeRunAbortListener: (() => void) | null = null;
+
+    if (runSignal?.aborted) {
+        localAbortController.abort(runSignal.reason);
+    } else if (runSignal) {
+        const onRunAbort = () => {
+            if (!localAbortController.signal.aborted) {
+                localAbortController.abort(runSignal.reason);
+            }
+        };
+        runSignal.addEventListener('abort', onRunAbort, { once: true });
+        removeRunAbortListener = () => runSignal.removeEventListener('abort', onRunAbort);
+    }
+
+    try {
+        return await withToolIdleWatchdog(
+            (watchdog) => mcpClient.callTool(
+                toolName,
+                renderedParams,
+                createProgressAwareMcpMeta(meta, watchdog, runPublisher, toolId),
+                localAbortController.signal,
+            ),
+            {
+                idleTimeoutMs,
+                toolName,
+                abortController: localAbortController,
+            },
+        );
+    } finally {
+        removeRunAbortListener?.();
+    }
+}
+
+function createProgressAwareMcpMeta(
+    meta: Record<string, any>,
+    watchdog: ToolIdleWatchdogHandle,
+    runPublisher: any,
+    toolId: string,
+): Record<string, any> {
+    const progressAwareMeta = { ...meta };
+
+    // These hooks are intentionally non-enumerable. In-process MCP adapters and
+    // tests can use them to report progress, while JSON-RPC transports will not
+    // serialize function/proxy values into the remote _meta payload.
+    Object.defineProperties(progressAwareMeta, {
+        publisher: {
+            enumerable: false,
+            value: wrapPublisherForProgress(runPublisher, watchdog),
+        },
+        toolId: {
+            enumerable: false,
+            value: toolId,
+        },
+        markProgress: {
+            enumerable: false,
+            value: watchdog.markProgress,
+        },
+    });
+
+    return progressAwareMeta;
+}
+
+function wrapPublisherForProgress(publisher: any, watchdog: ToolIdleWatchdogHandle): any {
+    if (!publisher || typeof publisher !== 'object') return publisher;
+    const progressMethods = new Set([
+        'toolProgress',
+        'chunk',
+        'thinkingChunk',
+        'attachment',
+        'publishAudioChunk',
+    ]);
+    return new Proxy(publisher, {
+        get(target, prop, receiver) {
+            const value = Reflect.get(target, prop, receiver);
+            if (typeof prop === 'string' && progressMethods.has(prop) && typeof value === 'function') {
+                return (...args: any[]) => {
+                    watchdog.markProgress();
+                    return value.apply(target, args);
+                };
+            }
+            return value;
+        },
+    });
 }

@@ -98,6 +98,24 @@ const KEEPALIVE_COUNT_MAX = 5;
 /** Exec polling timeout for the close event before settling with whatever we have. */
 const EXEC_DRAIN_GRACE_MS = 100;
 
+function isDefinitiveTimeoutOrIdleError(err: unknown): boolean {
+  if (err instanceof EnvironmentTimeoutError) return true;
+  if (!err || typeof err !== 'object') return false;
+
+  const maybeError = err as { name?: unknown; code?: unknown; message?: unknown };
+  const name = typeof maybeError.name === 'string' ? maybeError.name : '';
+  const code = typeof maybeError.code === 'string' ? maybeError.code : '';
+  const message = typeof maybeError.message === 'string' ? maybeError.message : '';
+
+  return (
+    code === 'ENV_TIMEOUT'
+    || code === 'TOOL_IDLE_TIMEOUT'
+    || name === 'EnvironmentTimeoutError'
+    || name === 'ToolHangError'
+    || /idle timeout|idle-timeout|no progress|made no progress|timed out|timeout/i.test(message)
+  );
+}
+
 /**
  * Factory function the session uses to construct its underlying SSH client.
  * Defaulted to the real `ssh2.Client` constructor; tests inject a mock.
@@ -179,6 +197,7 @@ export class EnvironmentSession extends EventEmitter {
   // Lifecycle timers — both pause during degraded
   private idleTimer: InternalTimer | null = null;
   private maxLifetimeTimer: InternalTimer | null = null;
+  private degradedTimer: NodeJS.Timeout | null = null;
 
   // ssh2 + open hooks
   private readonly clientFactory: SshClientFactory;
@@ -822,6 +841,7 @@ export class EnvironmentSession extends EventEmitter {
 
     this.transitionTo('degraded', reason);
     this.pauseTimers();
+    this.startDegradedTimer();
     this.scheduleReconnect();
   }
 
@@ -885,6 +905,7 @@ export class EnvironmentSession extends EventEmitter {
       // the user can include that idempotency in the command itself.
       this.client = client;
       this.reconnectAttempt = 0;
+      this.clearDegradedTimer();
       this.transitionTo('open', 'reconnected');
       this.resumeTimers();
       // Drain pending commands FIFO.
@@ -961,7 +982,7 @@ export class EnvironmentSession extends EventEmitter {
           const result = await op();
           resolve(result);
         } catch (err) {
-          if (this.state === 'degraded') {
+          if (this.state === 'degraded' && !isDefinitiveTimeoutOrIdleError(err)) {
             // Re-queue for replay. The pending entry's promise resolves the
             // outer promise — we deliberately fire-and-forget here so the
             // serialize chain progresses (otherwise we'd deadlock on drain).
@@ -1133,6 +1154,26 @@ export class EnvironmentSession extends EventEmitter {
   private clearTimers(): void {
     this.clearTimer('idleTimer');
     this.clearTimer('maxLifetimeTimer');
+    this.clearDegradedTimer();
+  }
+
+  private startDegradedTimer(): void {
+    this.clearDegradedTimer();
+    const ms = this.env.maxDegradedMs ?? ENV_DEFAULTS.maxDegradedMs;
+    if (!ms || ms <= 0) return;
+    this.degradedTimer = setTimeout(() => {
+      this.degradedTimer = null;
+      if (this.state !== 'degraded') return;
+      void this.close('degraded-timeout');
+    }, ms);
+    this.degradedTimer.unref?.();
+  }
+
+  private clearDegradedTimer(): void {
+    if (this.degradedTimer) {
+      clearTimeout(this.degradedTimer);
+      this.degradedTimer = null;
+    }
   }
 
   /**

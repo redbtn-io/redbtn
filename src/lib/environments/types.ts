@@ -130,6 +130,8 @@ export interface IEnvironment {
   idleTimeoutMs: number;
   /** Hard kill after this many ms. Default 28800000 (8 h). */
   maxLifetimeMs: number;
+  /** Hard ceiling for time spent degraded. Default 1800000 (30 min). */
+  maxDegradedMs?: number;
   /** Reconnect policy when the SSH connection drops mid-session. */
   reconnect: EnvironmentReconnectPolicy;
 
@@ -427,6 +429,7 @@ export const ENV_DEFAULTS = {
   port: 22,
   idleTimeoutMs: 5 * 60 * 1000, // 5 min
   maxLifetimeMs: 8 * 60 * 60 * 1000, // 8 h
+  maxDegradedMs: 30 * 60 * 1000, // 30 min
   reconnect: {
     maxAttempts: 5,
     backoffMs: 2000,
