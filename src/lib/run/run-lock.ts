@@ -1,10 +1,13 @@
 /**
  * Run Lock
  *
- * Distributed lock for run execution. Ensures only one run per conversation
- * can execute at a time. Uses Redis with automatic expiration and renewal.
+ * Distributed lock for run execution. Ensures only one run per (conversation,
+ * agent) pair can execute at a time. Uses Redis with automatic expiration
+ * and renewal.
  *
- * Key pattern: `run:lock:{conversationId}`
+ * Key pattern: `run:lock:{conversationId}` or
+ *              `run:lock:{conversationId}:{agentId}` when an agentId is
+ *              supplied (group-chat / agent-instance flows).
  *
  * @module lib/run/run-lock
  */
@@ -35,6 +38,8 @@ export interface AcquireLockOptions {
 export interface RunLockHandle {
   token: string;
   conversationId: string;
+  /** Set when the lock was acquired with an agentId (agent-instance / group-chat flow). */
+  agentId?: string;
   release: () => Promise<boolean>;
   stopRenewal: () => void;
 }
@@ -63,7 +68,8 @@ export class RunLock {
   constructor(private readonly redis: Redis) {}
 
   async acquire(conversationId: string, options?: AcquireLockOptions & { agentId?: string }): Promise<RunLockHandle | null> {
-    const key = RunKeys.lock(conversationId, options?.agentId);
+    const agentId = options?.agentId;
+    const key = RunKeys.lock(conversationId, agentId);
     const token = generateToken();
     const ttl = options?.ttlSeconds ?? RunConfig.LOCK_TTL_SECONDS;
 
@@ -79,7 +85,7 @@ export class RunLock {
       const renewalInterval = options?.renewalIntervalMs ?? RunConfig.LOCK_RENEWAL_INTERVAL_MS;
       renewalTimer = setInterval(async () => {
         try {
-          const renewed = await this.renew(conversationId, token, ttl);
+          const renewed = await this.renew(conversationId, token, ttl, agentId);
           if (!renewed) stopRenewal();
         } catch (error) {
           console.error('Lock renewal failed:', error);
@@ -90,40 +96,40 @@ export class RunLock {
 
     const release = async () => {
       stopRenewal();
-      return this.release(conversationId, token);
+      return this.release(conversationId, token, agentId);
     };
 
-    return { token, conversationId, release, stopRenewal };
+    return { token, conversationId, agentId, release, stopRenewal };
   }
 
-  async release(conversationId: string, token: string): Promise<boolean> {
-    const key = RunKeys.lock(conversationId);
+  async release(conversationId: string, token: string, agentId?: string): Promise<boolean> {
+    const key = RunKeys.lock(conversationId, agentId);
     const result = await this.redis.eval(RELEASE_LOCK_SCRIPT, 1, key, token);
     return result === 1;
   }
 
-  async renew(conversationId: string, token: string, ttlSeconds?: number): Promise<boolean> {
-    const key = RunKeys.lock(conversationId);
+  async renew(conversationId: string, token: string, ttlSeconds?: number, agentId?: string): Promise<boolean> {
+    const key = RunKeys.lock(conversationId, agentId);
     const ttl = ttlSeconds ?? RunConfig.LOCK_TTL_SECONDS;
     const result = await this.redis.eval(RENEW_LOCK_SCRIPT, 1, key, token, ttl.toString());
     return result === 1;
   }
 
-  async isLocked(conversationId: string): Promise<boolean> {
-    const key = RunKeys.lock(conversationId);
+  async isLocked(conversationId: string, agentId?: string): Promise<boolean> {
+    const key = RunKeys.lock(conversationId, agentId);
     const value = await this.redis.get(key);
     return value !== null;
   }
 
-  async getLockInfo(conversationId: string): Promise<{ token: string; ttl: number } | null> {
-    const key = RunKeys.lock(conversationId);
+  async getLockInfo(conversationId: string, agentId?: string): Promise<{ token: string; ttl: number } | null> {
+    const key = RunKeys.lock(conversationId, agentId);
     const [token, ttl] = await Promise.all([this.redis.get(key), this.redis.ttl(key)]);
     if (!token || ttl < 0) return null;
     return { token, ttl };
   }
 
-  async forceRelease(conversationId: string): Promise<boolean> {
-    const key = RunKeys.lock(conversationId);
+  async forceRelease(conversationId: string, agentId?: string): Promise<boolean> {
+    const key = RunKeys.lock(conversationId, agentId);
     const result = await this.redis.del(key);
     return result === 1;
   }
