@@ -1,10 +1,6 @@
 {
   "name": "@redbtn/redbtn",
-<<<<<<< HEAD
-  "version": "0.0.136-alpha",
-=======
-  "version": "0.0.135-alpha",
->>>>>>> origin/main
+  "version": "0.0.138-alpha",
   "description": "Graph-based automation engine for building, running, and orchestrating dynamic workflows",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
