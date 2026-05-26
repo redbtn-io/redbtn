@@ -28,10 +28,18 @@ function createConditionFunction(expression, targets, fallback) {
     if (!expression || expression.trim() === '') {
         return () => fallback || '__end__';
     }
-    // Validate expression safety
+    // Validate expression safety. Failure is loud (throws at graph-compile time)
+    // — silent fallback used to mask common author mistakes like `{{false}}` or
+    // `!state.x && state.y` and route to the wrong branch.
     if (!isSafeExpression(expression)) {
-        console.warn(`[ConditionEvaluator] Unsafe expression detected, using fallback: ${expression}`);
-        return () => fallback || '__end__';
+        throw new ConditionEvaluatorError(
+            `Unsupported condition expression: ${JSON.stringify(expression)}. ` +
+            `Supported shapes: literal 'true'/'false', 'state.field', '!state.field', ` +
+            `'state.field <op> value' (op: ===, !==, >, <, >=, <=), 'state.a && state.b', ` +
+            `'state.a || state.b', 'state.a && state.b <op> state.c'. ` +
+            `For anything more complex, precompute a boolean in a transform step and reference it.`,
+            expression
+        );
     }
     // Return function that evaluates expression
     return (state) => {
@@ -75,11 +83,33 @@ function createConditionFunction(expression, targets, fallback) {
             return fallback ? '__fallback__' : '__end__';
         }
         catch (error) {
-            console.error(`[ConditionEvaluator] Error evaluating "${expression}":`, error);
-            return fallback ? '__fallback__' : '__end__';
+            // Re-throw so LangGraph surfaces the failure as a run error rather
+            // than silently routing to fallback. The `__fallback__` edge is
+            // reserved for legitimate "no target key matched" routing (see the
+            // target-lookup branch above), not for parse/eval failures.
+            if (error instanceof ConditionEvaluatorError) {
+                throw error;
+            }
+            const msg = error && error.message ? error.message : String(error);
+            throw new ConditionEvaluatorError(
+                `Failed to evaluate condition ${JSON.stringify(expression)}: ${msg}`,
+                expression
+            );
         }
     };
 }
+/**
+ * Error thrown by the condition evaluator on unsupported expressions or eval
+ * failures. Carries the offending expression for diagnostics.
+ */
+class ConditionEvaluatorError extends Error {
+    constructor(message, expression) {
+        super(message);
+        this.name = 'ConditionEvaluatorError';
+        this.expression = expression;
+    }
+}
+exports.ConditionEvaluatorError = ConditionEvaluatorError;
 /**
  * Validates that expression only uses safe patterns
  * Allowlist-based approach for security
@@ -88,6 +118,10 @@ function isSafeExpression(expr) {
     const trimmed = expr.trim();
     // Allowlist of safe patterns
     const safePatterns = [
+        // Literal booleans: 'true' or 'false'
+        /^(true|false)$/,
+        // Unary negation of a property: !state.field or !state.field.nested
+        /^!state\.\w+(\.\w+)*$/,
         // Simple property access: state.field or state.field.nested
         /^state\.\w+(\.\w+)*$/,
         // Shorthand property access: just field or field.nested (will be auto-prefixed)
@@ -115,6 +149,16 @@ function isSafeExpression(expr) {
 function evaluateExpression(expr, state) {
     var _a;
     let trimmed = expr.trim();
+    // Pattern 0a: Literal booleans (must run before auto-prefix, which would
+    // otherwise rewrite `true`/`false` into `state.true`/`state.false`)
+    if (trimmed === 'true') return true;
+    if (trimmed === 'false') return false;
+    // Pattern 0b: Unary negation of a state path (!state.field or !state.a.b.c)
+    const negMatch = trimmed.match(/^!state\.(\w+(?:\.\w+)*)$/);
+    if (negMatch) {
+        const [, path] = negMatch;
+        return !getNestedProperty(state, path);
+    }
     // Auto-prefix shorthand expressions with 'state.'
     // If expression doesn't start with 'state.' and is just a property path, add it
     if (!trimmed.startsWith('state.') && /^\w+(\.\w+)*$/.test(trimmed)) {

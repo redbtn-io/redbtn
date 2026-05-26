@@ -26,3 +26,16 @@ export type ConditionFunction = (state: any) => string;
  * @returns Function that evaluates condition and returns next node ID
  */
 export declare function createConditionFunction(expression: string, targets?: Record<string, string>, fallback?: string): ConditionFunction;
+/**
+ * Error thrown by the condition evaluator on unsupported expressions or
+ * runtime evaluation failures. Carries the offending expression for diagnostics.
+ *
+ * - Thrown at graph-compile time when `createConditionFunction` is called with
+ *   an expression that does not match any allowlisted shape.
+ * - Thrown at run time from inside the returned closure when an allowlisted
+ *   expression somehow fails during evaluation.
+ */
+export declare class ConditionEvaluatorError extends Error {
+    readonly expression: string;
+    constructor(message: string, expression: string);
+}

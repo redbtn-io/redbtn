@@ -188,13 +188,21 @@ function normalizeDelayMs(value: any): number {
 }
 
 function evaluateStepCondition(condition: string, state: any): boolean {
-    try {
-        // resolveValue handles {{...}} pure expressions with type preservation,
-        // mixed strings via renderTemplate, and plain strings as-is.
-        const result = resolveValue(condition, state);
-        return Boolean(result);
-    } catch (error) {
-        console.error('[StepExecutor] Failed to evaluate condition:', condition, error);
-        return false;
+    // resolveValue handles {{...}} pure expressions with type preservation,
+    // mixed strings via renderTemplate, and plain strings as-is. It also
+    // catches eval errors internally and returns the *original string* on
+    // failure — detect that here and surface as a loud error rather than a
+    // silent false (which would skip the step without any author-visible
+    // signal).
+    const result = resolveValue(condition, state);
+    if (typeof condition === 'string' && typeof result === 'string' && result === condition) {
+        const trimmed = condition.trim();
+        if (trimmed.startsWith('{{') && trimmed.endsWith('}}')) {
+            throw new Error(
+                `Step condition failed to evaluate: ${condition}. ` +
+                `Check that the expression is valid JavaScript and that all referenced state paths exist.`
+            );
+        }
     }
+    return Boolean(result);
 }
