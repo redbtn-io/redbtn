@@ -17,6 +17,68 @@
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { BaseCheckpointSaver, WRITES_IDX_MAP, copyCheckpoint, getCheckpointId } = require('@langchain/langgraph-checkpoint');
 
+// fast-safe-stringify's silent-fallback string. When the underlying JSON.stringify
+// throws (typically on a BigInt), the serializer catches and writes this placeholder
+// instead of the real checkpoint. The placeholder later deserializes to a string,
+// which crashes LangGraph in `_first()` because `string.versions_seen` is undefined
+// and `undefined['__input__']` throws. Detect it at write time so the next failure
+// surfaces what was unserializable instead of silently corrupting checkpoints.
+const FAST_SAFE_STRINGIFY_PLACEHOLDER = '[unable to serialize, circular reference is too complex to analyze]';
+
+/**
+ * Walk an arbitrary value and return the path + native-type of the first sub-value
+ * that JSON.stringify cannot natively handle (BigInt, throwing getters, etc.).
+ * Returns null if nothing pathological is found within MAX_DEPTH.
+ */
+function findUnserializableValue(root: any, maxDepth = 30): { path: string; reason: string } | null {
+  const seen = new WeakSet<object>();
+  const stack: Array<{ value: any; path: string; depth: number }> = [{ value: root, path: '$', depth: 0 }];
+  while (stack.length > 0) {
+    const { value, path, depth } = stack.pop()!;
+    if (depth > maxDepth) continue;
+    const t = typeof value;
+    if (t === 'bigint') return { path, reason: `BigInt(${value.toString()})` };
+    if (t === 'symbol') return { path, reason: `Symbol(${(value as symbol).description ?? ''})` };
+    if (value === null || t !== 'object') continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    let keys: string[];
+    try {
+      keys = Object.keys(value);
+    } catch (e: any) {
+      return { path, reason: `Object.keys threw: ${e?.message ?? String(e)}` };
+    }
+    for (const k of keys) {
+      let v: any;
+      try {
+        v = value[k];
+      } catch (e: any) {
+        return { path: `${path}.${k}`, reason: `getter threw: ${e?.message ?? String(e)}` };
+      }
+      stack.push({ value: v, path: `${path}.${k}`, depth: depth + 1 });
+    }
+  }
+  return null;
+}
+
+function assertSerializationOk(label: string, source: any, bytes: Uint8Array): void {
+  // The 69-byte placeholder (67 chars + two JSON quotes) is the canonical signal
+  // of a silent JSON.stringify failure inside fast-safe-stringify.
+  if (bytes.byteLength > 80) return;
+  const decoded = Buffer.from(bytes).toString('utf8');
+  if (!decoded.includes(FAST_SAFE_STRINGIFY_PLACEHOLDER)) return;
+  const offender = findUnserializableValue(source);
+  const detail = offender
+    ? `${offender.path} (${offender.reason})`
+    : 'no BigInt/throwing-getter found in walk — may be a deeper structural issue';
+  throw new Error(
+    `[MongoCheckpointer] ${label} silently fell back to placeholder ` +
+    `("${FAST_SAFE_STRINGIFY_PLACEHOLDER}"). ` +
+    `Offending value: ${detail}. ` +
+    `Coerce this value to a JSON-safe primitive (e.g. String(bigint)) before it enters graph state.`
+  );
+}
+
 // ============================================================================
 // MongoDB schema helpers (raw mongoose access, no model recompilation)
 // ============================================================================
@@ -100,6 +162,15 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
       const metadataBytes = Buffer.from(doc.metadata, 'base64');
       const deserializedCheckpoint = await this.serde.loadsTyped('json', checkpointBytes);
       const deserializedMetadata = await this.serde.loadsTyped('json', metadataBytes);
+      // Refuse corrupted checkpoints written by an old engine before the put-time
+      // guard existed. A proper checkpoint is an object with versions_seen; the
+      // fast-safe-stringify placeholder deserializes to a plain string. Returning
+      // undefined here makes LangGraph fall back to emptyCheckpoint() instead of
+      // crashing in `_first()` with "Cannot read properties of undefined".
+      if (typeof deserializedCheckpoint !== 'object' || deserializedCheckpoint === null || !('versions_seen' in deserializedCheckpoint)) {
+        console.error(`[MongoCheckpointer] Refusing corrupted checkpoint for thread ${threadId} (checkpointId=${doc.checkpointId}): deserialized to ${typeof deserializedCheckpoint}. Falling back to emptyCheckpoint.`);
+        return undefined;
+      }
       const writeDocs = await WritesModel.find({ conversationId, threadId, checkpointNs, checkpointId: doc.checkpointId }).lean();
       const pendingWrites = await Promise.all(
         writeDocs.map(async (w: any) => {
@@ -147,6 +218,10 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
         const metadataBytes = Buffer.from(doc.metadata, 'base64');
         const deserializedCheckpoint = await this.serde.loadsTyped('json', checkpointBytes);
         const deserializedMetadata = await this.serde.loadsTyped('json', metadataBytes);
+        if (typeof deserializedCheckpoint !== 'object' || deserializedCheckpoint === null || !('versions_seen' in deserializedCheckpoint)) {
+          console.error(`[MongoCheckpointer] Skipping corrupted checkpoint in list() for thread ${threadId} (checkpointId=${doc.checkpointId})`);
+          continue;
+        }
         if (filter && !Object.entries(filter).every(([k, v]) => (deserializedMetadata as any)[k] === v)) continue;
         const writeDocs = await WritesModel.find({ conversationId, threadId, checkpointNs: doc.checkpointNs, checkpointId: doc.checkpointId }).lean();
         const pendingWrites = await Promise.all(
@@ -183,6 +258,8 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
         this.serde.dumpsTyped(preparedCheckpoint),
         this.serde.dumpsTyped(metadata),
       ]);
+      assertSerializationOk('put(checkpoint)', preparedCheckpoint, checkpointBytes);
+      assertSerializationOk('put(metadata)', metadata, metadataBytes);
       const checkpointStr = Buffer.from(checkpointBytes).toString('base64');
       const metadataStr = Buffer.from(metadataBytes).toString('base64');
       const parentCheckpointId = config.configurable?.checkpoint_id ?? null;
@@ -209,6 +286,7 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
       await Promise.all(
         writes.map(async ([channel, value]: [string, any], idx: number) => {
           const [, valueBytes] = await this.serde.dumpsTyped(value);
+          assertSerializationOk(`putWrites(${channel})`, value, valueBytes);
           const valueStr = Buffer.from(valueBytes).toString('base64');
           const resolvedIdx = WRITES_IDX_MAP[channel] ?? idx;
           await WritesModel.findOneAndUpdate(
