@@ -616,12 +616,12 @@ async function loadPreviousRunSnapshot(
 // =============================================================================
 
 function buildInitialState(
-  red: Red,
+  _red: Red,
   input: Record<string, unknown>,
   options: RunOptions,
   userSettings: Awaited<ReturnType<typeof loadUserSettings>>,
   runId: string,
-  publisher: RunPublisher,
+  _publisher: RunPublisher,
   abortController: AbortController,
   previousRun: PreviousRunSnapshot | null,
 ) {
@@ -644,40 +644,15 @@ CRITICAL RULES:
 
   const now = new Date();
 
-  let connectionManager: ConnectionManager | undefined;
-  if (options.connectionFetcher) {
-    connectionManager = new ConnectionManager({
-      userId: options.userId,
-      fetchConnection: options.connectionFetcher.fetchConnection,
-      fetchDefaultConnection: options.connectionFetcher.fetchDefaultConnection,
-      refreshConnection: options.connectionFetcher.refreshConnection,
-    });
-  }
-
+  // Infrastructure (neuronRegistry, mcpClient, memory, connectionManager,
+  // runPublisher, graphRegistry) is NOT placed in graph state any more. It
+  // carried Mongoose-internal Symbols that broke checkpoint serialization
+  // silently — see RunControlRegistry.ts docstring and the
+  // `lib/run/contextLookup.ts` helpers for the new lookup pattern. All of
+  // it lives in runControlRegistry keyed by runId; step executors read via
+  // `getRunPublisher(state)` etc. The registry attachment happens at the
+  // `runControlRegistry.register()` site below.
   return {
-    neuronRegistry: red.neuronRegistry,
-    memory: red.memory,
-    // messageQueue is intentionally omitted here — legacy legacy graph nodes (router.ts,
-    // planner.ts, responder.ts) that called messageQueue.publishStatus() used the old redGraph
-    // path, which was removed in v0.0.51-alpha alongside Red.respond(). New graph execution
-    // uses RunPublisher for all SSE events.
-    // Graph registry — passed so that 'graph' step executors can invoke subgraphs
-    _graphRegistry: red.graphRegistry,
-    mcpClient: {
-      // 4th arg is an optional AbortSignal; toolExecutor passes
-      // state._abortController?.signal so external interrupt cancels the
-      // in-flight tool call immediately instead of waiting on the bare 30s
-      // setTimeout in McpClient.sendRequest.
-      callTool: (toolName: string, args: unknown, meta?: unknown, signal?: AbortSignal) =>
-        red.callMcpTool(
-          toolName,
-          args as Record<string, unknown>,
-          meta as Record<string, unknown>,
-          signal,
-        ),
-    },
-    connectionManager,
-    runPublisher: publisher,
     // Top-level runId for ergonomic access by step executors / universalNode
     // when resolving the run-control registry context. Mirrors the canonical
     // `state.data.runId` path but saves the lookup hop. This is a primitive
@@ -1484,7 +1459,39 @@ export async function run(
   // universalNode / step executors / neuronExecutor read via
   // `runControlRegistry.get(runId).controller.signal` — that path survives
   // LangGraph checkpoint round-trips, unlike state-stashed controllers.
-  const runCtx = runControlRegistry.register(runId, WORKER_ID);
+  //
+  // We also attach run-scoped infrastructure (RunPublisher, registries,
+  // connectionManager, etc.) here instead of stuffing them into LangGraph
+  // state. Step executors look them up via `lib/run/contextLookup.ts`. This
+  // is what keeps the Mongoose-internal `Symbol(@@mdb.bson.type)` out of
+  // checkpoint payloads — that Symbol was what fast-safe-stringify silently
+  // replaced with a 69-byte placeholder, breaking every checkpoint resume.
+  let runCtxConnectionManager: ConnectionManager | undefined;
+  if (options.connectionFetcher) {
+    runCtxConnectionManager = new ConnectionManager({
+      userId: options.userId,
+      fetchConnection: options.connectionFetcher.fetchConnection,
+      fetchDefaultConnection: options.connectionFetcher.fetchDefaultConnection,
+      refreshConnection: options.connectionFetcher.refreshConnection,
+    });
+  }
+  const runCtxMcpClient = {
+    callTool: (toolName: string, args: unknown, meta?: unknown, signal?: AbortSignal) =>
+      red.callMcpTool(
+        toolName,
+        args as Record<string, unknown>,
+        meta as Record<string, unknown>,
+        signal,
+      ),
+  };
+  const runCtx = runControlRegistry.register(runId, WORKER_ID, {
+    runPublisher: publisher,
+    neuronRegistry: red.neuronRegistry,
+    mcpClient: runCtxMcpClient,
+    memory: red.memory,
+    connectionManager: runCtxConnectionManager,
+    graphRegistry: red.graphRegistry,
+  });
   // Local controller kept for legacy/fallback paths (anyone reading
   // `state._abortController` directly). Wired so the run-controller
   // aborting ALSO trips this one — no functional dependency, just defense.

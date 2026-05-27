@@ -7,6 +7,7 @@
 import type { ConnectionStepConfig } from '../types';
 import { renderTemplate } from '../templateRenderer';
 import { executeWithErrorHandling } from './errorHandler';
+import { getConnectionManager } from '../../../run/contextLookup';
 
 // Debug logging
 const DEBUG = false;
@@ -41,10 +42,10 @@ async function executeConnectionInternal(config: ConnectionStepConfig, state: an
         throw new Error('Connection step requires either connectionId or providerId');
     }
 
-    // Get ConnectionManager from state
-    const connectionManager = state.connectionManager;
+    // Get ConnectionManager from run-context registry (with state fallback for tests)
+    const connectionManager = getConnectionManager(state);
     if (!connectionManager) {
-        throw new Error('ConnectionManager not available in state. Connections feature may not be enabled.');
+        throw new Error('ConnectionManager not available in run context. Connections feature may not be enabled.');
     }
 
     // Render any template variables in connectionId

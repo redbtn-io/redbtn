@@ -20,6 +20,7 @@
 
 import type { ToolRef } from '../nodes/universal/types';
 import { getNativeRegistry } from './native-registry';
+import { getMcpClient, getGraphRegistry } from '../run/contextLookup';
 
 // =============================================================================
 // Public types
@@ -178,11 +179,11 @@ function resolveMcp(
   const toolName = dotIdx >= 0 ? name.slice(dotIdx + 1) : name;
   const llmFacingName = dotIdx >= 0 ? name.replace('.', '__') : name;
 
-  // Pull the registry from state. Webapp/worker put it in
-  // `state.mcpClient` (which is actually the McpRegistry instance — see
-  // toolExecutor.ts). Fall back to undefined; we'll throw on invoke if
-  // it's truly missing so the resolver itself doesn't fail at compile time.
-  const mcpClient: any = (state as any).mcpClient;
+  // Pull the registry from the run-context registry (with state fallback for
+  // tests). The McpRegistry instance is what gets registered there — same
+  // object as `state.mcpClient` was historically, just no longer routed
+  // through LangGraph state to avoid checkpoint-serialization corruption.
+  const mcpClient: any = getMcpClient(state);
 
   const found = mcpClient?.findTool ? mcpClient.findTool(toolName) : undefined;
   // Best-effort schema discovery — if the tool is registered we have a
@@ -199,9 +200,9 @@ function resolveMcp(
     inputSchema: ensureJsonSchema(schema),
     source: 'mcp',
     invoke: async (args, ctx) => {
-      const client: any = (ctx.state as any).mcpClient;
+      const client: any = getMcpClient(ctx.state);
       if (!client) {
-        throw new Error(`tool-resolver: McpRegistry not available in state for tool '${name}'`);
+        throw new Error(`tool-resolver: McpRegistry not available in run context for tool '${name}'`);
       }
       const result = await client.callTool(toolName, args, {
         // meta — best-effort; webapp passes proper conversation/message ids
@@ -263,13 +264,13 @@ async function resolveGraph(
   descriptionOverride: string | undefined,
   state: Record<string, unknown>,
 ): Promise<ResolvedTool> {
-  const graphRegistry: any = (state as any)._graphRegistry;
+  const graphRegistry: any = getGraphRegistry(state);
   const userId: string = ((state as any).data?.userId as string)
     ?? ((state as any).userId as string)
     ?? 'system';
 
   if (!graphRegistry) {
-    throw new Error(`tool-resolver: GraphRegistry not available in state for graph-as-tool '${graphId}'`);
+    throw new Error(`tool-resolver: GraphRegistry not available in run context for graph-as-tool '${graphId}'`);
   }
 
   const cfg = await loadGraphConfigForTool(graphRegistry, graphId, userId);

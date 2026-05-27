@@ -356,6 +356,31 @@ export class ConversationPublisher {
     });
   }
 
+  /**
+   * Publish a chat-component event to the conversation stream. Called by
+   * RunPublisher.publishComponent after the spec has been schema-validated.
+   * Mirror of `publishAttachment` — the spec is the "non-text artifact" and
+   * the conversation archiver persists it to `messages[].components[]`.
+   *
+   * Phase 2 of `chat-interactive-widgets`. Schema:
+   * `lib/chat-components/spec-schema.ts`.
+   */
+  async publishComponent(runId: string, event: {
+    type: 'component';
+    componentId: string;
+    spec: Record<string, unknown>;
+    timestamp: number;
+  }, messageId?: string): Promise<void> {
+    await this.publish({
+      type: 'component',
+      runId,
+      ...(messageId ? { messageId } : {}),
+      componentId: event.componentId,
+      spec: event.spec,
+      timestamp: event.timestamp,
+    });
+  }
+
   /** Show/hide typing indicator */
   async setTyping(isTyping: boolean, sourceRunId?: string): Promise<void> {
     await this.publish({
