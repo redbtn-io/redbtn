@@ -1,6 +1,6 @@
 {
   "name": "@redbtn/redbtn",
-  "version": "0.0.139-alpha",
+  "version": "0.0.142-alpha",
   "description": "Graph-based automation engine for building, running, and orchestrating dynamic workflows",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -79,6 +79,7 @@
     "@typescript-eslint/eslint-plugin": "^8.53.0",
     "@typescript-eslint/parser": "^8.53.0",
     "@vitest/ui": "^4.0.15",
+    "ajv": "^8.20.0",
     "eslint": "^9.39.2",
     "eslint-plugin-unused-imports": "^4.3.0",
     "happy-dom": "^20.0.11",
