@@ -47,9 +47,12 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
   return headers;
 }
 
+const ALLOWED_STATUSES = ['active', 'paused', 'disabled', 'error'] as const;
+type AllowedStatus = (typeof ALLOWED_STATUSES)[number];
+
 const updateAutomationTool: NativeToolDefinition = {
   description:
-    "Surgically update an existing automation's configuration (name, description, tags, triggers, defaultInput, inputMapping, configOverrides, concurrency, scheduleMode). Owner-only.",
+    "Surgically update an existing automation's configuration (name, description, tags, triggers, defaultInput, inputMapping, configOverrides, concurrency, scheduleMode, status). Owner-only. Pass `status: 'paused'` to pause or `status: 'active'` to resume — this is the single canonical knob for pause/resume.",
   server: 'automation',
   inputSchema: {
     type: 'object',
@@ -79,13 +82,18 @@ const updateAutomationTool: NativeToolDefinition = {
       configOverrides: { type: 'object', additionalProperties: true },
       concurrency: { type: 'string', enum: ['allow', 'skip', 'queue', 'interrupt'] },
       scheduleMode: { type: 'string', enum: ['cron', 'interval'] },
+      status: {
+        type: 'string',
+        enum: ['active', 'paused', 'disabled', 'error'],
+        description: "Canonical lifecycle field. 'active' = scheduler runs it; 'paused' = user pause; 'disabled' = admin/tier off; 'error' = auto-marked after validation failure.",
+      },
     },
     required: ['automationId'],
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
     const { automationId, ...patch } = rawArgs as any;
-    
+
     if (typeof automationId !== 'string' || !automationId.trim()) {
       return {
         content: [{ type: 'text', text: JSON.stringify({ error: 'automationId is required', code: 'VALIDATION' }) }],
@@ -98,6 +106,29 @@ const updateAutomationTool: NativeToolDefinition = {
     const forbidden = ['userId', 'graphId', 'createdAt', 'updatedAt'];
     for (const key of forbidden) {
       if (key in patch) delete patch[key];
+    }
+
+    // Canonical-status compatibility shim for the deprecation window.
+    // Spec: explanations/automation-status-spec.md.
+    // The webapp PATCH endpoint currently still keys on `isEnabled` and
+    // pair-writes `status` from it (route.ts:242-244). Until phase 6 flips
+    // the endpoint to accept `status` directly, translate any `status`
+    // argument into the equivalent `isEnabled` boolean here so a caller
+    // passing the canonical field gets the correct mongo write.
+    if (typeof patch.status === 'string') {
+      const normalized = patch.status as AllowedStatus;
+      if (!(ALLOWED_STATUSES as readonly string[]).includes(normalized)) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: `status must be one of ${ALLOWED_STATUSES.join(', ')}`, code: 'VALIDATION' }) }],
+          isError: true,
+        };
+      }
+      // active ⇄ isEnabled:true ; everything else ⇄ isEnabled:false
+      if (patch.isEnabled === undefined) {
+        patch.isEnabled = normalized === 'active';
+      }
+      // Drop the status field — the endpoint doesn't accept it yet (phase 6 fixes).
+      delete patch.status;
     }
 
     const baseUrl = getBaseUrl();
