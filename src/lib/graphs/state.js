@@ -5,35 +5,23 @@ const langgraph_1 = require("@langchain/langgraph");
 /**
  * 1. Define the State using Annotation
  * This is the shared memory object that flows between nodes.
+ *
+ * IMPORTANT: Infrastructure objects (RunPublisher, NeuronRegistry, McpClient,
+ * Memory, ConnectionManager, GraphRegistry, etc.) are deliberately NOT declared
+ * as channels. They live in `runControlRegistry` (lib/run/RunControlRegistry.ts)
+ * keyed by `state.runId`. Step executors read them via the `getX(state)` helpers
+ * in `lib/run/contextLookup.ts`.
+ *
+ * Why: those objects carry references to Mongoose internals — specifically
+ * `runPublisher.redlog._mongooseLib.default.mongo.BSON.bsonType` is a
+ * `Symbol(@@mdb.bson.type)`. `JSON.stringify` throws on Symbols.
+ * `fast-safe-stringify` (LangGraph's serializer) catches the throw and
+ * substitutes a 69-byte placeholder string. The placeholder later deserializes
+ * to a string, and LangGraph's `_first()` crashes with
+ * `Cannot read properties of undefined (reading '__input__')`. Keeping them
+ * out of state is the only way to make checkpoints serialize cleanly.
  */
 exports.RedGraphState = langgraph_1.Annotation.Root({
-    // Infrastructure components (available to all nodes)
-    neuronRegistry: (0, langgraph_1.Annotation)({
-        reducer: (x, y) => y
-    }),
-    mcpClient: (0, langgraph_1.Annotation)({
-        reducer: (x, y) => y
-    }),
-    memory: (0, langgraph_1.Annotation)({
-        reducer: (x, y) => y
-    }),
-    // messageQueue removed in v0.0.51-alpha — legacy respond() path deleted.
-    // RunPublisher (state.runPublisher) is the unified event publishing mechanism.
-    logger: (0, langgraph_1.Annotation)({
-        reducer: (x, y) => y
-    }),
-    // NEW: RunPublisher for unified event publishing (run path)
-    // Connection manager for OAuth/API key credential resolution
-    connectionManager: (0, langgraph_1.Annotation)({
-        reducer: (x, y) => y !== null && y !== void 0 ? y : x
-    }),
-    runPublisher: (0, langgraph_1.Annotation)({
-        reducer: (x, y) => y !== null && y !== void 0 ? y : x // Keep existing if new is null/undefined
-    }),
-    // Graph event publisher for live visualization
-    graphPublisher: (0, langgraph_1.Annotation)({
-        reducer: (x, y) => y !== null && y !== void 0 ? y : x // Keep existing if new is null/undefined
-    }),
     // Message ID for SSE event streaming
     messageId: (0, langgraph_1.Annotation)({
         reducer: (x, y) => y !== null && y !== void 0 ? y : x
@@ -55,18 +43,10 @@ exports.RedGraphState = langgraph_1.Annotation.Root({
         },
         default: () => ({})
     }),
-    // MCP Registry for universal nodes (Phase 2: Tool execution from config)
-    mcpRegistry: (0, langgraph_1.Annotation)({
-        reducer: (x, y) => y
-    }),
     // Node execution counter for system prompts
     nodeCounter: (0, langgraph_1.Annotation)({
         reducer: (x, y) => y,
         default: () => 1
-    }),
-    // Graph registry for subgraph execution (graph step type)
-    _graphRegistry: (0, langgraph_1.Annotation)({
-        reducer: (x, y) => y !== null && y !== void 0 ? y : x
     }),
     // Subgraph depth counter (prevents infinite recursion)
     _subgraphDepth: (0, langgraph_1.Annotation)({

@@ -61,6 +61,10 @@ function findUnserializableValue(root: any, maxDepth = 30): { path: string; reas
   return null;
 }
 
+// One-line warn dedupe so we don't flood logs with the same offender on every
+// checkpoint write within a single run.
+const _warnedOffenders = new Set<string>();
+
 function assertSerializationOk(label: string, source: any, bytes: Uint8Array): void {
   // The 69-byte placeholder (67 chars + two JSON quotes) is the canonical signal
   // of a silent JSON.stringify failure inside fast-safe-stringify.
@@ -71,11 +75,20 @@ function assertSerializationOk(label: string, source: any, bytes: Uint8Array): v
   const detail = offender
     ? `${offender.path} (${offender.reason})`
     : 'no BigInt/throwing-getter found in walk — may be a deeper structural issue';
-  throw new Error(
+  const key = `${label}::${detail}`;
+  if (_warnedOffenders.has(key)) return;
+  _warnedOffenders.add(key);
+  // LOG-ONLY. Throwing here cascades into the runPublisher pipeline and breaks
+  // streaming output (this is what broke Discord on the 0.0.147-alpha deploy).
+  // The read-side guard in getTuple() handles the silent corruption — this
+  // branch just surfaces *what* is unserializable so we can coerce it at the
+  // source. With the registry refactor (infra out of state) this branch
+  // should no longer fire in practice — its presence is belt-and-suspenders.
+  console.error(
     `[MongoCheckpointer] ${label} silently fell back to placeholder ` +
     `("${FAST_SAFE_STRINGIFY_PLACEHOLDER}"). ` +
     `Offending value: ${detail}. ` +
-    `Coerce this value to a JSON-safe primitive (e.g. String(bigint)) before it enters graph state.`
+    `Coerce this value to a JSON-safe primitive before it enters graph state.`
   );
 }
 
