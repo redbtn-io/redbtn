@@ -63,6 +63,9 @@ export interface GraphExecutorRuntimeOverrides {
     input?: Record<string, any>;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { getGraphRegistry } = require('../../../run/contextLookup') as { getGraphRegistry: (s: any) => any };
+
 /** Max subgraph call depth — prevents infinite recursion */
 const MAX_SUBGRAPH_DEPTH = 5;
 
@@ -128,12 +131,12 @@ export async function executeGraph(
         );
     }
 
-    // Acquire graph registry from state
-    const graphRegistry = state._graphRegistry;
+    // Acquire graph registry from run-context registry (with state fallback for tests)
+    const graphRegistry = getGraphRegistry(state);
     if (!graphRegistry) {
         throw new Error(
-            'Graph step requires graphRegistry in state. ' +
-            'Ensure _graphRegistry is passed in buildInitialState().'
+            'Graph step requires graphRegistry in run context. ' +
+            'Ensure runControlRegistry.register() was called with graphRegistry.'
         );
     }
 
@@ -145,20 +148,20 @@ export async function executeGraph(
     // Compile the subgraph (hits LRU cache in GraphRegistry)
     const compiledGraph = await graphRegistry.getGraph(graphId, userId);
 
-    // Build the subgraph's initial state
-    // We share infrastructure from the parent (no separate RunPublisher, no lock).
+    // Build the subgraph's initial state.
+    // Infrastructure (neuronRegistry, mcpClient, memory, runPublisher,
+    // connectionManager, graphRegistry) lives in runControlRegistry keyed by
+    // runId — and the subgraph inherits the parent's runId, so all of these
+    // are visible via `getX(state)` helpers without being copied into state.
+    // Keeping them out of state is what lets MongoCheckpointer serialize
+    // checkpoints without hitting Mongoose-internal Symbols.
+    // We propagate runId/userId here so the registry lookups inside the
+    // subgraph resolve correctly.
     const subInput: Record<string, any> = {
-        // Pass infrastructure through so neurons, tools, connections all work
-        neuronRegistry: state.neuronRegistry,
-        memory: state.memory,
-        mcpClient: state.mcpClient,
-        runPublisher: state.runPublisher,
-        connectionManager: state.connectionManager,
+        runId: state.runId,
+        userId: state.userId,
         // Track depth to prevent recursion
         _subgraphDepth: currentDepth + 1,
-        // Do NOT pass _graphRegistry yet — it's set below to avoid circular concerns.
-        // The subgraph will receive it so it can itself call graph steps.
-        _graphRegistry: graphRegistry,
         data: {},
     };
 

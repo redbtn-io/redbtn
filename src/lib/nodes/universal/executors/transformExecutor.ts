@@ -10,6 +10,7 @@ import { extractJSON } from '../../../utils/json-extractor';
 const { getGlobalStateClient } = require('../../../globalState') as { getGlobalStateClient: (opts?: any) => any };
 import type { TransformStepConfig } from '../types';
 import { executeBuildMessagesOperation as buildMessagesOpExternal } from './buildMessagesOperation';
+import { getRunPublisher } from '../../../run/contextLookup';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -140,7 +141,7 @@ export async function executeTransform(config: TransformStepConfig, state: any):
             if (!key) {
                 throw new Error(`Invalid shared path: ${config.outputField}. Expected format: shared.<key>`);
             }
-            const runPublisher = state.runPublisher;
+            const runPublisher = getRunPublisher(state);
             if (!runPublisher) {
                 // Engine paths that don't have a RunPublisher attached
                 // (rare) shouldn't crash. Warn and fall through to a
@@ -196,15 +197,16 @@ export async function executeTransform(config: TransformStepConfig, state: any):
         // Skipped when outputField already starts with `shared.` /
         // `globalState.` — those have explicit storage layers handled
         // above and dual-writing would just thrash Redis.
+        const autoPublisher = getRunPublisher(state);
         if (
             config.outputField &&
             state._parallelContext &&
-            state.runPublisher &&
+            autoPublisher &&
             !config.outputField.startsWith('shared.') &&
             !config.outputField.startsWith('globalState.')
         ) {
             try {
-                await state.runPublisher.setAutoStateField(config.outputField, result);
+                await autoPublisher.setAutoStateField(config.outputField, result);
                 if (DEBUG) console.log(`[TransformExecutor] Auto-mirrored ${config.outputField} → autoState`);
             } catch (err) {
                 console.warn(`[TransformExecutor] Auto-mirror failed for ${config.outputField}:`, err);
