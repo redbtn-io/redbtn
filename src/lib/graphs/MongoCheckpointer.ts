@@ -61,21 +61,33 @@ function findUnserializableValue(root: any, maxDepth = 30): { path: string; reas
   return null;
 }
 
-function assertSerializationOk(label: string, source: any, bytes: Uint8Array): void {
+// One-line warn-rate-limit: don't flood logs with the same offender on every checkpoint.
+const _warnedOffenders = new Set<string>();
+
+function assertSerializationOk(label: string, source: any, _bytes: Uint8Array): void {
   // The 69-byte placeholder (67 chars + two JSON quotes) is the canonical signal
   // of a silent JSON.stringify failure inside fast-safe-stringify.
-  if (bytes.byteLength > 80) return;
-  const decoded = Buffer.from(bytes).toString('utf8');
+  if (_bytes.byteLength > 80) return;
+  const decoded = Buffer.from(_bytes).toString('utf8');
   if (!decoded.includes(FAST_SAFE_STRINGIFY_PLACEHOLDER)) return;
   const offender = findUnserializableValue(source);
   const detail = offender
     ? `${offender.path} (${offender.reason})`
     : 'no BigInt/throwing-getter found in walk — may be a deeper structural issue';
-  throw new Error(
+  const key = `${label}::${detail}`;
+  if (_warnedOffenders.has(key)) return;
+  _warnedOffenders.add(key);
+  // LOG-ONLY: throwing here breaks the worker because runPublisher / mongoose
+  // internals get stashed in graph state and contain `Symbol(@@mdb.bson.type)`.
+  // The read-side guard in getTuple() already protects against the silent
+  // corruption — this branch just surfaces *what* is unserializable so we can
+  // coerce it at the source in a follow-up. Demote to console.error; let the
+  // write succeed (same behavior as pre-guard).
+  console.error(
     `[MongoCheckpointer] ${label} silently fell back to placeholder ` +
     `("${FAST_SAFE_STRINGIFY_PLACEHOLDER}"). ` +
     `Offending value: ${detail}. ` +
-    `Coerce this value to a JSON-safe primitive (e.g. String(bigint)) before it enters graph state.`
+    `Coerce this value to a JSON-safe primitive before it enters graph state.`
   );
 }
 
