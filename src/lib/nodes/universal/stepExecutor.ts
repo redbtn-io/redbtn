@@ -64,7 +64,16 @@ export async function executeStep(
     // Check optional condition
     if (step.condition) {
         console.log(`[StepExecutor] Checking condition: ${step.condition}`);
-        const shouldRun = evaluateStepCondition(step.condition, { state, parameters });
+        // Pass state DIRECTLY (not wrapped). The condition templates reference
+        // `state.data.foo` and `parameters.foo` — those keys are direct children
+        // of `state`, so wrapping in `{state, parameters}` would make every such
+        // path look up `wrapper.data.*` → undefined. Pre-0.0.139 the failure
+        // path returned the original template string and Boolean()-coerced it to
+        // true (every condition silently truthy), masking the bug. PR #168's
+        // fail-loud behavior surfaced it; this fix removes the wrapper. The
+        // `parameters` arg is merged in so explicit `parameters.X` templates
+        // keep working even if the parent state doesn't carry parameters.
+        const shouldRun = evaluateStepCondition(step.condition, { ...state, parameters });
         if (!shouldRun) {
             console.log(`[StepExecutor] Skipping step due to condition: ${step.condition}`);
             return {}; // Skip execution, return empty update
