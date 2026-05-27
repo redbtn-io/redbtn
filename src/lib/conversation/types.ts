@@ -226,6 +226,26 @@ export interface ConversationMessageAudioEvent {
   timestamp: number;
 }
 
+/**
+ * A chat-component spec produced during a run, forwarded onto the conversation
+ * stream so the chat UI can render it inline alongside text / attachments.
+ *
+ * Structural sibling of `ConversationAttachmentEvent`. `messageId` ties the
+ * component to the in-flight assistant message so the conversation archiver can
+ * persist it onto the correct `messages[].components[]` entry (phase 3 / W-4
+ * mirror).
+ *
+ * Frozen schema: `lib/chat-components/spec-schema.ts`.
+ */
+export interface ConversationComponentEvent {
+  type: 'component';
+  runId: string;
+  messageId?: string;
+  componentId: string;
+  spec: Record<string, unknown>;
+  timestamp: number;
+}
+
 export type ConversationEvent =
   | ConversationMessageEvent
   | ConversationMessageStartEvent
@@ -241,6 +261,7 @@ export type ConversationEvent =
   | ConversationRunCompleteEvent
   | ConversationRunErrorEvent
   | ConversationAttachmentEvent
+  | ConversationComponentEvent
   | ConversationAudioChunkEvent
   | ConversationInputTranscriptionEvent
   | ConversationOutputTranscriptionEvent
