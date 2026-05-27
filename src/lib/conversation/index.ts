@@ -16,4 +16,5 @@ export type {
   ConversationRunCompleteEvent,
   ConversationRunErrorEvent,
   ConversationAttachmentEvent,
+  ConversationComponentEvent,
 } from './types';
