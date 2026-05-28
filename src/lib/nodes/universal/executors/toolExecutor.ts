@@ -10,6 +10,7 @@ import { executeWithErrorHandling } from './errorHandler';
 import { getParserRegistry } from './parserRegistry';
 import { ParserExecutor } from './parserExecutor';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
+import { getRunPublisher, getMcpClient, getConnectionManager, getGraphRegistry } from '../../../run/contextLookup';
 import { ToolHangError, withToolIdleWatchdog, type ToolIdleWatchdogHandle } from '../../../tools/tool-idle-watchdog';
 import { getNativeRegistry } from '../../../tools/native-registry';
 import type { ToolStepConfig } from '../types';
@@ -136,7 +137,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
     }
 
     // Get RunPublisher for tool events (only available in run path)
-    const runPublisher = state.runPublisher;
+    const runPublisher = getRunPublisher(state);
 
     // Generate unique tool execution ID
     const toolId = `tool_${config.toolName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -200,7 +201,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     // Fall back to MCP — pass abort signal so parser-driven tool
                     // calls also honor mid-step interrupt. Signal comes from the
                     // RunControlRegistry (survives checkpoint round-trips).
-                    const mcpClient = state.mcpClient;
+                    const mcpClient = getMcpClient(state);
                     if (mcpClient) {
                         return callMcpToolWithIdleWatchdog(
                             mcpClient,
@@ -237,7 +238,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     // RunPublisher for conversation output type
                     runPublisher: runPublisher || null,
                     // GraphRegistry for subgraph output type
-                    _graphRegistry: state._graphRegistry || null,
+                    _graphRegistry: getGraphRegistry(state) || null,
                 });
                 console.log(`[ToolExecutor] Stream parser "${(config as any).streamParser}" loaded for ${config.toolName} (tool steps enabled)`);
             } else {
@@ -333,7 +334,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
         // -------------------------------------------------------------------------
         let resolvedCredentials: ResolvedToolCredentials | null = null;
         if (config.connectionId || config.providerId) {
-            const connectionManager = state.connectionManager;
+            const connectionManager = getConnectionManager(state);
             if (connectionManager) {
                 try {
                     const connId = config.connectionId
@@ -545,10 +546,10 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
         // -------------------------------------------------------------------------
         // MCP path (original logic)
         // -------------------------------------------------------------------------
-        // Get MCP client from state (it's the registry)
-        const mcpClient = state.mcpClient;
+        // Get MCP client from run-context registry (with state fallback for tests)
+        const mcpClient = getMcpClient(state);
         if (!mcpClient) {
-            throw new Error('MCP client not available in state');
+            throw new Error('MCP client not available in run context');
         }
         if (DEBUG)
             console.log('[ToolExecutor] Executing tool step', {

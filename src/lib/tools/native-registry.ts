@@ -1145,6 +1145,30 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     console.error('[NativeRegistry] Failed to register cancel_run:', msg);
   }
 
+  // ─── Chat-components pack (chat-interactive-widgets phases 5 + 10) ───────
+  // Emits inline-renderable component specs onto the active run stream so the
+  // chat UI can show buttons / info panels / forms attached to the agent
+  // message. Spec ref: chat-epic-4-interactive-signoff.md.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const emitComponent = require('./native/emit-component.js');
+    registry.register('emit_component', emitComponent.default || emitComponent);
+    console.log('[NativeRegistry] Registered built-in tool: emit_component');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register emit_component:', msg);
+  }
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const readComponentEvents = require('./native/read-component-events.js');
+    registry.register('read_component_events', readComponentEvents.default || readComponentEvents);
+    console.log('[NativeRegistry] Registered built-in tool: read_component_events');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register read_component_events:', msg);
+  }
+
   // ─── Utility pack (TOOL-HANDOFF.md §4.15) ─────────────────────────────────
   // Three pure utility tools — current time, abort-aware sleep, and ID
   // minting. No API calls; the only external surface is `wait`'s integration

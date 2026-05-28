@@ -150,6 +150,31 @@ export interface RunControlContext {
   currentStep?: { type: string; index: number };
   startedAt: Date;
   workerId: string;
+  /**
+   * Run-scoped infrastructure objects. These used to live as top-level
+   * channels on `RedGraphState` and got stuffed into LangGraph's
+   * `state.__start__`, where the checkpoint serializer would try to JSON-
+   * serialize them. That blew up silently because `runPublisher.redlog`
+   * carries a Mongoose-internal `Symbol(@@mdb.bson.type)` — fast-safe-stringify
+   * catches the `JSON.stringify` throw and substitutes a placeholder string,
+   * which on reload deserializes to a non-object and crashes LangGraph's
+   * `_first()` with `Cannot read properties of undefined (reading '__input__')`.
+   *
+   * Moving them to the registry follows the same pattern that already worked
+   * for `_abortController` (see file-level docstring): infrastructure stays
+   * in the worker process, only primitives (runId, userId) flow through
+   * checkpoints, and read-sites use the `getX(state)` helpers in
+   * `contextLookup.ts` which fall back to `state.X` for direct/test callers.
+   */
+  runPublisher?: any;
+  neuronRegistry?: any;
+  mcpClient?: any;
+  memory?: any;
+  connectionManager?: any;
+  graphRegistry?: any;
+  mcpRegistry?: any;
+  logger?: any;
+  graphPublisher?: any;
 }
 
 /**
@@ -185,10 +210,35 @@ export class RunControlRegistry {
    * Create + register a new control context for a run. Idempotent — if a
    * context already exists for `runId` it's returned as-is (the engine
    * handles run-id collisions at a higher layer).
+   *
+   * The optional `infra` argument attaches run-scoped infrastructure objects
+   * (RunPublisher, NeuronRegistry, etc.) — see `RunControlContext` docstring
+   * for why these live here instead of in graph state. When `register()` is
+   * called a second time for the same runId, infra objects in the second
+   * call merge into the existing context (subgraphs inherit the parent's
+   * registry without needing a new registration).
    */
-  register(runId: string, workerId: string): RunControlContext {
+  register(
+    runId: string,
+    workerId: string,
+    infra?: Partial<Pick<
+      RunControlContext,
+      | 'runPublisher'
+      | 'neuronRegistry'
+      | 'mcpClient'
+      | 'memory'
+      | 'connectionManager'
+      | 'graphRegistry'
+      | 'mcpRegistry'
+      | 'logger'
+      | 'graphPublisher'
+    >>,
+  ): RunControlContext {
     const existing = this.contexts.get(runId);
-    if (existing) return existing;
+    if (existing) {
+      if (infra) Object.assign(existing, infra);
+      return existing;
+    }
     const ctx: RunControlContext = {
       runId,
       controller: new AbortController(),
@@ -196,9 +246,35 @@ export class RunControlRegistry {
       onCancelCallbacks: new Set(),
       startedAt: new Date(),
       workerId,
+      ...(infra ?? {}),
     };
     this.contexts.set(runId, ctx);
     return ctx;
+  }
+
+  /**
+   * Attach (or replace) infrastructure objects on an already-registered run.
+   * Useful when the registration site doesn't have all infra in scope yet
+   * (e.g., RunPublisher is constructed after `register()` is called).
+   */
+  attachInfra(
+    runId: string,
+    infra: Partial<Pick<
+      RunControlContext,
+      | 'runPublisher'
+      | 'neuronRegistry'
+      | 'mcpClient'
+      | 'memory'
+      | 'connectionManager'
+      | 'graphRegistry'
+      | 'mcpRegistry'
+      | 'logger'
+      | 'graphPublisher'
+    >>,
+  ): void {
+    const ctx = this.contexts.get(runId);
+    if (!ctx) return;
+    Object.assign(ctx, infra);
   }
 
   /**

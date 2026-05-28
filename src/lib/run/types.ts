@@ -434,6 +434,34 @@ export interface AttachmentEvent extends BaseEvent {
 }
 
 /**
+ * Component event — a renderable chat-component spec produced during a run.
+ *
+ * Structural sibling of `AttachmentEvent`: "the agent produced a non-text artifact"
+ * — but instead of a file, the artifact is a declarative `ChatComponentSpec` that
+ * the chat UI renders inline. The frozen v1 schema lives in
+ * `lib/chat-components/spec-schema.ts` (signed off in
+ * `~/assistant/chat-epic-4-interactive-signoff.md`).
+ *
+ * The full spec rides on `spec` so the SSE forwarder + archiver + client renderer
+ * all consume the same shape. `componentId`/`runId`/`messageId` are duplicated at
+ * the top level for convenience (matches the AttachmentEvent shape) so consumers
+ * that index by these fields can do so without unwrapping `spec`.
+ */
+export interface ComponentEvent extends BaseEvent {
+  type: 'component';
+  /** Stable per-instance identifier (mirrors spec.componentId). */
+  componentId: string;
+  /** Run that produced this component (mirrors spec.runId — included for index/correlation). */
+  runId: string;
+  /** Owning message in the conversation (mirrors spec.messageId). Optional during the gap
+   *  between message_start and the first component emission. */
+  messageId?: string;
+  /** The full declarative spec. Schema-validated by RunPublisher.publishComponent
+   *  before publish; consumers may revalidate (defence-in-depth). */
+  spec: Record<string, unknown>;
+}
+
+/**
  * Union of all run events
  */
 export type RunEvent =
@@ -458,7 +486,8 @@ export type RunEvent =
   | ToolErrorEvent
   | AudioChunkEvent
   | InitEvent
-  | AttachmentEvent;
+  | AttachmentEvent
+  | ComponentEvent;
 
 /**
  * Event type discriminator
@@ -540,6 +569,29 @@ export const RunKeys = {
    * coordinating both sides.
    */
   interruptAck: (runId: string) => `run:interrupt:ack:${runId}`,
+  /**
+   * Component-event inbound channel: `run:component-event:{runId}`.
+   *
+   * Live in-run interaction channel for the chat-interactive-widgets feature.
+   * The webapp endpoint `POST /api/v1/runs/:runId/component-event` publishes
+   * a JSON `ComponentInteractionEvent` here; the engine appends it to the
+   * per-run inbox (`componentEvents`), which graph nodes drain via the
+   * native `read_component_events` tool.
+   *
+   * Mirrors the interrupt channel's pub/sub design — built on the same
+   * primitive intentionally so cancellation/inbound semantics share an
+   * abstraction (see `subscribeForComponentEvents` in `functions/run.ts`).
+   */
+  componentEvent: (runId: string) => `run:component-event:${runId}`,
+  /**
+   * Component-event inbox: `run:component-events:{runId}` (note the plural
+   * suffix — distinct from the channel above).
+   *
+   * Redis list that buffers component-event payloads until a graph node
+   * drains them via `read_component_events`. Lives only for the run's
+   * lifetime (TTL matches run state TTL).
+   */
+  componentEventsInbox: (runId: string) => `run:component-events:${runId}`,
 } as const;
 
 // =============================================================================

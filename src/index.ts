@@ -87,6 +87,29 @@ export type { RunOptions, RunResult, StreamingRunResult, ConnectionFetcher } fro
 // Export run utilities (used by SSE stream endpoints)
 export { RunKeys } from "./lib/run/types";
 export type { AudioChunkEvent, AttachmentEvent, AttachmentKind } from "./lib/run/types";
+
+// Export chat-components (frozen v1 ChatComponentSpec schema + validator).
+// See ~/assistant/chat-epic-4-interactive-signoff.md for the sign-off doc.
+export {
+  CHAT_COMPONENT_SPEC_SCHEMA_VERSION,
+  CHAT_COMPONENT_TYPES,
+  CHAT_COMPONENT_CHANNELS,
+  CHAT_COMPONENT_SURFACES,
+  CHAT_COMPONENT_SPEC_JSON_SCHEMA,
+  FOLLOWUP_TEXT_MAX_LENGTH,
+  validateChatComponentSpec,
+  assertChatComponentSpec,
+  ChatComponentSpecValidationError,
+} from './lib/chat-components';
+export type {
+  ChatComponentSpec,
+  ChatComponentType,
+  ChatComponentChannel,
+  ChatComponentSurface,
+  ChatComponentInteraction,
+  WidgetBinding,
+  ValidateResult,
+} from './lib/chat-components';
 export {
   classifyRunProgressStaleness,
   normalizeLastProgressAt,
@@ -100,7 +123,16 @@ export type {
   RunProgressStalenessOptions,
   RunProgressStalenessResult,
 } from "./lib/run";
-export { getRunState, getActiveRunForConversation, publishRunError, publishRunInterrupt, ARCHIVE_QUEUE_NAMES } from "./lib/run/run-publisher";
+export {
+  getRunState,
+  getActiveRunForConversation,
+  publishRunError,
+  publishRunInterrupt,
+  publishRunComponentEvent,
+  drainRunComponentEvents,
+  ARCHIVE_QUEUE_NAMES,
+} from "./lib/run/run-publisher";
+export type { ComponentInteractionEvent } from "./lib/run/run-publisher";
 
 // Export unified run trigger types and enrichment pipeline (Phase 1)
 export type {

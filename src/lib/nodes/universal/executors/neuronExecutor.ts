@@ -20,6 +20,7 @@ import { ParserExecutor, type ParserToolExecutor } from './parserExecutor';
 import { getParserRegistry } from './parserRegistry';
 import { getNativeRegistry } from '../../../tools/native-registry';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
+import { getRunPublisher, getNeuronRegistry, getMcpClient, getGraphRegistry } from '../../../run/contextLookup';
 import { HumanMessage } from '@langchain/core/messages';
 import { resolveToolStrategy, type ToolStrategy } from '../../../neurons/capability-matrix';
 import { resolveTools, toBindToolsPayload, type ResolvedTool } from '../../../tools/tool-resolver';
@@ -169,8 +170,8 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
   });
 
   try {
-    // Get neuron registry from state
-    const neuronRegistry = state.neuronRegistry;
+    // Get neuron registry from run-context registry (with state fallback for tests)
+    const neuronRegistry = getNeuronRegistry(state);
 
     // Pull the run-level AbortSignal once. Sourced from RunControlRegistry
     // so it survives any LangGraph checkpoint round-trip (state-stashed
@@ -612,12 +613,13 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       // Server-side TTS: Set up AudioStreamPipeline if the neuron is audio-optimized
       // -----------------------------------------------------------------------
       let audioPipeline: AudioStreamPipeline | null = null;
-      if (streamToUser && state.runPublisher) {
+      const streamPublisher = getRunPublisher(state);
+      if (streamToUser && streamPublisher) {
         try {
           const neuronConfig = await neuronRegistry.getConfig(neuronId, userId);
           if (neuronConfig.audioOptimized) {
             audioPipeline = new AudioStreamPipeline({
-              publisher: state.runPublisher,
+              publisher: streamPublisher,
               ttsOptions: {
                 voice: (state.data?.ttsVoice as string) || undefined,
                 speed: (state.data?.ttsSpeed as number) || undefined,
@@ -651,10 +653,11 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
                 const tool = nativeReg.get(toolName)!;
                 return tool.handler(params, {} as any);
               }
-              if (state.mcpClient) {
+              const mcp = getMcpClient(state);
+              if (mcp) {
                 // Pass abort signal so parser-driven tool calls also honor
                 // mid-step interrupt.
-                return state.mcpClient.callTool(
+                return mcp.callTool(
                   toolName,
                   params,
                   undefined,
@@ -676,9 +679,9 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
               guildId: inputData.guildId || state.data?.input?.guildId || null,
               botWorkspaceId: inputData.botWorkspaceId || null,
               // RunPublisher for conversation output type
-              runPublisher: state.runPublisher || null,
+              runPublisher: getRunPublisher(state) || null,
               // GraphRegistry for subgraph output type
-              _graphRegistry: state._graphRegistry || null,
+              _graphRegistry: getGraphRegistry(state) || null,
             });
             console.log(`[NeuronExecutor] Stream parser "${streamParserName}" loaded (outputs enabled)`);
           }
@@ -982,7 +985,7 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
     neuronRegistry,
   } = args;
 
-  const runPublisher: any = state.runPublisher;
+  const runPublisher: any = getRunPublisher(state);
   const maxIterations = typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0
     ? config.maxToolIterations
     : 5;

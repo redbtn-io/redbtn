@@ -20,6 +20,7 @@
 import { executeStep } from './stepExecutor';
 import { getNodeSystemPrefix } from '../../utils/node-helpers';
 import { runControlRegistry } from '../../run/RunControlRegistry';
+import { getRunPublisher } from '../../run/contextLookup';
 import type { NodeConfig } from './types';
 
 // Debug logging - set to true to enable verbose logs
@@ -100,9 +101,9 @@ function createNodeEventPublisher(state: any): {
     nodeComplete: (nodeId: string, nextNodeId: any, output?: any) => Promise<void>;
     nodeError: (nodeId: string, error: string) => Promise<void>;
 } | null {
-    // Use RunPublisher from run
-    if (state.runPublisher) {
-        const runPublisher = state.runPublisher;
+    // Use RunPublisher from run-context registry (falls back to state for tests)
+    const runPublisher = getRunPublisher(state);
+    if (runPublisher) {
         return {
             nodeStart: (nodeId: string, nodeType: string, nodeName: string) => runPublisher.nodeStart(nodeId, nodeType, nodeName),
             nodeProgress: (nodeId: string, step: string, options: any) => runPublisher.nodeProgress(nodeId, step, options),
@@ -319,9 +320,10 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
             // configs that use the `state.shared.<key>` namespace (the
             // initial PR #121 layer). Cheap when no shared writes —
             // single empty HGETALL. See run/run-shared-state.ts.
-            if (state.runPublisher) {
+            const nodePublisher = getRunPublisher(state);
+            if (nodePublisher) {
                 try {
-                    currentState.shared = await state.runPublisher.getSharedState();
+                    currentState.shared = await nodePublisher.getSharedState();
                 } catch (err) {
                     console.warn('[UniversalNode] Failed to hydrate state.shared:', err);
                     currentState.shared = currentState.shared ?? {};
@@ -336,9 +338,9 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
             // `state.data.x` then reflect peer-branch writes naturally.
             // Outside parallel blocks the flag is unset and nothing
             // hits Redis here.
-            if (currentState._parallelContext && state.runPublisher) {
+            if (currentState._parallelContext && nodePublisher) {
                 try {
-                    const autoState = await state.runPublisher.getAutoState();
+                    const autoState = await nodePublisher.getAutoState();
                     if (autoState && Object.keys(autoState).length > 0) {
                         // eslint-disable-next-line @typescript-eslint/no-require-imports
                         const { applyAutoStateOnto } = require('../../run/run-auto-state');

@@ -52,6 +52,7 @@ import {
 } from './types';
 import type { RedLog } from '@redbtn/redlog';
 import { ConversationPublisher, createConversationPublisher } from '../conversation';
+import { assertChatComponentSpec } from '../chat-components/spec-schema';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -862,6 +863,65 @@ export class RunPublisher {
   }
 
   // ===========================================================================
+  // Component Events (chat-interactive-widgets, phase 2)
+  // ===========================================================================
+
+  /**
+   * Publish a chat-component event to the run stream and (if conversationId is
+   * set) to the conversation stream so the chat UI can render it inline.
+   *
+   * The input is the *spec body* without engine-injected provenance — this
+   * method injects `runId`, `messageId`, `emittedAt`, and `surfaces: ['chat']`,
+   * then re-validates the assembled spec against the frozen v1 JSON Schema
+   * (`lib/chat-components/spec-schema.ts`). If validation fails, throws
+   * `ChatComponentSpecValidationError` and emits nothing — the publisher
+   * never carries an invalid spec onto the stream.
+   *
+   * @throws {ChatComponentSpecValidationError} if the assembled spec is invalid.
+   */
+  async publishComponent(spec: Record<string, unknown>): Promise<void> {
+    this.ensureInitialized();
+
+    const messageId = this.convMessageId ?? undefined;
+    const emittedAt = new Date().toISOString();
+    const assembled: Record<string, unknown> = {
+      ...spec,
+      runId: this.runId,
+      ...(messageId ? { messageId } : {}),
+      surfaces: ['chat'],
+      emittedAt,
+    };
+    const validated = assertChatComponentSpec(assembled);
+
+    const event = {
+      type: 'component' as const,
+      componentId: validated.componentId,
+      runId: this.runId,
+      ...(messageId ? { messageId } : {}),
+      spec: validated as unknown as Record<string, unknown>,
+      timestamp: Date.now(),
+    };
+    await this.publish(event);
+
+    if (this.convPublisher) {
+      this.convPublisher.publishComponent(this.runId, event, messageId).catch((err) => {
+        console.warn('[RunPublisher] Conv forward component failed:', err);
+      });
+    }
+
+    await this.persistLog({
+      level: 'info',
+      category: 'component',
+      message: `Component emitted: ${validated.type} (${validated.componentId})`,
+      metadata: {
+        componentId: validated.componentId,
+        type: validated.type,
+        messageId,
+      },
+    });
+  }
+
+  // ===========================================================================
   // Tool Events
   // ===========================================================================
 
@@ -1210,6 +1270,7 @@ function isProgressEvent(event: RunEvent): boolean {
     case 'thinking_complete':
     case 'audio_chunk':
     case 'attachment':
+    case 'component':
     case 'tool_start':
     case 'tool_progress':
     case 'tool_output':
@@ -1395,6 +1456,102 @@ export async function publishRunInterrupt(
   } catch (err) {
     console.error('[publishRunInterrupt] PUBLISH failed:', err);
     return 0;
+  }
+}
+
+/**
+ * Component-event interaction payload (chat-interactive-widgets phase 10).
+ *
+ * Posted to the per-run inbox by the webapp endpoint
+ * `POST /api/v1/runs/:runId/component-event` and drained by graph nodes
+ * via the native `read_component_events` tool.
+ */
+export interface ComponentInteractionEvent {
+  /** Stable id of the emitting chat-component spec. */
+  componentId: string;
+  /** Owning assistant message id (mirrors the spec). */
+  messageId?: string;
+  /** Payload provided by the user interaction (free-shape — schema
+   *  enforcement is the calling node's responsibility). */
+  payload: Record<string, unknown>;
+  /** Optional userId of the interacting user (engine-side audit). */
+  userId?: string;
+  /** ISO-8601 emission timestamp. */
+  timestamp: string;
+}
+
+/**
+ * Publish a component-interaction event to a run.
+ *
+ * Two-step delivery (same pattern the conversation publisher uses):
+ *   1. RPUSH onto the per-run inbox (`run:component-events:{runId}`) so a
+ *      node calling `read_component_events` after the publish sees the
+ *      payload regardless of subscriber timing.
+ *   2. PUBLISH a notification on `run:component-event:{runId}` so an
+ *      in-flight engine subscriber can wake immediately (no polling needed).
+ *
+ * Both keys live only for the run's lifetime — the list has an `EX` set
+ * to RunConfig.STATE_TTL_SECONDS on first append.
+ *
+ * @returns Number of channel subscribers that received the notification
+ *          (`0` means nobody is listening, e.g. run already done).
+ */
+export async function publishRunComponentEvent(
+  redis: Redis,
+  runId: string,
+  event: ComponentInteractionEvent,
+): Promise<number> {
+  const inboxKey = RunKeys.componentEventsInbox(runId);
+  const payload = JSON.stringify(event);
+  try {
+    const len = await redis.rpush(inboxKey, payload);
+    if (len === 1) {
+      try { await redis.expire(inboxKey, RunConfig.STATE_TTL_SECONDS); } catch { /* ignore */ }
+    }
+  } catch (err) {
+    console.error('[publishRunComponentEvent] RPUSH failed:', err);
+  }
+  try {
+    return await redis.publish(RunKeys.componentEvent(runId), payload);
+  } catch (err) {
+    console.error('[publishRunComponentEvent] PUBLISH failed:', err);
+    return 0;
+  }
+}
+
+/**
+ * Drain pending component-event payloads from a run's inbox.
+ *
+ * Atomic via LRANGE + LTRIM so concurrent drains don't return overlapping
+ * results. Called by the native `read_component_events` tool from inside
+ * a graph node; safe to call repeatedly between nodes.
+ *
+ * @param peek - If true, returns without removing the list contents.
+ *               Default false (drain semantics).
+ */
+export async function drainRunComponentEvents(
+  redis: Redis,
+  runId: string,
+  opts?: { peek?: boolean },
+): Promise<ComponentInteractionEvent[]> {
+  const inboxKey = RunKeys.componentEventsInbox(runId);
+  try {
+    const raw = await redis.lrange(inboxKey, 0, -1);
+    if (!opts?.peek && raw.length > 0) {
+      try { await redis.del(inboxKey); } catch { /* ignore */ }
+    }
+    return raw
+      .map((s) => {
+        try {
+          return JSON.parse(s) as ComponentInteractionEvent;
+        } catch {
+          return null;
+        }
+      })
+      .filter((e): e is ComponentInteractionEvent => e !== null);
+  } catch (err) {
+    console.error('[drainRunComponentEvents] LRANGE failed:', err);
+    return [];
   }
 }
 

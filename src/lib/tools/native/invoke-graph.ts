@@ -62,6 +62,7 @@ import type {
   NativeMcpResult,
 } from '../native-registry';
 import { isSystemResource } from '../../system-resource';
+import { getGraphRegistry, getNeuronRegistry, getMemory, getMcpClient } from '../../run/contextLookup';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -126,10 +127,10 @@ function buildRedShape(state: AnyObject, publisher: any): AnyObject | null {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const redlog = (publisher as any)?.redlog;
 
-  const graphRegistry = state?._graphRegistry;
-  const neuronRegistry = state?.neuronRegistry;
-  const memory = state?.memory;
-  const mcpClient = state?.mcpClient;
+  const graphRegistry = getGraphRegistry(state);
+  const neuronRegistry = getNeuronRegistry(state);
+  const memory = getMemory(state);
+  const mcpClient = getMcpClient(state);
 
   if (!redis || !graphRegistry || !neuronRegistry || !memory) {
     return null;
