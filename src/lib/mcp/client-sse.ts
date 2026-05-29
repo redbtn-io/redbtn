@@ -11,46 +11,18 @@ import {
   ResourceContents,
 } from './types';
 
-/**
- * Per-request auth-header provider. Invoked fresh on every outbound request
- * so short-lived tokens (e.g. a 5-minute identity JWT minted for a first-party
- * `*.redbtn.io` MCP connection's owner) never go stale between the one-time
- * startup registration and a long-running graph execution. The engine stays
- * provider-agnostic — the caller (worker / webapp) decides what to mint and
- * supplies this callback at registration time. Returned headers are merged
- * OVER the static `headers` so dynamic auth wins.
- */
-export type AuthHeaderProvider = () => Record<string, string> | Promise<Record<string, string>>;
-
 export class McpClientSSE {
   private serverUrl: string;
   private serverName: string;
   private sessionId: string;
   private requestId = 0;
   private extraHeaders: Record<string, string>;
-  private getAuthHeaders?: AuthHeaderProvider;
 
-  constructor(
-    serverUrl: string,
-    serverName: string,
-    headers?: Record<string, string>,
-    getAuthHeaders?: AuthHeaderProvider,
-  ) {
+  constructor(serverUrl: string, serverName: string, headers?: Record<string, string>) {
     this.serverUrl = serverUrl;
     this.serverName = serverName;
     this.sessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     this.extraHeaders = headers ?? {};
-    this.getAuthHeaders = getAuthHeaders;
-  }
-
-  /**
-   * Build the header set for an outbound request: static `extraHeaders` plus
-   * a fresh invocation of the auth provider (if any). Auth headers override
-   * static ones on key collision.
-   */
-  private async buildHeaders(base?: Record<string, string>): Promise<Record<string, string>> {
-    const auth = this.getAuthHeaders ? await this.getAuthHeaders() : {};
-    return { ...(base ?? {}), ...this.extraHeaders, ...auth };
   }
 
   /**
@@ -60,7 +32,7 @@ export class McpClientSSE {
     // Test connection with health check
     try {
       const response = await fetch(`${this.serverUrl}/health`, {
-        headers: await this.buildHeaders(),
+        headers: { ...this.extraHeaders },
       });
       if (!response.ok) {
         throw new Error(`Server health check failed: ${response.status}`);
@@ -173,7 +145,10 @@ export class McpClientSSE {
     try {
       const response = await fetch(`${this.serverUrl}/message`, {
         method: 'POST',
-        headers: await this.buildHeaders({ 'Content-Type': 'application/json' }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...this.extraHeaders,
+        },
         body: JSON.stringify(request),
         signal,
       });
@@ -210,7 +185,10 @@ export class McpClientSSE {
 
     await fetch(`${this.serverUrl}/message`, {
       method: 'POST',
-      headers: await this.buildHeaders({ 'Content-Type': 'application/json' }),
+      headers: {
+        'Content-Type': 'application/json',
+        ...this.extraHeaders,
+      },
       body: JSON.stringify(notification),
     });
   }
