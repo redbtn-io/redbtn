@@ -3,7 +3,7 @@
  * Tracks available MCP servers and their capabilities
  */
 
-import { McpClientSSE } from './client-sse';
+import { McpClientSSE, type AuthHeaderProvider } from './client-sse';
 import { Tool } from './types';
 
 export interface ServerRegistration {
@@ -19,6 +19,13 @@ export interface ServerConfig {
   url: string;  // e.g., 'http://localhost:3001/mcp'
   /** Optional HTTP headers forwarded on every request to this server (e.g. Authorization). */
   headers?: Record<string, string>;
+  /**
+   * Optional per-request auth-header provider. Invoked fresh on every outbound
+   * request — use for short-lived tokens that would expire if baked into static
+   * `headers` at registration time (e.g. a first-party `*.redbtn.io` identity
+   * JWT minted for the connection owner). See `AuthHeaderProvider` in client-sse.
+   */
+  getAuthHeaders?: AuthHeaderProvider;
 }
 
 /**
@@ -41,14 +48,14 @@ export class McpRegistry {
    * Register a server and connect to it
    */
   async registerServer(config: ServerConfig): Promise<void> {
-    const { name, url, headers } = config;
+    const { name, url, headers, getAuthHeaders } = config;
 
     if (this.clients.has(name)) {
       console.log(`[Registry] Server ${name} already registered`);
       return;
     }
 
-    const client = new McpClientSSE(url, name, headers);
+    const client = new McpClientSSE(url, name, headers, getAuthHeaders);
 
     try {
       // Connect and initialize
