@@ -24,8 +24,32 @@ import { createLogger } from '../utils/logger';
 import { NeuronConfig } from '../types/neuron';
 import { runControlRegistry, NeuronCall } from '../run/RunControlRegistry';
 import type { RedConfig } from '../../index';
+import { SYSTEM_USER_ID, LEGACY_SYSTEM_USER_ID } from '../system-resource';
 
 type PartialRedConfig = Pick<RedConfig, 'databaseUrl'> & Partial<Omit<RedConfig, 'databaseUrl'>>;
+
+/**
+ * Mongo `$or` branches that match a system-owned neuron. System neurons were
+ * migrated from `userId: 'system'` to canonical `SYSTEM_USER_ID` + an
+ * `isSystem: true` flag (all 14 system neurons; zero still use the legacy
+ * string). The registry must match all three forms or system neurons
+ * (red-neuron, red-worker, etc.) become invisible and graph runs fail with
+ * "Neuron '…' not found". Mirrors GraphRegistry's SYSTEM_OWNER_BRANCHES.
+ */
+const SYSTEM_OWNER_BRANCHES: Array<Record<string, unknown>> = [
+  { isSystem: true },
+  { userId: SYSTEM_USER_ID },
+  { userId: LEGACY_SYSTEM_USER_ID },
+];
+
+/** True if a neuron doc is system-owned in any migrated form. */
+function isSystemNeuron(doc: { userId?: string; isSystem?: boolean }): boolean {
+  return (
+    doc.isSystem === true ||
+    doc.userId === SYSTEM_USER_ID ||
+    doc.userId === LEGACY_SYSTEM_USER_ID
+  );
+}
 
 export { NeuronConfig, NeuronDocument } from '../types/neuron';
 
@@ -335,20 +359,21 @@ export class NeuronRegistry {
     if (config) return config;
     const doc = await Neuron.findOne({
       neuronId,
-      $or: [{ userId }, { userId: 'system' }],
+      $or: [{ userId }, ...SYSTEM_OWNER_BRANCHES],
     });
     if (!doc) throw new NeuronNotFoundError(`Neuron '${neuronId}' not found`);
 
     // Resolve apiKey from secretName via the vault. Unset → undefined →
     // LangChain falls through to platform env vars (OPENAI_API_KEY etc.).
     //
-    // For system neurons (`userId: 'system'`), the secret resolves under
-    // the *caller's* user ID — system neurons share configuration but
-    // each caller pays from their own vault entry.
+    // For system neurons (canonical SYSTEM_USER_ID / isSystem / legacy
+    // 'system'), the secret resolves under the *caller's* user ID — system
+    // neurons share configuration but each caller pays from their own vault
+    // entry.
     let resolvedKey: string | undefined;
     const docSecretName = (doc as any).secretName as string | undefined;
     if (docSecretName) {
-      const ownerForSecret = doc.userId === 'system' ? userId : doc.userId;
+      const ownerForSecret = isSystemNeuron(doc) ? userId : doc.userId;
       resolvedKey = await this.resolveSecret(docSecretName, ownerForSecret);
     }
 
@@ -463,7 +488,10 @@ export class NeuronRegistry {
 
   private async validateAccess(config: NeuronConfig, userId: string): Promise<void> {
     if (config.userId === userId) return;
-    if (config.userId === 'system') {
+    // Recognise system neurons in all migrated forms (canonical ID / isSystem
+    // flag / legacy string). Pre-fix this only matched the legacy string, so a
+    // canonical-ID system neuron was treated as another user's private neuron.
+    if (isSystemNeuron(config as { userId?: string; isSystem?: boolean })) {
       const userTier = await this.getUserTier(userId);
       if (userTier > config.tier) {
         throw new NeuronAccessDeniedError(
@@ -484,7 +512,8 @@ export class NeuronRegistry {
     const docs = await Neuron.find({
       $or: [
         { userId },
-        { userId: 'system', tier: { $gte: userTier } },
+        // System neurons are tier-gated; match all system-owner forms.
+        ...SYSTEM_OWNER_BRANCHES.map((branch) => ({ ...branch, tier: { $gte: userTier } })),
       ],
     }).sort({ tier: 1, neuronId: 1 });
     return docs.map((doc) => ({
