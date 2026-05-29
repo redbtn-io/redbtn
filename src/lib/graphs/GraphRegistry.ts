@@ -19,6 +19,21 @@ import { Graph } from '../models/Graph';
 import { compileGraphFromConfig, GraphCompilationError } from './compiler';
 import { GraphConfig, CompiledGraph } from '../types/graph';
 import type { RedConfig } from '../../index';
+import { SYSTEM_USER_ID, LEGACY_SYSTEM_USER_ID } from '../system-resource';
+
+/**
+ * Mongo `$or` branches that match a system-owned graph. System graphs were
+ * migrated from the legacy `userId: 'system'` string to the canonical
+ * `SYSTEM_USER_ID` ('000…001') + an `isSystem: true` flag. The registry must
+ * match all three forms or system graphs (red-assistant, red-chat, etc.)
+ * become invisible to every user and chat dispatch fails with
+ * "Graph '…' not found for user …". See lib/system-resource.ts.
+ */
+const SYSTEM_OWNER_BRANCHES: Array<Record<string, unknown>> = [
+  { isSystem: true },
+  { userId: SYSTEM_USER_ID },
+  { userId: LEGACY_SYSTEM_USER_ID },
+];
 
 type PartialRedConfig = Pick<RedConfig, 'databaseUrl'> & Partial<Omit<RedConfig, 'databaseUrl'>>;
 
@@ -87,7 +102,7 @@ export class GraphRegistry {
     }
     const doc = await Graph.findOne({
       graphId,
-      $or: [{ userId }, { userId: 'system' }],
+      $or: [{ userId }, ...SYSTEM_OWNER_BRANCHES],
     });
     if (!doc) throw new GraphNotFoundError(`Graph '${graphId}' not found for user ${userId}`);
     const rawConfig = doc.toObject();
@@ -109,7 +124,15 @@ export class GraphRegistry {
 
   private async validateAccess(graphConfig: GraphConfig, userId: string): Promise<void> {
     if (graphConfig.userId === userId) return;
-    if (graphConfig.userId === 'system') {
+    // Recognise system graphs in all migrated forms: canonical SYSTEM_USER_ID,
+    // the isSystem flag, or the legacy 'system' string. Pre-fix this only
+    // matched the legacy string, so canonical-ID system graphs (red-assistant
+    // et al.) were treated as another user's private graph → access denied.
+    const isSystem =
+      (graphConfig as any).isSystem === true ||
+      graphConfig.userId === SYSTEM_USER_ID ||
+      graphConfig.userId === LEGACY_SYSTEM_USER_ID;
+    if (isSystem) {
       const userTier = await this.getUserTier(userId);
       if (userTier > graphConfig.tier) {
         throw new GraphAccessDeniedError(
@@ -146,7 +169,9 @@ export class GraphRegistry {
     const docs = await Graph.find({
       $or: [
         { userId },
-        { userId: 'system', tier: { $gte: userTier } },
+        // System graphs are tier-gated. Match all system-owner forms, each
+        // still subject to the tier ceiling.
+        ...SYSTEM_OWNER_BRANCHES.map((branch) => ({ ...branch, tier: { $gte: userTier } })),
       ],
     });
     return docs.map((doc: any) => doc.toObject());
@@ -154,7 +179,7 @@ export class GraphRegistry {
 
   private async updateUsageStats(graphId: string, userId: string): Promise<void> {
     await Graph.updateOne(
-      { graphId, $or: [{ userId }, { userId: 'system' }] },
+      { graphId, $or: [{ userId }, ...SYSTEM_OWNER_BRANCHES] },
       { $inc: { usageCount: 1 }, $set: { lastUsedAt: new Date() } }
     ).exec();
   }
