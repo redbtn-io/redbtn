@@ -207,6 +207,32 @@ export class RunControlRegistry {
   private contexts = new Map<string, RunControlContext>();
 
   /**
+   * Tombstones for runs that were cancelled / interrupted.
+   *
+   * A run's live context is removed by `unregister()` in `run()`'s `finally`
+   * — but a DETACHED parallel-branch operation (the canonical case: the
+   * `thinking-indicator` typing loop, which polls in a parallel branch while
+   * the sibling analyst branch hangs) can still be mid-flight at that moment.
+   * Once the context is gone, `getRunSignal()` returns `undefined` and
+   * `checkAbort()` no-ops — so the straggler runs free to `maxIterations`
+   * (14.7h of Discord typing in the wild). The tombstone lets `checkAbort()`
+   * still detect the cancellation by `runId` for a grace window and stop it.
+   *
+   * Map: `runId` -> cancelledAt epoch ms. NOT a duration cap — it only fires
+   * for runs that were explicitly cancelled/interrupted; healthy long runs
+   * keep their live context and are never tombstoned.
+   */
+  private cancelledTombstones = new Map<string, number>();
+
+  /**
+   * How long a cancelled-run tombstone is honoured. A straggler loop checks
+   * abort at least once per iteration (seconds), so this only needs to cover
+   * the window between cancel→unregister and the loop's next check; 15 min is
+   * a generous safety margin that still bounds memory.
+   */
+  private static readonly TOMBSTONE_TTL_MS = 15 * 60 * 1000;
+
+  /**
    * Create + register a new control context for a run. Idempotent — if a
    * context already exists for `runId` it's returned as-is (the engine
    * handles run-id collisions at a higher layer).
@@ -369,6 +395,14 @@ export class RunControlRegistry {
       try { ctx.controller.abort(); } catch { /* ignore */ }
     }
 
+    // 1b. Tombstone the runId. A detached straggler (e.g. the thinking-indicator
+    //     parallel loop) may still be iterating after `run()`'s finally calls
+    //     `unregister()` and removes the live context above. Once that happens
+    //     `getRunSignal()` returns undefined and `checkAbort()` can no longer
+    //     see this aborted signal — so it consults the tombstone instead.
+    this.cancelledTombstones.set(runId, Date.now());
+    this.pruneTombstones();
+
     // 2. Fire tool-supplied cancel callbacks BEFORE walking neuron calls.
     //    Tools (ssh_shell, etc) need a chance to start killing remote
     //    work — the AbortController flip won't propagate to processes
@@ -407,6 +441,34 @@ export class RunControlRegistry {
       neuronCallsCancelled: cancelled,
       reason,
     };
+  }
+
+  /**
+   * Was this run cancelled / interrupted within the tombstone TTL?
+   *
+   * Used by `checkAbort()` as a fallback when the live context has already
+   * been unregistered but a detached operation is still running. Returns
+   * false for unknown or expired runIds. Prunes the checked entry on expiry.
+   */
+  wasCancelled(runId: string | undefined): boolean {
+    if (!runId) return false;
+    const at = this.cancelledTombstones.get(runId);
+    if (at === undefined) return false;
+    if (Date.now() - at > RunControlRegistry.TOMBSTONE_TTL_MS) {
+      this.cancelledTombstones.delete(runId);
+      return false;
+    }
+    return true;
+  }
+
+  /** Drop tombstones past their TTL. Called opportunistically from cancel(). */
+  private pruneTombstones(): void {
+    const now = Date.now();
+    for (const [rid, at] of this.cancelledTombstones) {
+      if (now - at > RunControlRegistry.TOMBSTONE_TTL_MS) {
+        this.cancelledTombstones.delete(rid);
+      }
+    }
   }
 
   /**
