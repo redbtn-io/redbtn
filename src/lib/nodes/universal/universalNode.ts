@@ -89,6 +89,19 @@ export function checkAbort(state: any): void {
                     : undefined;
         throw new RunInterruptedError(reasonStr);
     }
+    // Tombstone fallback. The live control context is removed by run()'s
+    // `finally` (unregister) as soon as the main execution unwinds — but a
+    // DETACHED parallel-branch operation (canonically the thinking-indicator
+    // typing loop, still polling while the sibling analyst branch hangs) can
+    // outlive that cleanup. With the context gone, getRunSignal() returns
+    // undefined and the check above silently passes, letting the straggler run
+    // to maxIterations. Consult the cancelled-run tombstone so it still aborts.
+    // This only fires for runs that were explicitly cancelled/interrupted —
+    // healthy long-running loops keep their live context and are unaffected.
+    const runId = state?.runId || state?.data?.runId;
+    if (runId && runControlRegistry.wasCancelled(runId)) {
+        throw new RunInterruptedError('cancelled');
+    }
 }
 
 /**
