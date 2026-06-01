@@ -12,6 +12,7 @@
 import type { LoopStepConfig } from '../types';
 import { executeStep } from '../stepExecutor';
 import { checkAbort } from '../universalNode';
+import { getRunPublisher } from '../../../run/contextLookup';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -125,6 +126,17 @@ export async function executeLoop(
     let exitConditionMet = false;
     // Clone current state to avoid mutating during loop
     const loopState: Record<string, any> = { ...state };
+    // Resolve the RunPublisher via the run-control registry. As of the
+    // "infrastructure-out-of-graph-state" refactor (see functions/run.js +
+    // run/contextLookup.ts) the publisher is NO LONGER attached to graph
+    // state — `loopState.runPublisher` is always undefined here. Reading it
+    // directly silently disabled BOTH the per-iteration `state.shared`
+    // re-hydrate AND the parallel-context auto-state overlay, so polling
+    // loops inside `parallel:` blocks (e.g. the thinking-indicator) never
+    // saw peer-branch writes and ran to maxIterations. `getRunPublisher`
+    // reads the registry first and falls back to `state.runPublisher` for
+    // direct/test callers.
+    const loopPublisher = getRunPublisher(loopState);
     while (iteration < maxIterations && !exitConditionMet) {
         iteration++;
         console.log(`[LoopExecutor] ====== ITERATION ${iteration}/${maxIterations} ======`);
@@ -132,9 +144,9 @@ export async function executeLoop(
         // Re-hydrate `state.shared` at the start of every iteration —
         // EXPLICIT cross-branch namespace (PR #121 layer). Required
         // for polling loops that read `state.shared.<key>`.
-        if (loopState.runPublisher) {
+        if (loopPublisher) {
             try {
-                loopState.shared = await loopState.runPublisher.getSharedState();
+                loopState.shared = await loopPublisher.getSharedState();
             } catch (err) {
                 console.warn('[LoopExecutor] Failed to hydrate state.shared:', err);
                 loopState.shared = loopState.shared ?? {};
@@ -146,9 +158,9 @@ export async function executeLoop(
         // thinking-indicator) sees peer writes to plain `state.data.x`
         // here without the config needing a `shared.` prefix. No-op
         // outside parallel blocks.
-        if (loopState._parallelContext && loopState.runPublisher) {
+        if (loopState._parallelContext && loopPublisher) {
             try {
-                const autoState = await loopState.runPublisher.getAutoState();
+                const autoState = await loopPublisher.getAutoState();
                 if (autoState && Object.keys(autoState).length > 0) {
                     // eslint-disable-next-line @typescript-eslint/no-require-imports
                     const { applyAutoStateOnto } = require('../../../run/run-auto-state');
