@@ -15,6 +15,7 @@
 import type { Red } from '../index';
 import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys, RunConfig } from '../lib/run';
 import { runControlRegistry, type CancelResult } from '../lib/run/RunControlRegistry';
+import { getOrCreateMeteringClient } from '../lib/run/meteringClient';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
 import { SYSTEM_TEMPLATES } from '../lib/types/graph';
@@ -316,45 +317,9 @@ export interface PreviousRunSnapshot {
   state: Record<string, unknown>;
 }
 
-/**
- * Process-singleton redToken metering client. One `UsageEventPublisher`
- * (XADD to `usage:events`) + `NeuronMeteringClient` per worker process, shared
- * across all runs (publishing is stateless fire-and-forget). Lazily built on
- * first run; returns `undefined` if redToken isn't available or init fails —
- * metering is strictly optional and must never affect a run.
- */
-let _meteringClient: any = null;
-let _meteringInitTried = false;
-function getOrCreateMeteringClient(redis: any): any {
-  if (_meteringInitTried) return _meteringClient;
-  _meteringInitTried = true;
-  try {
-    if (!redis) return null;
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const {
-      UsageEventPublisher,
-      NeuronMeteringClient,
-      ToolMeteringClient,
-      ResourceMeteringClient,
-    } = require('@redbtn/redtoken');
-    const publisher = new UsageEventPublisher(redis);
-    publisher.on?.('error', (err: unknown) => console.warn('[metering] publish error (non-fatal):', err));
-    // A bundle of per-surface clients sharing one publisher. Executors reach the
-    // surface they emit for: neuron (LLM), tool (native/MCP incl. scrape/search/
-    // tts/stt/storage ops), resource (compute per-node, + tts/stt/stream/env).
-    _meteringClient = {
-      publisher,
-      neuron: new NeuronMeteringClient(publisher),
-      tool: new ToolMeteringClient(publisher),
-      resource: new ResourceMeteringClient(publisher),
-    };
-    console.log('[metering] redToken usage metering initialised (neuron + tool + compute)');
-  } catch (err) {
-    console.warn('[metering] init failed — usage metering disabled (non-fatal):', err);
-    _meteringClient = null;
-  }
-  return _meteringClient;
-}
+// redToken process-singleton metering bundle lives in ../lib/run/meteringClient
+// so surfaces outside the run hot-path (e.g. EnvironmentManager) can reach it
+// via getProcessMeteringClient() without importing this module.
 
 /**
  * List of state keys that hold service objects / closures and must NOT be
