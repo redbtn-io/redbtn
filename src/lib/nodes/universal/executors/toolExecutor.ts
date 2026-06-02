@@ -10,7 +10,7 @@ import { executeWithErrorHandling } from './errorHandler';
 import { getParserRegistry } from './parserRegistry';
 import { ParserExecutor } from './parserExecutor';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
-import { getRunPublisher, getMcpClient, getConnectionManager, getGraphRegistry } from '../../../run/contextLookup';
+import { getRunPublisher, getMcpClient, getConnectionManager, getGraphRegistry, getMeteringClient } from '../../../run/contextLookup';
 import { ToolHangError, withToolIdleWatchdog, type ToolIdleWatchdogHandle } from '../../../tools/tool-idle-watchdog';
 import { getNativeRegistry } from '../../../tools/native-registry';
 import type { ToolStepConfig } from '../types';
@@ -141,6 +141,30 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
 
     // Generate unique tool execution ID
     const toolId = `tool_${config.toolName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    // redToken usage metering — one event per successful tool call. The
+    // consumer maps the tool to a cost class (scrape / web-search / storage-op /
+    // native-cheap / transform) via its catalog, so scrape/search/tts/stt/native/
+    // MCP tools all carry a token value. Fire-and-forget, never throws into a run.
+    const emitToolUsage = (source: 'native' | 'mcp'): void => {
+      try {
+        const tool = getMeteringClient(state)?.tool;
+        if (!tool) return;
+        tool.recordToolCall({
+          runId: state?.data?.runId || state?.runId || 'unknown',
+          accountId: state?.userId || state?.data?.userId || 'anonymous',
+          toolName: config.toolName,
+          source,
+          nodeId: state?.nodeConfig?.graphNodeId || state?.nodeConfig?.nodeId || state?.nodeId || state?.data?.currentNodeId,
+          stepId: config.outputField,
+          loopIteration: typeof state?.loopIteration === 'number' ? state.loopIteration : undefined,
+          conversationId: state?.data?.conversationId || state?.conversationId,
+          graphId: state?.graphId || state?.data?.graphId || state?.data?.options?.graphId,
+        });
+      } catch (e) {
+        console.warn('[metering] tool emit failed (non-fatal):', e instanceof Error ? e.message : e);
+      }
+    };
 
     // --- streamToConversation support ---
     // When runPublisher exists, parsed chunks route through it (which forwards
@@ -528,6 +552,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     }
                     // Forward native tool result to conversation stream
                     await forwardToConversation(serializedNativeResult);
+                    emitToolUsage('native');
                     return { [config.outputField]: serializedNativeResult };
                 } catch (nativeErr: any) {
                     lastNativeError = nativeErr instanceof Error ? nativeErr : new Error(String(nativeErr));
@@ -688,6 +713,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                 // Forward MCP tool result to conversation stream
                 await forwardToConversation(serializedResult);
 
+                emitToolUsage('mcp');
                 // Return output field
                 return {
                     [config.outputField]: serializedResult

@@ -331,11 +331,24 @@ function getOrCreateMeteringClient(redis: any): any {
   try {
     if (!redis) return null;
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { UsageEventPublisher, NeuronMeteringClient } = require('@redbtn/redtoken');
+    const {
+      UsageEventPublisher,
+      NeuronMeteringClient,
+      ToolMeteringClient,
+      ResourceMeteringClient,
+    } = require('@redbtn/redtoken');
     const publisher = new UsageEventPublisher(redis);
     publisher.on?.('error', (err: unknown) => console.warn('[metering] publish error (non-fatal):', err));
-    _meteringClient = new NeuronMeteringClient(publisher);
-    console.log('[metering] redToken usage metering initialised');
+    // A bundle of per-surface clients sharing one publisher. Executors reach the
+    // surface they emit for: neuron (LLM), tool (native/MCP incl. scrape/search/
+    // tts/stt/storage ops), resource (compute per-node, + tts/stt/stream/env).
+    _meteringClient = {
+      publisher,
+      neuron: new NeuronMeteringClient(publisher),
+      tool: new ToolMeteringClient(publisher),
+      resource: new ResourceMeteringClient(publisher),
+    };
+    console.log('[metering] redToken usage metering initialised (neuron + tool + compute)');
   } catch (err) {
     console.warn('[metering] init failed — usage metering disabled (non-fatal):', err);
     _meteringClient = null;
