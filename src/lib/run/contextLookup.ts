@@ -66,3 +66,11 @@ export function getGraphPublisher(state: any): any | undefined {
   const ctx = runControlRegistry.get(resolveRunId(state));
   return ctx?.graphPublisher ?? state?.graphPublisher;
 }
+
+/** redToken usage-metering client. Used by neuronExecutor to emit one usage
+ *  event per LLM call. Returns undefined when metering isn't wired (direct/test
+ *  callers, or init failure) — callers must treat it as optional + fail-safe. */
+export function getMeteringClient(state: any): any | undefined {
+  const ctx = runControlRegistry.get(resolveRunId(state));
+  return ctx?.meteringClient ?? state?.meteringClient;
+}

@@ -317,6 +317,33 @@ export interface PreviousRunSnapshot {
 }
 
 /**
+ * Process-singleton redToken metering client. One `UsageEventPublisher`
+ * (XADD to `usage:events`) + `NeuronMeteringClient` per worker process, shared
+ * across all runs (publishing is stateless fire-and-forget). Lazily built on
+ * first run; returns `undefined` if redToken isn't available or init fails —
+ * metering is strictly optional and must never affect a run.
+ */
+let _meteringClient: any = null;
+let _meteringInitTried = false;
+function getOrCreateMeteringClient(redis: any): any {
+  if (_meteringInitTried) return _meteringClient;
+  _meteringInitTried = true;
+  try {
+    if (!redis) return null;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { UsageEventPublisher, NeuronMeteringClient } = require('@redbtn/redtoken');
+    const publisher = new UsageEventPublisher(redis);
+    publisher.on?.('error', (err: unknown) => console.warn('[metering] publish error (non-fatal):', err));
+    _meteringClient = new NeuronMeteringClient(publisher);
+    console.log('[metering] redToken usage metering initialised');
+  } catch (err) {
+    console.warn('[metering] init failed — usage metering disabled (non-fatal):', err);
+    _meteringClient = null;
+  }
+  return _meteringClient;
+}
+
+/**
  * List of state keys that hold service objects / closures and must NOT be
  * carried into a resumed run. They're rebuilt fresh from the new Red instance
  * by buildInitialState().
@@ -1491,6 +1518,10 @@ export async function run(
     memory: red.memory,
     connectionManager: runCtxConnectionManager,
     graphRegistry: red.graphRegistry,
+    // redToken usage metering — process-singleton, fail-safe. Emits one usage
+    // event per LLM call to the `usage:events` Redis stream (the worker's
+    // consumer rates + posts to the ledger). Never blocks/breaks a run.
+    meteringClient: getOrCreateMeteringClient(red.redis),
   });
   // Local controller kept for legacy/fallback paths (anyone reading
   // `state._abortController` directly). Wired so the run-controller

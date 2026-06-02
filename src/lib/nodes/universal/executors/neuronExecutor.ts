@@ -20,7 +20,7 @@ import { ParserExecutor, type ParserToolExecutor } from './parserExecutor';
 import { getParserRegistry } from './parserRegistry';
 import { getNativeRegistry } from '../../../tools/native-registry';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
-import { getRunPublisher, getNeuronRegistry, getMcpClient, getGraphRegistry } from '../../../run/contextLookup';
+import { getRunPublisher, getNeuronRegistry, getMcpClient, getGraphRegistry, getMeteringClient } from '../../../run/contextLookup';
 import { HumanMessage } from '@langchain/core/messages';
 import { resolveToolStrategy, type ToolStrategy } from '../../../neurons/capability-matrix';
 import { resolveTools, toBindToolsPayload, type ResolvedTool } from '../../../tools/tool-resolver';
@@ -215,6 +215,16 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // Get model instance from registry (returns LangChain BaseChatModel)
     // Support userId at root or in data
     const userId = state.userId || state.data?.userId;
+
+    // redToken usage metering (shadow mode) — see emitNeuronUsage(). Thin
+    // closure binding the common per-execution args; each call path passes its
+    // own providerResponse (+ optional stepId override for the tool loop).
+    const emitUsage = (providerResponse: any, modelHint?: string, stepIdOverride?: string): void =>
+      emitNeuronUsage({
+        state, neuronRegistry, config, neuronId, userId, callRunId,
+        providerResponse, modelHint, stepIdOverride,
+      });
+
     let model: any = await neuronRegistry.getModel(
       neuronId,
       userId,
@@ -508,6 +518,11 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
         });
       }
 
+      // Emit usage for the non-streaming (structured-output) call. rawResponse
+      // is the raw provider message for native/Ollama; for withStructuredOutput
+      // it's the parsed object (no usage → extractor returns zeros, acceptable).
+      emitUsage(rawResponse);
+
       // Handle different response formats based on provider
       if (useNativeFormat) {
         // Ollama with native format returns AIMessage with JSON string content
@@ -635,6 +650,9 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
 
       response = '';
       let chunkCount = 0;
+      // Capture the chunk carrying provider usage for metering. LangChain emits
+      // usage_metadata on (usually) the final chunk when stream-usage is on.
+      let streamUsageChunk: any = null;
 
       // -----------------------------------------------------------------------
       // Stream parser support: if config has streamParser, set up a ParserExecutor
@@ -770,6 +788,11 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
           const chunk = iterResult.value;
           chunkCount++;
 
+          // Track the chunk that carries usage metadata (for metering emit).
+          if (chunk?.usage_metadata || chunk?.response_metadata?.usage || chunk?.usageMetadata) {
+            streamUsageChunk = chunk;
+          }
+
           if (chunkCount === 1) {
             console.log(`[NeuronExecutor] First chunk received after ${Date.now() - streamStartTime}ms`);
           }
@@ -812,6 +835,10 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       console.log(
         `[NeuronExecutor] Stream complete: ${chunkCount} chunks, ${response.length} chars, ${Date.now() - streamStartTime}ms`
       );
+
+      // Emit usage for the streaming call (best-effort — only if the provider
+      // surfaced usage metadata on a chunk; some streams omit it).
+      if (streamUsageChunk) void emitUsage(streamUsageChunk);
 
       // Flush stream parser outputs (send remaining text to voice, etc.)
       if (neuronParser) {
@@ -950,6 +977,57 @@ interface NativeToolUseLoopArgs {
 }
 
 /**
+ * redToken usage metering — fire-and-forget emit of one usage event per LLM
+ * call. Extracts the provider's token usage and (via the metering client)
+ * appends a sample to `state.metadata.tokens` + XADDs to the `usage:events`
+ * stream. Strictly optional and fail-safe: resolves to a no-op when the client
+ * isn't wired (tests / init failure) and NEVER throws into or slows a run.
+ *
+ * `stepIdOverride` lets the tool-use loop give each iteration a distinct stepId
+ * so their idempotency keys don't collide and dedupe each other.
+ */
+function emitNeuronUsage(params: {
+  state: any;
+  neuronRegistry: any;
+  config: any;
+  neuronId: string;
+  userId: string | undefined;
+  callRunId: string | undefined;
+  providerResponse: any;
+  modelHint?: string;
+  stepIdOverride?: string;
+}): void {
+  // Run async work detached so the hot path never awaits metering.
+  void (async () => {
+    try {
+      const client = getMeteringClient(params.state);
+      if (!client || !params.providerResponse) return;
+      let modelStr = params.modelHint;
+      if (!modelStr) {
+        try {
+          modelStr = (await params.neuronRegistry.getConfig(params.neuronId, params.userId))?.model;
+        } catch { /* config lookup is best-effort */ }
+      }
+      const s = params.state;
+      client.recordNeuronCall({
+        state: s,
+        runId: params.callRunId || 'unknown',
+        accountId: params.userId || 'anonymous',
+        model: modelStr || params.neuronId,
+        providerResponse: params.providerResponse,
+        nodeId: s?.nodeId || s?.data?.currentNodeId || s?.data?.nodeId,
+        stepId: params.stepIdOverride || params.config?.outputField,
+        loopIteration: typeof s?.loopIteration === 'number' ? s.loopIteration : undefined,
+        conversationId: s?.data?.conversationId || s?.conversationId,
+        graphId: s?.graphId || s?.data?.graphId || s?.data?.options?.graphId,
+      });
+    } catch (e) {
+      console.warn('[metering] neuron emit failed (non-fatal):', e instanceof Error ? e.message : e);
+    }
+  })();
+}
+
+/**
  * Generate a unique tool-call id for RunPublisher events.
  */
 function generateToolId(toolName: string, iteration: number): string {
@@ -1039,6 +1117,15 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
         `LLM invocation failed during tool-use loop (iteration ${iteration + 1}): ${invokeErr instanceof Error ? invokeErr.message : String(invokeErr)}`
       );
     }
+
+    // Meter each tool-loop iteration as its own LLM call. The stepId override
+    // (with the iteration index) keeps idempotency keys distinct so iterations
+    // don't dedupe against each other.
+    emitNeuronUsage({
+      state, neuronRegistry, config, neuronId, userId, callRunId,
+      providerResponse: response,
+      stepIdOverride: `${neuronStepId}:tool${iteration}`,
+    });
 
     const toolCalls: any[] = Array.isArray(response?.tool_calls) ? response.tool_calls : [];
     const responseContent: string = typeof response?.content === 'string'

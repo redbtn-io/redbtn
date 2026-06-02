@@ -175,6 +175,10 @@ export interface RunControlContext {
   mcpRegistry?: any;
   logger?: any;
   graphPublisher?: any;
+  /** redToken usage-metering client (NeuronMeteringClient). Emits one usage
+   *  event per LLM call to the `usage:events` Redis stream. Optional + fully
+   *  fail-safe — a metering outage never affects the run. */
+  meteringClient?: any;
 }
 
 /**
@@ -258,6 +262,7 @@ export class RunControlRegistry {
       | 'mcpRegistry'
       | 'logger'
       | 'graphPublisher'
+      | 'meteringClient'
     >>,
   ): RunControlContext {
     const existing = this.contexts.get(runId);
@@ -296,6 +301,7 @@ export class RunControlRegistry {
       | 'mcpRegistry'
       | 'logger'
       | 'graphPublisher'
+      | 'meteringClient'
     >>,
   ): void {
     const ctx = this.contexts.get(runId);
