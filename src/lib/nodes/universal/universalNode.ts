@@ -20,7 +20,7 @@
 import { executeStep } from './stepExecutor';
 import { getNodeSystemPrefix } from '../../utils/node-helpers';
 import { runControlRegistry } from '../../run/RunControlRegistry';
-import { getRunPublisher } from '../../run/contextLookup';
+import { getRunPublisher, getMeteringClient } from '../../run/contextLookup';
 import type { NodeConfig } from './types';
 
 // Debug logging - set to true to enable verbose logs
@@ -151,6 +151,10 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
     // MongoCheckpointer has already persisted state at the prior node's exit,
     // so throwing here gives a clean checkpoint boundary for resume.
     checkAbort(state);
+
+    // redToken: wall-clock for this node, so the `compute` event can carry a
+    // duration component. One compute event is emitted per successful node exit.
+    const nodeStartMs = Date.now();
 
     // Extract node config (injected by compiler)
     let nodeConfig: NodeConfig = state.nodeConfig || {};
@@ -486,6 +490,34 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
             nestedData: nestedUpdates.data ? Object.keys(nestedUpdates.data) : 'no data',
             messagesLength: nestedUpdates.data?.messages?.length
         });
+    }
+
+    // redToken: emit ONE compute event per node execution — the per-node
+    // "compute is compute" base. The node's neuron/tool steps already emit their
+    // own (priced) events; this captures the orchestration itself so every node
+    // carries a token value. Fire-and-forget, guarded, never throws into a run.
+    try {
+        const resource = getMeteringClient(state)?.resource;
+        if (resource) {
+            const _runId = state?.runId || state?.data?.runId || 'unknown';
+            resource.recordCompute({
+                runId: _runId,
+                accountId: state?.userId || state?.data?.userId || 'anonymous',
+                nodeId: graphNodeId,
+                nodeType: (nodeConfig as any).type || nodeConfig.nodeId || 'universal',
+                units: 1,
+                durationMs: Date.now() - nodeStartMs,
+                loopIteration: typeof state?.loopIteration === 'number' ? state.loopIteration : undefined,
+                conversationId: state?.data?.conversationId || state?.conversationId,
+                graphId: state?.graphId || state?.data?.graphId || state?.data?.options?.graphId,
+                // Per-execution key (node start time) so graph cycles re-running the
+                // same node don't dedupe to one charge; replay of the same stream
+                // entry keeps this key, so exactly-once on redelivery still holds.
+                idempotencyKey: `${_runId}:${graphNodeId}:compute:${nodeStartMs}`,
+            });
+        }
+    } catch (e) {
+        console.warn('[metering] compute emit failed (non-fatal):', e instanceof Error ? e.message : e);
     }
 
     // Return accumulated state updates

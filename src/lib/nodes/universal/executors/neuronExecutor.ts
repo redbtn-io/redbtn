@@ -1000,8 +1000,10 @@ function emitNeuronUsage(params: {
   // Run async work detached so the hot path never awaits metering.
   void (async () => {
     try {
-      const client = getMeteringClient(params.state);
-      if (!client || !params.providerResponse) return;
+      const bundle = getMeteringClient(params.state);
+      // bundle is { neuron, tool, resource, publisher }; emit via the neuron surface.
+      const neuron = bundle?.neuron;
+      if (!neuron || !params.providerResponse) return;
       let modelStr = params.modelHint;
       if (!modelStr) {
         try {
@@ -1009,7 +1011,7 @@ function emitNeuronUsage(params: {
         } catch { /* config lookup is best-effort */ }
       }
       const s = params.state;
-      client.recordNeuronCall({
+      neuron.recordNeuronCall({
         state: s,
         runId: params.callRunId || 'unknown',
         accountId: params.userId || 'anonymous',
