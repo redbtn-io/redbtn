@@ -43,6 +43,31 @@
  */
 
 import { EnvironmentSession, type SshClientFactory, type OnExecCompleteHandler } from './EnvironmentSession';
+import { getProcessMeteringClient } from '../run/meteringClient';
+
+/**
+ * redToken usage metering for an environment session that just closed. Emits one
+ * `environment` event series (per-hour ticks + remainder) for the session's
+ * lifetime. Fire-and-forget, fully guarded — metering must never affect a
+ * session's teardown. No-op when metering isn't initialised (no run has run yet).
+ */
+function emitEnvironmentSessionUsage(session: EnvironmentSession): void {
+  try {
+    const resource = getProcessMeteringClient()?.resource;
+    if (!resource || !session.openedAt) return;
+    const durationSeconds = Math.max(0, (Date.now() - session.openedAt.getTime()) / 1000);
+    if (durationSeconds <= 0) return;
+    resource.recordEnvironmentSession({
+      runId: session.runIdForMetering || `env-${session.environmentId}`,
+      accountId: session.userId, // accountId == redbtn userId
+      durationSeconds,
+      sessionId: `env-${session.environmentId}-${session.openedAt.getTime()}`,
+      nodeId: session.environmentId,
+    });
+  } catch (e) {
+    console.warn('[metering] environment session emit failed (non-fatal):', e instanceof Error ? e.message : e);
+  }
+}
 import {
   type IEnvironment,
   type EnvironmentStatus,
@@ -147,6 +172,7 @@ export class EnvironmentManager {
       // When a session reaches `closed` (idle/explicit/maxLifetime/etc), drop
       // it from the pool so the next acquire opens a fresh one.
       if (evt.to === 'closed') {
+        emitEnvironmentSessionUsage(session);
         const current = this.sessions.get(id);
         if (current === session) {
           this.sessions.delete(id);
