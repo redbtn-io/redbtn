@@ -226,6 +226,11 @@ export class EnvironmentSession extends EventEmitter {
     this.runId = opts.runId;
   }
 
+  /** The run this session was opened under, if any (for usage attribution). */
+  get runIdForMetering(): string | undefined {
+    return this.runId;
+  }
+
   // ---------------------------------------------------------------------------
   // Public — lifecycle
   // ---------------------------------------------------------------------------
