@@ -22,9 +22,12 @@ let _meteringInitTried = false;
 
 export function getOrCreateMeteringClient(redis: any): any {
   if (_meteringInitTried) return _meteringClient;
+  // Don't latch on a missing redis — a later run with a real handle should still
+  // get to initialise (otherwise a single early run without redis permanently
+  // disables metering for the process).
+  if (!redis) return null;
   _meteringInitTried = true;
   try {
-    if (!redis) return null;
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const {
       UsageEventPublisher,

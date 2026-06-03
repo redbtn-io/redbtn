@@ -156,7 +156,8 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
           toolName: config.toolName,
           source,
           nodeId: state?.nodeConfig?.graphNodeId || state?.nodeConfig?.nodeId || state?.nodeId || state?.data?.currentNodeId,
-          stepId: config.outputField,
+          // Per-node-execution token disambiguates graph edge-cycles (see universalNode).
+          stepId: typeof state?._nodeExecToken === 'number' ? `${config.outputField}:x${state._nodeExecToken}` : config.outputField,
           loopIteration: typeof state?.loopIteration === 'number' ? state.loopIteration : undefined,
           conversationId: state?.data?.conversationId || state?.conversationId,
           graphId: state?.graphId || state?.data?.graphId || state?.data?.options?.graphId,

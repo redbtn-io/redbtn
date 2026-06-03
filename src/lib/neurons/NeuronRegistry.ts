@@ -454,6 +454,10 @@ export class NeuronRegistry {
           topP: config.topP,
           apiKey: config.apiKey,
           configuration: { baseURL: config.endpoint },
+          // Emit token usage on the final streamed chunk (sets stream_options.
+          // include_usage). Without this, streamed OpenAI calls carry no usage
+          // and redToken metering counts them as zero.
+          streamUsage: true,
         });
       case 'anthropic':
         return new ChatAnthropic({
@@ -480,6 +484,7 @@ export class NeuronRegistry {
           topP: config.topP,
           apiKey: config.apiKey || 'not-needed',
           configuration: { baseURL: config.endpoint },
+          streamUsage: true, // count streamed usage (see openai case)
         });
       default:
         throw new NeuronProviderError(`Unknown provider: ${(config as NeuronConfig).provider}`);
