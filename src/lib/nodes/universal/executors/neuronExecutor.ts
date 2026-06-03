@@ -1011,6 +1011,10 @@ function emitNeuronUsage(params: {
         } catch { /* config lookup is best-effort */ }
       }
       const s = params.state;
+      // Append the per-node-execution token (set by universalNode) so distinct
+      // executions of the same node across graph edge-cycles don't dedupe-collide.
+      const baseStepId = params.stepIdOverride || params.config?.outputField;
+      const execToken = typeof s?._nodeExecToken === 'number' ? `:x${s._nodeExecToken}` : '';
       neuron.recordNeuronCall({
         state: s,
         runId: params.callRunId || 'unknown',
@@ -1018,7 +1022,7 @@ function emitNeuronUsage(params: {
         model: modelStr || params.neuronId,
         providerResponse: params.providerResponse,
         nodeId: s?.nodeId || s?.data?.currentNodeId || s?.data?.nodeId,
-        stepId: params.stepIdOverride || params.config?.outputField,
+        stepId: baseStepId ? `${baseStepId}${execToken}` : baseStepId,
         loopIteration: typeof s?.loopIteration === 'number' ? s.loopIteration : undefined,
         conversationId: s?.data?.conversationId || s?.conversationId,
         graphId: s?.graphId || s?.data?.graphId || s?.data?.options?.graphId,
