@@ -155,6 +155,12 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
     // redToken: wall-clock for this node, so the `compute` event can carry a
     // duration component. One compute event is emitted per successful node exit.
     const nodeStartMs = Date.now();
+    // Per-execution token so neuron/tool/compute usage events from THIS node
+    // execution get distinct idempotency keys across graph EDGE-CYCLES (same
+    // nodeId revisited via a router/retry edge) — without it, the second genuine
+    // execution collides with the first and its charge is deduped away. Stream
+    // redelivery of one execution keeps the same token, so it still dedupes.
+    state._nodeExecToken = nodeStartMs;
 
     // Extract node config (injected by compiler)
     let nodeConfig: NodeConfig = state.nodeConfig || {};
