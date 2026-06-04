@@ -1175,6 +1175,22 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
       const resolved = resolvedTools.find((t) => t.name === toolName);
       const toolId = generateToolId(toolName, iteration);
 
+      // Auto-inject environment context from node parameters so the LLM
+      // does not need to supply environmentId / workingDir explicitly.
+      // Only injects when: (1) the parameter is set on the node/graph,
+      // (2) the tool schema declares that property, and (3) the LLM did
+      // not already provide a value (LLM-supplied values always win).
+      if (resolved) {
+        const stateParams = (state as any)?.parameters;
+        const schemaProps = (resolved.inputSchema as any)?.properties as Record<string, unknown> | undefined;
+        if (stateParams?.environmentId && schemaProps?.environmentId && !parsedArgs.environmentId) {
+          parsedArgs.environmentId = stateParams.environmentId;
+        }
+        if (stateParams?.workingDir && schemaProps?.workingDir && !parsedArgs.workingDir) {
+          parsedArgs.workingDir = stateParams.workingDir;
+        }
+      }
+
       // Cooperative abort check before dispatch
       if (abortSignal?.aborted) {
         const err: Error & { name: string } = new Error('Neuron tool-use loop aborted before tool dispatch');
