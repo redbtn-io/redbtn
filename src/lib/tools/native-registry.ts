@@ -1515,6 +1515,20 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     console.error('[NativeRegistry] Failed to register list_dir:', msg);
   }
 
+  // ─── run_command — env-aware shell execution (hides SSH from LLM) ───────────
+  try {
+    // Run Command — execute a shell command on the configured environment.
+    // Reads environmentId from context.state.data.environmentId so the LLM
+    // never has to pass SSH credentials or connection details.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const runCommand = require('./native/run-command.js');
+    registry.register('run_command', runCommand.default || runCommand);
+    console.log('[NativeRegistry] Registered built-in tool: run_command');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register run_command:', msg);
+  }
+
   // ─── Platform pack — Phase A (PLATFORM-PACK-HANDOFF.md §2 Phase A) ────────
   // Agents-build-agents meta-tools. Native CRUD over the platform's own
   // primitives — graphs, nodes, neurons, streams. Combined with the
