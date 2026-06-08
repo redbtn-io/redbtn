@@ -1173,11 +1173,6 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
   let lastToolResult: unknown = undefined;
   let lastToolName: string | undefined;
   let finalContent = '';
-  // Some models (notably Gemini flash with native function-calling) occasionally
-  // end the loop with an empty final turn — no tool calls AND no text — leaving
-  // the user with a blank "No response". Nudge once for a summary before
-  // accepting empty, so a productive run never ends silent.
-  let nudgedForEmptyFinal = false;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     // Cooperative abort check between iterations
@@ -1224,18 +1219,6 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
 
     // No tool calls -> this is the final assistant message.
     if (toolCalls.length === 0) {
-      // Empty final turn after a productive run → nudge once for a summary
-      // rather than returning a silent "No response".
-      if (!responseContent.trim() && !nudgedForEmptyFinal && iteration > 0) {
-        nudgedForEmptyFinal = true;
-        messages.push(response);
-        messages.push({
-          role: 'user',
-          content: 'Provide your final response now: a concise summary of what you did, the key results, and any next steps. Do not call any more tools.',
-        });
-        console.log('[NeuronExecutor] Empty final turn — nudging model once for a summary');
-        continue;
-      }
       finalContent = responseContent;
       // Stream the final content to the user if requested. We do this once
       // at the end (rather than incrementally) because the tool-use loop
