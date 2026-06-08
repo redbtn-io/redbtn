@@ -64,10 +64,24 @@ export async function executeWithErrorHandling<T>(
     console.error(`[ErrorHandler] ${stepInfo?.type || 'Step'} failed after ${attempt} attempts. Strategy: ${onError}`);
 
     switch (onError) {
-        case 'fallback':
+        case 'fallback': {
+            // Opt-in error surfacing: a string fallbackValue may reference the
+            // real error via {{error}} / {{error.message}} / {{error.name}} so
+            // the user sees what actually failed instead of a generic message.
+            // Non-string fallbacks (and strings without the placeholder) are
+            // returned unchanged — zero impact on existing configs.
+            let value = fallbackValue;
+            if (typeof value === 'string' && lastError && value.includes('{{error')) {
+                const msg = lastError.message || String(lastError);
+                value = value
+                    .replace(/\{\{\s*error\.message\s*\}\}/g, msg)
+                    .replace(/\{\{\s*error\.name\s*\}\}/g, lastError.name || 'Error')
+                    .replace(/\{\{\s*error\s*\}\}/g, msg);
+            }
             if (DEBUG)
-                console.log(`[ErrorHandler] Using fallback value for ${stepInfo?.field || 'output'}:`, JSON.stringify(fallbackValue).substring(0, 100));
-            return fallbackValue;
+                console.log(`[ErrorHandler] Using fallback value for ${stepInfo?.field || 'output'}:`, JSON.stringify(value).substring(0, 100));
+            return value as T;
+        }
         case 'skip':
             if (DEBUG)
                 console.log(`[ErrorHandler] Skipping ${stepInfo?.type || 'step'}`);
