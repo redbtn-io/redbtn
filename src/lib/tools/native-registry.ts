@@ -167,6 +167,8 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   'invoke_graph',
 
   // ── Nodes ──
+  'list_nodes',
+  'get_node',
   'create_node',
   'update_node',
   'node_patch',
@@ -1515,6 +1517,20 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     console.error('[NativeRegistry] Failed to register list_dir:', msg);
   }
 
+  // ─── run_command — env-aware shell execution (hides SSH from LLM) ───────────
+  try {
+    // Run Command — execute a shell command on the configured environment.
+    // Reads environmentId from context.state.data.environmentId so the LLM
+    // never has to pass SSH credentials or connection details.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const runCommand = require('./native/run-command.js');
+    registry.register('run_command', runCommand.default || runCommand);
+    console.log('[NativeRegistry] Registered built-in tool: run_command');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register run_command:', msg);
+  }
+
   // ─── Platform pack — Phase A (PLATFORM-PACK-HANDOFF.md §2 Phase A) ────────
   // Agents-build-agents meta-tools. Native CRUD over the platform's own
   // primitives — graphs, nodes, neurons, streams. Combined with the
@@ -1631,7 +1647,29 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     console.error('[NativeRegistry] Failed to register get_graph_compile_log:', msg);
   }
 
-  // Platform pack — node tools (4)
+  // Platform pack — node tools (6)
+  try {
+    // List Nodes — GET /api/nodes (system + public + owned + shared)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const listNodes = require('./native/list-nodes.js');
+    registry.register('list_nodes', listNodes.default || listNodes);
+    console.log('[NativeRegistry] Registered built-in tool: list_nodes');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register list_nodes:', msg);
+  }
+
+  try {
+    // Get Node — GET /api/nodes/:nodeId (full step config + parameters)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const getNode = require('./native/get-node.js');
+    registry.register('get_node', getNode.default || getNode);
+    console.log('[NativeRegistry] Registered built-in tool: get_node');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register get_node:', msg);
+  }
+
   try {
     // Create Node — POST /api/v1/nodes
     // eslint-disable-next-line @typescript-eslint/no-require-imports

@@ -53,7 +53,7 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
 
 const getAutomationTool: NativeToolDefinition = {
   description:
-    "Fetch the full definition of a single automation by id (triggers, defaultInput, inputMapping, secret names, stats, status). Use to inspect an automation's shape and current state before triggering it.",
+    "Fetch the full definition of a single automation by id (triggers, defaultInput, inputMapping, secret names, stats, status). Use to inspect an automation's shape and current state before triggering it. The response includes `graphId` — use that with get_graph to inspect the underlying graph structure, then get_node for individual node step details.",
   server: 'automation',
   inputSchema: {
     type: 'object',
