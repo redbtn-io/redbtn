@@ -56,35 +56,77 @@ export { mergeMessageContent, normalizeMessages };
 /**
  * Resolve a config value that might be a template string like "{{parameters.temperature}}"
  * Returns the resolved value (as number if it was a parameter reference) or the original value
+ *
+ * Supports:
+ *   - "{{parameters.someField}}"
+ *   - "{{parameters.someField || 'default'}}"
+ *   - "{{state.data.someField}}"
+ *   - "{{state.data.someField || 'default'}}"
  */
 function resolveConfigValue(value: any, state: any): any {
   if (typeof value !== 'string') {
     return value;
   }
 
-  // Check if it's a simple parameter template like "{{parameters.temperature}}"
-  const paramMatch = value.match(/^\{\{parameters\.(\w+)\}\}$/);
-  if (paramMatch && state.parameters) {
-    const paramName = paramMatch[1];
-    const resolved = state.parameters[paramName];
-    if (resolved !== undefined) {
-      if (DEBUG) console.log(`[NeuronExecutor] Resolved parameter ${paramName}:`, resolved);
-      return resolved;
+  // Match: {{<expr>}} where <expr> may be "path || 'fallback'" or just "path"
+  const templateMatch = value.match(/^\{\{(.+?)\}\}$/);
+  if (!templateMatch) return value;
+
+  const expr = templateMatch[1].trim();
+
+  // Split on || to get primary and optional fallback
+  // e.g. "parameters.neuronId || 'gemini-2-5-flash-chat'" → ["parameters.neuronId", "'gemini-2-5-flash-chat'"]
+  const parts = expr.split(/\s*\|\|\s*/);
+  const primaryExpr = parts[0].trim();
+  const fallbackExpr = parts[1]?.trim();
+
+  function resolveExpr(e: string): any {
+    // parameters.someField
+    const paramMatch = e.match(/^parameters\.(\w+)$/);
+    if (paramMatch && state.parameters) {
+      return state.parameters[paramMatch[1]];
+    }
+    // state.someField (e.g. state.data.environmentId)
+    const stateMatch = e.match(/^state\.(.+)$/);
+    if (stateMatch) {
+      return getNestedProperty(state, stateMatch[1]);
+    }
+    return undefined;
+  }
+
+  function parseLiteral(e: string): any {
+    // Quoted string: 'value' or "value"
+    const strMatch = e.match(/^['"](.*)['"]$/);
+    if (strMatch) return strMatch[1];
+    // Number
+    const n = Number(e);
+    if (!isNaN(n)) return n;
+    // Boolean
+    if (e === 'true') return true;
+    if (e === 'false') return false;
+    return undefined;
+  }
+
+  const primary = resolveExpr(primaryExpr);
+  if (primary !== undefined && primary !== null && primary !== '') {
+    if (DEBUG) console.log(`[NeuronExecutor] Resolved template "${expr}":`, primary);
+    return primary;
+  }
+
+  if (fallbackExpr !== undefined) {
+    const fallbackResolved = resolveExpr(fallbackExpr);
+    if (fallbackResolved !== undefined) {
+      if (DEBUG) console.log(`[NeuronExecutor] Resolved fallback template "${fallbackExpr}":`, fallbackResolved);
+      return fallbackResolved;
+    }
+    const literal = parseLiteral(fallbackExpr);
+    if (literal !== undefined) {
+      if (DEBUG) console.log(`[NeuronExecutor] Using literal fallback for "${primaryExpr}":`, literal);
+      return literal;
     }
   }
 
-  // Check if it's a state reference like "{{state.data.someValue}}"
-  const stateMatch = value.match(/^\{\{state\.(.+)\}\}$/);
-  if (stateMatch) {
-    const path = stateMatch[1];
-    const resolved = getNestedProperty(state, path);
-    if (resolved !== undefined) {
-      if (DEBUG) console.log(`[NeuronExecutor] Resolved state path ${path}:`, resolved);
-      return resolved;
-    }
-  }
-
-  // Not a template or couldn't resolve - return as-is
+  // Not a recognized template or couldn't resolve — return as-is
   return value;
 }
 
@@ -412,7 +454,33 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
             });
         }
       } else {
-        throw new Error(`Field ${fieldName} is not an array. Cannot use as messages.`);
+        // The field resolved to a non-array (string, undefined, etc.).
+        // Fall through to standard template rendering rather than throwing —
+        // the intent is a string userPrompt like {{state.data.task}}, not a
+        // messages-array reference.  Treat it as regular template interpolation.
+        console.log('[NeuronExecutor] userPrompt field resolved to non-array, treating as string prompt', {
+          fieldName,
+          type: typeof messagesArray
+        });
+        // Fall into the else branch below by reassigning the local var used there
+        // We do this by rebuilding messages via the standard path.
+        let systemPrompt: string | undefined = config.systemPrompt
+          ? renderTemplate(config.systemPrompt, state)
+          : undefined;
+        if (state.systemPrefix) {
+          systemPrompt = systemPrompt
+            ? `${state.systemPrefix}\n\n${systemPrompt}`
+            : state.systemPrefix;
+        }
+        const resolvedPrompt = messagesArray != null ? String(messagesArray) : renderTemplate(config.userPrompt, state);
+        messages = [];
+        if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+        const multimodalMsg = buildMultimodalMessage(config, resolvedPrompt, state);
+        if (multimodalMsg) {
+          messages.push(multimodalMsg);
+        } else {
+          messages.push({ role: 'user', content: resolvedPrompt });
+        }
       }
 
       // In messages-array mode, if multimodal is configured and audio/image data
@@ -920,7 +988,16 @@ async function buildBaseMessagesForToolLoop(
     const fieldName = messagesFieldMatch[1];
     const messagesArray = getNestedProperty(state, fieldName);
     if (!Array.isArray(messagesArray)) {
-      throw new Error(`Field ${fieldName} is not an array. Cannot use as messages.`);
+      // Non-array: fall through to string rendering (same fix as main executor)
+      console.log('[NeuronExecutor] buildBaseMessages: field not array, treating as string prompt', fieldName);
+      const resolvedPrompt = messagesArray != null ? String(messagesArray) : renderTemplate(config.userPrompt, state);
+      let systemPrompt: string | undefined = config.systemPrompt ? renderTemplate(config.systemPrompt, state) : undefined;
+      if (state.systemPrefix) systemPrompt = systemPrompt ? `${state.systemPrefix}\n\n${systemPrompt}` : state.systemPrefix;
+      messages = [];
+      if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+      const mm = buildMultimodalMessage(config, resolvedPrompt, state);
+      messages.push(mm ?? { role: 'user', content: resolvedPrompt });
+      return normalizeMessages(messages);
     }
     messages = [...messagesArray];
 
@@ -1096,6 +1173,11 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
   let lastToolResult: unknown = undefined;
   let lastToolName: string | undefined;
   let finalContent = '';
+  // Some models (notably Gemini flash with native function-calling) occasionally
+  // end the loop with an empty final turn — no tool calls AND no text — leaving
+  // the user with a blank "No response". Nudge once for a summary before
+  // accepting empty, so a productive run never ends silent.
+  let nudgedForEmptyFinal = false;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     // Cooperative abort check between iterations
@@ -1142,6 +1224,18 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
 
     // No tool calls -> this is the final assistant message.
     if (toolCalls.length === 0) {
+      // Empty final turn after a productive run → nudge once for a summary
+      // rather than returning a silent "No response".
+      if (!responseContent.trim() && !nudgedForEmptyFinal && iteration > 0) {
+        nudgedForEmptyFinal = true;
+        messages.push(response);
+        messages.push({
+          role: 'user',
+          content: 'Provide your final response now: a concise summary of what you did, the key results, and any next steps. Do not call any more tools.',
+        });
+        console.log('[NeuronExecutor] Empty final turn — nudging model once for a summary');
+        continue;
+      }
       finalContent = responseContent;
       // Stream the final content to the user if requested. We do this once
       // at the end (rather than incrementally) because the tool-use loop
@@ -1182,12 +1276,16 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
       // not already provide a value (LLM-supplied values always win).
       if (resolved) {
         const stateParams = (state as any)?.parameters;
+        const stateData = (state as any)?.data;
         const schemaProps = (resolved.inputSchema as any)?.properties as Record<string, unknown> | undefined;
-        if (stateParams?.environmentId && schemaProps?.environmentId && !parsedArgs.environmentId) {
-          parsedArgs.environmentId = stateParams.environmentId;
+        // Auto-inject environmentId: check state.parameters first, then state.data
+        const envId = stateParams?.environmentId || stateData?.environmentId;
+        if (envId && schemaProps?.environmentId && !parsedArgs.environmentId) {
+          parsedArgs.environmentId = envId;
         }
-        if (stateParams?.workingDir && schemaProps?.workingDir && !parsedArgs.workingDir) {
-          parsedArgs.workingDir = stateParams.workingDir;
+        const workDir = stateParams?.workingDir || stateData?.workingDir;
+        if (workDir && schemaProps?.workingDir && !parsedArgs.workingDir) {
+          parsedArgs.workingDir = workDir;
         }
       }
 
