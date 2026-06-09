@@ -28,6 +28,12 @@ export interface AudioStreamPipelineOptions {
   publisher: RunPublisher;
   /** TTS synthesis options (voice, speed, endpoint) */
   ttsOptions?: SynthesizeOptions;
+  /**
+   * Optional external AbortSignal (e.g. the run-level abort signal from
+   * RunControlRegistry). When fired, the pipeline cancels immediately —
+   * equivalent to calling cancel() directly.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -64,10 +70,37 @@ export class AudioStreamPipeline {
   private publishedCount = 0;
   private isPublishing = false;
   private flushed = false;
+  /** Internal AbortController — cancelled by cancel() or the external signal */
+  private controller = new AbortController();
 
   constructor(options: AudioStreamPipelineOptions) {
     this.publisher = options.publisher;
     this.ttsOptions = options.ttsOptions || {};
+
+    // Wire the external signal (e.g. run-level abort) into the pipeline so an
+    // external run-abort also cancels synthesis without requiring a manual call.
+    if (options.signal) {
+      if (options.signal.aborted) {
+        this.controller.abort();
+      } else {
+        options.signal.addEventListener('abort', () => this.cancel(), { once: true });
+      }
+    }
+  }
+
+  /**
+   * Cancel the pipeline immediately.
+   *
+   * Aborts all in-flight synthesis requests, marks the pipeline as flushed
+   * (so no new work is accepted), and resolves any pending flush() calls
+   * immediately without waiting for synthesis to complete.
+   *
+   * Safe to call multiple times — idempotent.
+   */
+  cancel(): void {
+    if (this.flushed) return;
+    this.flushed = true;
+    this.controller.abort();
   }
 
   /**
@@ -93,9 +126,10 @@ export class AudioStreamPipeline {
    * Call this when the LLM stream completes.
    *
    * The final audio chunk will have `isFinal: true`.
+   * If cancel() has already been called this returns immediately.
    */
   async flush(): Promise<void> {
-    if (this.flushed) return;
+    if (this.flushed) return;  // also returns immediately after cancel()
     this.flushed = true;
 
     // Flush remaining text from chunker
@@ -124,10 +158,16 @@ export class AudioStreamPipeline {
    * Synthesis runs immediately in the background.
    */
   private enqueueSynthesis(text: string): void {
+    if (this.controller.signal.aborted) return;
     const index = this.jobs.length;
 
-    // Fire synthesis immediately (non-blocking)
-    const promise = synthesize(text, this.ttsOptions).catch((error) => {
+    // Fire synthesis immediately (non-blocking), threading the abort signal
+    // so a cancel() or run-abort terminates in-flight Kokoro fetches promptly.
+    const promise = synthesize(text, { ...this.ttsOptions, signal: this.controller.signal }).catch((error) => {
+      // Swallow cancellation errors silently — text stream is unaffected
+      if (error instanceof Error && (error.name === 'AbortError' || error.message === 'TTS synthesis cancelled')) {
+        return null;
+      }
       console.warn(`[AudioStreamPipeline] TTS synthesis failed for chunk ${index}:`, error instanceof Error ? error.message : error);
       return null; // Swallow error -- text stream is unaffected
     });
@@ -148,8 +188,14 @@ export class AudioStreamPipeline {
 
     try {
       while (this.publishedCount < this.jobs.length) {
+        // Stop publishing if the pipeline was cancelled
+        if (this.controller.signal.aborted) break;
+
         const job = this.jobs[this.publishedCount];
         const audio = await job.promise;
+
+        // Re-check after awaiting — abort may have fired while synthesis ran
+        if (this.controller.signal.aborted) break;
 
         if (audio) {
           const isFinal = this.flushed && this.publishedCount === this.jobs.length - 1;
@@ -165,8 +211,9 @@ export class AudioStreamPipeline {
           } catch (pubError) {
             console.warn(`[AudioStreamPipeline] Failed to publish audio chunk ${job.index}:`, pubError instanceof Error ? pubError.message : pubError);
           }
-        } else if (this.flushed && this.publishedCount === this.jobs.length - 1) {
-          // Last chunk failed synthesis -- still publish a final marker with empty audio
+        } else if (this.flushed && !this.controller.signal.aborted && this.publishedCount === this.jobs.length - 1) {
+          // Last chunk failed synthesis — publish a final marker with empty audio
+          // so the client knows the TTS stream ended. Skip on cancel (no marker needed).
           try {
             await this.publisher.publish({
               type: 'audio_chunk' as any,

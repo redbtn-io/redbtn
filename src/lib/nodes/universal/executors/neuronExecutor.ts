@@ -733,6 +733,9 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
                 voice: (state.data?.ttsVoice as string) || undefined,
                 speed: (state.data?.ttsSpeed as number) || undefined,
               },
+              // Thread the run-level abort signal so an external interrupt
+              // cancels in-flight Kokoro fetches immediately.
+              signal: abortSignal,
             });
             console.log('[NeuronExecutor] TTS audio pipeline enabled for audio-optimized neuron:', neuronId);
           }
@@ -919,9 +922,10 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
         if (asyncIter.return) {
           try { await asyncIter.return(); } catch (_) { /* ignore close errors */ }
         }
-        // Best-effort flush of any pending TTS audio on error
+        // Cancel the TTS pipeline immediately on stream error/abort — avoids
+        // waiting up to N×15s for in-flight Kokoro fetches to time out.
         if (audioPipeline) {
-          try { await audioPipeline.flush(); } catch (_) { /* ignore */ }
+          audioPipeline.cancel();
         }
         throw streamErr;
       }

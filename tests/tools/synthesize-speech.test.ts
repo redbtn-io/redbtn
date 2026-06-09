@@ -92,7 +92,7 @@ describe('synthesize_speech — kokoro happy path', () => {
     vi.restoreAllMocks();
   });
 
-  test('default provider=kokoro, default voice=af_bella, returns WAV with durationMs', async () => {
+  test('default provider=kokoro, default voice=af_heart, returns WAV with durationMs', async () => {
     const wavBuffer = makeFakeWavBuffer(48000, 24000); // 2 seconds
     let receivedBody: any = null;
     let receivedUrl = '';
@@ -111,13 +111,13 @@ describe('synthesize_speech — kokoro happy path', () => {
     expect(result.isError).toBeFalsy();
     expect(receivedUrl).toBe('http://test-kokoro.local:8880/v1/audio/speech');
     expect(receivedBody.input).toBe('Hello world');
-    expect(receivedBody.voice).toBe('af_bella');
+    expect(receivedBody.voice).toBe('af_heart');
     expect(receivedBody.response_format).toBe('wav');
     expect(receivedBody.model).toBe('kokoro');
 
     const body = JSON.parse(result.content[0].text);
     expect(body.provider).toBe('kokoro');
-    expect(body.voice).toBe('af_bella');
+    expect(body.voice).toBe('af_heart');
     expect(body.format).toBe('wav');
     expect(body.mimeType).toBe('audio/wav');
     expect(typeof body.audioBase64).toBe('string');

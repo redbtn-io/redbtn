@@ -1206,6 +1206,19 @@ export class RunPublisher {
     }
     // Fire-and-forget archive job — non-blocking, non-fatal
     this._enqueueArchive(event).catch(() => {});
+
+    // Forward audio_chunk to the conversation stream so the chat UI receives
+    // server-side TTS audio. Catches BOTH the publishAudioChunk() path and the
+    // AudioStreamPipeline.tryPublish() path (which calls publish() directly).
+    // ConversationPublisher marks audio_chunk as EPHEMERAL — it is published to
+    // pub/sub only and is NOT written to the replay list or archived to Mongo.
+    if ((event as any).type === 'audio_chunk' && this.convPublisher && this.convMessageId) {
+      const audioEvent = event as any;
+      const mimeType = audioEvent.format === 'mp3' ? 'audio/mpeg' : `audio/${audioEvent.format ?? 'mpeg'}`;
+      this.convPublisher.publishAudioChunk(this.convMessageId, audioEvent.audio ?? '', mimeType).catch((err) => {
+        console.warn('[RunPublisher] Conv forward audio_chunk failed:', err);
+      });
+    }
   }
 
   /**

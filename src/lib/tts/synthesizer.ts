@@ -8,8 +8,38 @@
  * @module lib/tts/synthesizer
  */
 
-/** Default Kokoro TTS endpoint */
-const DEFAULT_TTS_ENDPOINT = 'http://192.168.1.6:8880/v1/audio/speech';
+/** Default Kokoro TTS base URL */
+const DEFAULT_TTS_BASE = 'http://192.168.1.6:8880';
+
+/**
+ * Canonical default voice for all Kokoro TTS calls.
+ * Import this constant in every consumer to keep a single source of truth.
+ */
+export const KOKORO_DEFAULT_VOICE = 'af_heart';
+
+/** TTS path on the Kokoro endpoint (OpenAI-compatible) */
+const TTS_SPEECH_PATH = '/v1/audio/speech';
+
+/**
+ * Resolve the TTS endpoint URL.
+ *
+ * Priority order:
+ * 1. Caller-supplied `endpoint` option (explicit override, full URL)
+ * 2. `TTS_URL` env var (base URL — path appended by this function)
+ * 3. `TTS_ENDPOINT` env var (legacy — treated as full URL, no path appended)
+ * 4. Hard-coded default base + path
+ */
+function resolveTtsEndpoint(endpoint?: string): string {
+  if (endpoint) return endpoint;
+  if (process.env.TTS_URL) {
+    return process.env.TTS_URL.replace(/\/$/, '') + TTS_SPEECH_PATH;
+  }
+  if (process.env.TTS_ENDPOINT) {
+    // Legacy: already includes the full path
+    return process.env.TTS_ENDPOINT;
+  }
+  return DEFAULT_TTS_BASE + TTS_SPEECH_PATH;
+}
 
 /** Request timeout in milliseconds */
 const TTS_TIMEOUT_MS = 15000;
@@ -22,8 +52,10 @@ export interface SynthesizeOptions {
   voice?: string;
   /** Speech speed multiplier (default: 1.0) */
   speed?: number;
-  /** TTS endpoint URL (default: Kokoro on .6:8880) */
+  /** TTS endpoint URL (full URL — overrides TTS_URL / TTS_ENDPOINT env vars) */
   endpoint?: string;
+  /** Optional AbortSignal to cancel an in-flight synthesis request */
+  signal?: AbortSignal;
 }
 
 /**
@@ -39,16 +71,28 @@ export async function synthesize(
   options: SynthesizeOptions = {},
 ): Promise<Buffer> {
   const {
-    voice = 'af_heart',
+    voice = KOKORO_DEFAULT_VOICE,
     speed = 1.0,
-    endpoint = process.env.TTS_ENDPOINT || DEFAULT_TTS_ENDPOINT,
+    endpoint,
+    signal: callerSignal,
   } = options;
+  const resolvedEndpoint = resolveTtsEndpoint(endpoint);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), TTS_TIMEOUT_MS);
 
+  // Also abort when the caller's signal fires (e.g. run cancelled)
+  const onCallerAbort = () => controller.abort(callerSignal?.reason);
+  if (callerSignal) {
+    if (callerSignal.aborted) {
+      clearTimeout(timeoutId);
+      throw new Error('TTS synthesis aborted');
+    }
+    callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+  }
+
   try {
-    const response = await fetch(endpoint, {
+    const response = await fetch(resolvedEndpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -70,11 +114,18 @@ export async function synthesize(
     return Buffer.from(arrayBuffer);
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
+      // Distinguish a caller-initiated cancel from a timeout
+      if (callerSignal?.aborted) {
+        throw new Error('TTS synthesis cancelled');
+      }
       throw new Error(`TTS synthesis timed out after ${TTS_TIMEOUT_MS}ms`);
     }
     throw error;
   } finally {
     clearTimeout(timeoutId);
+    if (callerSignal) {
+      callerSignal.removeEventListener('abort', onCallerAbort);
+    }
   }
 }
 
@@ -86,19 +137,20 @@ export async function synthesize(
  * @returns true if the server responds successfully
  */
 export async function isTtsAvailable(
-  endpoint: string = process.env.TTS_ENDPOINT || DEFAULT_TTS_ENDPOINT,
+  endpoint?: string,
 ): Promise<boolean> {
+  const resolvedEndpoint = resolveTtsEndpoint(endpoint);
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
     try {
-      const response = await fetch(endpoint, {
+      const response = await fetch(resolvedEndpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'kokoro',
           input: 'test',
-          voice: 'af_heart',
+          voice: KOKORO_DEFAULT_VOICE,
           speed: 1.0,
           response_format: 'mp3',
         }),
