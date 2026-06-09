@@ -199,6 +199,28 @@ export interface GraphConfig {
   neuronAssignments?: Record<string, string>;
   /** Graph-level configuration options */
   config?: GraphGlobalConfig;
+  /**
+   * Data-permissions capability profile (the data-permissions layer).
+   *
+   * When present, runs of this graph are JAILED: native State + Knowledge tools
+   * are enforced fail-closed against the declared grants. A graph with NO
+   * `capabilities` field is UNPROFILED → unrestricted (today's behavior, fully
+   * backward-compatible). See `lib/permissions/` for the model + enforcement.
+   *
+   * Shape: `{ name, description?, capabilities: [{ resource, actions[], selector }] }`.
+   * Typed as a loose record here to avoid a hard dependency from the graph
+   * types onto the permissions module; the engine normalizes it via
+   * `resolveCapabilityProfile()` at run start.
+   */
+  capabilities?: {
+    name?: string;
+    description?: string;
+    capabilities: Array<{
+      resource: 'state' | 'knowledge';
+      actions: Array<'read' | 'write' | 'create' | 'delete'>;
+      selector: string;
+    }>;
+  };
   /** Node positions for visual editor (nodeId → {x, y}) */
   layout?: Record<string, NodePosition>;
   /** Base64-encoded thumbnail image for library view */

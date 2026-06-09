@@ -74,3 +74,18 @@ export function getMeteringClient(state: any): any | undefined {
   const ctx = runControlRegistry.get(resolveRunId(state));
   return ctx?.meteringClient ?? state?.meteringClient;
 }
+
+/**
+ * Capability profile for the run (data-permissions layer). Resolved from the
+ * graph config at run start (see run.ts) and attached to the run control
+ * context. Returns `undefined` when the run has NO profile — which the
+ * enforcement layer treats as UNRESTRICTED (backward-compatible default).
+ *
+ * The native-tool dispatch chokepoint reads this via the registry's stored
+ * resolver, NOT off graph state, so it survives checkpoint round-trips and
+ * cannot be tampered with by anything that mutates LangGraph state.
+ */
+export function getCapabilityProfile(state: any): any | undefined {
+  const ctx = runControlRegistry.get(resolveRunId(state));
+  return ctx?.capabilityProfile ?? state?.capabilityProfile;
+}

@@ -16,6 +16,7 @@ import type { Red } from '../index';
 import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys, RunConfig } from '../lib/run';
 import { runControlRegistry, type CancelResult } from '../lib/run/RunControlRegistry';
 import { getOrCreateMeteringClient } from '../lib/run/meteringClient';
+import { resolveCapabilityProfile } from '../lib/permissions/resolve';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
 import { SYSTEM_TEMPLATES } from '../lib/types/graph';
@@ -1489,6 +1490,13 @@ export async function run(
         signal,
       ),
   };
+  // Data-permissions: resolve the agent's capability profile from the graph
+  // config (if any). `null` when the graph declares no profile → the run is
+  // UNPROFILED and the native-tool gate is a no-op (backward compatible). When
+  // present, the native-tool dispatch chokepoint enforces it fail-closed. We
+  // resolve here (not in the tool layer) so the profile is fixed at run start
+  // and can't be swapped mid-run by a state-mutating step.
+  const capabilityProfile = resolveCapabilityProfile(compiledGraph?.config);
   const runCtx = runControlRegistry.register(runId, WORKER_ID, {
     runPublisher: publisher,
     neuronRegistry: red.neuronRegistry,
@@ -1500,6 +1508,7 @@ export async function run(
     // event per LLM call to the `usage:events` Redis stream (the worker's
     // consumer rates + posts to the ledger). Never blocks/breaks a run.
     meteringClient: getOrCreateMeteringClient(red.redis),
+    capabilityProfile: capabilityProfile ?? undefined,
   });
   // Local controller kept for legacy/fallback paths (anyone reading
   // `state._abortController` directly). Wired so the run-controller
