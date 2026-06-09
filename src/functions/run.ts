@@ -1384,9 +1384,10 @@ export async function run(
     runId,
     userId,
     // agentId is not yet a typed RunOptions field — accessed via cast until it
-    // is promoted. Defensively check both the top-level cast and the nested
-    // data.options path (some callers embed it in the options bag).
-    agentId: agentId ?? ((options as any).data?.options?.agentId as string | undefined),
+    // is promoted. The worker passes it top-level on the run options (see
+    // worker run processor: `...(agentId && { agentId })`); no caller embeds
+    // it anywhere else.
+    agentId,
     log: red.redlog,
     automationRunId: options.automationRunId,
     automationRunsCollection,

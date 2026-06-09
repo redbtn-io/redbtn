@@ -324,6 +324,14 @@ export class ConversationPublisher {
     // Persist when we have tools OR an agentId to stamp. Even with no tool
     // history, we need the message to carry the agentId attribution so reload
     // doesn't render a grey "Assistant" bubble for failed/interrupted agents.
+    //
+    // INTENTIONAL BEHAVIOR CHANGE: a multi-agent run that errors before
+    // emitting any content or tools now persists an EMPTY-content row
+    // ({ content: '', metadata: { runId, runError, agentId } }) where
+    // previously nothing was persisted. A correctly-attributed empty bubble
+    // beats a silently missing one — the runError metadata tells the UI what
+    // happened. Dedup ($ne on messages.id) prevents duplicates if the
+    // archiver wrote the row first.
     if (messageId && (Array.isArray(tools) && tools.length > 0 || agentId)) {
       try {
         await this.persistMessage({
