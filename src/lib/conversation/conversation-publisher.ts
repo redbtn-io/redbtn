@@ -255,12 +255,14 @@ export class ConversationPublisher {
     messageId: string,
     finalContent?: string,
     tools?: unknown[],
+    graphRun?: unknown,
   ): Promise<void> {
     await this.publish({
       type: 'run_complete',
       runId,
       messageId,
       finalContent,
+      ...(graphRun ? { graphRun } : {}),
       timestamp: Date.now(),
     });
     // Persist whenever we have a messageId — runs can complete with empty
@@ -277,6 +279,7 @@ export class ConversationPublisher {
           content: finalContent || '',
           metadata: { runId },
           toolExecutions: Array.isArray(tools) ? tools : undefined,
+          graphRun,
         });
       } catch (err) {
         console.error('[ConversationPublisher] Backstop persistMessage failed:', err);
@@ -579,6 +582,13 @@ export class ConversationPublisher {
      *  the in-place $set below just overwrites with the same data (or the
      *  more-complete data if forwarding lapsed). */
     toolExecutions?: unknown[];
+    /** Optional graph run trace ({graphId,runId,status,executionPath,
+     *  nodeProgress}) to persist on the message. The per-node progress events
+     *  are NOT forwarded over the conversation SSE stream, so the webapp can't
+     *  build this client-side — without this server-side backstop
+     *  `message.graphRun` stays empty and the chat UI's graph-run view hangs
+     *  on "Loading…". */
+    graphRun?: unknown;
   }): Promise<void> {
     try {
       // Use mongoose to persist to the conversation
@@ -618,6 +628,7 @@ export class ConversationPublisher {
               ...(Array.isArray(params.toolExecutions) && params.toolExecutions.length > 0
                 ? { toolExecutions: params.toolExecutions }
                 : {}),
+              ...(params.graphRun ? { graphRun: params.graphRun } : {}),
               timestamp: new Date(),
             },
           },
@@ -650,6 +661,21 @@ export class ConversationPublisher {
           );
         } catch (err) {
           console.error('[ConversationPublisher] toolExecutions $set failed:', err);
+        }
+      }
+
+      // graphRun backfill: same in-place $set semantics as toolExecutions, so
+      // the completed graph trace lands on the message whether the $push above
+      // pushed a new row or no-op'd on an existing one (archiver got there
+      // first). This is the ONLY writer of real executionPath/nodeProgress.
+      if (params.graphRun) {
+        try {
+          await db.collection('user_conversations').updateOne(
+            { ...filter, 'messages.id': params.messageId },
+            { $set: { 'messages.$.graphRun': params.graphRun } },
+          );
+        } catch (err) {
+          console.error('[ConversationPublisher] graphRun $set failed:', err);
         }
       }
 

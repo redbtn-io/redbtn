@@ -400,6 +400,17 @@ export class RunPublisher {
           // This array goes into the message via persistMessage's in-place
           // $set so the truth lands even when forwarding doesn't.
           this.state!.tools,
+          // Pass the completed graph run trace so the chat UI can render the
+          // finished graph run. Node-progress events aren't forwarded over the
+          // conversation stream, so this server-side persistence is the only
+          // source of real executionPath/nodeProgress on the message.
+          {
+            graphId: this.state!.graphId,
+            runId: this.runId,
+            status: 'completed',
+            executionPath: this.state!.graph.executionPath || [],
+            nodeProgress: this.state!.graph.nodeProgress || {},
+          },
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_complete failed:", err);
