@@ -53,6 +53,21 @@ export interface NodeProgress {
 /**
  * A tool execution record
  */
+/**
+ * Subgraph origin tag for a tool execution. Present ONLY when the tool was
+ * invoked inside a subgraph (a universal-node `graph` step). Top-level tools
+ * have NO `subgraph` field. The webapp UI filters on this tag to hide/show
+ * subgraph-originated tool entries on the message bubble.
+ */
+export interface SubgraphTag {
+  /** Subgraph call depth — 1 for a direct subgraph, 2+ for nested subgraphs. */
+  depth: number;
+  /** graphId of the subgraph that invoked this tool. */
+  graphId: string;
+  /** Human-readable name of the subgraph. */
+  name: string;
+}
+
 export interface ToolExecution {
   toolId: string;
   toolName: string;
@@ -64,6 +79,11 @@ export interface ToolExecution {
   steps: Array<ProgressStep & { progress?: number }>;
   result?: unknown;
   error?: string;
+  /**
+   * Subgraph origin tag — present only when this tool ran inside a subgraph.
+   * Top-level tools omit this field entirely.
+   */
+  subgraph?: SubgraphTag;
 }
 
 /**
@@ -332,6 +352,8 @@ export interface ToolStartEvent extends BaseEvent {
    * the tool bubble to its parent neuron.
    */
   neuronStepId?: string;
+  /** Subgraph origin tag — present only for subgraph-originated tools. */
+  subgraph?: SubgraphTag;
 }
 
 export interface ToolProgressEvent extends BaseEvent {
@@ -340,6 +362,8 @@ export interface ToolProgressEvent extends BaseEvent {
   step: string;
   progress?: number;
   data?: Record<string, unknown>;
+  /** Subgraph origin tag — present only for subgraph-originated tools. */
+  subgraph?: SubgraphTag;
 }
 
 export interface ToolOutputEvent extends BaseEvent {
@@ -363,6 +387,8 @@ export interface ToolCompleteEvent extends BaseEvent {
   triggeredBy?: 'step' | 'neuron';
   /** Owning neuron step id when triggeredBy === 'neuron'. */
   neuronStepId?: string;
+  /** Subgraph origin tag — present only for subgraph-originated tools. */
+  subgraph?: SubgraphTag;
 }
 
 export interface ToolErrorEvent extends BaseEvent {
@@ -373,6 +399,8 @@ export interface ToolErrorEvent extends BaseEvent {
   triggeredBy?: 'step' | 'neuron';
   /** Owning neuron step id when triggeredBy === 'neuron'. */
   neuronStepId?: string;
+  /** Subgraph origin tag — present only for subgraph-originated tools. */
+  subgraph?: SubgraphTag;
 }
 
 /**
@@ -688,6 +716,8 @@ export function createToolExecution(params: {
   toolId: string;
   toolName: string;
   toolType: string;
+  /** Subgraph origin tag — omit for top-level tools. */
+  subgraph?: SubgraphTag;
 }): ToolExecution {
   return {
     toolId: params.toolId,
@@ -696,5 +726,7 @@ export function createToolExecution(params: {
     status: 'running',
     startedAt: Date.now(),
     steps: [],
+    // Only attach when present so top-level tools have no `subgraph` field.
+    ...(params.subgraph ? { subgraph: params.subgraph } : {}),
   };
 }
