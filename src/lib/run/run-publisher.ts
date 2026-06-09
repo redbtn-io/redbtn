@@ -794,6 +794,33 @@ export class RunPublisher {
   }
 
   // ===========================================================================
+  // Conversation message injection (push_message tool)
+  // ===========================================================================
+
+  /**
+   * Push a standalone message to the conversation stream using the
+   * RunPublisher's existing ConversationPublisher (same Redis connection).
+   *
+   * This avoids the latency of opening a new IORedis connection inside the
+   * push_message tool, which was causing these injected messages to arrive at
+   * the client AFTER the run_complete event (wrong ordering in the chat UI).
+   *
+   * @returns the generated messageId
+   */
+  async pushConversationMessage(params: {
+    content: string;
+    role?: 'assistant' | 'system';
+    metadata?: Record<string, unknown>;
+  }): Promise<string | null> {
+    if (!this.convPublisher) return null;
+    return this.convPublisher.pushMessage({
+      role: params.role ?? 'assistant',
+      content: params.content,
+      metadata: params.metadata,
+    });
+  }
+
+  // ===========================================================================
   // Audio Streaming (Server-side TTS)
   // ===========================================================================
 

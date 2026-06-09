@@ -59,8 +59,41 @@ const definition: NativeToolDefinition = {
     const { publisher } = context;
     publisher?.emit?.('log', `push_message to ${conversationId}: ${content.substring(0, 50)}...`);
 
+    // Collect metadata: include runId + agentId so the chat UI can attribute
+    // push_message bubbles to the correct agent (same avatar / label as the
+    // run's final response).
+    const agentId = (context.state?.options as Record<string, unknown> | undefined)?.agentId as string | undefined;
+    const metadata: Record<string, unknown> = {
+      source: 'push_message_tool',
+      runId: context.runId ?? context.state?.runId,
+      ...(agentId ? { agentId } : {}),
+    };
+
+    // Preferred path: use the RunPublisher's existing ConversationPublisher so
+    // the message is published on the SAME Redis connection as run_complete.
+    // This guarantees ordering — the message arrives at the client BEFORE the
+    // run_complete event, not after it.
+    const runPublisher = publisher as (typeof publisher & { pushConversationMessage?: (p: Record<string, unknown>) => Promise<string | null> }) | null;
+    if (runPublisher?.pushConversationMessage) {
+      try {
+        const messageId = await runPublisher.pushConversationMessage({
+          content,
+          role: role as 'assistant' | 'system',
+          metadata,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: true, messageId, conversationId }) }],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Unknown error';
+        publisher?.emit?.('log', `push_message via RunPublisher failed, falling back: ${msg}`);
+        // Fall through to the IORedis fallback path below
+      }
+    }
+
+    // Fallback: create a short-lived Redis connection (original behaviour).
+    // Used when push_message is called outside a full run context.
     try {
-      // Get Redis connection from environment
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const IORedis = require('ioredis');
       const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
@@ -69,29 +102,16 @@ const definition: NativeToolDefinition = {
       try {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const { createConversationPublisher } = require('../../conversation/index');
-        const convPublisher = createConversationPublisher({
-          redis,
-          conversationId,
-        });
+        const convPublisher = createConversationPublisher({ redis, conversationId });
 
         const messageId = await convPublisher.pushMessage({
           role: role as 'assistant' | 'system',
           content,
-          metadata: {
-            source: 'push_message_tool',
-            runId: context.state?.runId,
-          },
+          metadata,
         });
 
         return {
-          content: [{
-            type: 'text',
-            text: JSON.stringify({
-              success: true,
-              messageId,
-              conversationId,
-            }),
-          }],
+          content: [{ type: 'text', text: JSON.stringify({ success: true, messageId, conversationId }) }],
         };
       } finally {
         await redis.quit().catch(() => { /* ignore */ });
