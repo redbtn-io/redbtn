@@ -14,7 +14,7 @@
  */
 
 export { TtsChunker, findBreakPoint } from './chunker';
-export { synthesize, isTtsAvailable, type SynthesizeOptions } from './synthesizer';
+export { synthesize, isTtsAvailable, KOKORO_DEFAULT_VOICE, type SynthesizeOptions } from './synthesizer';
 export { transcribe, isSttAvailable, type TranscribeOptions, type TranscribeResult } from './transcriber';
 export { AudioStreamPipeline, type AudioStreamPipelineOptions } from './audio-stream';
 export { VoiceClient, type VoiceClientOptions } from './voice-client';

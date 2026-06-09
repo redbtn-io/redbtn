@@ -1206,6 +1206,29 @@ export class RunPublisher {
     }
     // Fire-and-forget archive job — non-blocking, non-fatal
     this._enqueueArchive(event).catch(() => {});
+
+    // Forward audio_chunk to the conversation stream so the chat UI receives
+    // server-side TTS audio. Catches BOTH the publishAudioChunk() path and the
+    // AudioStreamPipeline.tryPublish() path (which calls publish() directly).
+    // ConversationPublisher marks audio_chunk as EPHEMERAL — it is published to
+    // pub/sub only and is NOT written to the replay list or archived to Mongo.
+    if ((event as any).type === 'audio_chunk' && this.convPublisher && this.convMessageId) {
+      const audioEvent = event as any;
+      // mime derivation: the client's AudioPlaybackQueue decodes raw PCM16 and
+      // reads the sample rate from a `rate=` mime parameter (defaulting 24k).
+      // The streaming pipeline synthesizes PCM at Kokoro's native 24 kHz, so
+      // 'pcm' maps to 'audio/pcm;rate=24000'. MP3 must NEVER be forwarded here
+      // (the client has no MP3 demuxer — it would PCM-decode it into noise);
+      // the pipeline no longer emits mp3, but map it defensively anyway.
+      const fmt = audioEvent.format ?? 'pcm';
+      const mimeType =
+        fmt === 'pcm' ? 'audio/pcm;rate=24000'
+        : fmt === 'mp3' ? 'audio/mpeg'
+        : `audio/${fmt}`;
+      this.convPublisher.publishAudioChunk(this.convMessageId, audioEvent.audio ?? '', mimeType).catch((err) => {
+        console.warn('[RunPublisher] Conv forward audio_chunk failed:', err);
+      });
+    }
   }
 
   /**
