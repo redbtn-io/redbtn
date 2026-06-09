@@ -1214,7 +1214,17 @@ export class RunPublisher {
     // pub/sub only and is NOT written to the replay list or archived to Mongo.
     if ((event as any).type === 'audio_chunk' && this.convPublisher && this.convMessageId) {
       const audioEvent = event as any;
-      const mimeType = audioEvent.format === 'mp3' ? 'audio/mpeg' : `audio/${audioEvent.format ?? 'mpeg'}`;
+      // mime derivation: the client's AudioPlaybackQueue decodes raw PCM16 and
+      // reads the sample rate from a `rate=` mime parameter (defaulting 24k).
+      // The streaming pipeline synthesizes PCM at Kokoro's native 24 kHz, so
+      // 'pcm' maps to 'audio/pcm;rate=24000'. MP3 must NEVER be forwarded here
+      // (the client has no MP3 demuxer — it would PCM-decode it into noise);
+      // the pipeline no longer emits mp3, but map it defensively anyway.
+      const fmt = audioEvent.format ?? 'pcm';
+      const mimeType =
+        fmt === 'pcm' ? 'audio/pcm;rate=24000'
+        : fmt === 'mp3' ? 'audio/mpeg'
+        : `audio/${fmt}`;
       this.convPublisher.publishAudioChunk(this.convMessageId, audioEvent.audio ?? '', mimeType).catch((err) => {
         console.warn('[RunPublisher] Conv forward audio_chunk failed:', err);
       });

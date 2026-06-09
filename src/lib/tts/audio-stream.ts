@@ -163,7 +163,10 @@ export class AudioStreamPipeline {
 
     // Fire synthesis immediately (non-blocking), threading the abort signal
     // so a cancel() or run-abort terminates in-flight Kokoro fetches promptly.
-    const promise = synthesize(text, { ...this.ttsOptions, signal: this.controller.signal }).catch((error) => {
+    // Streaming pipeline ALWAYS synthesizes raw PCM: the chat client's
+    // AudioPlaybackQueue decodes PCM16 chunks directly; MP3 frames don't
+    // survive arbitrary chunk-boundary splits and the client has no demuxer.
+    const promise = synthesize(text, { ...this.ttsOptions, signal: this.controller.signal, format: 'pcm' }).catch((error) => {
       // Swallow cancellation errors silently — text stream is unaffected
       if (error instanceof Error && (error.name === 'AbortError' || error.message === 'TTS synthesis cancelled')) {
         return null;
@@ -205,7 +208,7 @@ export class AudioStreamPipeline {
               audio: audio.toString('base64'),
               index: job.index,
               isFinal,
-              format: 'mp3',
+              format: 'pcm',
               timestamp: Date.now(),
             });
           } catch (pubError) {
@@ -220,7 +223,7 @@ export class AudioStreamPipeline {
               audio: '',
               index: job.index,
               isFinal: true,
-              format: 'mp3',
+              format: 'pcm',
               timestamp: Date.now(),
             });
           } catch {

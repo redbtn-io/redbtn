@@ -56,7 +56,21 @@ export interface SynthesizeOptions {
   endpoint?: string;
   /** Optional AbortSignal to cancel an in-flight synthesis request */
   signal?: AbortSignal;
+  /**
+   * Output format (default: 'mp3').
+   *
+   * 'pcm' = raw 16-bit little-endian mono PCM at 24 kHz (Kokoro's native
+   * rate — verified empirically). The STREAMING pipeline must use 'pcm':
+   * the chat client's AudioPlaybackQueue decodes raw PCM16 chunks (it has
+   * no MP3 demuxer, and MP3 frames don't survive arbitrary chunk-boundary
+   * splits anyway). 'mp3' remains the default for whole-utterance callers
+   * (the synthesize_speech tool, file output).
+   */
+  format?: 'mp3' | 'pcm';
 }
+
+/** Sample rate of Kokoro's raw PCM output (16-bit LE mono). */
+export const KOKORO_PCM_SAMPLE_RATE = 24000;
 
 /**
  * Synthesize text to MP3 audio using Kokoro TTS.
@@ -75,6 +89,7 @@ export async function synthesize(
     speed = 1.0,
     endpoint,
     signal: callerSignal,
+    format = 'mp3',
   } = options;
   const resolvedEndpoint = resolveTtsEndpoint(endpoint);
 
@@ -100,7 +115,7 @@ export async function synthesize(
         input: text,
         voice,
         speed,
-        response_format: 'mp3',
+        response_format: format,
       }),
       signal: controller.signal,
     });
