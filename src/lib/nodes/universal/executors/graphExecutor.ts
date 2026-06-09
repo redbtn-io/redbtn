@@ -10,6 +10,12 @@
  * state._subgraphDepth and rejects execution at depth > 5.
  */
 
+// Static import (contextLookup has no back-edge to the executors, so this is
+// not circular — toolExecutor imports the same helper statically). Replaces an
+// earlier module-top `require`, which couldn't resolve the extensionless `.ts`
+// when the source is loaded directly under vitest.
+import { getGraphRegistry } from '../../../run/contextLookup';
+
 export interface GraphStepConfig {
     /** ID of the graph to invoke (must exist in MongoDB graphs collection) */
     graphId: string;
@@ -62,9 +68,6 @@ export interface GraphExecutorRuntimeOverrides {
     /** Additional input fields to inject into the subgraph's data.input */
     input?: Record<string, any>;
 }
-
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const { getGraphRegistry } = require('../../../run/contextLookup') as { getGraphRegistry: (s: any) => any };
 
 /** Max subgraph call depth — prevents infinite recursion */
 const MAX_SUBGRAPH_DEPTH = 5;
@@ -148,6 +151,19 @@ export async function executeGraph(
     // Compile the subgraph (hits LRU cache in GraphRegistry)
     const compiledGraph = await graphRegistry.getGraph(graphId, userId);
 
+    // Resolve a human-readable subgraph name for the visibility tag. getConfig
+    // is LRU-cached in GraphRegistry, so this is cheap. Best-effort — fall back
+    // to the graphId when the registry doesn't expose getConfig (e.g. in tests).
+    let subgraphName = graphId;
+    try {
+        if (typeof graphRegistry.getConfig === 'function') {
+            const cfg = await graphRegistry.getConfig(graphId, userId);
+            subgraphName = cfg?.name || cfg?.graphName || graphId;
+        }
+    } catch {
+        // ignore — name is cosmetic, graphId is a fine fallback
+    }
+
     // Build the subgraph's initial state.
     // Infrastructure (neuronRegistry, mcpClient, memory, runPublisher,
     // connectionManager, graphRegistry) lives in runControlRegistry keyed by
@@ -187,10 +203,38 @@ export async function executeGraph(
         subInput.messages = state.messages || [];
     }
 
+    // -----------------------------------------------------------------------
+    // CRITICAL: propagate the parent run's runId INTO subInput.data.
+    //
+    // `RedGraphState` (lib/graphs/state.js) does NOT declare a top-level
+    // `runId` channel — only `data` is a channel. So `subInput.runId` set
+    // above is DROPPED by LangGraph when the subgraph runs, and the subgraph's
+    // nodes resolve the run context via `resolveRunId(state) = state.runId ||
+    // state.data.runId` (lib/run/contextLookup.ts). Without `data.runId`, the
+    // inner tool/neuron executors get NO runPublisher/logger → their tool
+    // calls and logs never surface on the parent run.
+    //
+    // When inputMapping is used, subInput.data starts empty and never carries
+    // data.runId, which is exactly the bug observed on run
+    // run_K5bQmNvIHTxjpHNbRrfC_ (graph LpERO9iVE-u4): the subgraph's inner
+    // get_context_history / now tool calls were invisible at the parent level.
+    //
+    // We therefore force-set data.runId and data.options.runId to the PARENT
+    // runId so every subgraph node resolves the parent's RunPublisher.
+    // -----------------------------------------------------------------------
+    const parentRunId: string | undefined =
+        state.runId || state.data?.runId || state.data?.options?.runId;
+    if (parentRunId) {
+        subInput.data.runId = parentRunId;
+        subInput.data.options = {
+            ...(subInput.data.options || {}),
+            runId: parentRunId,
+        };
+    }
+
     // Tag this execution as a subgraph invocation so graph nodes and logs can
     // distinguish it from a top-level chat/webhook/cron run.
     // Carry the parent run's runId forward so child runs are traceable.
-    const parentRunId: string | undefined = state.data?.runId || state.data?.options?.runId;
     subInput.data.input = subInput.data.input || {};
     subInput.data.input._trigger = {
         type: 'subgraph',
@@ -199,6 +243,24 @@ export async function executeGraph(
             parentGraphId: state.data?.options?.graphId,
             subgraphDepth: currentDepth + 1,
         },
+    };
+
+    // -----------------------------------------------------------------------
+    // Subgraph VISIBILITY tag. The tool executor reads `state.data._subgraph`
+    // and forwards it to RunPublisher.toolStart so every tool the subgraph
+    // fires is tagged `subgraph:{depth,graphId,name}` in state.tools, the
+    // persisted message tools, and the tool logs. The webapp filters on this
+    // tag to hide/show subgraph-originated tools on the message bubble.
+    //
+    // `depth` reflects this invocation's depth (currentDepth + 1). For nested
+    // subgraphs the depth is 2+. Each level overwrites `_subgraph` with its
+    // own graphId/name/depth, so a tool always carries the tag of the deepest
+    // subgraph that actually fired it.
+    // -----------------------------------------------------------------------
+    subInput.data._subgraph = {
+        depth: currentDepth + 1,
+        graphId,
+        name: subgraphName,
     };
 
     // -----------------------------------------------------------------------

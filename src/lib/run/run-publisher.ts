@@ -43,6 +43,7 @@ import {
   type RunOutput,
   type TokenMetadata,
   type ToolExecution,
+  type SubgraphTag,
   type AttachmentKind,
   RunKeys,
   RunConfig,
@@ -935,10 +936,18 @@ export class RunPublisher {
       triggeredBy?: 'step' | 'neuron';
       /** Owning neuron step id when triggeredBy === 'neuron'. */
       neuronStepId?: string;
+      /**
+       * Subgraph origin tag — present only when this tool ran inside a
+       * subgraph (a universal-node `graph` step). Top-level tools omit it.
+       * Tags the persisted `state.tools` entry, the tool_start event, and the
+       * tool log metadata so the UI can hide/show subgraph-originated tools.
+       */
+      subgraph?: SubgraphTag;
     },
   ): Promise<void> {
     this.ensureInitialized();
-    const tool = createToolExecution({ toolId, toolName, toolType });
+    const subgraph = options?.subgraph;
+    const tool = createToolExecution({ toolId, toolName, toolType, subgraph });
     this.state!.tools.push(tool);
     await this.saveState();
     const ts = Date.now();
@@ -952,20 +961,24 @@ export class RunPublisher {
       input: options?.input,
       triggeredBy,
       neuronStepId,
+      ...(subgraph ? { subgraph } : {}),
       timestamp: ts,
     });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_start', toolId, toolName, toolType, input: options?.input,
-        triggeredBy, neuronStepId, timestamp: ts,
+        triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
     }
     await this.persistLog({
       level: 'info',
       category: 'tool',
       message: `Tool started: ${toolName}`,
-      metadata: { toolId, toolName, toolType, input: options?.input, triggeredBy, neuronStepId },
+      metadata: {
+        toolId, toolName, toolType, input: options?.input, triggeredBy, neuronStepId,
+        ...(subgraph ? { subgraph } : {}),
+      },
     });
   }
 
@@ -981,19 +994,20 @@ export class RunPublisher {
     }
     await this.saveState();
     const ts = Date.now();
-    await this.publish({ type: 'tool_progress', toolId, step, progress: options?.progress, data: options?.data, timestamp: ts });
+    const subgraph = tool?.subgraph;
+    await this.publish({ type: 'tool_progress', toolId, step, progress: options?.progress, data: options?.data, ...(subgraph ? { subgraph } : {}), timestamp: ts });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_progress', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
-        step, progress: options?.progress, data: options?.data, timestamp: ts,
+        step, progress: options?.progress, data: options?.data, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
     }
     await this.persistLog({
       level: 'info',
       category: 'tool',
       message: `Tool progress: ${step}`,
-      metadata: { toolId, step, progress: options?.progress, ...options?.data },
+      metadata: { toolId, step, progress: options?.progress, ...options?.data, ...(subgraph ? { subgraph } : {}) },
     });
   }
 
@@ -1015,15 +1029,16 @@ export class RunPublisher {
     const ts = Date.now();
     const triggeredBy = options?.triggeredBy ?? 'step';
     const neuronStepId = options?.neuronStepId;
+    const subgraph = tool?.subgraph;
     await this.publish({
       type: 'tool_complete', toolId, result, metadata,
-      triggeredBy, neuronStepId, timestamp: ts,
+      triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
     });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_complete', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
-        result, metadata, triggeredBy, neuronStepId, timestamp: ts,
+        result, metadata, triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
     }
     // Extract a useful preview of the tool result for persistent logging.
@@ -1035,7 +1050,7 @@ export class RunPublisher {
       level: logLevel,
       category: 'tool',
       message: `Tool completed: ${tool?.toolName ?? toolId}${resultPreview.isFailure ? ' (non-zero exit)' : ''}`,
-      metadata: { toolId, toolName: tool?.toolName, duration: tool?.duration, ...resultPreview.meta, ...metadata },
+      metadata: { toolId, toolName: tool?.toolName, duration: tool?.duration, ...resultPreview.meta, ...metadata, ...(subgraph ? { subgraph } : {}) },
     });
   }
 
@@ -1055,22 +1070,23 @@ export class RunPublisher {
     const ts = Date.now();
     const triggeredBy = options?.triggeredBy ?? 'step';
     const neuronStepId = options?.neuronStepId;
+    const subgraph = tool?.subgraph;
     await this.publish({
       type: 'tool_error', toolId, error,
-      triggeredBy, neuronStepId, timestamp: ts,
+      triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
     });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_error', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
-        error, triggeredBy, neuronStepId, timestamp: ts,
+        error, triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
     }
     await this.persistLog({
       level: 'error',
       category: 'tool',
       message: `Tool error: ${error}`,
-      metadata: { toolId, toolName: tool?.toolName, error },
+      metadata: { toolId, toolName: tool?.toolName, error, ...(subgraph ? { subgraph } : {}) },
     });
   }
 

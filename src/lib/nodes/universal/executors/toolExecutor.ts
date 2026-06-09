@@ -20,6 +20,35 @@ function getNativeRegistryLazy(): any {
 }
 
 /**
+ * Resolve the subgraph visibility tag from graph state.
+ *
+ * `graphExecutor` writes `state.data._subgraph = { depth, graphId, name }`
+ * into the subgraph's initial state. Tools fired anywhere inside that subgraph
+ * read it here and forward it to RunPublisher.toolStart so the resulting
+ * `state.tools` entry (and the persisted message tools + tool logs) carry a
+ * `subgraph` marker. Top-level (non-subgraph) tools return `undefined` and are
+ * therefore NOT tagged — preserving today's behavior exactly.
+ */
+function resolveSubgraphTag(
+    state: any,
+): { depth: number; graphId: string; name: string } | undefined {
+    const tag = state?.data?._subgraph;
+    if (
+        tag &&
+        typeof tag === 'object' &&
+        typeof tag.depth === 'number' &&
+        typeof tag.graphId === 'string'
+    ) {
+        return {
+            depth: tag.depth,
+            graphId: tag.graphId,
+            name: typeof tag.name === 'string' ? tag.name : tag.graphId,
+        };
+    }
+    return undefined;
+}
+
+/**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
  * rationale. Reads from the per-process RunControlRegistry (survives
  * checkpoint round-trips), with `state._abortController` as a fallback for
@@ -138,6 +167,11 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
 
     // Get RunPublisher for tool events (only available in run path)
     const runPublisher = getRunPublisher(state);
+
+    // Subgraph visibility tag — undefined for top-level tools. When present,
+    // it's forwarded to RunPublisher.toolStart so this tool is marked as
+    // subgraph-originated in state.tools / message tools / logs.
+    const subgraphTag = resolveSubgraphTag(state);
 
     // Generate unique tool execution ID
     const toolId = `tool_${config.toolName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -411,7 +445,10 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
         if (nativeRegistry.has(config.toolName)) {
             console.log(`[ToolExecutor] Routing to native tool: ${config.toolName}`);
             if (runPublisher) {
-                await runPublisher.toolStart(toolId, config.toolName, 'native', { input: renderedParams });
+                await runPublisher.toolStart(toolId, config.toolName, 'native', {
+                    input: renderedParams,
+                    ...(subgraphTag ? { subgraph: subgraphTag } : {}),
+                });
             }
 
             // Build onChunk callback for real-time stream parsing
@@ -586,7 +623,8 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
         // Emit tool_start event
         if (runPublisher) {
             await runPublisher.toolStart(toolId, config.toolName, 'mcp', {
-                input: renderedParams
+                input: renderedParams,
+                ...(subgraphTag ? { subgraph: subgraphTag } : {}),
             });
         }
 
