@@ -12,6 +12,7 @@
 import { getCapabilityProfile } from '../run/contextLookup';
 import { enforceToolCapability } from '../permissions/enforce';
 import { CapabilityDeniedError } from '../permissions/types';
+import { persistDenial } from '../permissions/persist-denial';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -316,6 +317,10 @@ export class NativeToolRegistry {
           `[NativeRegistry] capability DENY: tool=${name} resource=${err.resource} ` +
             `action=${err.action} address=${err.address} profile=${err.profileName}`,
         );
+        // Durable audit: fire-and-forget POST to the webapp. NEVER blocks and
+        // NEVER throws — the `isError` result must return immediately, exactly
+        // as before. A persistence failure cannot affect the run or this result.
+        persistDenial(context, name, err);
         return {
           content: [{ type: 'text', text: `Error: ${err.message}` }],
           isError: true,
