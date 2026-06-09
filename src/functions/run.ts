@@ -1383,6 +1383,11 @@ export async function run(
     redis,
     runId,
     userId,
+    // agentId is not yet a typed RunOptions field — accessed via cast until it
+    // is promoted. The worker passes it top-level on the run options (see
+    // worker run processor: `...(agentId && { agentId })`); no caller embeds
+    // it anywhere else.
+    agentId,
     log: red.redlog,
     automationRunId: options.automationRunId,
     automationRunsCollection,
