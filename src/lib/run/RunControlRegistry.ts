@@ -179,6 +179,15 @@ export interface RunControlContext {
    *  event per LLM call to the `usage:events` Redis stream. Optional + fully
    *  fail-safe — a metering outage never affects the run. */
   meteringClient?: any;
+  /**
+   * Capability profile for the data-permissions layer (State + Knowledge).
+   * Resolved from the graph config at run start and read by the native-tool
+   * dispatch chokepoint via `getCapabilityProfile(state)`. `undefined` means
+   * the run is UNPROFILED → unrestricted (backward-compatible). Lives here, not
+   * in graph state, so a profiled jail can't be stripped by a checkpoint
+   * round-trip or a state-mutating step.
+   */
+  capabilityProfile?: any;
 }
 
 /**
@@ -263,6 +272,7 @@ export class RunControlRegistry {
       | 'logger'
       | 'graphPublisher'
       | 'meteringClient'
+      | 'capabilityProfile'
     >>,
   ): RunControlContext {
     const existing = this.contexts.get(runId);
@@ -302,6 +312,7 @@ export class RunControlRegistry {
       | 'logger'
       | 'graphPublisher'
       | 'meteringClient'
+      | 'capabilityProfile'
     >>,
   ): void {
     const ctx = this.contexts.get(runId);
