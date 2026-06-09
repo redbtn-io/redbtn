@@ -122,6 +122,13 @@ export interface RunPublisherOptions {
   runId: string;
   /** User executing the run */
   userId: string;
+  /**
+   * Optional agent/graph id used as the conversation participant in multi-agent
+   * chats. When set, this value is stamped onto the persisted assistant message
+   * as `metadata.agentId` so the chat UI can attribute the message to the
+   * correct agent (name, avatar, colour) even after a page reload.
+   */
+  agentId?: string;
   /** Optional AutomationRun.runId to mirror progress heartbeat into Mongo. */
   automationRunId?: string;
   /** Optional automationruns collection handle for Mongo heartbeat mirroring. */
@@ -155,6 +162,8 @@ export class RunPublisher {
   private readonly redis: Redis;
   private readonly runId: string;
   private readonly userId: string;
+  /** Agent id for multi-agent attribution — stamped onto persisted messages. */
+  private readonly agentId?: string;
   private readonly automationRunId?: string;
   private readonly automationRunsCollection?: AutomationRunsCollection;
   private readonly generationId: string;
@@ -172,6 +181,7 @@ export class RunPublisher {
     this.redis = options.redis;
     this.runId = options.runId;
     this.userId = options.userId;
+    this.agentId = options.agentId;
     this.automationRunId = options.automationRunId;
     this.automationRunsCollection = options.automationRunsCollection;
     this.generationId = options.generationId ?? options.runId;
@@ -411,6 +421,9 @@ export class RunPublisher {
             executionPath: this.state!.graph.executionPath || [],
             nodeProgress: this.state!.graph.nodeProgress || {},
           },
+          // Thread agentId through so it lands on metadata.agentId of the
+          // persisted message. Absent for single-agent / non-attributed runs.
+          this.agentId,
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_complete failed:", err);
@@ -518,6 +531,8 @@ export class RunPublisher {
           this.convMessageId,
           error,
           this.state!.tools,
+          // Thread agentId so failed-run messages are also attributed.
+          this.agentId,
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_error failed:", err);
@@ -593,6 +608,8 @@ export class RunPublisher {
           this.convMessageId,
           reason ? `Run interrupted: ${reason}` : 'Run interrupted',
           this.state!.tools,
+          // Thread agentId so interrupted-run messages are also attributed.
+          this.agentId,
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_interrupted failed:", err);

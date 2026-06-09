@@ -1383,6 +1383,10 @@ export async function run(
     redis,
     runId,
     userId,
+    // agentId is not yet a typed RunOptions field — accessed via cast until it
+    // is promoted. Defensively check both the top-level cast and the nested
+    // data.options path (some callers embed it in the options bag).
+    agentId: agentId ?? ((options as any).data?.options?.agentId as string | undefined),
     log: red.redlog,
     automationRunId: options.automationRunId,
     automationRunsCollection,

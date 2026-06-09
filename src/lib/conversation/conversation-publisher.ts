@@ -249,6 +249,11 @@ export class ConversationPublisher {
    *  `tools` is the run's full tool history (state.tools array). When the
    *  archiver missed tool_event forwards, the persisted message has
    *  toolExecutions: [] — this set updates it to the truth.
+   *
+   *  `agentId` is the conversation-participant agent id for multi-agent
+   *  attribution. When present it is stamped onto `metadata.agentId` of the
+   *  persisted message so the chat UI can render the correct name/avatar/colour
+   *  on reload (live streaming already receives agentId via SSE enrichment).
    */
   async publishRunComplete(
     runId: string,
@@ -256,6 +261,7 @@ export class ConversationPublisher {
     finalContent?: string,
     tools?: unknown[],
     graphRun?: unknown,
+    agentId?: string,
   ): Promise<void> {
     await this.publish({
       type: 'run_complete',
@@ -263,6 +269,7 @@ export class ConversationPublisher {
       messageId,
       finalContent,
       ...(graphRun ? { graphRun } : {}),
+      ...(agentId ? { agentId } : {}),
       timestamp: Date.now(),
     });
     // Persist whenever we have a messageId — runs can complete with empty
@@ -277,9 +284,10 @@ export class ConversationPublisher {
           messageId,
           role: 'assistant',
           content: finalContent || '',
-          metadata: { runId },
+          metadata: { runId, ...(agentId ? { agentId } : {}) },
           toolExecutions: Array.isArray(tools) ? tools : undefined,
           graphRun,
+          agentId,
         });
       } catch (err) {
         console.error('[ConversationPublisher] Backstop persistMessage failed:', err);
@@ -293,28 +301,38 @@ export class ConversationPublisher {
    *  assistant message. Failed runs frequently ran tools before the failure
    *  and that history was previously lost — only completed runs persisted
    *  tool data. Same in-place $set semantics as `publishRunComplete`.
+   *
+   *  `agentId` is the conversation-participant agent id for multi-agent
+   *  attribution. Stamped onto `metadata.agentId` so failed/interrupted runs
+   *  are attributed the same way completed runs are.
    */
   async publishRunError(
     runId: string,
     messageId: string,
     error: string,
     tools?: unknown[],
+    agentId?: string,
   ): Promise<void> {
     await this.publish({
       type: 'run_error',
       runId,
       messageId,
       error,
+      ...(agentId ? { agentId } : {}),
       timestamp: Date.now(),
     });
-    if (messageId && Array.isArray(tools) && tools.length > 0) {
+    // Persist when we have tools OR an agentId to stamp. Even with no tool
+    // history, we need the message to carry the agentId attribution so reload
+    // doesn't render a grey "Assistant" bubble for failed/interrupted agents.
+    if (messageId && (Array.isArray(tools) && tools.length > 0 || agentId)) {
       try {
         await this.persistMessage({
           messageId,
           role: 'assistant',
           content: '',
-          metadata: { runId, runError: error },
-          toolExecutions: tools,
+          metadata: { runId, runError: error, ...(agentId ? { agentId } : {}) },
+          toolExecutions: Array.isArray(tools) && tools.length > 0 ? tools : undefined,
+          agentId,
         });
       } catch (err) {
         console.error('[ConversationPublisher] Failed/interrupted backstop persistMessage failed:', err);
@@ -589,6 +607,14 @@ export class ConversationPublisher {
      *  `message.graphRun` stays empty and the chat UI's graph-run view hangs
      *  on "Loading…". */
     graphRun?: unknown;
+    /**
+     * Optional agent id for multi-agent attribution. When present it is
+     * stamped onto `messages[].metadata.agentId` so the chat UI can render
+     * the correct agent identity after a page reload. Absent for
+     * single-agent / non-attributed runs — no field is written in that case
+     * so existing messages are never clobbered with an empty string.
+     */
+    agentId?: string;
   }): Promise<void> {
     try {
       // Use mongoose to persist to the conversation
@@ -615,6 +641,13 @@ export class ConversationPublisher {
       // entry and its update is a no-op. This replaces the old non-atomic
       // `$pull then $push` pattern which produced duplicates when two
       // writers both raced past the $pull.
+      // Merge agentId into the metadata bag for the $push so newly-created
+      // messages carry attribution from the start. Using spread preserves any
+      // existing metadata fields (runId, runError, etc.).
+      const pushMetadata = params.agentId
+        ? { ...(params.metadata ?? {}), agentId: params.agentId }
+        : params.metadata;
+
       await db.collection('user_conversations').updateOne(
         { ...filter, 'messages.id': { $ne: params.messageId } },
         {
@@ -624,7 +657,7 @@ export class ConversationPublisher {
               role: params.role,
               content: params.content,
               ...(params.thinking ? { thinking: params.thinking } : {}),
-              metadata: params.metadata,
+              metadata: pushMetadata,
               ...(Array.isArray(params.toolExecutions) && params.toolExecutions.length > 0
                 ? { toolExecutions: params.toolExecutions }
                 : {}),
@@ -676,6 +709,21 @@ export class ConversationPublisher {
           );
         } catch (err) {
           console.error('[ConversationPublisher] graphRun $set failed:', err);
+        }
+      }
+
+      // agentId backfill: in-place $set so attribution lands on the message
+      // whether the $push above created a new row or was a no-op (archiver got
+      // there first). Only writes when agentId is present — single-agent /
+      // non-attributed runs must never clobber an existing agentId with undefined.
+      if (params.agentId) {
+        try {
+          await db.collection('user_conversations').updateOne(
+            { ...filter, 'messages.id': params.messageId },
+            { $set: { 'messages.$.metadata.agentId': params.agentId } },
+          );
+        } catch (err) {
+          console.error('[ConversationPublisher] agentId $set failed:', err);
         }
       }
 
