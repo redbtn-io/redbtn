@@ -47,16 +47,36 @@ function resolveWebappBase(): string | undefined {
 }
 
 /**
- * Resolve the run's auth token from the tool context, mirroring the state
- * tools' `buildHeaders` precedence: `state.authToken` first, then
- * `state.data.authToken`.
+ * Build the webapp auth headers EXACTLY like the native state tools'
+ * `buildHeaders` (see `native/set-global-state.ts`). Worker runs do NOT carry a
+ * user Bearer token — they authenticate as a service principal via
+ * `X-Internal-Key` + `X-User-Id`. Sending only `Authorization: Bearer` (the
+ * original mistake) meant the POST was skipped on every real worker run.
+ *
+ * Returns the header map plus `canAuth` — true when the request can authenticate
+ * at all (a Bearer token, OR an internal key paired with a user id). When false
+ * we skip the POST (the console.warn in the gate remains the fallback record).
  */
-function resolveAuthToken(context: NativeToolContext): string | undefined {
+function buildAuthHeaders(context: NativeToolContext): {
+  headers: Record<string, string>;
+  canAuth: boolean;
+} {
   const state = context?.state as Record<string, any> | undefined;
-  const token =
-    (state?.authToken as string | undefined) ||
-    (state?.data?.authToken as string | undefined);
-  return typeof token === 'string' && token.trim() ? token.trim() : undefined;
+  const authToken =
+    (state?.authToken as string | undefined) || (state?.data?.authToken as string | undefined);
+  const userId =
+    (state?.userId as string | undefined) || (state?.data?.userId as string | undefined);
+  const internalKey = process.env.INTERNAL_SERVICE_KEY;
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+  if (userId) headers['X-User-Id'] = userId;
+  if (internalKey) headers['X-Internal-Key'] = internalKey;
+
+  // The webapp accepts either a Bearer credential or a service principal
+  // (X-Internal-Key + X-User-Id). Anything less can't authenticate → skip.
+  const canAuth = !!authToken || (!!internalKey && !!userId);
+  return { headers, canAuth };
 }
 
 /**
@@ -91,11 +111,11 @@ export function persistDenial(
 ): void {
   try {
     const base = resolveWebappBase();
-    const authToken = resolveAuthToken(context);
+    const { headers, canAuth } = buildAuthHeaders(context);
 
-    // Graceful skip: without a base URL or auth token we cannot durably
-    // persist. The console.warn in the gate is the fallback record. Do not throw.
-    if (!base || !authToken) return;
+    // Graceful skip: without a base URL or a usable credential we cannot
+    // durably persist. The console.warn in the gate is the fallback record.
+    if (!base || !canAuth) return;
 
     // Contract body — MUST match the webapp receiver exactly. No userId: the
     // webapp derives it from the bearer token (trust boundary).
@@ -115,10 +135,7 @@ export function persistDenial(
     // Fire-and-forget: never await, never let a rejection escape.
     void fetch(`${base}/api/v1/permissions/denials`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${authToken}`,
-      },
+      headers,
       body: JSON.stringify(body),
     })
       .then(() => {
