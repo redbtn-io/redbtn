@@ -206,7 +206,16 @@ export interface StreamingRunResult {
 const DEFAULT_GRAPH_ID = SYSTEM_TEMPLATES.DEFAULT;
 const DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS = RunConfig.RUN_PROGRESS_STALE_MS;
 const DEFAULT_RUN_PROGRESS_WATCHDOG_INTERVAL_MS = 30 * 1000;
-const DEFAULT_RUN_CONFIG_TIMEOUT_MS = 300 * 1000;
+// 0 = NO hard wall-clock cap by default. A run that is actively making
+// progress must never be killed for taking "too long" (a long build, a slow
+// install, a big migration). The progress-idle watchdog
+// (DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS, 30 min of NO progress) is the real
+// safety net for genuinely-stuck runs. A graph/automation can still opt into
+// a hard wall-clock timeout via `config.timeout` (seconds) or the
+// RUN_CONFIG_TIMEOUT_MS env var. Previously this defaulted to 300s, which
+// silently aborted any run — actively working or not — at exactly 5 minutes
+// (observed killing long Red Coder commands mid-execution).
+const DEFAULT_RUN_CONFIG_TIMEOUT_MS = 0;
 
 function generateRunId(): string {
   return `run_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
@@ -549,9 +558,14 @@ async function executeWithRunProgressWatchdog(
   },
 ): Promise<RunResult> {
   const progressWatchdog = startRunProgressWatchdog(args);
-  const configTimeout = startRunConfigTimeout(args);
+  // Hard wall-clock cap is opt-in: only race against it when a positive
+  // timeout was configured (graph config.timeout / RUN_CONFIG_TIMEOUT_MS).
+  // Default 0 → no cap; the progress watchdog handles genuinely-stuck runs.
+  const configTimeout = args.configTimeoutMs > 0 ? startRunConfigTimeout(args) : null;
   try {
-    return await Promise.race([operation(), progressWatchdog.promise, configTimeout.promise]);
+    const racers: Promise<RunResult>[] = [operation(), progressWatchdog.promise];
+    if (configTimeout) racers.push(configTimeout.promise);
+    return await Promise.race(racers);
   } catch (err) {
     if (err instanceof RunProgressWatchdogError || err instanceof RunConfigTimeoutError) {
       return failRunFromWatchdog(args.publisher, err);
@@ -559,7 +573,7 @@ async function executeWithRunProgressWatchdog(
     throw err;
   } finally {
     progressWatchdog.stop();
-    configTimeout.stop();
+    configTimeout?.stop();
   }
 }
 
