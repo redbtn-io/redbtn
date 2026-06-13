@@ -1,0 +1,176 @@
+/**
+ * Data-tool → capability mapping.
+ *
+ * The single source of truth for which native tools are DATA tools (State or
+ * Knowledge), what action each performs, and how to extract the resource
+ * ADDRESS (the thing a selector is matched against) from the tool's arguments.
+ *
+ * Anything NOT in this map is treated as a non-data tool and is NEVER gated by
+ * the capability layer — the enforcement hook short-circuits to "allow" for
+ * unmapped tool names. This keeps the blast radius of the permissions layer
+ * scoped strictly to State + Knowledge, per the task.
+ *
+ * # Address semantics
+ *
+ *   - State tools: the address is the `namespace` arg. Prefix-jailing a State
+ *     namespace (e.g. `coder/*`) is the primary defense.
+ *   - Knowledge tools: the address is the LIBRARY identity. Most library tools
+ *     take an opaque `libraryId`; `create_library` takes a human `name`. We
+ *     expose BOTH the raw arg and a hint of which field it came from so the
+ *     enforcement layer can match a selector against whatever the agent
+ *     supplied. (Selectors authored for Knowledge therefore generally target
+ *     library NAMES for create, and library IDs for mutate/read of an existing
+ *     library — operators should grant the prefix on whichever identity their
+ *     workflow uses; for the Red Coder jail we grant create by name-prefix and
+ *     a wildcard is intentionally NOT used.)
+ *
+ * # Why a per-tool extractor instead of a generic arg sniff
+ *
+ * Tools are inconsistent: namespace vs libraryId vs name vs libraryIds[]. An
+ * explicit table is auditable — a reviewer can see exactly which mutation
+ * paths are covered and what each one keys on. A generic sniff would silently
+ * miss a renamed field.
+ *
+ * @module lib/permissions/tool-map
+ */
+
+import type { CapabilityAction, CapabilityResource } from './types';
+
+/** One or more addresses extracted from a tool call (some tools fan out). */
+export interface ExtractedAddress {
+  /** Addresses to check. ALL must pass for the call to be allowed. */
+  addresses: string[];
+  /**
+   * True when the tool COULD touch resources but no specific address was
+   * supplied (e.g. `search_all_libraries` with no `libraryIds`, or a list-all
+   * tool). For a profiled run this means "broad/unscoped access" and the
+   * enforcement layer treats it as requiring a wildcard-capable grant.
+   */
+  unscoped?: boolean;
+}
+
+export interface DataToolRule {
+  resource: CapabilityResource;
+  action: CapabilityAction;
+  /**
+   * Pull the address(es) this call targets out of the raw tool args. Returns
+   * `{ addresses: [], unscoped: true }` when the tool is inherently broad and
+   * no narrowing identifier was given.
+   */
+  extract: (args: Record<string, unknown>) => ExtractedAddress;
+}
+
+function str(v: unknown): string {
+  return typeof v === 'string' ? v.trim() : '';
+}
+
+function strArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return v.map((x) => str(x)).filter((x) => x.length > 0);
+}
+
+/** Address extractor for State tools — always keys on `namespace`. */
+function stateNamespace(args: Record<string, unknown>): ExtractedAddress {
+  const ns = str(args.namespace);
+  if (!ns) return { addresses: [], unscoped: true };
+  return { addresses: [ns] };
+}
+
+/** Address extractor for single-library tools — keys on `libraryId`. */
+function libraryId(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.libraryId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
+/** Address extractor for `create_library` — keys on the new `name`. */
+function libraryName(args: Record<string, unknown>): ExtractedAddress {
+  const name = str(args.name);
+  if (!name) return { addresses: [], unscoped: true };
+  return { addresses: [name] };
+}
+
+/** `search_all_libraries`: optional `libraryIds[]` filter, else broad. */
+function libraryIdsFilter(args: Record<string, unknown>): ExtractedAddress {
+  const ids = strArray(args.libraryIds);
+  if (ids.length === 0) return { addresses: [], unscoped: true };
+  return { addresses: ids };
+}
+
+/**
+ * The data-tool table. EXHAUSTIVE for State + Knowledge mutation AND read
+ * paths in `native/`. Read tools are included so a jail can also prevent
+ * cross-tenant *reads* (data exfiltration), not just writes — but read grants
+ * are independent, so a profile that only restricts writes can leave reads
+ * open by granting `read: '*'`.
+ *
+ * Grouped + commented by domain so the audit is legible.
+ */
+export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
+  // ── State: reads ──────────────────────────────────────────────────────────
+  get_global_state: { resource: 'state', action: 'read', extract: stateNamespace },
+  list_global_state: { resource: 'state', action: 'read', extract: stateNamespace },
+  get_global_schema: { resource: 'state', action: 'read', extract: stateNamespace },
+  // list_namespaces enumerates ALL namespaces the user can access — inherently
+  // broad. Mapped as an unscoped read so a jailed agent needs a wildcard read
+  // grant to enumerate (otherwise it could discover sibling-workflow namespaces).
+  list_namespaces: {
+    resource: 'state',
+    action: 'read',
+    extract: () => ({ addresses: [], unscoped: true }),
+  },
+
+  // ── State: writes ─────────────────────────────────────────────────────────
+  set_global_state: { resource: 'state', action: 'write', extract: stateNamespace },
+  state_patch: { resource: 'state', action: 'write', extract: stateNamespace },
+
+  // ── State: deletes ────────────────────────────────────────────────────────
+  delete_global_state: { resource: 'state', action: 'delete', extract: stateNamespace },
+  delete_namespace: { resource: 'state', action: 'delete', extract: stateNamespace },
+
+  // ── Knowledge: reads ──────────────────────────────────────────────────────
+  list_libraries: {
+    resource: 'knowledge',
+    action: 'read',
+    extract: () => ({ addresses: [], unscoped: true }),
+  },
+  get_document: { resource: 'knowledge', action: 'read', extract: libraryId },
+  list_documents: { resource: 'knowledge', action: 'read', extract: libraryId },
+  search_documents: {
+    // search_documents keys on a Chroma `collection`, not a library id. It does
+    // not address a user library namespace by id/name, so we map it as an
+    // unscoped knowledge read (a jail must grant a wildcard read to use it).
+    resource: 'knowledge',
+    action: 'read',
+    extract: () => ({ addresses: [], unscoped: true }),
+  },
+  search_all_libraries: {
+    resource: 'knowledge',
+    action: 'read',
+    extract: libraryIdsFilter,
+  },
+
+  // ── Knowledge: create ─────────────────────────────────────────────────────
+  create_library: { resource: 'knowledge', action: 'create', extract: libraryName },
+  add_document: { resource: 'knowledge', action: 'write', extract: libraryId },
+  upload_to_library: { resource: 'knowledge', action: 'write', extract: libraryId },
+
+  // ── Knowledge: writes (mutate existing) ───────────────────────────────────
+  update_library: { resource: 'knowledge', action: 'write', extract: libraryId },
+  update_document: { resource: 'knowledge', action: 'write', extract: libraryId },
+  reprocess_document: { resource: 'knowledge', action: 'write', extract: libraryId },
+
+  // ── Knowledge: deletes ────────────────────────────────────────────────────
+  delete_library: { resource: 'knowledge', action: 'delete', extract: libraryId },
+  delete_document: { resource: 'knowledge', action: 'delete', extract: libraryId },
+};
+
+/** Is this tool name a gated data tool? */
+export function isDataTool(name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(DATA_TOOL_RULES, name);
+}
+
+/** Get the rule for a data tool, or undefined if it's not a data tool. */
+export function getDataToolRule(name: string): DataToolRule | undefined {
+  return DATA_TOOL_RULES[name];
+}

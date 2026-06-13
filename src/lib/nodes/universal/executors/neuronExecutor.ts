@@ -38,6 +38,32 @@ function getRunSignal(state: any): AbortSignal | undefined {
     return state?._abortController?.signal;
 }
 
+/**
+ * Resolve the subgraph visibility tag from graph state. Mirrors the helper in
+ * toolExecutor.ts: when a neuron step runs inside a subgraph, `graphExecutor`
+ * has written `state.data._subgraph = { depth, graphId, name }`. Any tool the
+ * LLM invokes (triggeredBy:'neuron') is then tagged so the UI can filter it.
+ * Returns undefined for top-level neurons — those tools stay untagged.
+ */
+function resolveSubgraphTag(
+    state: any,
+): { depth: number; graphId: string; name: string } | undefined {
+    const tag = state?.data?._subgraph;
+    if (
+        tag &&
+        typeof tag === 'object' &&
+        typeof tag.depth === 'number' &&
+        typeof tag.graphId === 'string'
+    ) {
+        return {
+            depth: tag.depth,
+            graphId: tag.graphId,
+            name: typeof tag.name === 'string' ? tag.name : tag.graphId,
+        };
+    }
+    return undefined;
+}
+
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
 
@@ -707,6 +733,9 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
                 voice: (state.data?.ttsVoice as string) || undefined,
                 speed: (state.data?.ttsSpeed as number) || undefined,
               },
+              // Thread the run-level abort signal so an external interrupt
+              // cancels in-flight Kokoro fetches immediately.
+              signal: abortSignal,
             });
             console.log('[NeuronExecutor] TTS audio pipeline enabled for audio-optimized neuron:', neuronId);
           }
@@ -893,9 +922,10 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
         if (asyncIter.return) {
           try { await asyncIter.return(); } catch (_) { /* ignore close errors */ }
         }
-        // Best-effort flush of any pending TTS audio on error
+        // Cancel the TTS pipeline immediately on stream error/abort — avoids
+        // waiting up to N×15s for in-flight Kokoro fetches to time out.
         if (audioPipeline) {
-          try { await audioPipeline.flush(); } catch (_) { /* ignore */ }
+          audioPipeline.cancel();
         }
         throw streamErr;
       }
@@ -1300,10 +1330,12 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
 
       // Emit tool_start
       if (runPublisher) {
+        const subgraphTag = resolveSubgraphTag(state);
         await runPublisher.toolStart(toolId, toolName, resolved?.source ?? 'native', {
           input: parsedArgs,
           triggeredBy: 'neuron',
           neuronStepId,
+          ...(subgraphTag ? { subgraph: subgraphTag } : {}),
         });
       }
 

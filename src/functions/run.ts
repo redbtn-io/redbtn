@@ -16,6 +16,7 @@ import type { Red } from '../index';
 import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys, RunConfig } from '../lib/run';
 import { runControlRegistry, type CancelResult } from '../lib/run/RunControlRegistry';
 import { getOrCreateMeteringClient } from '../lib/run/meteringClient';
+import { resolveCapabilityProfile } from '../lib/permissions/resolve';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
 import { SYSTEM_TEMPLATES } from '../lib/types/graph';
@@ -205,7 +206,16 @@ export interface StreamingRunResult {
 const DEFAULT_GRAPH_ID = SYSTEM_TEMPLATES.DEFAULT;
 const DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS = RunConfig.RUN_PROGRESS_STALE_MS;
 const DEFAULT_RUN_PROGRESS_WATCHDOG_INTERVAL_MS = 30 * 1000;
-const DEFAULT_RUN_CONFIG_TIMEOUT_MS = 300 * 1000;
+// 0 = NO hard wall-clock cap by default. A run that is actively making
+// progress must never be killed for taking "too long" (a long build, a slow
+// install, a big migration). The progress-idle watchdog
+// (DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS, 30 min of NO progress) is the real
+// safety net for genuinely-stuck runs. A graph/automation can still opt into
+// a hard wall-clock timeout via `config.timeout` (seconds) or the
+// RUN_CONFIG_TIMEOUT_MS env var. Previously this defaulted to 300s, which
+// silently aborted any run — actively working or not — at exactly 5 minutes
+// (observed killing long Red Coder commands mid-execution).
+const DEFAULT_RUN_CONFIG_TIMEOUT_MS = 0;
 
 function generateRunId(): string {
   return `run_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
@@ -548,9 +558,14 @@ async function executeWithRunProgressWatchdog(
   },
 ): Promise<RunResult> {
   const progressWatchdog = startRunProgressWatchdog(args);
-  const configTimeout = startRunConfigTimeout(args);
+  // Hard wall-clock cap is opt-in: only race against it when a positive
+  // timeout was configured (graph config.timeout / RUN_CONFIG_TIMEOUT_MS).
+  // Default 0 → no cap; the progress watchdog handles genuinely-stuck runs.
+  const configTimeout = args.configTimeoutMs > 0 ? startRunConfigTimeout(args) : null;
   try {
-    return await Promise.race([operation(), progressWatchdog.promise, configTimeout.promise]);
+    const racers: Promise<RunResult>[] = [operation(), progressWatchdog.promise];
+    if (configTimeout) racers.push(configTimeout.promise);
+    return await Promise.race(racers);
   } catch (err) {
     if (err instanceof RunProgressWatchdogError || err instanceof RunConfigTimeoutError) {
       return failRunFromWatchdog(args.publisher, err);
@@ -558,7 +573,7 @@ async function executeWithRunProgressWatchdog(
     throw err;
   } finally {
     progressWatchdog.stop();
-    configTimeout.stop();
+    configTimeout?.stop();
   }
 }
 
@@ -1382,6 +1397,11 @@ export async function run(
     redis,
     runId,
     userId,
+    // agentId is not yet a typed RunOptions field — accessed via cast until it
+    // is promoted. The worker passes it top-level on the run options (see
+    // worker run processor: `...(agentId && { agentId })`); no caller embeds
+    // it anywhere else.
+    agentId,
     log: red.redlog,
     automationRunId: options.automationRunId,
     automationRunsCollection,
@@ -1489,6 +1509,13 @@ export async function run(
         signal,
       ),
   };
+  // Data-permissions: resolve the agent's capability profile from the graph
+  // config (if any). `null` when the graph declares no profile → the run is
+  // UNPROFILED and the native-tool gate is a no-op (backward compatible). When
+  // present, the native-tool dispatch chokepoint enforces it fail-closed. We
+  // resolve here (not in the tool layer) so the profile is fixed at run start
+  // and can't be swapped mid-run by a state-mutating step.
+  const capabilityProfile = resolveCapabilityProfile(compiledGraph?.config);
   const runCtx = runControlRegistry.register(runId, WORKER_ID, {
     runPublisher: publisher,
     neuronRegistry: red.neuronRegistry,
@@ -1500,6 +1527,7 @@ export async function run(
     // event per LLM call to the `usage:events` Redis stream (the worker's
     // consumer rates + posts to the ledger). Never blocks/breaks a run.
     meteringClient: getOrCreateMeteringClient(red.redis),
+    capabilityProfile: capabilityProfile ?? undefined,
   });
   // Local controller kept for legacy/fallback paths (anyone reading
   // `state._abortController` directly). Wired so the run-controller

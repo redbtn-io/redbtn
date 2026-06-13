@@ -43,6 +43,7 @@ import {
   type RunOutput,
   type TokenMetadata,
   type ToolExecution,
+  type SubgraphTag,
   type AttachmentKind,
   RunKeys,
   RunConfig,
@@ -121,6 +122,13 @@ export interface RunPublisherOptions {
   runId: string;
   /** User executing the run */
   userId: string;
+  /**
+   * Optional agent/graph id used as the conversation participant in multi-agent
+   * chats. When set, this value is stamped onto the persisted assistant message
+   * as `metadata.agentId` so the chat UI can attribute the message to the
+   * correct agent (name, avatar, colour) even after a page reload.
+   */
+  agentId?: string;
   /** Optional AutomationRun.runId to mirror progress heartbeat into Mongo. */
   automationRunId?: string;
   /** Optional automationruns collection handle for Mongo heartbeat mirroring. */
@@ -154,6 +162,8 @@ export class RunPublisher {
   private readonly redis: Redis;
   private readonly runId: string;
   private readonly userId: string;
+  /** Agent id for multi-agent attribution — stamped onto persisted messages. */
+  private readonly agentId?: string;
   private readonly automationRunId?: string;
   private readonly automationRunsCollection?: AutomationRunsCollection;
   private readonly generationId: string;
@@ -171,6 +181,7 @@ export class RunPublisher {
     this.redis = options.redis;
     this.runId = options.runId;
     this.userId = options.userId;
+    this.agentId = options.agentId;
     this.automationRunId = options.automationRunId;
     this.automationRunsCollection = options.automationRunsCollection;
     this.generationId = options.generationId ?? options.runId;
@@ -399,6 +410,20 @@ export class RunPublisher {
           // This array goes into the message via persistMessage's in-place
           // $set so the truth lands even when forwarding doesn't.
           this.state!.tools,
+          // Pass the completed graph run trace so the chat UI can render the
+          // finished graph run. Node-progress events aren't forwarded over the
+          // conversation stream, so this server-side persistence is the only
+          // source of real executionPath/nodeProgress on the message.
+          {
+            graphId: this.state!.graphId,
+            runId: this.runId,
+            status: 'completed',
+            executionPath: this.state!.graph.executionPath || [],
+            nodeProgress: this.state!.graph.nodeProgress || {},
+          },
+          // Thread agentId through so it lands on metadata.agentId of the
+          // persisted message. Absent for single-agent / non-attributed runs.
+          this.agentId,
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_complete failed:", err);
@@ -506,6 +531,8 @@ export class RunPublisher {
           this.convMessageId,
           error,
           this.state!.tools,
+          // Thread agentId so failed-run messages are also attributed.
+          this.agentId,
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_error failed:", err);
@@ -581,6 +608,8 @@ export class RunPublisher {
           this.convMessageId,
           reason ? `Run interrupted: ${reason}` : 'Run interrupted',
           this.state!.tools,
+          // Thread agentId so interrupted-run messages are also attributed.
+          this.agentId,
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_interrupted failed:", err);
@@ -935,10 +964,18 @@ export class RunPublisher {
       triggeredBy?: 'step' | 'neuron';
       /** Owning neuron step id when triggeredBy === 'neuron'. */
       neuronStepId?: string;
+      /**
+       * Subgraph origin tag — present only when this tool ran inside a
+       * subgraph (a universal-node `graph` step). Top-level tools omit it.
+       * Tags the persisted `state.tools` entry, the tool_start event, and the
+       * tool log metadata so the UI can hide/show subgraph-originated tools.
+       */
+      subgraph?: SubgraphTag;
     },
   ): Promise<void> {
     this.ensureInitialized();
-    const tool = createToolExecution({ toolId, toolName, toolType });
+    const subgraph = options?.subgraph;
+    const tool = createToolExecution({ toolId, toolName, toolType, subgraph });
     this.state!.tools.push(tool);
     await this.saveState();
     const ts = Date.now();
@@ -952,20 +989,24 @@ export class RunPublisher {
       input: options?.input,
       triggeredBy,
       neuronStepId,
+      ...(subgraph ? { subgraph } : {}),
       timestamp: ts,
     });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_start', toolId, toolName, toolType, input: options?.input,
-        triggeredBy, neuronStepId, timestamp: ts,
+        triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
     }
     await this.persistLog({
       level: 'info',
       category: 'tool',
       message: `Tool started: ${toolName}`,
-      metadata: { toolId, toolName, toolType, input: options?.input, triggeredBy, neuronStepId },
+      metadata: {
+        toolId, toolName, toolType, input: options?.input, triggeredBy, neuronStepId,
+        ...(subgraph ? { subgraph } : {}),
+      },
     });
   }
 
@@ -981,19 +1022,20 @@ export class RunPublisher {
     }
     await this.saveState();
     const ts = Date.now();
-    await this.publish({ type: 'tool_progress', toolId, step, progress: options?.progress, data: options?.data, timestamp: ts });
+    const subgraph = tool?.subgraph;
+    await this.publish({ type: 'tool_progress', toolId, step, progress: options?.progress, data: options?.data, ...(subgraph ? { subgraph } : {}), timestamp: ts });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_progress', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
-        step, progress: options?.progress, data: options?.data, timestamp: ts,
+        step, progress: options?.progress, data: options?.data, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
     }
     await this.persistLog({
       level: 'info',
       category: 'tool',
       message: `Tool progress: ${step}`,
-      metadata: { toolId, step, progress: options?.progress, ...options?.data },
+      metadata: { toolId, step, progress: options?.progress, ...options?.data, ...(subgraph ? { subgraph } : {}) },
     });
   }
 
@@ -1015,15 +1057,16 @@ export class RunPublisher {
     const ts = Date.now();
     const triggeredBy = options?.triggeredBy ?? 'step';
     const neuronStepId = options?.neuronStepId;
+    const subgraph = tool?.subgraph;
     await this.publish({
       type: 'tool_complete', toolId, result, metadata,
-      triggeredBy, neuronStepId, timestamp: ts,
+      triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
     });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_complete', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
-        result, metadata, triggeredBy, neuronStepId, timestamp: ts,
+        result, metadata, triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
     }
     // Extract a useful preview of the tool result for persistent logging.
@@ -1035,7 +1078,7 @@ export class RunPublisher {
       level: logLevel,
       category: 'tool',
       message: `Tool completed: ${tool?.toolName ?? toolId}${resultPreview.isFailure ? ' (non-zero exit)' : ''}`,
-      metadata: { toolId, toolName: tool?.toolName, duration: tool?.duration, ...resultPreview.meta, ...metadata },
+      metadata: { toolId, toolName: tool?.toolName, duration: tool?.duration, ...resultPreview.meta, ...metadata, ...(subgraph ? { subgraph } : {}) },
     });
   }
 
@@ -1055,22 +1098,23 @@ export class RunPublisher {
     const ts = Date.now();
     const triggeredBy = options?.triggeredBy ?? 'step';
     const neuronStepId = options?.neuronStepId;
+    const subgraph = tool?.subgraph;
     await this.publish({
       type: 'tool_error', toolId, error,
-      triggeredBy, neuronStepId, timestamp: ts,
+      triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
     });
     // Forward to conversation stream
     if (this.convPublisher) {
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_error', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
-        error, triggeredBy, neuronStepId, timestamp: ts,
+        error, triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
     }
     await this.persistLog({
       level: 'error',
       category: 'tool',
       message: `Tool error: ${error}`,
-      metadata: { toolId, toolName: tool?.toolName, error },
+      metadata: { toolId, toolName: tool?.toolName, error, ...(subgraph ? { subgraph } : {}) },
     });
   }
 
@@ -1162,6 +1206,29 @@ export class RunPublisher {
     }
     // Fire-and-forget archive job — non-blocking, non-fatal
     this._enqueueArchive(event).catch(() => {});
+
+    // Forward audio_chunk to the conversation stream so the chat UI receives
+    // server-side TTS audio. Catches BOTH the publishAudioChunk() path and the
+    // AudioStreamPipeline.tryPublish() path (which calls publish() directly).
+    // ConversationPublisher marks audio_chunk as EPHEMERAL — it is published to
+    // pub/sub only and is NOT written to the replay list or archived to Mongo.
+    if ((event as any).type === 'audio_chunk' && this.convPublisher && this.convMessageId) {
+      const audioEvent = event as any;
+      // mime derivation: the client's AudioPlaybackQueue decodes raw PCM16 and
+      // reads the sample rate from a `rate=` mime parameter (defaulting 24k).
+      // The streaming pipeline synthesizes PCM at Kokoro's native 24 kHz, so
+      // 'pcm' maps to 'audio/pcm;rate=24000'. MP3 must NEVER be forwarded here
+      // (the client has no MP3 demuxer — it would PCM-decode it into noise);
+      // the pipeline no longer emits mp3, but map it defensively anyway.
+      const fmt = audioEvent.format ?? 'pcm';
+      const mimeType =
+        fmt === 'pcm' ? 'audio/pcm;rate=24000'
+        : fmt === 'mp3' ? 'audio/mpeg'
+        : `audio/${fmt}`;
+      this.convPublisher.publishAudioChunk(this.convMessageId, audioEvent.audio ?? '', mimeType).catch((err) => {
+        console.warn('[RunPublisher] Conv forward audio_chunk failed:', err);
+      });
+    }
   }
 
   /**

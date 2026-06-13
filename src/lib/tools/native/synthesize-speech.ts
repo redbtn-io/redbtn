@@ -24,6 +24,7 @@
  */
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
+import { KOKORO_DEFAULT_VOICE } from '../../tts/synthesizer';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -39,7 +40,6 @@ interface SynthesizeArgs {
 }
 
 const DEFAULT_KOKORO_BASE = 'http://192.168.1.6:8880';
-const DEFAULT_KOKORO_VOICE = 'af_bella';
 const DEFAULT_GEMINI_VOICE = 'Kore';
 const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash-preview-tts';
 
@@ -297,7 +297,7 @@ const synthesizeSpeechTool: NativeToolDefinition = {
       voice: {
         type: 'string',
         description:
-          "Voice identifier. Default depends on provider — 'af_bella' for kokoro, 'Kore' for gemini.",
+          "Voice identifier. Default depends on provider — 'af_heart' for kokoro, 'Kore' for gemini.",
       },
       provider: {
         type: 'string',
@@ -344,7 +344,7 @@ const synthesizeSpeechTool: NativeToolDefinition = {
         ? args.voice.trim()
         : provider === 'gemini'
           ? DEFAULT_GEMINI_VOICE
-          : DEFAULT_KOKORO_VOICE;
+          : KOKORO_DEFAULT_VOICE;
 
     const startTime = Date.now();
     console.log(

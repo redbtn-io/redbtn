@@ -9,6 +9,11 @@
  * is required downstream.
  */
 
+import { getCapabilityProfile } from '../run/contextLookup';
+import { enforceToolCapability } from '../permissions/enforce';
+import { CapabilityDeniedError } from '../permissions/types';
+import { persistDenial } from '../permissions/persist-denial';
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
@@ -278,10 +283,55 @@ export class NativeToolRegistry {
 
   /**
    * Invoke a native tool handler with the given args and context.
+   *
+   * # Data-permissions gate (fail-closed)
+   *
+   * Before dispatching, we enforce the run's capability profile for DATA tools
+   * (State + Knowledge). This is the single chokepoint every native tool call
+   * passes through (the universal-node tool executor AND the neuron-driven
+   * tool-resolver both call `callTool`), so it's the right place to gate.
+   *
+   * Semantics:
+   *   - Unprofiled run (no `capabilityProfile` on the run context) → unchanged
+   *     behavior, fully unrestricted (backward compatible).
+   *   - Non-data tool → never gated.
+   *   - Profiled run + data tool addressing outside its grant → DENIED. We
+   *     return a model-readable `isError` result instead of throwing, so the
+   *     LLM can adapt rather than crashing the run.
    */
   async callTool(name: string, args: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
     const tool = this.tools.get(name);
     if (!tool) throw new Error(`Native tool not found: ${name}`);
+
+    // Capability enforcement. Wrapped defensively: a failure to RESOLVE the
+    // profile (lookup throws) must never crash an otherwise-valid call, but a
+    // genuine DENY (CapabilityDeniedError) must be surfaced to the model.
+    try {
+      const profile = getCapabilityProfile(context?.state);
+      if (profile) {
+        enforceToolCapability(profile, name, args ?? {});
+      }
+    } catch (err) {
+      if (err instanceof CapabilityDeniedError) {
+        console.warn(
+          `[NativeRegistry] capability DENY: tool=${name} resource=${err.resource} ` +
+            `action=${err.action} address=${err.address} profile=${err.profileName}`,
+        );
+        // Durable audit: fire-and-forget POST to the webapp. NEVER blocks and
+        // NEVER throws — the `isError` result must return immediately, exactly
+        // as before. A persistence failure cannot affect the run or this result.
+        persistDenial(context, name, err);
+        return {
+          content: [{ type: 'text', text: `Error: ${err.message}` }],
+          isError: true,
+        };
+      }
+      // Any non-deny error in the gate is fail-OPEN for availability — the gate
+      // never breaks a call it couldn't even evaluate. (Resolution errors are
+      // not a security boundary; the boundary is a real CapabilityDeniedError.)
+      console.warn(`[NativeRegistry] capability check errored for tool=${name} (allowing):`, err);
+    }
+
     return tool.handler(args, context);
   }
 }
