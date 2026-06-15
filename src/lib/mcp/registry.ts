@@ -82,6 +82,77 @@ export class McpRegistry {
   }
 
   /**
+   * Register a server WITHOUT the connect/initialize/listTools handshake.
+   *
+   * Use this for gateways that require per-request authentication (so the
+   * unauthenticated `initialize`/`tools/list` handshake would 401), but expose
+   * their tool roster via an unauthenticated `GET {url}/health` endpoint and
+   * accept credentials per-call via `_meta.credentials.headers`. Credentials
+   * are supplied at call time (templated per-run from state), NOT here.
+   *
+   * Tool schemas are best-effort: `/health` only advertises tool names, so we
+   * register permissive object schemas. The neuron tool-resolver tolerates
+   * this (the runtime tool call validates server-side).
+   *
+   * @param config.tools Optional explicit tool roster. When omitted we probe
+   *   `{url}/health` for a `tools: string[]` list.
+   */
+  async registerStaticServer(config: ServerConfig & { tools?: string[]; messagePath?: string }): Promise<void> {
+    const { name, url, headers } = config;
+
+    if (this.clients.has(name)) {
+      console.log(`[Registry] Static server ${name} already registered`);
+      return;
+    }
+
+    let toolNames: string[] = config.tools ?? [];
+    if (toolNames.length === 0) {
+      try {
+        const res = await fetch(`${url}/health`, { headers: { ...(headers ?? {}) } });
+        if (res.ok) {
+          const body: any = await res.json();
+          if (Array.isArray(body?.tools)) {
+            toolNames = body.tools.filter((t: unknown) => typeof t === 'string');
+          }
+        } else {
+          console.warn(`[Registry] Static server ${name} health probe returned ${res.status}`);
+        }
+      } catch (err) {
+        console.warn(`[Registry] Static server ${name} health probe failed:`, err);
+      }
+    }
+
+    if (toolNames.length === 0) {
+      throw new Error(`[Registry] registerStaticServer: no tools discovered for ${name} at ${url}`);
+    }
+
+    const tools: Tool[] = toolNames.map((toolName) => ({
+      name: toolName,
+      description: `MCP tool ${toolName} on ${name}`,
+      inputSchema: { type: 'object', properties: {} },
+    }));
+
+    const client = new McpClientSSE(url, name, {
+      headers,
+      // Gateway namespaces (mcp.redbtn.io/<provider>/<service>) expose their
+      // JSON-RPC endpoint at the base URL, not at /message. Default '' here;
+      // callers can override for servers that use the /message convention.
+      messagePath: config.messagePath ?? '',
+    });
+    const registration: ServerRegistration = {
+      name,
+      version: '1.0.0',
+      tools,
+      capabilities: { tools: { listChanged: false } },
+      url,
+    };
+
+    this.clients.set(name, client);
+    this.servers.set(name, registration);
+    console.log(`[Registry] Statically registered ${name} with ${tools.length} tools (no handshake)`);
+  }
+
+  /**
    * Unregister a server
    */
   async unregisterServer(serverName: string): Promise<void> {
