@@ -1182,6 +1182,39 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
     : 5;
   const neuronStepId = config.outputField;
 
+  // Resolve per-run tool credentials once at loop start. These are templated
+  // from state (e.g. a short-lived end-user bearer at
+  // state.data.input.userToken) and injected into every model-driven tool
+  // call's _meta.credentials so MCP servers (via the gateway) authenticate AS
+  // THE USER, not as the graph owner. Headers that render empty are dropped.
+  const toolCredentials: { type: string; headers: Record<string, string> } | undefined = (() => {
+    const cfgCreds = config.toolCredentials;
+    if (!cfgCreds || !cfgCreds.headers) return undefined;
+    const headers: Record<string, string> = {};
+    for (const [key, tmpl] of Object.entries(cfgCreds.headers)) {
+      let rendered: string;
+      try {
+        rendered = typeof tmpl === 'string' ? renderTemplate(tmpl, state) : '';
+      } catch {
+        rendered = '';
+      }
+      // Drop unresolved/empty headers — an unresolved `{{...}}` leaks the raw
+      // template, and a bare scheme (e.g. "Bearer ") carries no credential.
+      const trimmed = (rendered || '').trim();
+      if (!trimmed || trimmed.includes('{{') || /^Bearer\s*$/i.test(trimmed)) continue;
+      headers[key] = rendered;
+    }
+    if (Object.keys(headers).length === 0) return undefined;
+    return { type: cfgCreds.type || 'bearer', headers };
+  })();
+  if (config.toolCredentials) {
+    // Never log the credential value — only whether it resolved + which headers.
+    console.log('[NeuronExecutor] Per-run tool credentials:', {
+      resolved: !!toolCredentials,
+      headerNames: toolCredentials ? Object.keys(toolCredentials.headers) : [],
+    });
+  }
+
   // Bind the tools onto the model. LangChain's BaseChatModel.bindTools()
   // returns a new runnable with the tools wired up; we use it for every
   // invocation in the loop.
@@ -1350,7 +1383,11 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
           runId: ctxRunId,
           toolId,
           abortSignal: localAbort.signal ?? null,
-          credentials: undefined,
+          // Per-run credentials (templated from state) so MCP tool calls
+          // authenticate as the END USER. The MCP resolver forwards this as
+          // `_meta.credentials`, which the gateway reads
+          // (`_meta.credentials.headers.Authorization`) to scope the request.
+          credentials: toolCredentials,
         });
         lastToolResult = result;
         lastToolName = toolName;

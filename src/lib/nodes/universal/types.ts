@@ -232,6 +232,29 @@ export interface NeuronStepConfig {
      * exits the loop.
      */
     maxToolIterations?: number;
+    /**
+     * Per-run credentials injected into every model-driven (native tool-use
+     * loop) tool call's `_meta.credentials`. Use this when an attached MCP
+     * tool must authenticate as the END USER with a token that lives in run
+     * state (e.g. a short-lived bearer passed in via the webhook body) rather
+     * than via a stored ConnectionManager connection.
+     *
+     * `headers` values support template variables resolved against state, e.g.:
+     *   { "headers": { "Authorization": "Bearer {{state.data.input.userToken}}" } }
+     *
+     * When a header renders to an empty / unresolved value it is dropped, so a
+     * run without the token simply makes unauthenticated calls (the tool side
+     * decides whether that is a 401).
+     *
+     * NOTE: only honoured by the `native` toolStrategy loop. Deterministic
+     * `tool` steps continue to resolve credentials via ConnectionManager.
+     */
+    toolCredentials?: {
+        /** Credential type label forwarded to the tool (informational). Defaults to 'bearer'. */
+        type?: string;
+        /** HTTP headers, values templated against state. */
+        headers: Record<string, string>;
+    };
 }
 
 /**
