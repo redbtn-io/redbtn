@@ -97,7 +97,7 @@ export class McpRegistry {
    * @param config.tools Optional explicit tool roster. When omitted we probe
    *   `{url}/health` for a `tools: string[]` list.
    */
-  async registerStaticServer(config: ServerConfig & { tools?: string[] }): Promise<void> {
+  async registerStaticServer(config: ServerConfig & { tools?: string[]; messagePath?: string }): Promise<void> {
     const { name, url, headers } = config;
 
     if (this.clients.has(name)) {
@@ -132,7 +132,13 @@ export class McpRegistry {
       inputSchema: { type: 'object', properties: {} },
     }));
 
-    const client = new McpClientSSE(url, name, headers);
+    const client = new McpClientSSE(url, name, {
+      headers,
+      // Gateway namespaces (mcp.redbtn.io/<provider>/<service>) expose their
+      // JSON-RPC endpoint at the base URL, not at /message. Default '' here;
+      // callers can override for servers that use the /message convention.
+      messagePath: config.messagePath ?? '',
+    });
     const registration: ServerRegistration = {
       name,
       version: '1.0.0',
