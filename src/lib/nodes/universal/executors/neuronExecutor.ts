@@ -24,6 +24,7 @@ import { getRunPublisher, getNeuronRegistry, getMcpClient, getGraphRegistry, get
 import { HumanMessage } from '@langchain/core/messages';
 import { resolveToolStrategy, type ToolStrategy } from '../../../neurons/capability-matrix';
 import { resolveTools, toBindToolsPayload, type ResolvedTool } from '../../../tools/tool-resolver';
+import { coerceArgsToSchema } from '../../../tools/coerce-args';
 
 /**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
@@ -1335,6 +1336,17 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
         }
       }
 
+      // Schema-aware argument coercion. Some models emit a structured field as
+      // a STRING (e.g. config: "{\"x\":1}" instead of config: {x:1}); parse it
+      // back to the type the tool's schema requires so the downstream API/AJV
+      // doesn't reject it. Conservative: only coerces when the param's declared
+      // type excludes 'string' and the parse yields a matching type — a real
+      // string param is never mangled. Any-typed params are left for the server
+      // (which knows the real target schema) to handle. See coerce-args.ts.
+      const dispatchArgs = resolved
+        ? coerceArgsToSchema(parsedArgs, resolved.inputSchema as Record<string, unknown>)
+        : parsedArgs;
+
       // Cooperative abort check before dispatch
       if (abortSignal?.aborted) {
         const err: Error & { name: string } = new Error('Neuron tool-use loop aborted before tool dispatch');
@@ -1365,7 +1377,7 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
       if (runPublisher) {
         const subgraphTag = resolveSubgraphTag(state);
         await runPublisher.toolStart(toolId, toolName, resolved?.source ?? 'native', {
-          input: parsedArgs,
+          input: dispatchArgs,
           triggeredBy: 'neuron',
           neuronStepId,
           ...(subgraphTag ? { subgraph: subgraphTag } : {}),
@@ -1378,7 +1390,7 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
         if (!resolved) {
           throw new Error(`LLM emitted tool_call for unknown tool '${toolName}'`);
         }
-        result = await resolved.invoke(parsedArgs, {
+        result = await resolved.invoke(dispatchArgs, {
           state,
           runId: ctxRunId,
           toolId,
