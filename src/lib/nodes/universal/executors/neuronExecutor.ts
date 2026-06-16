@@ -1343,9 +1343,25 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
       // type excludes 'string' and the parse yields a matching type — a real
       // string param is never mangled. Any-typed params are left for the server
       // (which knows the real target schema) to handle. See coerce-args.ts.
-      const dispatchArgs = resolved
-        ? coerceArgsToSchema(parsedArgs, resolved.inputSchema as Record<string, unknown>)
-        : parsedArgs;
+      //
+      // Defensive: coercion is a pure convenience on a hot path — if it ever
+      // throws for some pathological schema/value, fall back to the raw args so
+      // a coercion bug can NEVER break a tool dispatch.
+      let dispatchArgs = parsedArgs;
+      if (resolved) {
+        try {
+          dispatchArgs = coerceArgsToSchema(
+            parsedArgs,
+            resolved.inputSchema as Record<string, unknown>,
+          );
+        } catch (coerceErr: any) {
+          console.warn(
+            `[NeuronExecutor] arg coercion failed for '${toolName}' (using raw args):`,
+            coerceErr?.message ?? coerceErr,
+          );
+          dispatchArgs = parsedArgs;
+        }
+      }
 
       // Cooperative abort check before dispatch
       if (abortSignal?.aborted) {
