@@ -39,6 +39,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { formatStateApiError } from '../state-error';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -132,6 +133,13 @@ const statePatchTool: NativeToolDefinition = {
                 'e.g. "/todo/12/done" addresses the `done` field of element 12 in the `todo` array.',
             },
             value: {
+              // Declaring every JSON type (rather than leaving it untyped)
+              // nudges the model to emit a NATIVE value instead of a JSON
+              // string. The operand is any-typed against this tool's schema, so
+              // engine-side coercion does not touch it — the webapp validates/
+              // coerces the resulting document against the namespace's actual
+              // schema (see webapp validateNamespaceWriteValue).
+              type: ['string', 'number', 'boolean', 'object', 'array', 'null'],
               description:
                 'Operand value. Required for set/append/prepend/merge/inc; omitted for remove. ' +
                 'For `inc`, must be a number. For `merge`, must be an object.',
@@ -187,17 +195,17 @@ const statePatchTool: NativeToolDefinition = {
       }
 
       if (!response.ok) {
-        // Surface the webapp's error envelope verbatim — webapp returns
-        // `{ error: '...' }` (legacy) or `{ error: { message, type, code } }`
-        // (newer). Either way we pass through to the caller.
+        const errorBody = formatStateApiError(
+          data,
+          response.status,
+          response.statusText,
+          'State patch API',
+        );
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(data || {
-                error: `State patch API ${response.status} ${response.statusText}`,
-                status: response.status,
-              }),
+              text: JSON.stringify(errorBody),
             },
           ],
           isError: true,
