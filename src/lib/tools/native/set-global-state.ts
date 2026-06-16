@@ -26,6 +26,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { formatStateApiError } from '../state-error';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -76,6 +77,12 @@ const setGlobalStateTool: NativeToolDefinition = {
         description: 'The key within the namespace.',
       },
       value: {
+        // Declaring every JSON type (rather than leaving it untyped) nudges the
+        // model to emit a NATIVE value instead of a JSON string. The value is
+        // any-typed against this tool's schema, so engine-side coercion does not
+        // touch it — the webapp validates/coerces it against the namespace's
+        // actual schema (see webapp validateNamespaceWriteValue).
+        type: ['string', 'number', 'boolean', 'object', 'array', 'null'],
         description:
           'The value to store. Accepts any JSON-serialisable value (string, number, boolean, object, array, null).',
       },
@@ -164,17 +171,17 @@ const setGlobalStateTool: NativeToolDefinition = {
       const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
-        // Surface the webapp's error envelope verbatim. For 422 schema validation errors,
-        // the webapp returns { error: { message, code }, expectedSchema, validationErrors }.
-        // Pass through structured to the caller so graphs can handle validation feedback.
+        const errorBody = formatStateApiError(
+          data,
+          response.status,
+          response.statusText,
+          'Global state API',
+        );
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(data || {
-                error: `Global state API ${response.status} ${response.statusText}`,
-                status: response.status,
-              }),
+              text: JSON.stringify(errorBody),
             },
           ],
           isError: true,
