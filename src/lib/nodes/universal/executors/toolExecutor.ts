@@ -461,35 +461,49 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                             if (outputs && outputs.length > 0) {
                                 for (const output of outputs) {
                                     if (useRunPublisherForConv) {
-                                        // Route through RunPublisher → both run stream + conversation stream
-                                        if (typeof output === 'string') {
-                                            runPublisher.chunk(output).catch((err: any) => {
-                                                console.warn('[ToolExecutor] onChunk RunPublisher.chunk error:', err.message);
-                                            });
-                                        } else if (Array.isArray(output)) {
-                                            for (const item of output) {
-                                                if (item && item.content) {
-                                                    if (item.thinking) {
-                                                        runPublisher.thinkingChunk(item.content).catch((err: any) => {
-                                                            console.warn('[ToolExecutor] onChunk RunPublisher.thinkingChunk error:', err.message);
-                                                        });
-                                                    } else {
-                                                        runPublisher.chunk(item.content).catch((err: any) => {
-                                                            console.warn('[ToolExecutor] onChunk RunPublisher.chunk error:', err.message);
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        } else if (output && typeof output === 'object' && output.content) {
-                                            if (output.thinking) {
-                                                runPublisher.thinkingChunk(output.content).catch((err: any) => {
-                                                    console.warn('[ToolExecutor] onChunk RunPublisher.thinkingChunk error:', err.message);
-                                                });
-                                            } else {
-                                                runPublisher.chunk(output.content).catch((err: any) => {
+                                        // Route through RunPublisher → both run stream + conversation stream.
+                                        // A parser item may carry `toolEvent` (start/result) — these become
+                                        // proper run tool events so the chat UI shows tool bubbles for the
+                                        // remote agent's inner tool calls (Discord uses its own thread path).
+                                        const emitRP = (item: any) => {
+                                            if (item == null) return;
+                                            if (typeof item === 'string') {
+                                                runPublisher.chunk(item).catch((err: any) => {
                                                     console.warn('[ToolExecutor] onChunk RunPublisher.chunk error:', err.message);
                                                 });
+                                                return;
                                             }
+                                            if (typeof item !== 'object') return;
+                                            if (item.toolEvent === 'start' && item.toolId) {
+                                                runPublisher.toolStart(String(item.toolId), String(item.toolName || 'tool'), 'remote', { input: item.toolInput }).catch((err: any) => {
+                                                    console.warn('[ToolExecutor] onChunk RunPublisher.toolStart error:', err.message);
+                                                });
+                                            } else if (item.toolEvent === 'result' && item.toolId) {
+                                                if (item.isError) {
+                                                    runPublisher.toolError(String(item.toolId), typeof item.toolResult === 'string' ? item.toolResult : JSON.stringify(item.toolResult ?? '')).catch((err: any) => {
+                                                        console.warn('[ToolExecutor] onChunk RunPublisher.toolError error:', err.message);
+                                                    });
+                                                } else {
+                                                    runPublisher.toolComplete(String(item.toolId), item.toolResult).catch((err: any) => {
+                                                        console.warn('[ToolExecutor] onChunk RunPublisher.toolComplete error:', err.message);
+                                                    });
+                                                }
+                                            } else if (item.content) {
+                                                if (item.thinking) {
+                                                    runPublisher.thinkingChunk(item.content).catch((err: any) => {
+                                                        console.warn('[ToolExecutor] onChunk RunPublisher.thinkingChunk error:', err.message);
+                                                    });
+                                                } else {
+                                                    runPublisher.chunk(item.content).catch((err: any) => {
+                                                        console.warn('[ToolExecutor] onChunk RunPublisher.chunk error:', err.message);
+                                                    });
+                                                }
+                                            }
+                                        };
+                                        if (Array.isArray(output)) {
+                                            for (const item of output) emitRP(item);
+                                        } else {
+                                            emitRP(output);
                                         }
                                     } else {
                                         // Standalone ConversationPublisher path
