@@ -290,6 +290,94 @@ async function loadConversationEnrichment(
 }
 
 // =============================================================================
+// Graph-referenced secret discovery
+// =============================================================================
+
+/**
+ * Secret names a graph references via `_secrets.NAME`
+ * (e.g. `{{state.data.input._secrets.SSH_KEY}}`) or `{{secret:NAME}}` anywhere
+ * in its node-step configs.
+ *
+ * Resolving these from the user's own secrets is what makes a chat/agent "just
+ * work" without the caller having to pre-declare the secret in graphInputs: the
+ * graph already states which secrets it needs by referencing them, so we resolve
+ * exactly those — least-privilege, never injecting a secret the graph doesn't
+ * reference. (Historically only copy-as-chat seeded `{{secret:NAME}}` into
+ * graphInputs, so conversations created another way had empty `_secrets` and
+ * e.g. ssh failed with "Unsupported key format".)
+ *
+ * Cached per-graphId with a short TTL — node configs change rarely and a few
+ * minutes of staleness is acceptable (mirrors the compiled-graph cache TTL).
+ */
+const GRAPH_SECRET_NAMES_TTL_MS = 5 * 60 * 1000;
+const graphSecretNamesCache = new Map<string, { names: string[]; at: number }>();
+
+export function extractSecretNamesFromConfig(json: string): string[] {
+  const names = new Set<string>();
+  // `_secrets.NAME`, `_secrets['NAME']`, `_secrets["NAME"]`
+  const refRe = /_secrets(?:\.([A-Za-z_$][\w$]*)|\[\s*['"]([^'"]+)['"]\s*\])/g;
+  let m: RegExpExecArray | null;
+  while ((m = refRe.exec(json)) !== null) {
+    const name = m[1] || m[2];
+    if (name) names.add(name);
+  }
+  // `{{secret:NAME}}` placeholders embedded directly in node configs
+  const phRe = /\{\{\s*secret:([^}]+?)\s*\}\}/g;
+  while ((m = phRe.exec(json)) !== null) {
+    if (m[1]) names.add(m[1].trim());
+  }
+  return [...names];
+}
+
+async function collectGraphReferencedSecretNames(
+  graphId: string | undefined,
+): Promise<string[]> {
+  if (!graphId) return [];
+
+  const cached = graphSecretNamesCache.get(graphId);
+  if (cached && Date.now() - cached.at < GRAPH_SECRET_NAMES_TTL_MS) {
+    return cached.names;
+  }
+
+  try {
+    const mongoose = (await import('mongoose')).default;
+    const db = mongoose.connection.db;
+    if (!db) return cached?.names ?? [];
+
+    const graph = (await db.collection('graphs').findOne(
+      { graphId },
+      { projection: { nodes: 1 } },
+    )) as { nodes?: Array<{ config?: { nodeId?: string } }> } | null;
+
+    const nodeIds = (graph?.nodes ?? [])
+      .map((n) => n?.config?.nodeId)
+      .filter((id): id is string => typeof id === 'string');
+
+    const names = new Set<string>();
+    if (nodeIds.length > 0) {
+      const nodeDocs = await db
+        .collection('nodes')
+        .find({ nodeId: { $in: nodeIds } }, { projection: { steps: 1 } })
+        .toArray();
+      for (const doc of nodeDocs) {
+        for (const name of extractSecretNamesFromConfig(
+          JSON.stringify((doc as { steps?: unknown }).steps ?? doc),
+        )) {
+          names.add(name);
+        }
+      }
+    }
+
+    const result = [...names];
+    graphSecretNamesCache.set(graphId, { names: result, at: Date.now() });
+    return result;
+  } catch (err) {
+    console.warn(`[enrich-input] Failed to scan graph ${graphId} for secret refs:`, err);
+    return cached?.names ?? [];
+  }
+}
+
+// =============================================================================
 // Step 3: Resolve secrets
 // =============================================================================
 
@@ -298,15 +386,23 @@ async function resolveSecrets(
   userId: string,
   automationDoc: AutomationDoc | null,
   runId: string,
+  graphReferencedNames: string[] = [],
 ): Promise<{ resolvedSecrets: Record<string, string>; enriched: Record<string, unknown> }> {
   const resolvedSecrets: Record<string, string> = {};
 
-  // Collect secret names: explicit list from automation + auto-detected placeholders
+  // Collect secret names from three sources:
+  //   1. automation.secretNames   — explicit per-automation declaration
+  //   2. {{secret:NAME}} placeholders found in the input (e.g. graphInputs)
+  //   3. _secrets.NAME references in the graph's own node configs
+  // Source 3 is what makes secrets "just work" for any chat/agent: the graph
+  // declares what it needs by referencing it, so the user's matching secret is
+  // resolved without a pre-seeded graphInputs placeholder.
   const detectedNames = detectSecretPlaceholders(input);
   const secretNames = [
     ...new Set([
       ...(automationDoc?.secretNames ?? []),
       ...detectedNames,
+      ...graphReferencedNames,
     ]),
   ];
 
@@ -477,8 +573,11 @@ export async function enrichInput(options: EnrichInputOptions): Promise<Enrichme
   // already does this in its fullInput construction step.
 
   // ── Step 4: Resolve secrets ─────────────────────────────────────────────────
+  // Also resolve any secrets the graph references via `_secrets.NAME` so a chat
+  // or agent works without a pre-seeded graphInputs placeholder.
+  const graphReferencedSecretNames = await collectGraphReferencedSecretNames(graphId);
   const { resolvedSecrets, enriched: afterSecrets } =
-    await resolveSecrets(input, userId, automationDoc, runId);
+    await resolveSecrets(input, userId, automationDoc, runId, graphReferencedSecretNames);
   input = afterSecrets;
 
   // ── Step 5: Resolve global-state refs ───────────────────────────────────────
