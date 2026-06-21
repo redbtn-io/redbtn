@@ -32,17 +32,17 @@ describe('RunPublisher turn-by-turn segmentation', () => {
   const orig = process.env.SEGMENTED_CONVERSATION_GRAPHS;
   beforeEach(() => { process.env.ARCHIVE_QUEUE_DISABLED = 'true'; });
   afterEach(() => {
-    if (orig === undefined) delete process.env.SEGMENTED_CONVERSATION_GRAPHS;
-    else process.env.SEGMENTED_CONVERSATION_GRAPHS = orig;
+    if (orig === undefined) delete process.env.DISABLE_CONVERSATION_SEGMENTATION;
+    else process.env.DISABLE_CONVERSATION_SEGMENTATION = orig;
     delete process.env.ARCHIVE_QUEUE_DISABLED;
     vi.restoreAllMocks();
   });
 
-  it('opens a new message per kind change; first turn reuses the base id', async () => {
-    process.env.SEGMENTED_CONVERSATION_GRAPHS = 'graph-seg';
+  it('opens a new message per kind change; first turn reuses the base id (ON by default for any conversation)', async () => {
+    delete process.env.DISABLE_CONVERSATION_SEGMENTATION;
     const { redis, convPublished } = makeRedis();
     const p = new RunPublisher({ redis, runId: 'run-seg', userId: 'u1', agentId: 'agent-x' });
-    await p.init('graph-seg', 'Seg', {}, 'conv-1', undefined, 'msg_base');
+    await p.init('any-graph', 'Any', {}, 'conv-1', undefined, 'msg_base');
 
     await p.thinkingChunk('reasoning');               // turn 0 (thinking) → reuses msg_base
     await p.chunk('answer');                           // thinking → content → new segment
@@ -56,8 +56,8 @@ describe('RunPublisher turn-by-turn segmentation', () => {
     expect(ms.every((m) => m.metadata.runId === 'run-seg' && m.metadata.agentId === 'agent-x')).toBe(true);
   });
 
-  it('coalesces consecutive same-kind chunks into one turn', async () => {
-    process.env.SEGMENTED_CONVERSATION_GRAPHS = '*';
+  it('a single-turn graph (content only) still produces exactly one message', async () => {
+    delete process.env.DISABLE_CONVERSATION_SEGMENTATION;
     const { redis, convPublished } = makeRedis();
     const p = new RunPublisher({ redis, runId: 'run-seg2', userId: 'u1' });
     await p.init('any-graph', 'Any', {}, 'conv-1', undefined, 'msg_base');
@@ -65,11 +65,11 @@ describe('RunPublisher turn-by-turn segmentation', () => {
     expect(starts(convPublished)).toEqual([]);
   });
 
-  it('is a no-op when the graph is not in the allowlist (legacy single message)', async () => {
-    process.env.SEGMENTED_CONVERSATION_GRAPHS = 'other-graph';
+  it('global kill-switch DISABLE_CONVERSATION_SEGMENTATION=1 falls back to single message', async () => {
+    process.env.DISABLE_CONVERSATION_SEGMENTATION = '1';
     const { redis, convPublished } = makeRedis();
     const p = new RunPublisher({ redis, runId: 'run-plain', userId: 'u1' });
-    await p.init('graph-seg', 'Seg', {}, 'conv-1', undefined, 'msg_base');
+    await p.init('any-graph', 'Any', {}, 'conv-1', undefined, 'msg_base');
     await p.thinkingChunk('reasoning');
     await p.chunk('answer');
     await p.toolStart('t1', 'ssh_shell', 'remote');
