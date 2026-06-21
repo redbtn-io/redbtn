@@ -59,18 +59,16 @@ import { assertChatComponentSpec } from '../chat-components/spec-schema';
 const DEBUG = false;
 
 /**
- * Turn-by-turn segmentation is opt-in per graph via the
- * `SEGMENTED_CONVERSATION_GRAPHS` env var — a comma-separated list of graphIds
- * (or `*` for all). Beta enables it for `claude-assistant` only; prod stays off
- * until verified. Reading env per-run keeps it a pure config toggle (no rebuild
- * to flip), and an unset/empty var means legacy single-message behaviour.
+ * Turn-by-turn output is how a conversation works — not a per-graph opt-in.
+ * It is therefore ON by default for every conversation run (any run with a
+ * ConversationPublisher); single-turn graphs are unaffected because they never
+ * change output kind, so they produce exactly one message just as before.
+ *
+ * The only control is a single global OFF switch — `DISABLE_CONVERSATION_SEGMENTATION=1`
+ * — purely as an ops escape hatch, NOT a graph allowlist.
  */
-function isSegmentedGraph(graphId: string | undefined): boolean {
-  if (!graphId) return false;
-  const raw = (process.env.SEGMENTED_CONVERSATION_GRAPHS || '').trim();
-  if (!raw) return false;
-  const ids = raw.split(',').map((s) => s.trim()).filter(Boolean);
-  return ids.includes('*') || ids.includes(graphId);
+function conversationSegmentationEnabled(): boolean {
+  return process.env.DISABLE_CONVERSATION_SEGMENTATION !== '1';
 }
 
 // ---------------------------------------------------------------------------
@@ -193,12 +191,13 @@ export class RunPublisher {
   private convMessageId: string | null = null;
 
   // --- Turn-by-turn segmentation -------------------------------------------
-  // When enabled (per-graph via SEGMENTED_CONVERSATION_GRAPHS), a single run
-  // emits MULTIPLE conversation messages — one per "turn" — instead of one
+  // ON by default for every conversation run (see conversationSegmentationEnabled).
+  // A run emits MULTIPLE conversation messages — one per "turn" — instead of one
   // message that coalesces all thinking/tools/content. A new message (segment)
   // opens whenever the output KIND changes (thinking ↔ content ↔ tool), so the
   // conversation reads in true emission order: Working → tool → content →
-  // tool → … . Disabled = legacy single-message behaviour (no-op).
+  // tool → … . Single-turn graphs never change kind, so they still produce
+  // exactly one message.
   private segmented = false;
   /** The first/base conv message id — segment ids derive from it deterministically. */
   private baseConvMessageId: string | null = null;
@@ -316,7 +315,7 @@ export class RunPublisher {
         // mint a fresh one when the caller didn't supply.
         this.convMessageId = convMessageId || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         this.baseConvMessageId = this.convMessageId;
-        this.segmented = isSegmentedGraph(graphId);
+        this.segmented = conversationSegmentationEnabled();
         await this.convPublisher.publishRunStart(this.runId, this.convMessageId, graphId, graphName);
         if (DEBUG) console.log(`[RunPublisher] Conversation forwarding enabled for ${conversationId}${this.segmented ? ' (segmented turn-by-turn)' : ''}`);
       } catch (err) {
