@@ -58,6 +58,21 @@ import { assertChatComponentSpec } from '../chat-components/spec-schema';
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
 
+/**
+ * Turn-by-turn segmentation is opt-in per graph via the
+ * `SEGMENTED_CONVERSATION_GRAPHS` env var — a comma-separated list of graphIds
+ * (or `*` for all). Beta enables it for `claude-assistant` only; prod stays off
+ * until verified. Reading env per-run keeps it a pure config toggle (no rebuild
+ * to flip), and an unset/empty var means legacy single-message behaviour.
+ */
+function isSegmentedGraph(graphId: string | undefined): boolean {
+  if (!graphId) return false;
+  const raw = (process.env.SEGMENTED_CONVERSATION_GRAPHS || '').trim();
+  if (!raw) return false;
+  const ids = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  return ids.includes('*') || ids.includes(graphId);
+}
+
 // ---------------------------------------------------------------------------
 // Module-level singleton BullMQ Queue instances
 // One Queue per (name, prefix) pair — shared across all RunPublisher instances.
@@ -174,8 +189,21 @@ export class RunPublisher {
   private initialized = false;
   /** ConversationPublisher for forwarding events to the chat UI */
   private convPublisher: ConversationPublisher | null = null;
-  /** Message ID used for conversation stream (stable across run lifetime) */
+  /** Message ID for the CURRENT conversation segment (see segmentation below). */
   private convMessageId: string | null = null;
+
+  // --- Turn-by-turn segmentation -------------------------------------------
+  // When enabled (per-graph via SEGMENTED_CONVERSATION_GRAPHS), a single run
+  // emits MULTIPLE conversation messages — one per "turn" — instead of one
+  // message that coalesces all thinking/tools/content. A new message (segment)
+  // opens whenever the output KIND changes (thinking ↔ content ↔ tool), so the
+  // conversation reads in true emission order: Working → tool → content →
+  // tool → … . Disabled = legacy single-message behaviour (no-op).
+  private segmented = false;
+  /** The first/base conv message id — segment ids derive from it deterministically. */
+  private baseConvMessageId: string | null = null;
+  private currentSegmentKind: 'thinking' | 'content' | 'tool' | null = null;
+  private segmentIndex = 0;
 
   constructor(options: RunPublisherOptions) {
     this.redis = options.redis;
@@ -287,8 +315,10 @@ export class RunPublisher {
         // pre-allocates one so the response and SSE events agree) and only
         // mint a fresh one when the caller didn't supply.
         this.convMessageId = convMessageId || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        this.baseConvMessageId = this.convMessageId;
+        this.segmented = isSegmentedGraph(graphId);
         await this.convPublisher.publishRunStart(this.runId, this.convMessageId, graphId, graphName);
-        if (DEBUG) console.log(`[RunPublisher] Conversation forwarding enabled for ${conversationId}`);
+        if (DEBUG) console.log(`[RunPublisher] Conversation forwarding enabled for ${conversationId}${this.segmented ? ' (segmented turn-by-turn)' : ''}`);
       } catch (err) {
         console.warn('[RunPublisher] Failed to create conversation publisher:', err);
         this.convPublisher = null;
@@ -792,12 +822,47 @@ export class RunPublisher {
   // Streaming
   // ===========================================================================
 
+  /**
+   * Turn-by-turn boundary. When segmentation is on, opening a different KIND of
+   * output (thinking ↔ content ↔ tool) closes the current conversation message
+   * and opens a fresh one, so each turn is its own bubble in emission order.
+   * The first segment reuses the run's pre-allocated message (from
+   * publishRunStart) so the optimistic bubble still collapses. Segment ids are
+   * derived deterministically from the base id (`<base>-s<N>`) so a worker
+   * retry reproduces the same ids and the archiver upserts idempotently.
+   * No-op when segmentation is off or the kind hasn't changed (so it costs
+   * nothing per-token — boundaries fire once per turn, not per chunk).
+   */
+  private async ensureSegment(kind: 'thinking' | 'content' | 'tool'): Promise<void> {
+    if (!this.segmented || !this.convPublisher || !this.convMessageId) return;
+    if (this.currentSegmentKind === kind) return;
+    if (this.currentSegmentKind === null) {
+      // First segment: adopt the already-started pre-allocated message.
+      this.currentSegmentKind = kind;
+      return;
+    }
+    // Kind changed → close the open segment, open a new one.
+    const prevId = this.convMessageId;
+    await this.convPublisher.completeMessage(prevId).catch(() => {});
+    this.segmentIndex += 1;
+    const newId = `${this.baseConvMessageId}-s${this.segmentIndex}`;
+    this.convMessageId = newId;
+    this.currentSegmentKind = kind;
+    await this.convPublisher.startMessage(newId, 'assistant', {
+      runId: this.runId,
+      segmentIndex: this.segmentIndex,
+      kind,
+      ...(this.agentId ? { agentId: this.agentId } : {}),
+    }).catch(() => {});
+  }
+
   async chunk(content: string): Promise<void> {
     this.ensureInitialized();
     this.state!.output.content += content;
     await this.publish({ type: 'chunk', content, timestamp: Date.now() });
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
+      await this.ensureSegment('content');
       this.convPublisher.streamContent(this.runId, this.convMessageId, content).catch((err) => {
         console.warn("[RunPublisher] Conv forward content_chunk failed:", err);
       });
@@ -810,6 +875,7 @@ export class RunPublisher {
     await this.publish({ type: 'chunk', content, thinking: true, timestamp: Date.now() });
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
+      await this.ensureSegment('thinking');
       this.convPublisher.streamThinking(this.runId, this.convMessageId, content).catch((err) => {
         console.warn("[RunPublisher] Conv forward thinking_chunk failed:", err);
       });
@@ -994,6 +1060,9 @@ export class RunPublisher {
     });
     // Forward to conversation stream
     if (this.convPublisher) {
+      // A tool call is its own turn: open a `tool` segment so it renders as a
+      // distinct bubble between text turns (no-op when segmentation is off).
+      await this.ensureSegment('tool');
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_start', toolId, toolName, toolType, input: options?.input,
         triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
