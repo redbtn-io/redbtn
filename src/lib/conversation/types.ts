@@ -76,6 +76,23 @@ export interface ConversationStatusEvent {
   timestamp: number;
 }
 
+/**
+ * Agent presence — "is a run working in this conversation", decoupled from any
+ * output message. Emitted by RunPublisher on run start/complete so the chat UI
+ * can show a "Working / Reconnecting" indicator WITHOUT pre-allocating an empty
+ * assistant message. Ephemeral (not replayed) — reload restores presence from
+ * the /active-generation probe, not from replay.
+ */
+export interface ConversationAgentPresenceEvent {
+  type: 'agent_presence';
+  runId: string;
+  /** The run's base message id (for optimistic mapping); not required. */
+  messageId?: string;
+  agentId?: string;
+  state: 'working' | 'reconnecting' | 'idle';
+  timestamp: number;
+}
+
 // ── Run-aware conversation events ──
 // These are published by RunPublisher when a run has a conversationId.
 // They allow the chat UI to group thinking/tools/content into unified run bubbles.
@@ -254,6 +271,7 @@ export type ConversationEvent =
   | ConversationMessageStoredEvent
   | ConversationTypingEvent
   | ConversationStatusEvent
+  | ConversationAgentPresenceEvent
   | ConversationRunStartEvent
   | ConversationThinkingChunkEvent
   | ConversationContentChunkEvent

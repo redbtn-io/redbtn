@@ -317,6 +317,14 @@ export class RunPublisher {
         this.baseConvMessageId = this.convMessageId;
         this.segmented = conversationSegmentationEnabled();
         await this.convPublisher.publishRunStart(this.runId, this.convMessageId, graphId, graphName);
+        // Presence: "this run is working", decoupled from any message. The chat
+        // UI shows the Working/Reconnecting indicator from this — no empty
+        // pre-allocated bubble needed. Ephemeral; reload restores via the
+        // /active-generation probe.
+        await this.convPublisher.publishPresence(this.runId, 'working', {
+          messageId: this.convMessageId,
+          ...(this.agentId ? { agentId: this.agentId } : {}),
+        });
         if (DEBUG) console.log(`[RunPublisher] Conversation forwarding enabled for ${conversationId}${this.segmented ? ' (segmented turn-by-turn)' : ''}`);
       } catch (err) {
         console.warn('[RunPublisher] Failed to create conversation publisher:', err);
@@ -426,6 +434,12 @@ export class RunPublisher {
     // keeps Redis tidy and reclaims the space immediately.
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
+    // Presence: run done → clear the Working indicator.
+    if (this.convPublisher) {
+      await this.convPublisher.publishPresence(this.runId, 'idle', {
+        ...(this.agentId ? { agentId: this.agentId } : {}),
+      }).catch(() => {});
+    }
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       try {
@@ -550,6 +564,12 @@ export class RunPublisher {
     }
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
+    // Presence: run errored → clear the Working indicator.
+    if (this.convPublisher) {
+      await this.convPublisher.publishPresence(this.runId, 'idle', {
+        ...(this.agentId ? { agentId: this.agentId } : {}),
+      }).catch(() => {});
+    }
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       try {
@@ -626,6 +646,12 @@ export class RunPublisher {
     }
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
+    // Presence: run interrupted → clear the Working indicator.
+    if (this.convPublisher) {
+      await this.convPublisher.publishPresence(this.runId, 'idle', {
+        ...(this.agentId ? { agentId: this.agentId } : {}),
+      }).catch(() => {});
+    }
     // Forward to conversation stream if present so chat UI can render the
     // interrupt indicator and stop showing the spinner.
     if (this.convPublisher && this.convMessageId) {
@@ -836,8 +862,17 @@ export class RunPublisher {
     if (!this.segmented || !this.convPublisher || !this.convMessageId) return;
     if (this.currentSegmentKind === kind) return;
     if (this.currentSegmentKind === null) {
-      // First segment: adopt the already-started pre-allocated message.
+      // First segment: emit a real message_start for the base id (segment 0).
+      // run_start no longer creates the assistant message (it's now presence-
+      // only in the decoupled UI), so the first turn must mint its own message.
+      // Same base id → the optimistic-bubble mapping and idempotent upsert hold.
       this.currentSegmentKind = kind;
+      await this.convPublisher.startMessage(this.convMessageId, 'assistant', {
+        runId: this.runId,
+        segmentIndex: 0,
+        kind,
+        ...(this.agentId ? { agentId: this.agentId } : {}),
+      }).catch(() => {});
       return;
     }
     // Kind changed → close the open segment, open a new one.
