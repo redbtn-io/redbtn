@@ -27,9 +27,10 @@ function makeRedis() {
 }
 
 const starts = (events: any[]) => events.filter((e) => e.type === 'message_start');
+const presence = (events: any[]) => events.filter((e) => e.type === 'agent_presence');
 
 describe('RunPublisher turn-by-turn segmentation', () => {
-  const orig = process.env.SEGMENTED_CONVERSATION_GRAPHS;
+  const orig = process.env.DISABLE_CONVERSATION_SEGMENTATION;
   beforeEach(() => { process.env.ARCHIVE_QUEUE_DISABLED = 'true'; });
   afterEach(() => {
     if (orig === undefined) delete process.env.DISABLE_CONVERSATION_SEGMENTATION;
@@ -38,31 +39,35 @@ describe('RunPublisher turn-by-turn segmentation', () => {
     vi.restoreAllMocks();
   });
 
-  it('opens a new message per kind change; first turn reuses the base id (ON by default for any conversation)', async () => {
+  it('emits a message_start per turn (first turn = base id) + presence working on init', async () => {
     delete process.env.DISABLE_CONVERSATION_SEGMENTATION;
     const { redis, convPublished } = makeRedis();
     const p = new RunPublisher({ redis, runId: 'run-seg', userId: 'u1', agentId: 'agent-x' });
     await p.init('any-graph', 'Any', {}, 'conv-1', undefined, 'msg_base');
 
-    await p.thinkingChunk('reasoning');               // turn 0 (thinking) → reuses msg_base
-    await p.chunk('answer');                           // thinking → content → new segment
-    await p.toolStart('t1', 'ssh_shell', 'remote');    // content → tool → new segment
-    await p.chunk('more');                             // tool → content → new segment
+    // Presence "working" fires on init (decoupled from any message).
+    expect(presence(convPublished).map((e) => e.state)).toEqual(['working']);
+    expect(presence(convPublished)[0]).toMatchObject({ runId: 'run-seg', agentId: 'agent-x' });
+
+    await p.thinkingChunk('reasoning');               // turn 0 (thinking) → message_start(base)
+    await p.chunk('answer');                           // thinking → content → new turn
+    await p.toolStart('t1', 'ssh_shell', 'remote');    // content → tool → new turn
+    await p.chunk('more');                             // tool → content → new turn
 
     const ms = starts(convPublished);
-    expect(ms.map((m) => m.messageId)).toEqual(['msg_base-s1', 'msg_base-s2', 'msg_base-s3']);
-    expect(ms.map((m) => m.metadata.kind)).toEqual(['content', 'tool', 'content']);
-    expect(ms.map((m) => m.metadata.segmentIndex)).toEqual([1, 2, 3]);
+    expect(ms.map((m) => m.messageId)).toEqual(['msg_base', 'msg_base-s1', 'msg_base-s2', 'msg_base-s3']);
+    expect(ms.map((m) => m.metadata.kind)).toEqual(['thinking', 'content', 'tool', 'content']);
+    expect(ms.map((m) => m.metadata.segmentIndex)).toEqual([0, 1, 2, 3]);
     expect(ms.every((m) => m.metadata.runId === 'run-seg' && m.metadata.agentId === 'agent-x')).toBe(true);
   });
 
-  it('a single-turn graph (content only) still produces exactly one message', async () => {
+  it('a single-turn graph (content only) produces exactly one message_start', async () => {
     delete process.env.DISABLE_CONVERSATION_SEGMENTATION;
     const { redis, convPublished } = makeRedis();
     const p = new RunPublisher({ redis, runId: 'run-seg2', userId: 'u1' });
     await p.init('any-graph', 'Any', {}, 'conv-1', undefined, 'msg_base');
-    await p.chunk('a'); await p.chunk('b'); await p.chunk('c');   // all one content turn (reuses base)
-    expect(starts(convPublished)).toEqual([]);
+    await p.chunk('a'); await p.chunk('b'); await p.chunk('c');   // one content turn → message_start(base)
+    expect(starts(convPublished).map((m) => m.messageId)).toEqual(['msg_base']);
   });
 
   it('global kill-switch DISABLE_CONVERSATION_SEGMENTATION=1 falls back to single message', async () => {
