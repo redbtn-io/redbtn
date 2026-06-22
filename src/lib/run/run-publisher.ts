@@ -59,16 +59,13 @@ import { assertChatComponentSpec } from '../chat-components/spec-schema';
 const DEBUG = false;
 
 /**
- * Turn-by-turn output is how a conversation works — not a per-graph opt-in.
- * It is therefore ON by default for every conversation run (any run with a
- * ConversationPublisher); single-turn graphs are unaffected because they never
- * change output kind, so they produce exactly one message just as before.
- *
- * The only control is a single global OFF switch — `DISABLE_CONVERSATION_SEGMENTATION=1`
- * — purely as an ops escape hatch, NOT a graph allowlist.
+ * Turn-by-turn output is how a conversation works — not a toggle. It is ALWAYS
+ * on for every conversation run (any run with a ConversationPublisher); there is
+ * deliberately no way to disable it. Single-turn graphs are unaffected because
+ * they never change output kind, so they produce exactly one message anyway.
  */
 function conversationSegmentationEnabled(): boolean {
-  return process.env.DISABLE_CONVERSATION_SEGMENTATION !== '1';
+  return true;
 }
 
 // ---------------------------------------------------------------------------

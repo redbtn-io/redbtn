@@ -70,15 +70,14 @@ describe('RunPublisher turn-by-turn segmentation', () => {
     expect(starts(convPublished).map((m) => m.messageId)).toEqual(['msg_base']);
   });
 
-  it('global kill-switch DISABLE_CONVERSATION_SEGMENTATION=1 falls back to single message', async () => {
+  it('segmentation is unconditional — there is no env switch to disable it', async () => {
+    // Even with the (removed) kill-switch env set, segmentation stays ON.
     process.env.DISABLE_CONVERSATION_SEGMENTATION = '1';
     const { redis, convPublished } = makeRedis();
     const p = new RunPublisher({ redis, runId: 'run-plain', userId: 'u1' });
     await p.init('any-graph', 'Any', {}, 'conv-1', undefined, 'msg_base');
     await p.thinkingChunk('reasoning');
     await p.chunk('answer');
-    await p.toolStart('t1', 'ssh_shell', 'remote');
-    await p.chunk('more');
-    expect(starts(convPublished)).toEqual([]);
+    expect(starts(convPublished).map((m) => m.messageId)).toEqual(['msg_base', 'msg_base-s1']);
   });
 });
