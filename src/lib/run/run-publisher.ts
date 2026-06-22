@@ -200,6 +200,14 @@ export class RunPublisher {
   private baseConvMessageId: string | null = null;
   private currentSegmentKind: 'thinking' | 'content' | 'tool' | null = null;
   private segmentIndex = 0;
+  /**
+   * toolId → the conversation segment (message id) the tool was STARTED in.
+   * tool_complete / tool_error / tool_progress must target that same segment —
+   * `convMessageId` may have advanced to a later content/thinking segment by the
+   * time the tool finishes, which would otherwise leave the tool bubble stuck
+   * "running" because the UI can't find it in the current segment.
+   */
+  private toolSegmentIds = new Map<string, string>();
 
   constructor(options: RunPublisherOptions) {
     this.redis = options.redis;
@@ -1094,6 +1102,9 @@ export class RunPublisher {
       // A tool call is its own turn: open a `tool` segment so it renders as a
       // distinct bubble between text turns (no-op when segmentation is off).
       await this.ensureSegment('tool');
+      // Remember which segment this tool lives in so its later complete/error
+      // events target the SAME bubble even after the segment advances.
+      if (this.convMessageId) this.toolSegmentIds.set(toolId, this.convMessageId);
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_start', toolId, toolName, toolType, input: options?.input,
         triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
@@ -1126,7 +1137,7 @@ export class RunPublisher {
     await this.publish({ type: 'tool_progress', toolId, step, progress: options?.progress, data: options?.data, ...(subgraph ? { subgraph } : {}), timestamp: ts });
     // Forward to conversation stream
     if (this.convPublisher) {
-      this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
+      this.convPublisher.publishToolEvent(this.runId, this.toolSegmentIds.get(toolId) ?? this.convMessageId ?? "", {
         type: 'tool_progress', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
         step, progress: options?.progress, data: options?.data, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
@@ -1164,7 +1175,7 @@ export class RunPublisher {
     });
     // Forward to conversation stream
     if (this.convPublisher) {
-      this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
+      this.convPublisher.publishToolEvent(this.runId, this.toolSegmentIds.get(toolId) ?? this.convMessageId ?? "", {
         type: 'tool_complete', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
         result, metadata, triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
@@ -1205,7 +1216,7 @@ export class RunPublisher {
     });
     // Forward to conversation stream
     if (this.convPublisher) {
-      this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
+      this.convPublisher.publishToolEvent(this.runId, this.toolSegmentIds.get(toolId) ?? this.convMessageId ?? "", {
         type: 'tool_error', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
         error, triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
