@@ -459,6 +459,19 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   }
 
   try {
+    // Alert Desktop — push an OS notification + spoken TTS alert to all of the
+    // calling user's connected desktop machines (redAgent) via Redis pub/sub
+    // (channel desktop:alert:{userId}). Relayed by the webapp /ws/desktop gateway.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const alertDesktop = require('./native/alert-desktop.js');
+    registry.register('alert_desktop', alertDesktop.default || alertDesktop);
+    console.log('[NativeRegistry] Registered built-in tool: alert_desktop');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register alert_desktop:', msg);
+  }
+
+  try {
     // Push Stream Event — ephemeral status events to a Stream session's UI
     // (no conversation-history pollution, separate from terminal run results)
     // eslint-disable-next-line @typescript-eslint/no-require-imports
