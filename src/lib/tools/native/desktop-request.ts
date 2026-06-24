@@ -251,5 +251,94 @@ export async function requestDesktop(args: RequestDesktopArgs): Promise<Computer
   }
 }
 
-module.exports = { requestDesktop };
+
+export interface RequestDesktopRawArgs {
+  userId: string;
+  kind: string;
+  payload?: AnyObject;
+  timeoutMs?: number;
+}
+
+/**
+ * Generic desktop round-trip for non-computer message kinds (exec, settings).
+ * Publishes { kind, id, ...payload } to desktop:cmd:{userId} and resolves with
+ * the FULL parsed reply object (passthrough — exec_result carries `result`,
+ * settings_result carries `settings`). Fail-safe: never throws; returns
+ * { ok:false, error:{ code:'desktop_failed', message } } on any failure.
+ */
+export async function requestDesktopRaw(args: RequestDesktopRawArgs): Promise<AnyObject> {
+  const id = randomUUID();
+  const timeoutMs =
+    typeof args.timeoutMs === 'number' && Number.isFinite(args.timeoutMs) && args.timeoutMs > 0
+      ? args.timeoutMs
+      : DEFAULT_TIMEOUT_MS;
+  const userId = (args.userId || '').trim();
+  if (!userId)
+    return { ok: false, error: { code: 'desktop_failed', message: 'No userId available; cannot target any desktop.' } };
+
+  const cmdChannel = `${CMD_CHANNEL_PREFIX}${userId}`;
+  const replyChannel = `${REPLY_CHANNEL_PREFIX}${id}`;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let pub: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let sub: any = null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const IORedis = require('ioredis');
+    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+    pub = new IORedis(redisUrl, { maxRetriesPerRequest: 3 });
+    sub = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+    const result = await new Promise<AnyObject>((resolve) => {
+      let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+      const finish = (value: AnyObject): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      };
+      sub.on('message', (_channel: string, payload: string) => {
+        let parsed: AnyObject | null = null;
+        try {
+          parsed = JSON.parse(payload) as AnyObject;
+        } catch {
+          return;
+        }
+        if (!parsed || typeof parsed !== 'object') return;
+        finish({ ...parsed, ok: parsed.ok === true });
+      });
+      sub
+        .subscribe(replyChannel)
+        .then(() => {
+          const message = JSON.stringify({ kind: args.kind, id, ...(args.payload || {}) });
+          return pub.publish(cmdChannel, message);
+        })
+        .catch((err: unknown) => {
+          const m = err instanceof Error ? err.message : String(err);
+          finish({ ok: false, error: { code: 'desktop_failed', message: `transport error: ${m}` } });
+        });
+      timer = setTimeout(() => {
+        finish({
+          ok: false,
+          error: { code: 'desktop_failed', message: `No desktop responded within ${timeoutMs}ms (is redAgent running?)` },
+        });
+      }, timeoutMs);
+    });
+    return result;
+  } catch (err: unknown) {
+    const m = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: { code: 'desktop_failed', message: m } };
+  } finally {
+    if (sub) {
+      try { await sub.unsubscribe(); } catch { /* ignore */ }
+      try { await sub.quit(); } catch { /* ignore */ }
+    }
+    if (pub) {
+      try { await pub.quit(); } catch { /* ignore */ }
+    }
+  }
+}
+
+module.exports = { requestDesktop, requestDesktopRaw };
 module.exports.requestDesktop = requestDesktop;
+module.exports.requestDesktopRaw = requestDesktopRaw;

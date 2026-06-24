@@ -502,6 +502,8 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     registry.register('desktop_key', desktop.desktopKey);
     registry.register('desktop_scroll', desktop.desktopScroll);
     registry.register('desktop_screen_info', desktop.desktopScreenInfo);
+    registry.register('desktop_exec', desktop.desktopExec);
+    registry.register('desktop_settings', desktop.desktopSettings);
     console.log(
       '[NativeRegistry] Registered built-in tools: desktop_screenshot, desktop_click, desktop_move, desktop_type, desktop_key, desktop_scroll, desktop_screen_info',
     );

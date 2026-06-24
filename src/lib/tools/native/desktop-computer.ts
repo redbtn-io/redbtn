@@ -42,7 +42,7 @@
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { requestDesktop } = require('./desktop-request.js') as typeof import('./desktop-request');
+const { requestDesktop, requestDesktopRaw } = require('./desktop-request.js') as typeof import('./desktop-request');
 import type { ComputerAction, ComputerResultMessage } from './desktop-request';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -357,3 +357,70 @@ module.exports = {
   desktopScroll: desktopScrollTool,
   desktopScreenInfo: desktopScreenInfoTool,
 };
+
+
+// ─── desktop_exec ────────────────────────────────────────────────────────────
+
+const desktopExecTool: NativeToolDefinition = {
+  description:
+    "Run a shell command on the current user's connected desktop (redAgent). Returns { ok, result:{ stdout, stderr, exitCode, durationMs, truncated } }. Round-trips over Redis to the /ws/desktop gateway; gated by the desktop's exec settings. Fails safe with a desktop_failed error if no desktop is connected or exec is disabled.",
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      command: { type: 'string', description: 'Executable / command to run. Required.' },
+      args: { type: 'array', items: { type: 'string' }, description: 'Argument vector (no shell parsing). Optional.' },
+      cwd: { type: 'string', description: 'Working directory. Optional.' },
+      env: { type: 'object', description: 'Extra environment variables. Optional.' },
+      timeoutMs: { type: 'number', description: 'Hard-kill after this many ms. Optional.' },
+    },
+    required: ['command'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const userId = resolveUserId(context);
+    if (!userId) return noUserResult();
+    const command = typeof rawArgs?.command === 'string' ? rawArgs.command : '';
+    if (!command.trim())
+      return textResult({ ok: false, error: { code: 'desktop_failed', message: 'command is required' } }, true);
+    const payload: AnyObject = { command };
+    if (Array.isArray(rawArgs.args)) payload.args = rawArgs.args;
+    if (typeof rawArgs.cwd === 'string') payload.cwd = rawArgs.cwd;
+    if (rawArgs.env && typeof rawArgs.env === 'object') payload.env = rawArgs.env;
+    if (typeof rawArgs.timeoutMs === 'number') payload.timeoutMs = rawArgs.timeoutMs;
+    context?.publisher?.emit?.('log', `desktop_exec → desktop:cmd:${userId}`);
+    const reply = await requestDesktopRaw({ userId, kind: 'exec', payload, timeoutMs: resolveTimeoutMs(rawArgs) });
+    return textResult(reply, reply?.ok !== true);
+  },
+};
+
+// ─── desktop_settings ────────────────────────────────────────────────────────
+
+const desktopSettingsTool: NativeToolDefinition = {
+  description:
+    "Read or update the current user's desktop (redAgent) local settings — TTS provider/voice/speed, computer-use & exec toggles, launch-at-login, etc. op:'get' returns current settings (secrets redacted); op:'set' shallow-merges `patch` and returns the updated settings. Round-trips over Redis to the /ws/desktop gateway.",
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      op: { type: 'string', enum: ['get', 'set'], description: "'get' to read, 'set' to merge patch. Required." },
+      patch: { type: 'object', description: 'Partial settings to shallow-merge (op:set only).' },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
+    },
+    required: ['op'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const userId = resolveUserId(context);
+    if (!userId) return noUserResult();
+    const op: 'get' | 'set' = rawArgs?.op === 'set' ? 'set' : 'get';
+    const payload: AnyObject = { op };
+    if (op === 'set' && rawArgs?.patch && typeof rawArgs.patch === 'object') payload.patch = rawArgs.patch;
+    context?.publisher?.emit?.('log', `desktop_settings:${op} → desktop:cmd:${userId}`);
+    const reply = await requestDesktopRaw({ userId, kind: 'settings', payload, timeoutMs: resolveTimeoutMs(rawArgs) });
+    return textResult(reply, reply?.ok !== true);
+  },
+};
+
+export const desktopExec = desktopExecTool;
+export const desktopSettings = desktopSettingsTool;
