@@ -105,9 +105,10 @@ export interface RequestDesktopArgs {
 
 const CMD_CHANNEL_PREFIX = 'desktop:cmd:';
 const REPLY_CHANNEL_PREFIX = 'desktop:reply:';
-const PRESENCE_PREFIX = 'desktop:presence:';
 
-const DEFAULT_TIMEOUT_MS = 30_000;
+// Connected desktops reply in well under a second; this bounds the wait when
+// NO desktop is connected (the round-trip timeout is our presence detector).
+const DEFAULT_TIMEOUT_MS = 12_000;
 
 /** Build a fail-safe `computer_result` carrying a `computer_failed` error. */
 function failResult(id: string, message: string): ComputerResultMessage {
@@ -117,28 +118,6 @@ function failResult(id: string, message: string): ComputerResultMessage {
     ok: false,
     error: { code: 'computer_failed', message },
   };
-}
-
-/**
- * Count connected desktops for a user via SCAN over
- * `desktop:presence:{userId}:*`. SCAN (cursor-based) is used instead of KEYS
- * so we never block Redis on large keyspaces. Mirrors `alert_desktop`.
- */
-async function countPresence(redis: AnyObject, userId: string): Promise<number> {
-  const match = `${PRESENCE_PREFIX}${userId}:*`;
-  let cursor = '0';
-  let count = 0;
-  let iterations = 0;
-  do {
-    const [next, keys] = (await redis.scan(cursor, 'MATCH', match, 'COUNT', 100)) as [
-      string,
-      string[],
-    ];
-    cursor = next;
-    count += keys.length;
-    iterations += 1;
-  } while (cursor !== '0' && iterations < 1000);
-  return count;
 }
 
 /**
@@ -176,18 +155,14 @@ export async function requestDesktop(args: RequestDesktopArgs): Promise<Computer
     // connection below — same split the gateway + entity-stream code uses.
     pub = new IORedis(redisUrl, { maxRetriesPerRequest: 3 });
 
-    // Presence gate: if zero desktops are connected, fail immediately instead
-    // of waiting out the full timeout. Best-effort — a SCAN failure must not
-    // block a request that might still succeed, so we only short-circuit on a
-    // confirmed zero.
-    try {
-      const connected = await countPresence(pub, userId);
-      if (connected === 0) {
-        return failResult(id, 'No desktop connected.');
-      }
-    } catch {
-      /* presence check is best-effort — fall through and try the round-trip */
-    }
+    // NOTE: we deliberately do NOT pre-gate on a presence SCAN. `SCAN ... MATCH`
+    // is unreliable for finding a single key in a large keyspace (COUNT is a
+    // per-iteration hint, not a guarantee), so it produced false "no desktop"
+    // results even when a desktop was connected. Instead the round-trip TIMEOUT
+    // is the source of truth: a connected desktop replies in well under a
+    // second; if nothing answers within `timeoutMs` we return a clean
+    // "no desktop responded" failure. The cost is only paid when no desktop is
+    // actually connected.
 
     // Dedicated subscriber. `maxRetriesPerRequest: null` mirrors the gateway's
     // subscriber connection (BullMQ/ioredis subscriber-mode requirement).
@@ -240,7 +215,12 @@ export async function requestDesktop(args: RequestDesktopArgs): Promise<Computer
         });
 
       timer = setTimeout(() => {
-        finish(failResult(id, `timed out after ${timeoutMs}ms waiting for desktop`));
+        finish(
+          failResult(
+            id,
+            `No desktop responded within ${timeoutMs}ms (is redAgent running and computer-use enabled?)`,
+          ),
+        );
       }, timeoutMs);
     });
 
