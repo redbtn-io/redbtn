@@ -46,8 +46,25 @@ export interface NativeToolContext {
   } | null;
 }
 
+/**
+ * A single MCP content block returned by a native tool.
+ *
+ * Text blocks are the overwhelming majority. The `image` variant mirrors the
+ * MCP `ImageContent` shape (`{ type:'image', data:<base64>, mimeType }`) so a
+ * tool like `desktop_screenshot` can hand back a real image the model can see
+ * — any consumer that understands image blocks (e.g. an MCP transport, or a
+ * future neuron-side passthrough) gets the pixels, while the existing
+ * text-first `content[0]` extraction in toolExecutor remains backward
+ * compatible. Tools that want the screenshot to land usefully in graph state
+ * should ALSO emit a text block (with the base64 / dataUrl + geometry) — see
+ * `desktop-screenshot.ts`.
+ */
+export type NativeMcpContent =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string };
+
 export interface NativeMcpResult {
-  content: Array<{ type: 'text'; text: string }>;
+  content: NativeMcpContent[];
   isError?: boolean;
 }
 
@@ -469,6 +486,28 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register alert_desktop:', msg);
+  }
+
+  try {
+    // Desktop computer-use pack — screenshot + mouse/keyboard control of the
+    // calling user's connected desktop (redAgent), driven over Redis
+    // request→reply (desktop:cmd:{userId} → desktop:reply:{id}) through the
+    // webapp /ws/desktop gateway. Seven thin tools share one round-trip helper.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const desktop = require('./native/desktop-computer.js');
+    registry.register('desktop_screenshot', desktop.desktopScreenshot);
+    registry.register('desktop_click', desktop.desktopClick);
+    registry.register('desktop_move', desktop.desktopMove);
+    registry.register('desktop_type', desktop.desktopType);
+    registry.register('desktop_key', desktop.desktopKey);
+    registry.register('desktop_scroll', desktop.desktopScroll);
+    registry.register('desktop_screen_info', desktop.desktopScreenInfo);
+    console.log(
+      '[NativeRegistry] Registered built-in tools: desktop_screenshot, desktop_click, desktop_move, desktop_type, desktop_key, desktop_scroll, desktop_screen_info',
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register desktop computer-use tools:', msg);
   }
 
   try {
