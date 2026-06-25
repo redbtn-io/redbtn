@@ -67,7 +67,9 @@ const ttsSynthesizeTool: NativeToolDefinition = {
     // Re-shape the response to the historical schema so existing callers that
     // destructure `audioData`, `sampleRate`, `channels`, `bitDepth` keep working.
     try {
-      const body = JSON.parse(result.content[0].text);
+      const first = result.content[0];
+      const firstText = first && first.type === 'text' ? first.text : '{}';
+      const body = JSON.parse(firstText);
       return {
         content: [
           {

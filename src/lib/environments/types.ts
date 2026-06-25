@@ -112,16 +112,34 @@ export interface IEnvironment {
   description?: string;
 
   // --- Target ---
-  /** Discriminator. v1 = `'self-hosted'`. Phase G reserves `'redbtn-hosted'`. */
-  kind: 'self-hosted';
-  /** Hostname or IP. */
-  host: string;
-  /** SSH port. Default 22. */
+  /**
+   * Discriminator. v1 = `'self-hosted'` (user-supplied SSH target). Phase G
+   * reserves `'redbtn-hosted'`. `'desktop-agent'` is a push-model connector
+   * (redAgent): the desktop holds an OUTBOUND WebSocket to the webapp gateway
+   * and redbtn targets it by Redis pub/sub — there is no SSH host/port/secret
+   * for this kind, so those fields are optional below.
+   */
+  kind: 'self-hosted' | 'desktop-agent';
+  /** Hostname or IP. Required for `self-hosted`; absent for `desktop-agent`. */
+  host?: string;
+  /** SSH port. Default 22. Not used by `desktop-agent`. */
   port: number;
-  /** SSH username. */
-  user: string;
-  /** Name of the secret holding the SSH private key (PEM). Resolved by caller. */
-  secretRef: string;
+  /** SSH username. Required for `self-hosted`; absent for `desktop-agent`. */
+  user?: string;
+  /**
+   * Name of the secret holding the SSH private key (PEM). Resolved by caller.
+   * Required for `self-hosted`; empty/absent for `desktop-agent` (no secret —
+   * the connector authenticates its own outbound socket with the user's token).
+   */
+  secretRef?: string;
+
+  // --- Desktop-agent (push connector) fields ---
+  /** Stable per-install id reported by the desktop connector at register time. */
+  installId?: string;
+  /** Capabilities the desktop advertised (e.g. `['alert','tts','exec','chat']`). */
+  capabilities?: string[];
+  /** Last time the connector was seen (heartbeat / register). */
+  lastSeenAt?: Date;
   /** Default working directory for `exec`. Optional — falls back to home. */
   workingDir?: string;
 

@@ -109,17 +109,25 @@ export class EnvironmentSecretMissingError extends Error {
  */
 function applyDefaults(raw: Record<string, unknown>): IEnvironment {
   const reconnectRaw = (raw.reconnect ?? {}) as Partial<EnvironmentReconnectPolicy>;
+  // Preserve the discriminator. `desktop-agent` envs have no SSH host/user/
+  // secret — keep those fields optional rather than coercing to `String(undefined)`.
+  const kind: IEnvironment['kind'] = raw.kind === 'desktop-agent' ? 'desktop-agent' : 'self-hosted';
   return {
     environmentId: String(raw.environmentId),
     userId: String(raw.userId),
     name: String(raw.name ?? ''),
     description: raw.description as string | undefined,
-    kind: 'self-hosted',
-    host: String(raw.host),
+    kind,
+    host: raw.host !== undefined && raw.host !== null ? String(raw.host) : undefined,
     port: typeof raw.port === 'number' ? raw.port : ENV_DEFAULTS.port,
-    user: String(raw.user),
-    secretRef: String(raw.secretRef ?? ''),
+    user: raw.user !== undefined && raw.user !== null ? String(raw.user) : undefined,
+    secretRef: raw.secretRef !== undefined && raw.secretRef !== null ? String(raw.secretRef) : undefined,
     workingDir: raw.workingDir as string | undefined,
+    installId: raw.installId as string | undefined,
+    capabilities: Array.isArray(raw.capabilities) ? (raw.capabilities as string[]) : undefined,
+    lastSeenAt: raw.lastSeenAt
+      ? (raw.lastSeenAt instanceof Date ? raw.lastSeenAt : new Date(raw.lastSeenAt as string | number))
+      : undefined,
     idleTimeoutMs: typeof raw.idleTimeoutMs === 'number' ? raw.idleTimeoutMs : ENV_DEFAULTS.idleTimeoutMs,
     maxLifetimeMs: typeof raw.maxLifetimeMs === 'number' ? raw.maxLifetimeMs : ENV_DEFAULTS.maxLifetimeMs,
     reconnect: {
@@ -208,14 +216,29 @@ export async function loadAndResolveEnvironment(
   const env = applyDefaults(raw);
 
   // -------------------------------------------------------------------------
-  // 2. Access check
+  // 2. Access check (applies to every kind)
   // -------------------------------------------------------------------------
   if (!hasAccess(env, userId)) {
     throw new EnvironmentAccessDeniedError(environmentId, userId);
   }
 
   // -------------------------------------------------------------------------
-  // 3. Secret resolution
+  // desktop-agent: push-model connector. There is NO SSH host/port/secret —
+  // desktop commands are routed over Redis pub/sub (see the `alert_desktop`
+  // and desktop computer-use native tools + the webapp `/ws/desktop` gateway),
+  // not an EnvironmentSession exec. Skip secret/sshKey resolution entirely and
+  // return an empty key.
+  //
+  // TODO(Phase 2): build a DesktopAgentSession so `exec` requests can be
+  // round-tripped over the connector socket (consent-gated). Until then this
+  // helper only validates ownership/visibility for desktop-agent envs.
+  // -------------------------------------------------------------------------
+  if (env.kind === 'desktop-agent') {
+    return { env, sshKey: '' };
+  }
+
+  // -------------------------------------------------------------------------
+  // 3. Secret resolution (self-hosted SSH only)
   // -------------------------------------------------------------------------
   if (!env.secretRef) {
     throw new EnvironmentSecretMissingError(environmentId, '<missing>');

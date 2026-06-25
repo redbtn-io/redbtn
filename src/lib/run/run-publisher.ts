@@ -901,10 +901,17 @@ export class RunPublisher {
     await this.publish({ type: 'chunk', content, timestamp: Date.now() });
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
-      await this.ensureSegment('content');
-      this.convPublisher.streamContent(this.runId, this.convMessageId, content).catch((err) => {
-        console.warn("[RunPublisher] Conv forward content_chunk failed:", err);
-      });
+      // Only open/switch a content segment on real (non-whitespace) content so
+      // we never mint empty "No response" bubbles. Whitespace that arrives while
+      // a content segment is already open still streams through (preserves the
+      // spaces between word chunks); whitespace at a kind boundary is dropped as
+      // leading trim rather than opening an empty segment.
+      if (content.trim().length > 0) await this.ensureSegment('content');
+      if (this.currentSegmentKind === 'content') {
+        this.convPublisher.streamContent(this.runId, this.convMessageId, content).catch((err) => {
+          console.warn("[RunPublisher] Conv forward content_chunk failed:", err);
+        });
+      }
     }
   }
 
@@ -914,10 +921,14 @@ export class RunPublisher {
     await this.publish({ type: 'chunk', content, thinking: true, timestamp: Date.now() });
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
-      await this.ensureSegment('thinking');
-      this.convPublisher.streamThinking(this.runId, this.convMessageId, content).catch((err) => {
-        console.warn("[RunPublisher] Conv forward thinking_chunk failed:", err);
-      });
+      // Same guard as content: only open/switch a thinking segment on real
+      // (non-whitespace) reasoning text so empty reasoning never mints a bubble.
+      if (content.trim().length > 0) await this.ensureSegment('thinking');
+      if (this.currentSegmentKind === 'thinking') {
+        this.convPublisher.streamThinking(this.runId, this.convMessageId, content).catch((err) => {
+          console.warn("[RunPublisher] Conv forward thinking_chunk failed:", err);
+        });
+      }
     }
   }
 
