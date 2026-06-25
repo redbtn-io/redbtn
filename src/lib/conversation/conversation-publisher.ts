@@ -12,9 +12,9 @@
  *
  * Archive side-channel:
  * - After every publish(), enqueues a BullMQ job to `conversation-archive` queue
- *   (unless ARCHIVE_QUEUE_DISABLED=true). Each job has a dedup ID of
- *   `{conversationId}:{seq}`. Attachment events have their base64 payload stripped
- *   before enqueueing — only the reference (fileId/url) is archived.
+ *   (unless ARCHIVE_QUEUE_DISABLED=true). Attachment events have their base64
+ *   payload stripped before enqueueing — only the reference (fileId/url) is
+ *   archived.
  */
 
 import type Redis from 'ioredis';
@@ -70,6 +70,10 @@ function getArchiveQueue(name: string, _redis: unknown, prefix: string): Instanc
     _archiveQueues.set(key, new _BullQueue(name, { connection: getBullMQConnection(), prefix }));
   }
   return _archiveQueues.get(key)!;
+}
+
+export function createConversationArchiveJobId(conversationId: string, seq: number, timestamp = Date.now()): string {
+  return `${conversationId}_${timestamp}_${seq}`;
 }
 
 export interface ConversationPublisherOptions {
@@ -607,8 +611,10 @@ export class ConversationPublisher {
       const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
       const queue = getArchiveQueue('conversation-archive', this.redis, prefix);
       await queue.add('archive', jobData, {
-        // BullMQ does not allow colons in jobIds — use underscore separator
-        jobId: `${this.conversationId}_${seq}`,
+        // BullMQ keeps completed jobs for a while. The sequence key can expire
+        // before those old job IDs are removed, so the job ID must not be just
+        // conversationId+seq or fresh archive jobs get deduped away silently.
+        jobId: createConversationArchiveJobId(this.conversationId, seq),
         removeOnComplete: { age: 3600, count: 500 },
         removeOnFail: { age: 86400 },
       });
