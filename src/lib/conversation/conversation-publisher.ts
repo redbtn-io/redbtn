@@ -420,6 +420,26 @@ export class ConversationPublisher {
     });
   }
 
+  /**
+   * Agent presence — "this run is working / idle in the conversation", decoupled
+   * from any output message. Drives the "Working / Reconnecting" indicator
+   * without a pre-allocated empty assistant message. Ephemeral (not replayed).
+   */
+  async publishPresence(
+    runId: string,
+    state: 'working' | 'reconnecting' | 'idle',
+    opts?: { messageId?: string; agentId?: string },
+  ): Promise<void> {
+    await this.publish({
+      type: 'agent_presence',
+      runId,
+      ...(opts?.messageId ? { messageId: opts.messageId } : {}),
+      ...(opts?.agentId ? { agentId: opts.agentId } : {}),
+      state,
+      timestamp: Date.now(),
+    });
+  }
+
   /** Send a status update */
   async status(action: string, description?: string): Promise<void> {
     await this.publish({
@@ -538,7 +558,7 @@ export class ConversationPublisher {
   // -- Internal --
 
   /** Ephemeral event types that should NOT be stored in replay list or archived */
-  private static readonly EPHEMERAL_TYPES = new Set(['audio_chunk']);
+  private static readonly EPHEMERAL_TYPES = new Set(['audio_chunk', 'agent_presence']);
 
   private async publish(event: ConversationEvent): Promise<void> {
     const json = JSON.stringify(event);

@@ -58,6 +58,16 @@ import { assertChatComponentSpec } from '../chat-components/spec-schema';
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
 
+/**
+ * Turn-by-turn output is how a conversation works — not a toggle. It is ALWAYS
+ * on for every conversation run (any run with a ConversationPublisher); there is
+ * deliberately no way to disable it. Single-turn graphs are unaffected because
+ * they never change output kind, so they produce exactly one message anyway.
+ */
+function conversationSegmentationEnabled(): boolean {
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Module-level singleton BullMQ Queue instances
 // One Queue per (name, prefix) pair — shared across all RunPublisher instances.
@@ -174,8 +184,30 @@ export class RunPublisher {
   private initialized = false;
   /** ConversationPublisher for forwarding events to the chat UI */
   private convPublisher: ConversationPublisher | null = null;
-  /** Message ID used for conversation stream (stable across run lifetime) */
+  /** Message ID for the CURRENT conversation segment (see segmentation below). */
   private convMessageId: string | null = null;
+
+  // --- Turn-by-turn segmentation -------------------------------------------
+  // ON by default for every conversation run (see conversationSegmentationEnabled).
+  // A run emits MULTIPLE conversation messages — one per "turn" — instead of one
+  // message that coalesces all thinking/tools/content. A new message (segment)
+  // opens whenever the output KIND changes (thinking ↔ content ↔ tool), so the
+  // conversation reads in true emission order: Working → tool → content →
+  // tool → … . Single-turn graphs never change kind, so they still produce
+  // exactly one message.
+  private segmented = false;
+  /** The first/base conv message id — segment ids derive from it deterministically. */
+  private baseConvMessageId: string | null = null;
+  private currentSegmentKind: 'thinking' | 'content' | 'tool' | null = null;
+  private segmentIndex = 0;
+  /**
+   * toolId → the conversation segment (message id) the tool was STARTED in.
+   * tool_complete / tool_error / tool_progress must target that same segment —
+   * `convMessageId` may have advanced to a later content/thinking segment by the
+   * time the tool finishes, which would otherwise leave the tool bubble stuck
+   * "running" because the UI can't find it in the current segment.
+   */
+  private toolSegmentIds = new Map<string, string>();
 
   constructor(options: RunPublisherOptions) {
     this.redis = options.redis;
@@ -287,8 +319,18 @@ export class RunPublisher {
         // pre-allocates one so the response and SSE events agree) and only
         // mint a fresh one when the caller didn't supply.
         this.convMessageId = convMessageId || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        this.baseConvMessageId = this.convMessageId;
+        this.segmented = conversationSegmentationEnabled();
         await this.convPublisher.publishRunStart(this.runId, this.convMessageId, graphId, graphName);
-        if (DEBUG) console.log(`[RunPublisher] Conversation forwarding enabled for ${conversationId}`);
+        // Presence: "this run is working", decoupled from any message. The chat
+        // UI shows the Working/Reconnecting indicator from this — no empty
+        // pre-allocated bubble needed. Ephemeral; reload restores via the
+        // /active-generation probe.
+        await this.convPublisher.publishPresence(this.runId, 'working', {
+          messageId: this.convMessageId,
+          ...(this.agentId ? { agentId: this.agentId } : {}),
+        });
+        if (DEBUG) console.log(`[RunPublisher] Conversation forwarding enabled for ${conversationId}${this.segmented ? ' (segmented turn-by-turn)' : ''}`);
       } catch (err) {
         console.warn('[RunPublisher] Failed to create conversation publisher:', err);
         this.convPublisher = null;
@@ -397,6 +439,12 @@ export class RunPublisher {
     // keeps Redis tidy and reclaims the space immediately.
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
+    // Presence: run done → clear the Working indicator.
+    if (this.convPublisher) {
+      await this.convPublisher.publishPresence(this.runId, 'idle', {
+        ...(this.agentId ? { agentId: this.agentId } : {}),
+      }).catch(() => {});
+    }
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       try {
@@ -521,6 +569,12 @@ export class RunPublisher {
     }
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
+    // Presence: run errored → clear the Working indicator.
+    if (this.convPublisher) {
+      await this.convPublisher.publishPresence(this.runId, 'idle', {
+        ...(this.agentId ? { agentId: this.agentId } : {}),
+      }).catch(() => {});
+    }
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
       try {
@@ -597,6 +651,12 @@ export class RunPublisher {
     }
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
+    // Presence: run interrupted → clear the Working indicator.
+    if (this.convPublisher) {
+      await this.convPublisher.publishPresence(this.runId, 'idle', {
+        ...(this.agentId ? { agentId: this.agentId } : {}),
+      }).catch(() => {});
+    }
     // Forward to conversation stream if present so chat UI can render the
     // interrupt indicator and stop showing the spinner.
     if (this.convPublisher && this.convMessageId) {
@@ -792,15 +852,66 @@ export class RunPublisher {
   // Streaming
   // ===========================================================================
 
+  /**
+   * Turn-by-turn boundary. When segmentation is on, opening a different KIND of
+   * output (thinking ↔ content ↔ tool) closes the current conversation message
+   * and opens a fresh one, so each turn is its own bubble in emission order.
+   * The first segment reuses the run's pre-allocated message (from
+   * publishRunStart) so the optimistic bubble still collapses. Segment ids are
+   * derived deterministically from the base id (`<base>-s<N>`) so a worker
+   * retry reproduces the same ids and the archiver upserts idempotently.
+   * No-op when segmentation is off or the kind hasn't changed (so it costs
+   * nothing per-token — boundaries fire once per turn, not per chunk).
+   */
+  private async ensureSegment(kind: 'thinking' | 'content' | 'tool'): Promise<void> {
+    if (!this.segmented || !this.convPublisher || !this.convMessageId) return;
+    if (this.currentSegmentKind === kind) return;
+    if (this.currentSegmentKind === null) {
+      // First segment: emit a real message_start for the base id (segment 0).
+      // run_start no longer creates the assistant message (it's now presence-
+      // only in the decoupled UI), so the first turn must mint its own message.
+      // Same base id → the optimistic-bubble mapping and idempotent upsert hold.
+      this.currentSegmentKind = kind;
+      await this.convPublisher.startMessage(this.convMessageId, 'assistant', {
+        runId: this.runId,
+        segmentIndex: 0,
+        kind,
+        ...(this.agentId ? { agentId: this.agentId } : {}),
+      }).catch(() => {});
+      return;
+    }
+    // Kind changed → close the open segment, open a new one.
+    const prevId = this.convMessageId;
+    await this.convPublisher.completeMessage(prevId).catch(() => {});
+    this.segmentIndex += 1;
+    const newId = `${this.baseConvMessageId}-s${this.segmentIndex}`;
+    this.convMessageId = newId;
+    this.currentSegmentKind = kind;
+    await this.convPublisher.startMessage(newId, 'assistant', {
+      runId: this.runId,
+      segmentIndex: this.segmentIndex,
+      kind,
+      ...(this.agentId ? { agentId: this.agentId } : {}),
+    }).catch(() => {});
+  }
+
   async chunk(content: string): Promise<void> {
     this.ensureInitialized();
     this.state!.output.content += content;
     await this.publish({ type: 'chunk', content, timestamp: Date.now() });
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
-      this.convPublisher.streamContent(this.runId, this.convMessageId, content).catch((err) => {
-        console.warn("[RunPublisher] Conv forward content_chunk failed:", err);
-      });
+      // Only open/switch a content segment on real (non-whitespace) content so
+      // we never mint empty "No response" bubbles. Whitespace that arrives while
+      // a content segment is already open still streams through (preserves the
+      // spaces between word chunks); whitespace at a kind boundary is dropped as
+      // leading trim rather than opening an empty segment.
+      if (content.trim().length > 0) await this.ensureSegment('content');
+      if (this.currentSegmentKind === 'content') {
+        this.convPublisher.streamContent(this.runId, this.convMessageId, content).catch((err) => {
+          console.warn("[RunPublisher] Conv forward content_chunk failed:", err);
+        });
+      }
     }
   }
 
@@ -810,9 +921,14 @@ export class RunPublisher {
     await this.publish({ type: 'chunk', content, thinking: true, timestamp: Date.now() });
     // Forward to conversation stream
     if (this.convPublisher && this.convMessageId) {
-      this.convPublisher.streamThinking(this.runId, this.convMessageId, content).catch((err) => {
-        console.warn("[RunPublisher] Conv forward thinking_chunk failed:", err);
-      });
+      // Same guard as content: only open/switch a thinking segment on real
+      // (non-whitespace) reasoning text so empty reasoning never mints a bubble.
+      if (content.trim().length > 0) await this.ensureSegment('thinking');
+      if (this.currentSegmentKind === 'thinking') {
+        this.convPublisher.streamThinking(this.runId, this.convMessageId, content).catch((err) => {
+          console.warn("[RunPublisher] Conv forward thinking_chunk failed:", err);
+        });
+      }
     }
   }
 
@@ -994,6 +1110,12 @@ export class RunPublisher {
     });
     // Forward to conversation stream
     if (this.convPublisher) {
+      // A tool call is its own turn: open a `tool` segment so it renders as a
+      // distinct bubble between text turns (no-op when segmentation is off).
+      await this.ensureSegment('tool');
+      // Remember which segment this tool lives in so its later complete/error
+      // events target the SAME bubble even after the segment advances.
+      if (this.convMessageId) this.toolSegmentIds.set(toolId, this.convMessageId);
       this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
         type: 'tool_start', toolId, toolName, toolType, input: options?.input,
         triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
@@ -1026,7 +1148,7 @@ export class RunPublisher {
     await this.publish({ type: 'tool_progress', toolId, step, progress: options?.progress, data: options?.data, ...(subgraph ? { subgraph } : {}), timestamp: ts });
     // Forward to conversation stream
     if (this.convPublisher) {
-      this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
+      this.convPublisher.publishToolEvent(this.runId, this.toolSegmentIds.get(toolId) ?? this.convMessageId ?? "", {
         type: 'tool_progress', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
         step, progress: options?.progress, data: options?.data, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
@@ -1064,7 +1186,7 @@ export class RunPublisher {
     });
     // Forward to conversation stream
     if (this.convPublisher) {
-      this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
+      this.convPublisher.publishToolEvent(this.runId, this.toolSegmentIds.get(toolId) ?? this.convMessageId ?? "", {
         type: 'tool_complete', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
         result, metadata, triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
@@ -1105,7 +1227,7 @@ export class RunPublisher {
     });
     // Forward to conversation stream
     if (this.convPublisher) {
-      this.convPublisher.publishToolEvent(this.runId, this.convMessageId ?? "", {
+      this.convPublisher.publishToolEvent(this.runId, this.toolSegmentIds.get(toolId) ?? this.convMessageId ?? "", {
         type: 'tool_error', toolId, toolName: tool?.toolName || '', toolType: tool?.toolType || '',
         error, triggeredBy, neuronStepId, ...(subgraph ? { subgraph } : {}), timestamp: ts,
       }).catch(() => {});
