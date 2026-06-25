@@ -8,11 +8,11 @@
  *
  * # Transport contract (must match the webapp desktop-gateway + redAgent)
  *
- *   Request channel `desktop:cmd:{userId}`
+ *   Request channel `desktop:cmd:{userId}:{installId}`
  *     The tool PUBLISHes the full protocol message
  *       { "kind":"computer", "id":"<uuid>", "request": <ComputerAction> }
- *     here. The gateway (one dedicated subscriber per connected socket) relays
- *     it verbatim down that socket.
+ *     here. The gateway socket for that installId relays it verbatim down that
+ *     desktop connection.
  *
  *   Reply channel `desktop:reply:{id}`  (keyed by the request's `id`)
  *     When the desktop sends a `computer_result` (or `exec_result`/`ack`) up
@@ -20,14 +20,12 @@
  *     subscribed to `desktop:reply:{id}` BEFORE it publishes the command,
  *     receives the first such message and resolves.
  *
- * # v1 limitation (documented)
+ * # Targeting
  *
- * The command channel is keyed by `{userId}`, exactly like alerts. If a user
- * has multiple desktops connected, ALL of them receive the command — but the
- * reply is keyed by the unique request `id`, so the FIRST desktop to answer
- * wins and any later duplicate replies are ignored (the subscriber is torn
- * down after the first message). Targeting a specific `installId`/display is a
- * follow-up.
+ * Callers must resolve an Environment `environmentId` to the desktop
+ * connector's `installId` before calling this helper. The helper refuses to
+ * publish without an installId, so computer-use/exec/settings cannot silently
+ * fall back to user-wide broadcast.
  *
  * # Fail-safe
  *
@@ -101,6 +99,7 @@ export interface RequestDesktopArgs {
   request: ComputerAction;
   /** Reject (resolve to ok:false) after this many ms. Default 30000. */
   timeoutMs?: number;
+  installId: string;
 }
 
 const CMD_CHANNEL_PREFIX = 'desktop:cmd:';
@@ -136,8 +135,10 @@ export async function requestDesktop(args: RequestDesktopArgs): Promise<Computer
 
   const userId = (args.userId || '').trim();
   if (!userId) return failResult(id, 'No userId available; cannot target any desktop.');
+  const installId = (args.installId || '').trim();
+  if (!installId) return failResult(id, 'No installId available; targeting a specific desktop is required.');
 
-  const cmdChannel = `${CMD_CHANNEL_PREFIX}${userId}`;
+  const cmdChannel = `${CMD_CHANNEL_PREFIX}${userId}:${installId}`;
   const replyChannel = `${REPLY_CHANNEL_PREFIX}${id}`;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -257,11 +258,12 @@ export interface RequestDesktopRawArgs {
   kind: string;
   payload?: AnyObject;
   timeoutMs?: number;
+  installId: string;
 }
 
 /**
  * Generic desktop round-trip for non-computer message kinds (exec, settings).
- * Publishes { kind, id, ...payload } to desktop:cmd:{userId} and resolves with
+ * Publishes { kind, id, ...payload } to desktop:cmd:{userId}:{installId} and resolves with
  * the FULL parsed reply object (passthrough — exec_result carries `result`,
  * settings_result carries `settings`). Fail-safe: never throws; returns
  * { ok:false, error:{ code:'desktop_failed', message } } on any failure.
@@ -275,8 +277,11 @@ export async function requestDesktopRaw(args: RequestDesktopRawArgs): Promise<An
   const userId = (args.userId || '').trim();
   if (!userId)
     return { ok: false, error: { code: 'desktop_failed', message: 'No userId available; cannot target any desktop.' } };
+  const installId = (args.installId || '').trim();
+  if (!installId)
+    return { ok: false, error: { code: 'desktop_failed', message: 'No installId available; targeting a specific desktop is required.' } };
 
-  const cmdChannel = `${CMD_CHANNEL_PREFIX}${userId}`;
+  const cmdChannel = `${CMD_CHANNEL_PREFIX}${userId}:${installId}`;
   const replyChannel = `${REPLY_CHANNEL_PREFIX}${id}`;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let pub: any = null;

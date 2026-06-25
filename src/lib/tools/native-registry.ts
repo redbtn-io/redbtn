@@ -476,9 +476,10 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   }
 
   try {
-    // Alert Desktop — push an OS notification + spoken TTS alert to all of the
-    // calling user's connected desktop machines (redAgent) via Redis pub/sub
-    // (channel desktop:alert:{userId}). Relayed by the webapp /ws/desktop gateway.
+    // Alert Desktop — push an OS notification + spoken TTS alert to one targeted
+    // desktop machine (redAgent) via Redis pub/sub
+    // (channel desktop:cmd:{userId}:{installId}). Relayed by the webapp
+    // /ws/desktop gateway.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const alertDesktop = require('./native/alert-desktop.js');
     registry.register('alert_desktop', alertDesktop.default || alertDesktop);
@@ -490,9 +491,9 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
 
   try {
     // Desktop computer-use pack — screenshot + mouse/keyboard control of the
-    // calling user's connected desktop (redAgent), driven over Redis
-    // request→reply (desktop:cmd:{userId} → desktop:reply:{id}) through the
-    // webapp /ws/desktop gateway. Seven thin tools share one round-trip helper.
+    // calling user's targeted desktop (redAgent), driven over Redis
+    // request→reply (desktop:cmd:{userId}:{installId} → desktop:reply:{id})
+    // through the webapp /ws/desktop gateway.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const desktop = require('./native/desktop-computer.js');
     registry.register('desktop_screenshot', desktop.desktopScreenshot);
@@ -504,8 +505,10 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     registry.register('desktop_screen_info', desktop.desktopScreenInfo);
     registry.register('desktop_exec', desktop.desktopExec);
     registry.register('desktop_settings', desktop.desktopSettings);
+    registry.register('desktop_list', desktop.desktopList);
+    registry.register('desktop_ping', desktop.desktopPing);
     console.log(
-      '[NativeRegistry] Registered built-in tools: desktop_screenshot, desktop_click, desktop_move, desktop_type, desktop_key, desktop_scroll, desktop_screen_info',
+      '[NativeRegistry] Registered built-in tools: desktop_screenshot, desktop_click, desktop_move, desktop_type, desktop_key, desktop_scroll, desktop_screen_info, desktop_exec, desktop_settings, desktop_list, desktop_ping',
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

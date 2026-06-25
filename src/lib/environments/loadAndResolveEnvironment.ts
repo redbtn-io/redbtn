@@ -224,9 +224,10 @@ export async function loadAndResolveEnvironment(
 
   // -------------------------------------------------------------------------
   // desktop-agent: push-model connector. There is NO SSH host/port/secret —
-  // alerts are fire-and-forget over Redis pub/sub (see the `alert_desktop`
-  // native tool + the webapp `/ws/desktop` gateway), not an EnvironmentSession
-  // exec. Skip secret/sshKey resolution entirely and return an empty key.
+  // desktop commands are routed over Redis pub/sub (see the `alert_desktop`
+  // and desktop computer-use native tools + the webapp `/ws/desktop` gateway),
+  // not an EnvironmentSession exec. Skip secret/sshKey resolution entirely and
+  // return an empty key.
   //
   // TODO(Phase 2): build a DesktopAgentSession so `exec` requests can be
   // round-tripped over the connector socket (consent-gated). Until then this

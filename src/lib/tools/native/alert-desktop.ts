@@ -1,18 +1,18 @@
 /**
  * alert_desktop — Native Tool (redAgent push connector)
  *
- * Sends an OS-notification / spoken alert to ALL of the calling user's
- * connected desktop machines (redAgent connectors).
+ * Sends an OS-notification / spoken alert to one targeted desktop machine
+ * (redAgent connector).
  *
  * # How delivery works
  *
  * This tool is fire-and-forget over Redis pub/sub — it does NOT open an
- * EnvironmentSession or address a single `environmentId`. The webapp runs a
- * `/ws/desktop` gateway: each connected desktop holds an outbound WebSocket,
- * and the gateway subscribes a Redis client to `desktop:alert:{userId}` for
- * that socket. When this tool PUBLISHes an alert to that channel, every one of
- * the user's connected desktops receives it and pops a native notification
- * (optionally speaking the body via TTS).
+ * EnvironmentSession, but it DOES require an `environmentId` so the caller
+ * targets one desktop install. The webapp runs a `/ws/desktop` gateway: each
+ * connected desktop holds an outbound WebSocket, and the gateway subscribes a
+ * Redis client to `desktop:cmd:{userId}:{installId}` for that socket. When this
+ * tool PUBLISHes an alert to that targeted channel, only that desktop receives
+ * it and pops a native notification (optionally speaking the body via TTS).
  *
  * Wire contract (matches redAgent `src/shared/protocol.ts` `AlertMessage`):
  *
@@ -28,8 +28,8 @@
  *
  * The gateway maintains a presence key per connected install:
  *   `desktop:presence:{userId}:{installId}`  (≈70s TTL, refreshed on heartbeat)
- * We SCAN (never KEYS) for `desktop:presence:{userId}:*` to report how many
- * desktops are currently connected (`delivered`).
+ * We check the targeted presence key to report whether the target appeared
+ * online at send time. Redis `PUBLISH` gives the actual subscriber count.
  *
  * # Fail-safe
  *
@@ -41,6 +41,7 @@
  */
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
+import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -51,6 +52,7 @@ type WireLevel = 'info' | 'warning' | 'critical';
 type InputLevel = 'info' | 'success' | 'warning' | 'error';
 
 interface AlertDesktopArgs {
+  environmentId: string;
   title: string;
   body: string;
   speak?: boolean;
@@ -59,7 +61,7 @@ interface AlertDesktopArgs {
   speed?: number;
 }
 
-const ALERT_CHANNEL_PREFIX = 'desktop:alert:';
+const CMD_CHANNEL_PREFIX = 'desktop:cmd:';
 const PRESENCE_PREFIX = 'desktop:presence:';
 
 /** Map the broad input level onto the protocol wire enum. */
@@ -84,36 +86,37 @@ function makeAlertId(): string {
   return `alert_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/**
- * Count connected desktops for a user via SCAN over
- * `desktop:presence:{userId}:*`. SCAN (cursor-based) is used instead of KEYS
- * so we never block Redis on large keyspaces.
- */
-async function countPresence(redis: AnyObject, userId: string): Promise<number> {
-  const match = `${PRESENCE_PREFIX}${userId}:*`;
-  let cursor = '0';
-  let count = 0;
-  // Bound the walk so a pathological keyspace can't spin forever.
-  let iterations = 0;
-  do {
-    const [next, keys] = (await redis.scan(cursor, 'MATCH', match, 'COUNT', 100)) as [
-      string,
-      string[],
-    ];
-    cursor = next;
-    count += keys.length;
-    iterations += 1;
-  } while (cursor !== '0' && iterations < 1000);
-  return count;
+function resolveUserId(context: NativeToolContext): string | null {
+  const userId =
+    (context?.state?.userId as string | undefined) ||
+    (context?.state?.data?.userId as string | undefined) ||
+    (context?.state?.options?.userId as string | undefined);
+  return userId && String(userId).trim() ? String(userId).trim() : null;
+}
+
+async function resolveInstallId(context: NativeToolContext, environmentId: string): Promise<string | undefined> {
+  const userId = resolveUserId(context);
+  if (!userId) return undefined;
+
+  try {
+    const { env } = await loadAndResolveEnvironment(environmentId, userId);
+    return env.installId;
+  } catch (err) {
+    throw new Error(`Failed to resolve environment ${environmentId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 const alertDesktopTool: NativeToolDefinition = {
   description:
-    "Send an alert (OS notification + optional spoken TTS) to all of the current user's connected desktop machines (redAgent). Fire-and-forget over Redis pub/sub — targets every connected desktop, no environmentId needed. Returns how many desktops were connected at send time.",
+    "Send an alert (OS notification + optional spoken TTS) to a targeted desktop machine (redAgent). Fire-and-forget over Redis pub/sub. Requires environmentId and fails if the desktop environment cannot be resolved.",
   server: 'system',
   inputSchema: {
     type: 'object',
     properties: {
+      environmentId: {
+        type: 'string',
+        description: 'environmentId of the target desktop agent.',
+      },
       title: {
         type: 'string',
         description: 'Short notification title. Required.',
@@ -143,21 +146,22 @@ const alertDesktopTool: NativeToolDefinition = {
         description: 'Optional TTS speed multiplier (1.0 = normal).',
       },
     },
-    required: ['title', 'body'],
+    required: ['environmentId', 'title', 'body'],
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
     const args = rawArgs as Partial<AlertDesktopArgs>;
+    const environmentId = typeof args.environmentId === 'string' ? args.environmentId.trim() : '';
     const title = typeof args.title === 'string' ? args.title.trim() : '';
     const body = typeof args.body === 'string' ? args.body.trim() : '';
 
-    if (!title || !body) {
+    if (!environmentId || !title || !body) {
       return {
         content: [
           {
             type: 'text',
             text: JSON.stringify({
-              error: 'Both title and body are required non-empty strings',
+              error: 'environmentId, title, and body are required non-empty strings',
               code: 'VALIDATION',
             }),
           },
@@ -166,12 +170,7 @@ const alertDesktopTool: NativeToolDefinition = {
       };
     }
 
-    // Resolve the target user from run state (same pattern as the other
-    // native tools — userId is injected onto the graph state at run start).
-    const userId =
-      (context?.state?.userId as string | undefined) ||
-      (context?.state?.data?.userId as string | undefined) ||
-      (context?.state?.options?.userId as string | undefined);
+    const userId = resolveUserId(context);
 
     if (!userId) {
       // No user context → nothing to target. Fail safe: return delivered:0,
@@ -190,7 +189,49 @@ const alertDesktopTool: NativeToolDefinition = {
       };
     }
 
-    const channel = `${ALERT_CHANNEL_PREFIX}${userId}`;
+    let installId: string | undefined;
+    try {
+      installId = await resolveInstallId(context, environmentId);
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              delivered: 0,
+              channel: null,
+              error: {
+                code: 'desktop_failed',
+                message: err instanceof Error ? err.message : String(err),
+              },
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    if (!installId) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              delivered: 0,
+              channel: null,
+              error: {
+                code: 'desktop_failed',
+                message: `Target environment ${environmentId} does not have an active desktop connection (missing installId).`,
+              },
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const channel = `${CMD_CHANNEL_PREFIX}${userId}:${installId}`;
+    const presenceKey = `${PRESENCE_PREFIX}${userId}:${installId}`;
     const speak = args.speak !== false; // default true
     const level = toWireLevel(args.level);
 
@@ -221,23 +262,21 @@ const alertDesktopTool: NativeToolDefinition = {
       const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
       redis = new IORedis(redisUrl, { maxRetriesPerRequest: 3 });
 
-      // Count connected desktops (best-effort — a SCAN failure must not block
-      // the publish).
-      let delivered = 0;
+      // Best-effort presence check. PUBLISH's subscriber count below remains
+      // the source of truth for whether a connected gateway socket received it.
+      let targetOnline = false;
       try {
-        delivered = await countPresence(redis, userId);
+        targetOnline = (await redis.exists(presenceKey)) > 0;
       } catch (scanErr) {
         const m = scanErr instanceof Error ? scanErr.message : String(scanErr);
-        publisher?.emit?.('log', `alert_desktop presence scan failed (continuing): ${m}`);
+        publisher?.emit?.('log', `alert_desktop presence check failed (continuing): ${m}`);
       }
 
-      // Publish the alert. The gateway relays it to every connected socket
-      // subscribed to this channel.
-      await redis.publish(channel, JSON.stringify(alert));
+      const delivered = await redis.publish(channel, JSON.stringify(alert));
 
       const note =
         delivered === 0
-          ? 'No desktops currently connected; the alert was published but may not be delivered.'
+          ? 'Target desktop is not currently connected; the alert was published but no gateway socket received it.'
           : undefined;
 
       return {
@@ -247,6 +286,9 @@ const alertDesktopTool: NativeToolDefinition = {
             text: JSON.stringify({
               delivered,
               channel,
+              environmentId,
+              installId,
+              targetOnline,
               alert,
               ...(note ? { note } : {}),
             }),
