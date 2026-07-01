@@ -117,9 +117,11 @@ export interface IEnvironment {
    * reserves `'redbtn-hosted'`. `'desktop-agent'` is a push-model connector
    * (redAgent): the desktop holds an OUTBOUND WebSocket to the webapp gateway
    * and redbtn targets it by Redis pub/sub — there is no SSH host/port/secret
-   * for this kind, so those fields are optional below.
+   * for this kind, so those fields are optional below. `'cli'` is the same
+   * push-model connector but headless (the `redbtn` CLI's `connect` command);
+   * it is resolved identically to `'desktop-agent'` (no SSH).
    */
-  kind: 'self-hosted' | 'desktop-agent';
+  kind: 'self-hosted' | 'desktop-agent' | 'cli';
   /** Hostname or IP. Required for `self-hosted`; absent for `desktop-agent`. */
   host?: string;
   /** SSH port. Default 22. Not used by `desktop-agent`. */

@@ -111,7 +111,8 @@ function applyDefaults(raw: Record<string, unknown>): IEnvironment {
   const reconnectRaw = (raw.reconnect ?? {}) as Partial<EnvironmentReconnectPolicy>;
   // Preserve the discriminator. `desktop-agent` envs have no SSH host/user/
   // secret — keep those fields optional rather than coercing to `String(undefined)`.
-  const kind: IEnvironment['kind'] = raw.kind === 'desktop-agent' ? 'desktop-agent' : 'self-hosted';
+  const kind: IEnvironment['kind'] =
+    raw.kind === 'desktop-agent' ? 'desktop-agent' : raw.kind === 'cli' ? 'cli' : 'self-hosted';
   return {
     environmentId: String(raw.environmentId),
     userId: String(raw.userId),
@@ -233,7 +234,9 @@ export async function loadAndResolveEnvironment(
   // round-tripped over the connector socket (consent-gated). Until then this
   // helper only validates ownership/visibility for desktop-agent envs.
   // -------------------------------------------------------------------------
-  if (env.kind === 'desktop-agent') {
+  // `cli` is the headless variant of the desktop push connector — same
+  // no-SSH, Redis-relayed model, resolved identically.
+  if (env.kind === 'desktop-agent' || env.kind === 'cli') {
     return { env, sshKey: '' };
   }
 
