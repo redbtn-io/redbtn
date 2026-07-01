@@ -43,6 +43,7 @@
  */
 
 import { EnvironmentSession, type SshClientFactory, type OnExecCompleteHandler } from './EnvironmentSession';
+import type { IEnvironmentSession } from './IEnvironmentSession';
 import { getProcessMeteringClient } from '../run/meteringClient';
 
 /**
@@ -87,14 +88,14 @@ export interface EnvironmentManagerOptions {
 }
 
 export class EnvironmentManager {
-  private readonly sessions = new Map<string, EnvironmentSession>();
+  private readonly sessions = new Map<string, IEnvironmentSession>();
 
   /**
    * Tracks in-flight `acquire()` calls so concurrent acquires for the same
    * environmentId share the same opening promise rather than racing two
    * SSH handshakes.
    */
-  private readonly opening = new Map<string, Promise<EnvironmentSession>>();
+  private readonly opening = new Map<string, Promise<IEnvironmentSession>>();
 
   private clientFactory?: SshClientFactory;
   private onExecComplete?: OnExecCompleteHandler;
@@ -133,7 +134,7 @@ export class EnvironmentManager {
    *     `@redbtn/redsecrets` (passed in here as the resolved `sshKey`).
    *   - Verify the `userId` has access to this environment.
    */
-  async acquire(env: IEnvironment, sshKey: string, userId: string): Promise<EnvironmentSession> {
+  async acquire(env: IEnvironment, sshKey: string, userId: string): Promise<IEnvironmentSession> {
     const id = env.environmentId;
 
     // 1. Warm path — live session already in the pool.
@@ -238,7 +239,10 @@ export class EnvironmentManager {
    * `GET /api/v1/environments/:id/status` route and by Phase F's UI.
    */
   status(environmentId: string): EnvironmentStatus | null {
-    const session = this.sessions.get(environmentId);
+    // SSH-oriented introspection — read the concrete session's runtime fields.
+    // A push (DesktopAgentSession) entry returns undefined for the SSH-only
+    // fields, which the status API tolerates.
+    const session = this.sessions.get(environmentId) as EnvironmentSession | undefined;
     if (!session) return null;
     return {
       environmentId,

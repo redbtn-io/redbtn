@@ -64,6 +64,7 @@
 
 import { EventEmitter } from 'events';
 import { Client, type ConnectConfig, type SFTPWrapper, type Stats, type FileEntryWithStats } from 'ssh2';
+import type { IEnvironmentSession } from './IEnvironmentSession';
 import {
   type IEnvironment,
   type EnvironmentLifecycleState,
@@ -173,7 +174,7 @@ interface InternalTimer {
   remainingMs: number | null;
 }
 
-export class EnvironmentSession extends EventEmitter {
+export class EnvironmentSession extends EventEmitter implements IEnvironmentSession {
   readonly environmentId: string;
   readonly userId: string;
   readonly env: IEnvironment;
