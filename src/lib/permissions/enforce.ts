@@ -26,8 +26,22 @@ import { decide, selectorMatches } from './matcher';
 import { getDataToolRule } from './tool-map';
 import {
   CapabilityDeniedError,
+  type CapabilityAction,
   type CapabilityProfile,
+  type CapabilityResource,
 } from './types';
+
+/**
+ * Resources that are FAIL-CLOSED: denied when the run has no profile granting them
+ * (the inverse of state/knowledge's fail-open default). See types.ts.
+ */
+const FAIL_CLOSED_RESOURCES = new Set(['exec', 'computer', 'environment']);
+
+/** Best-effort address for a denial error message (the env being targeted, or '*'). */
+function envAddrForError(args: Record<string, unknown>): string {
+  const id = typeof args?.environmentId === 'string' ? args.environmentId.trim() : '';
+  return id || '*';
+}
 
 /** Does the profile have ANY grant whose selector is a wildcard for this resource+action? */
 function hasWildcardGrant(
@@ -61,14 +75,34 @@ export function enforceToolCapability(
   toolName: string,
   args: Record<string, unknown>,
 ): void {
-  // 1. No profile → today's behavior, fully unrestricted.
-  if (!profile) return;
-
-  // 2. Not a data tool → out of scope for this layer.
+  // 1. Not a mapped tool → out of scope for this layer (allow).
   const rule = getDataToolRule(toolName);
   if (!rule) return;
 
   const { resource, action } = rule;
+
+  // 2. No profile.
+  //    - DATA resources (state/knowledge): today's behavior — unrestricted (fail-OPEN, back-compat).
+  //    - HIGH-RISK resources (exec/computer/environment): FAIL-CLOSED — denied. Running shell /
+  //      controlling a machine must never be inherited by an unprofiled run. This also closes the
+  //      prior hole where a corrupted profile normalized to null (⇒ was unrestricted) — exec is now
+  //      denied on the null path regardless.
+  if (!profile) {
+    if (FAIL_CLOSED_RESOURCES.has(resource)) {
+      throw new CapabilityDeniedError({
+        resource,
+        action,
+        address: envAddrForError(args),
+        profileName: '(none)',
+        message:
+          `Permission denied: ${resource} is fail-closed and the run has no capability ` +
+          `profile granting it. An operator must attach a profile granting ` +
+          `${resource}:${action} (scoped to the environmentId, or '*') to this agent.`,
+      });
+    }
+    return;
+  }
+
   const { addresses, unscoped } = rule.extract(args ?? {});
 
   // 3. Unscoped/broad call (e.g. list-all, search-all with no filter, or a
@@ -130,20 +164,21 @@ export function normalizeProfile(raw: unknown): CapabilityProfile | null {
     capabilities: [],
   };
 
+  const VALID_RESOURCES = new Set(['state', 'knowledge', 'exec', 'computer', 'environment']);
+  const VALID_ACTIONS = new Set(['read', 'write', 'create', 'delete', 'execute', 'control']);
   for (const c of caps) {
     if (!c || typeof c !== 'object') continue;
     const cap = c as Record<string, unknown>;
     const resource = cap.resource;
-    if (resource !== 'state' && resource !== 'knowledge') continue;
+    if (typeof resource !== 'string' || !VALID_RESOURCES.has(resource)) continue;
     const actions = Array.isArray(cap.actions)
-      ? cap.actions.filter(
-          (a): a is 'read' | 'write' | 'create' | 'delete' =>
-            a === 'read' || a === 'write' || a === 'create' || a === 'delete',
-        )
+      ? (cap.actions.filter(
+          (a): a is CapabilityAction => typeof a === 'string' && VALID_ACTIONS.has(a),
+        ) as CapabilityAction[])
       : [];
     if (actions.length === 0) continue;
     const selector = typeof cap.selector === 'string' ? cap.selector : '';
-    normalized.capabilities.push({ resource, actions, selector });
+    normalized.capabilities.push({ resource: resource as CapabilityResource, actions, selector });
   }
 
   return normalized;

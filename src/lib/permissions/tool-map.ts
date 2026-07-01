@@ -98,6 +98,20 @@ function libraryIdsFilter(args: Record<string, unknown>): ExtractedAddress {
 }
 
 /**
+ * Address extractor for exec + computer tools — keys on `environmentId` (the
+ * env/connector the op targets). Selectors are authored as environmentIds so an
+ * agent is jailed to specific machines. A call with NO environmentId (e.g.
+ * `ssh_shell` inline host/user mode) is UNSCOPED → requires an explicit `'*'`
+ * grant. Because exec/computer are fail-closed (enforce.ts), an unmapped-address
+ * op with no wildcard grant is denied.
+ */
+function envId(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.environmentId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
+/**
  * The data-tool table. EXHAUSTIVE for State + Knowledge mutation AND read
  * paths in `native/`. Read tools are included so a jail can also prevent
  * cross-tenant *reads* (data exfiltration), not just writes — but read grants
@@ -163,6 +177,29 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   // ── Knowledge: deletes ────────────────────────────────────────────────────
   delete_library: { resource: 'knowledge', action: 'delete', extract: libraryId },
   delete_document: { resource: 'knowledge', action: 'delete', extract: libraryId },
+
+  // ── Exec: run commands / file I/O via an environment session ──────────────
+  // FAIL-CLOSED (enforce.ts): denied unless the run's profile grants
+  // `exec:execute` for the target environmentId (or `'*'`). This CLOSES the
+  // prior hole where these tools were unmapped ⇒ ungated even in profiled runs.
+  // Reading/writing files on a machine you can exec on is not a meaningfully
+  // separate authority, so file ops share the single `execute` verb (split into
+  // exec:read/exec:write later only if finer control is wanted).
+  run_command: { resource: 'exec', action: 'execute', extract: envId },
+  ssh_shell: { resource: 'exec', action: 'execute', extract: envId }, // inline (no environmentId) ⇒ unscoped ⇒ needs '*'
+  read_file: { resource: 'exec', action: 'execute', extract: envId },
+  ssh_copy: { resource: 'exec', action: 'execute', extract: envId },
+  desktop_exec: { resource: 'exec', action: 'execute', extract: envId },
+
+  // ── Computer-use: screen + mouse/keyboard (desktop connectors) ────────────
+  // FAIL-CLOSED. Grant `computer:control` scoped to the desktop's environmentId.
+  desktop_screenshot: { resource: 'computer', action: 'control', extract: envId },
+  desktop_screen_info: { resource: 'computer', action: 'control', extract: envId },
+  desktop_click: { resource: 'computer', action: 'control', extract: envId },
+  desktop_move: { resource: 'computer', action: 'control', extract: envId },
+  desktop_type: { resource: 'computer', action: 'control', extract: envId },
+  desktop_key: { resource: 'computer', action: 'control', extract: envId },
+  desktop_scroll: { resource: 'computer', action: 'control', extract: envId },
 };
 
 /** Is this tool name a gated data tool? */
