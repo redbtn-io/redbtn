@@ -2,7 +2,7 @@
  * Exec-guard runtime gates (exec-binding Goal 2): kill switch, rate limit,
  * fail-closed-on-audit. Mocks ioredis + fetch.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runExecGuard, ExecBlockedError, isGuardedExecTool, __setRedisForTest } from '../../src/lib/permissions/exec-guard';
 
 // Injected fake redis (no real connection).
@@ -89,5 +89,25 @@ describe('exec-guard — fail-closed on audit (D12)', () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false }) as Response));
     await expect(runExecGuard(ctx, 'run_command', okArgs)).resolves.toBeUndefined();
     delete process.env.EXEC_AUDIT_FAIL_OPEN;
+  });
+});
+
+describe('exec-guard — SHADOW mode (Goal 3: log-only migration)', () => {
+  beforeEach(() => { process.env.PERMISSIONS_SHADOW = 'true'; });
+  afterEach(() => { delete process.env.PERMISSIONS_SHADOW; });
+
+  it('ALLOWS through when the rate limit is exceeded (log-only)', async () => {
+    process.env.EXEC_RATE_MAX = '2';
+    redisState.incr.mockImplementation(async () => 99); // way over
+    await expect(runExecGuard(ctx, 'run_command', okArgs)).resolves.toBeUndefined();
+    delete process.env.EXEC_RATE_MAX;
+  });
+  it('ALLOWS through when the audit is unavailable (log-only)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false }) as Response));
+    await expect(runExecGuard(ctx, 'run_command', okArgs)).resolves.toBeUndefined();
+  });
+  it('STILL DENIES on an explicit kill switch (not relaxed by shadow)', async () => {
+    redisState.get.mockImplementation(async (k: string) => (k === 'exec:kill:global' ? '1' : null));
+    await expect(runExecGuard(ctx, 'run_command', okArgs)).rejects.toMatchObject({ code: 'kill_switch' });
   });
 });

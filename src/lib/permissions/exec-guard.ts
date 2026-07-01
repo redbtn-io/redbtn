@@ -104,6 +104,14 @@ export async function runExecGuard(
   const address = envId || '*';
   const r = redis();
 
+  // SHADOW mode (exec-binding Goal 3): deploy the new engine to the prod worker
+  // WITHOUT changing exec outcomes, while logging what WOULD block. In shadow,
+  // rate-limit + audit-unavailable become log-only (allow-through, recorded), so
+  // previously-ungated exec users aren't broken during migration. The KILL
+  // SWITCH is NOT relaxed — it's an explicit operator emergency stop, orthogonal
+  // to the migration.
+  const shadow = process.env.PERMISSIONS_SHADOW === 'true';
+
   // ── Gate 8a: kill switch. Fail-closed on a genuine flag; if Redis is
   //    UNREACHABLE we do NOT block here (the audit gate below is the hard
   //    fail-closed — a kill switch that can't be read shouldn't wedge all exec,
@@ -138,6 +146,10 @@ export async function runExecGuard(
         const n = await r.incr(c.key);
         if (n === 1) await r.expire(c.key, win + 5);
         if (n > c.max) {
+          if (shadow) {
+            void auditAttempt(context, name, resource, rule.action, address, 'blocked', 'shadow_rate');
+            break; // log-only during migration — do not block
+          }
           throw new ExecBlockedError({
             code: 'rate_limited', resource, address,
             message: `Permission denied: exec rate limit exceeded (${c.max}/${win}s). Slow down or an operator must raise the limit.`,
@@ -153,12 +165,13 @@ export async function runExecGuard(
   // ── Gate 7: durable audit, FAIL-CLOSED (D12). Record the ATTEMPT; if it
   //    cannot be durably written, DENY (no silent unlogged exec). ─────────────
   const ok = await auditAttempt(context, name, resource, rule.action, address, 'allowed');
-  if (!ok && process.env.EXEC_AUDIT_FAIL_OPEN !== 'true') {
+  if (!ok && process.env.EXEC_AUDIT_FAIL_OPEN !== 'true' && !shadow) {
     throw new ExecBlockedError({
       code: 'audit_unavailable', resource, address,
       message: `Permission denied: exec attempt could not be durably audited (audit sink unavailable). ${resource} is fail-closed on audit — no unlogged execution.`,
     });
   }
+  // (shadow: an unaudited attempt is allowed through — log-only during migration.)
 }
 
 /**

@@ -10,7 +10,7 @@
  */
 
 import { getCapabilityProfile } from '../run/contextLookup';
-import { enforceToolCapability } from '../permissions/enforce';
+import { enforceToolCapability, isFailClosedResource } from '../permissions/enforce';
 import { CapabilityDeniedError } from '../permissions/types';
 import { persistDenial } from '../permissions/persist-denial';
 import { isGuardedExecTool, runExecGuard, ExecBlockedError, auditAttempt } from '../permissions/exec-guard';
@@ -335,23 +335,34 @@ export class NativeToolRegistry {
       enforceToolCapability(profile ?? null, name, args ?? {});
     } catch (err) {
       if (err instanceof CapabilityDeniedError) {
+        // SHADOW (Goal 3): during migration, a would-be exec/computer DENY is
+        // logged + audited but NOT enforced (the tool runs), so previously-ungated
+        // exec users aren't broken while we enumerate + grant them. Data denials
+        // (already live in prod) are ALWAYS enforced — shadow only relaxes the new
+        // fail-closed exec/computer resources.
+        const shadow =
+          process.env.PERMISSIONS_SHADOW === 'true' && isFailClosedResource(err.resource);
         console.warn(
-          `[NativeRegistry] capability DENY: tool=${name} resource=${err.resource} ` +
-            `action=${err.action} address=${err.address} profile=${err.profileName}`,
+          `[NativeRegistry] capability ${shadow ? 'SHADOW-' : ''}DENY: tool=${name} ` +
+            `resource=${err.resource} action=${err.action} address=${err.address} profile=${err.profileName}`,
         );
-        // Durable audit: fire-and-forget POST to the webapp. NEVER blocks and
-        // NEVER throws — the `isError` result must return immediately, exactly
-        // as before. A persistence failure cannot affect the run or this result.
+        // Durable audit: fire-and-forget POST to the webapp. NEVER blocks/throws.
         persistDenial(context, name, err);
-        return {
-          content: [{ type: 'text', text: `Error: ${err.message}` }],
-          isError: true,
-        };
+        if (!shadow) {
+          return {
+            content: [{ type: 'text', text: `Error: ${err.message}` }],
+            isError: true,
+          };
+        }
+        // shadow: record the would-block, then fall through to run the handler.
+        void auditAttempt(context, name, err.resource, err.action, err.address, 'blocked', 'shadow_capability');
       }
-      // Any non-deny error in the gate is fail-OPEN for availability — the gate
-      // never breaks a call it couldn't even evaluate. (Resolution errors are
-      // not a security boundary; the boundary is a real CapabilityDeniedError.)
-      console.warn(`[NativeRegistry] capability check errored for tool=${name} (allowing):`, err);
+      else {
+        // Any non-deny error in the gate is fail-OPEN for availability — the gate
+        // never breaks a call it couldn't even evaluate. (Resolution errors are
+        // not a security boundary; the boundary is a real CapabilityDeniedError.)
+        console.warn(`[NativeRegistry] capability check errored for tool=${name} (allowing):`, err);
+      }
     }
 
     // Exec runtime gates (kill switch / rate limit / fail-closed audit) — runs
