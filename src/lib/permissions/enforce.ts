@@ -37,6 +37,11 @@ import {
  */
 const FAIL_CLOSED_RESOURCES = new Set(['exec', 'computer', 'environment']);
 
+/** True for high-risk resources gated fail-closed (exec/computer/environment). */
+export function isFailClosedResource(resource: string): boolean {
+  return FAIL_CLOSED_RESOURCES.has(resource);
+}
+
 /** Best-effort address for a denial error message (the env being targeted, or '*'). */
 function envAddrForError(args: Record<string, unknown>): string {
   const id = typeof args?.environmentId === 'string' ? args.environmentId.trim() : '';

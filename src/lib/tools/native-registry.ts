@@ -13,6 +13,8 @@ import { getCapabilityProfile } from '../run/contextLookup';
 import { enforceToolCapability } from '../permissions/enforce';
 import { CapabilityDeniedError } from '../permissions/types';
 import { persistDenial } from '../permissions/persist-denial';
+import { isGuardedExecTool, runExecGuard, ExecBlockedError, auditAttempt } from '../permissions/exec-guard';
+import { getDataToolRule } from '../permissions/tool-map';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -325,9 +327,12 @@ export class NativeToolRegistry {
     // genuine DENY (CapabilityDeniedError) must be surfaced to the model.
     try {
       const profile = getCapabilityProfile(context?.state);
-      if (profile) {
-        enforceToolCapability(profile, name, args ?? {});
-      }
+      // ALWAYS call enforce (even when unprofiled): data resources short-circuit
+      // to allow on a null profile (back-compat), but exec/computer are
+      // FAIL-CLOSED and MUST be denied on an unprofiled run — so the null case
+      // has to reach enforce. (Previously this was `if (profile)`, which skipped
+      // enforcement entirely for unprofiled runs and defeated fail-closed.)
+      enforceToolCapability(profile ?? null, name, args ?? {});
     } catch (err) {
       if (err instanceof CapabilityDeniedError) {
         console.warn(
@@ -347,6 +352,33 @@ export class NativeToolRegistry {
       // never breaks a call it couldn't even evaluate. (Resolution errors are
       // not a security boundary; the boundary is a real CapabilityDeniedError.)
       console.warn(`[NativeRegistry] capability check errored for tool=${name} (allowing):`, err);
+    }
+
+    // Exec runtime gates (kill switch / rate limit / fail-closed audit) — runs
+    // AFTER the capability check, only for exec/computer/environment tools.
+    if (isGuardedExecTool(name)) {
+      try {
+        await runExecGuard(context, name, args ?? {});
+      } catch (err) {
+        if (err instanceof ExecBlockedError) {
+          console.warn(
+            `[NativeRegistry] exec BLOCKED: tool=${name} code=${err.code} ` +
+              `resource=${err.resource} address=${err.address}`,
+          );
+          // Best-effort record of the block (audit sink may be the very thing down).
+          void auditAttempt(
+            context, name, err.resource,
+            getDataToolRule(name)?.action ?? 'execute', err.address, 'blocked', err.code,
+          );
+          return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+        }
+        // Any UNEXPECTED guard error is fail-closed for these high-risk tools.
+        console.warn(`[NativeRegistry] exec guard errored for tool=${name} (denying, fail-closed):`, err);
+        return {
+          content: [{ type: 'text', text: 'Error: exec guard failed; denied (fail-closed).' }],
+          isError: true,
+        };
+      }
     }
 
     return tool.handler(args, context);
