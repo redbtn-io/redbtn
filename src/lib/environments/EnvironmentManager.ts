@@ -43,6 +43,7 @@
  */
 
 import { EnvironmentSession, type SshClientFactory, type OnExecCompleteHandler } from './EnvironmentSession';
+import { DesktopAgentSession } from './DesktopAgentSession';
 import type { IEnvironmentSession } from './IEnvironmentSession';
 import { getProcessMeteringClient } from '../run/meteringClient';
 
@@ -157,14 +158,20 @@ export class EnvironmentManager {
     const inFlight = this.opening.get(id);
     if (inFlight) return inFlight;
 
-    // 3. Cold path — construct session, kick off open(), record in maps.
-    const session = new EnvironmentSession({
-      env,
-      sshKey,
-      userId,
-      clientFactory: this.clientFactory,
-      onExecComplete: this.onExecComplete,
-    });
+    // 3. Cold path — construct session (by kind), kick off open(), record in maps.
+    //    Push connectors (desktop-agent/cli) speak the /ws/desktop relay via
+    //    DesktopAgentSession; self-hosted uses SSH via EnvironmentSession. Both
+    //    implement IEnvironmentSession so the tools don't care which.
+    const isPush = env.kind === 'desktop-agent' || env.kind === 'cli';
+    const session: IEnvironmentSession = isPush
+      ? new DesktopAgentSession(env, userId, env.installId ?? '')
+      : new EnvironmentSession({
+          env,
+          sshKey,
+          userId,
+          clientFactory: this.clientFactory,
+          onExecComplete: this.onExecComplete,
+        });
 
     // Forward lifecycle events to the manager so observers can subscribe at
     // the manager level (Phase F dashboard).
@@ -173,7 +180,8 @@ export class EnvironmentManager {
       // When a session reaches `closed` (idle/explicit/maxLifetime/etc), drop
       // it from the pool so the next acquire opens a fresh one.
       if (evt.to === 'closed') {
-        emitEnvironmentSessionUsage(session);
+        // SSH-only metering; push sessions have no ssh2 duration to record.
+        if (session instanceof EnvironmentSession) emitEnvironmentSessionUsage(session);
         const current = this.sessions.get(id);
         if (current === session) {
           this.sessions.delete(id);
