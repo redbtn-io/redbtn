@@ -1,17 +1,10 @@
 /**
  * Delete Library — Native Library Tool
  *
- * Permanently deletes a Knowledge Library and all of its documents via the
- * webapp API (`DELETE /api/v1/libraries/:libraryId?permanent=true`).
- *
- * Spec: TOOL-HANDOFF.md §4.4
- *   - inputs: libraryId (required)
- *   - output: { ok: true, deletedDocuments: number }
- *
- * The webapp DELETE route supports both archive (default) and permanent
- * delete (`?permanent=true`). The spec wording — `deletedDocuments` — implies
- * a hard delete, so we always pass `permanent=true` here. To soft-archive
- * instead, callers should use `update_library` (the API uses isArchived).
+ * ARCHIVES a Knowledge Library by default (reversible with restore_library);
+ * `permanent: true` destroys it — record, Chroma collection, and stored
+ * files. The webapp only permits permanent deletion of an already-archived
+ * library, so the permanent path archives first, then purges.
  */
 
 import type {
@@ -25,6 +18,7 @@ type AnyObject = Record<string, any>;
 
 interface DeleteLibraryArgs {
   libraryId: string;
+  permanent?: boolean;
 }
 
 function getBaseUrl(): string {
@@ -51,14 +45,19 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
 
 const deleteLibraryTool: NativeToolDefinition = {
   description:
-    'Permanently delete a Knowledge Library and all of its documents. Destructive — there is no undo. Use carefully.',
+    'Delete a Knowledge Library. By default this ARCHIVES it (hidden from listings, fully reversible with restore_library). Pass permanent: true to destroy the library, its documents, vectors, and stored files for good.',
   server: 'library',
   inputSchema: {
     type: 'object',
     properties: {
       libraryId: {
         type: 'string',
-        description: 'Library id to permanently delete.',
+        description: 'Library id to delete.',
+      },
+      permanent: {
+        type: 'boolean',
+        description:
+          'true = permanently destroy the library and everything in it. Default false = archive (reversible).',
       },
     },
     required: ['libraryId'],
@@ -107,13 +106,23 @@ const deleteLibraryTool: NativeToolDefinition = {
       /* ignore — fall through to the delete */
     }
 
-    // Step 2 — actually delete (permanent=true).
-    const url = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}?permanent=true`;
+    // Step 2 — archive (default) or archive-then-purge (permanent).
+    const libBase = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}`;
     try {
-      const response = await fetch(url, {
-        method: 'DELETE',
-        headers: buildHeaders(context),
-      });
+      let response: Response;
+      if (args.permanent === true) {
+        // Permanent deletion requires the archived state — archive first.
+        await fetch(`${libBase}/archive`, { method: 'POST', headers: buildHeaders(context) }).catch(() => {});
+        response = await fetch(`${libBase}?permanent=true`, {
+          method: 'DELETE',
+          headers: buildHeaders(context),
+        });
+      } else {
+        response = await fetch(`${libBase}/archive`, {
+          method: 'POST',
+          headers: buildHeaders(context),
+        });
+      }
 
       if (!response.ok) {
         let errBody = '';
@@ -148,10 +157,16 @@ const deleteLibraryTool: NativeToolDefinition = {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({
-              ok: true,
-              deletedDocuments,
-            }),
+            text: JSON.stringify(
+              args.permanent === true
+                ? { ok: true, deleted: true, deletedDocuments }
+                : {
+                    ok: true,
+                    archived: true,
+                    documents: deletedDocuments,
+                    note: 'Archived (reversible). Use restore_library to bring it back, or permanent: true to destroy.',
+                  }
+            ),
           },
         ],
       };
