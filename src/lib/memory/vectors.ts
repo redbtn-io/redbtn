@@ -129,8 +129,8 @@ export class VectorStoreManager {
    * @param embeddingModel Model name for embeddings (default: nomic-embed-text)
    */
   constructor(
-    chromaUrl: string = process.env.CHROMA_URL || 'http://localhost:8024',
-    ollamaUrl: string = process.env.OLLAMA_URL || DEFAULT_OLLAMA_URL,
+    chromaUrl: string = process.env.CHROMA_URL || process.env.VECTOR_DB_URL || 'http://localhost:8024',
+    ollamaUrl: string = process.env.OLLAMA_URL || process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_URL,
     embeddingModel: string = DEFAULT_EMBEDDING_MODEL
   ) {
     this.chromaUrl = chromaUrl;
@@ -349,6 +349,22 @@ export class VectorStoreManager {
   }
 
   /**
+   * Get an existing collection without creating it.
+   * Read/delete paths use this to avoid hiding drift by materializing empty
+   * collections for typos or stale library records.
+   */
+  async getCollection(collectionName: string): Promise<Collection> {
+    try {
+      const collection = await this.client.getCollection({ name: collectionName });
+      console.log(`[VectorStore] Found collection: ${collectionName}`);
+      return collection;
+    } catch (error) {
+      console.error(`[VectorStore] Collection not found ${collectionName}:`, error);
+      throw error;
+    }
+  }
+
+  /**
    * Add documents to a collection
    * @param collectionName Name of the collection
    * @param chunks Array of document chunks with metadata
@@ -447,7 +463,7 @@ export class VectorStoreManager {
         includeEmbeddings = false
       } = config;
 
-      const collection = await this.getOrCreateCollection(collectionName);
+      const collection = await this.getCollection(collectionName);
 
       // Generate embedding for query
       const queryEmbedding = await this.generateEmbedding(query);
@@ -511,7 +527,7 @@ export class VectorStoreManager {
     ids: string[]
   ): Promise<number> {
     try {
-      const collection = await this.getOrCreateCollection(collectionName);
+      const collection = await this.getCollection(collectionName);
       
       await collection.delete({
         ids
@@ -536,7 +552,7 @@ export class VectorStoreManager {
     filter: Record<string, any>
   ): Promise<number> {
     try {
-      const collection = await this.getOrCreateCollection(collectionName);
+      const collection = await this.getCollection(collectionName);
       
       await collection.delete({
         where: filter
@@ -587,7 +603,7 @@ export class VectorStoreManager {
    */
   async getCollectionStats(collectionName: string): Promise<CollectionStats> {
     try {
-      const collection = await this.getOrCreateCollection(collectionName);
+      const collection = await this.getCollection(collectionName);
       const count = await collection.count();
       
       return {

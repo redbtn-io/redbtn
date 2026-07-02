@@ -525,10 +525,21 @@ export class RunPublisher {
       response: responseValue,
     };
 
+    // Terminal-binding exit code: a graph node can force a non-zero exit by
+    // writing `state.exitCode` (read from the full final state, then the legacy
+    // `state.data.exitCode` fallback). Absent / non-numeric → 0 (success).
+    const rawExit =
+      (safeFinalState as Record<string, unknown>).exitCode ??
+      (runOutput?.data && typeof runOutput.data === 'object'
+        ? (runOutput.data as Record<string, unknown>).exitCode
+        : undefined);
+    const exitCode = typeof rawExit === 'number' && Number.isFinite(rawExit) ? rawExit : 0;
+
     await this.publish({
       type: 'run_complete',
       metadata: this.state!.metadata,
       output: eventOutput,
+      exitCode,
       timestamp: Date.now(),
     });
     const duration = this.state!.completedAt! - this.state!.startedAt;
@@ -604,6 +615,7 @@ export class RunPublisher {
       error,
       errorStack: truncatedStack,
       runId: this.runId,
+      exitCode: 1,
       timestamp: ts,
     });
     // Alias event — publish both so any consumer listening for either name
@@ -614,6 +626,7 @@ export class RunPublisher {
       error,
       errorStack: truncatedStack,
       runId: this.runId,
+      exitCode: 1,
       timestamp: ts,
     });
     await this.persistLog({
@@ -680,6 +693,7 @@ export class RunPublisher {
       type: 'run_interrupted',
       runId: this.runId,
       reason,
+      exitCode: 130,
       timestamp: ts,
     });
     await this.persistLog({
@@ -699,6 +713,31 @@ export class RunPublisher {
     this.state!.currentStatus = { action, description };
     await this.saveState();
     await this.publish({ type: 'status', action, description, timestamp: Date.now() });
+  }
+
+  // ===========================================================================
+  // Terminal Output (Terminal binding)
+  // ===========================================================================
+
+  /**
+   * Publish an explicit stdout chunk. Used by the Terminal binding (and any
+   * command-style graph node) that wants shell-accurate output framing rather
+   * than relying on the binding's `chunk → stdout` mapping. Fire-and-forget
+   * from the engine's perspective; subscribers map it straight to stdout.
+   */
+  async stdout(chunk: string): Promise<void> {
+    this.ensureInitialized();
+    await this.publish({ type: 'stdout', chunk, timestamp: Date.now() });
+  }
+
+  /**
+   * Publish an explicit stderr chunk. Symmetric with `stdout()`; subscribers
+   * map it straight to stderr (and the binding treats it as a soft error
+   * signal that does NOT by itself set a non-zero exit code).
+   */
+  async stderr(chunk: string): Promise<void> {
+    this.ensureInitialized();
+    await this.publish({ type: 'stderr', chunk, timestamp: Date.now() });
   }
 
   // ===========================================================================
@@ -1456,6 +1495,8 @@ function isProgressEvent(event: RunEvent): boolean {
     case 'node_complete':
     case 'node_error':
     case 'chunk':
+    case 'stdout':
+    case 'stderr':
     case 'thinking_complete':
     case 'audio_chunk':
     case 'attachment':

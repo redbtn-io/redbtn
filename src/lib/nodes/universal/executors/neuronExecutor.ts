@@ -1303,6 +1303,11 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
     // turn has the full context.
     messages.push(response);
 
+    // Images returned by tools this iteration, attached as ONE vision `user`
+    // message AFTER all tool results (keeping tool_call/tool_result contiguity
+    // intact — providers reject a non-tool message wedged between them).
+    const pendingImages: string[] = [];
+
     // Dispatch each tool call.
     for (const toolCall of toolCalls) {
       // Tool call shape: { id, name, args, type? } in LangChain core.
@@ -1451,16 +1456,41 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
         }, { triggeredBy: 'neuron', neuronStepId });
       }
 
-      // Append a `tool` role message so the LLM sees the result on the
-      // next iteration. Different providers expect slightly different
-      // shapes; we send the most permissive form (LangChain core handles
-      // the per-provider translation).
+      // Append a `tool` role message so the LLM sees the result on the next
+      // iteration. Image results (e.g. desktop_screenshot) are NOT stringified
+      // into the text transcript — that would push multi-MB base64 through the
+      // context window and fail the next call. Instead the `tool` message
+      // carries compact base64-free metadata and the image is queued as a
+      // vision part (see pendingImages, flushed after the loop).
+      const formatted = formatToolResultForModel(result);
       messages.push({
         role: 'tool',
         tool_call_id: toolCallId,
         name: toolName,
-        content: typeof result === 'string' ? result : safeStringify(result),
+        content: formatted.text,
       });
+      if (formatted.images.length) pendingImages.push(...formatted.images);
+    }
+
+    // Flush any images returned this iteration as a single vision `user` turn,
+    // AFTER every tool message (so tool_call/tool_result pairing stays valid).
+    // Use a real HumanMessage (not a plain {role,content} object) so LangChain
+    // routes the image_url parts through the provider's multimodal path — the
+    // same construction the known-working attachment path uses
+    // (buildMultimodalMessage). A plain object with array content is not
+    // reliably coerced to a multimodal message, so the image would be dropped.
+    if (pendingImages.length) {
+      messages.push(
+        new HumanMessage({
+          content: [
+            ...pendingImages.map((url) => ({ type: 'image_url', image_url: { url } })),
+            {
+              type: 'text',
+              text: `The image(s) above are the visual result of the preceding tool call(s). Look at them and use them to answer.`,
+            },
+          ] as any,
+        }),
+      );
     }
   }
 
@@ -1501,4 +1531,92 @@ function safeStringify(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/** Hard cap on the text form of a tool result fed back to the model. */
+const MAX_TOOL_TEXT = 8000;
+
+/**
+ * Strip inline base64 image payloads out of a text blob so a multi-MB image
+ * never lands in the model's TEXT transcript. Neutralises: `data:<mime>;base64,…`
+ * URIs, and JSON `"base64":"…"` / `"dataUrl":"…"` fields (which
+ * `desktop_screenshot` emits). Without this, a single screenshot fed back as a
+ * `tool` message blows the context window and fails the next LLM call.
+ */
+function stripInlineImageData(s: string): string {
+  if (typeof s !== 'string' || !s) return s;
+  return s
+    .replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g, 'data:image/*;base64,<omitted>')
+    .replace(/"(dataUrl|base64|data)"\s*:\s*"[A-Za-z0-9+/=]{80,}"/g, '"$1":"<omitted>"');
+}
+
+/**
+ * Format a tool result for the model's message thread. Detects MCP image
+ * content (e.g. `desktop_screenshot` → `{content:[{type:'image',data,mimeType}]}`)
+ * and routes each image out as a data-URL to attach as a VISION part, while the
+ * returned `text` (for the required `tool` message) carries only compact,
+ * base64-free metadata. Non-image results fall back to the prior stringify
+ * behaviour (still base64-stripped + length-capped defensively).
+ */
+export function formatToolResultForModel(result: unknown): { text: string; images: string[] } {
+  const images: string[] = [];
+
+  if (result && typeof result === 'object') {
+    const obj = result as Record<string, unknown>;
+
+    // Shape 1: raw MCP result with a content-block array
+    // ({content:[{type:'image',data,mimeType},{type:'text',text}]}).
+    if (Array.isArray(obj.content)) {
+      const textPieces: string[] = [];
+      for (const block of obj.content as Array<Record<string, unknown>>) {
+        if (block && typeof block === 'object') {
+          if (block.type === 'image' && typeof block.data === 'string' && block.data) {
+            const mime = typeof block.mimeType === 'string' ? block.mimeType : 'image/png';
+            images.push(
+              (block.data as string).startsWith('data:')
+                ? (block.data as string)
+                : `data:${mime};base64,${block.data}`,
+            );
+            continue;
+          }
+          if (block.type === 'text' && typeof block.text === 'string') {
+            textPieces.push(stripInlineImageData(block.text));
+            continue;
+          }
+        }
+        textPieces.push(stripInlineImageData(safeStringify(block)));
+      }
+      const text =
+        textPieces.join('\n').trim() ||
+        (images.length ? `[${images.length} image(s) returned — provided to you below]` : '(no content)');
+      return { text: text.slice(0, MAX_TOOL_TEXT), images };
+    }
+
+    // Shape 2: UNWRAPPED image result. tool-resolver.ts strips the MCP wrapper
+    // and returns the text block's parsed JSON — so desktop_screenshot arrives
+    // here as {ok,format,width,height,mimeType,dataUrl,base64} and the image
+    // block is already gone. Recover the pixels from dataUrl / base64 so vision
+    // still works, and emit compact metadata with those heavy fields removed.
+    const dataUrl =
+      typeof obj.dataUrl === 'string' && (obj.dataUrl as string).startsWith('data:')
+        ? (obj.dataUrl as string)
+        : null;
+    const b64 = typeof obj.base64 === 'string' && (obj.base64 as string).length > 80 ? (obj.base64 as string) : null;
+    if (dataUrl || b64) {
+      if (dataUrl) {
+        images.push(dataUrl);
+      } else {
+        const mime =
+          (typeof obj.mimeType === 'string' && obj.mimeType) ||
+          (typeof obj.format === 'string' ? `image/${obj.format}` : 'image/png');
+        images.push(`data:${mime};base64,${b64}`);
+      }
+      const { base64: _b, dataUrl: _d, data: _dat, ...rest } = obj;
+      void _b; void _d; void _dat;
+      return { text: stripInlineImageData(safeStringify(rest)).slice(0, MAX_TOOL_TEXT), images };
+    }
+  }
+
+  const raw = typeof result === 'string' ? result : safeStringify(result);
+  return { text: stripInlineImageData(raw).slice(0, MAX_TOOL_TEXT), images };
 }
