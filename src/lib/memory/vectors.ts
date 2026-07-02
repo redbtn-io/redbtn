@@ -135,6 +135,8 @@ export interface SyncDocumentResult {
   reusedChunks: number;    // Chunks whose stored vector was reused (hash match)
   deletedChunks: number;   // Stale chunk ids removed (shrink / legacy ids)
   charCount: number;       // Length of the source text
+  /** True when beforeSwap vetoed the write — stored vectors were untouched */
+  aborted?: boolean;
 }
 
 // --- Vector Store Manager ---
@@ -203,7 +205,14 @@ export class VectorStoreManager {
 
         if (!response.ok) {
           const errorText = await response.text();
-          throw new Error(`Ollama embeddings error: ${response.status} - ${errorText}`);
+          const error = new Error(`Ollama embeddings error: ${response.status} - ${errorText}`);
+          // 4xx responses are permanent (missing model, oversize input,
+          // malformed request) — retrying just hammers Ollama with doomed
+          // calls and delays the terminal failure.
+          if (response.status >= 400 && response.status < 500) {
+            Object.assign(error, { permanent: true });
+          }
+          throw error;
         }
 
         const data = await response.json();
@@ -214,6 +223,10 @@ export class VectorStoreManager {
 
         return data.embedding;
       } catch (error) {
+        if ((error as { permanent?: boolean })?.permanent === true) {
+          console.error('[VectorStore] Embedding failed permanently (not retried):', error instanceof Error ? error.message : error);
+          throw error;
+        }
         lastError = error;
         if (attempt < EMBEDDING_RETRY_ATTEMPTS) {
           const delay = EMBEDDING_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) * (1 + Math.random());
@@ -512,6 +525,11 @@ export class VectorStoreManager {
    * @param metadata Document metadata applied to every chunk
    * @param chunkingConfig Optional chunking configuration
    * @param onProgress Optional progress callback for the embedding phase
+   * @param beforeSwap Optional guard called after embedding, immediately
+   *   before the vector swap. Return false to abort the swap (result comes
+   *   back with `aborted: true`) — callers use this to re-verify the
+   *   document wasn't superseded or archived while embedding ran, so a
+   *   stale job can never clobber a newer job's vectors.
    * @returns Sync statistics
    */
   async syncDocument(
@@ -520,7 +538,8 @@ export class VectorStoreManager {
     text: string,
     metadata: Record<string, any>,
     chunkingConfig?: ChunkingConfig,
-    onProgress?: EmbeddingProgressCallback
+    onProgress?: EmbeddingProgressCallback,
+    beforeSwap?: () => Promise<boolean>
   ): Promise<SyncDocumentResult> {
     const collection = await this.getOrCreateCollection(collectionName);
     const textChunks = await this.chunkText(text, chunkingConfig);
@@ -528,7 +547,9 @@ export class VectorStoreManager {
 
     // Fetch the document's existing chunks (paged — a large doc with
     // embeddings included is a multi-MB payload) and index their vectors by
-    // content hash for reuse.
+    // content hash for reuse. Reuse is gated on the embedding model that
+    // produced the stored vector — mixing models in one document would make
+    // similarity scores meaningless.
     const existingIds: string[] = [];
     const embeddingByHash = new Map<string, number[]>();
     const pageSize = 500;
@@ -542,9 +563,11 @@ export class VectorStoreManager {
       const ids = page.ids ?? [];
       for (let i = 0; i < ids.length; i++) {
         existingIds.push(ids[i]);
-        const hash = (page.metadatas?.[i] as Record<string, any> | null)?.chunkHash;
+        const md = (page.metadatas?.[i] as Record<string, any> | null) ?? {};
+        const hash = md.chunkHash;
         const embedding = page.embeddings?.[i];
-        if (typeof hash === 'string' && Array.isArray(embedding) && embedding.length > 0) {
+        const sameModel = md.embeddingModel === undefined || md.embeddingModel === this.embeddingModel;
+        if (typeof hash === 'string' && sameModel && Array.isArray(embedding) && embedding.length > 0) {
           embeddingByHash.set(hash, embedding as number[]);
         }
       }
@@ -563,6 +586,21 @@ export class VectorStoreManager {
       embeddingByHash.set(hashes[chunkIndex], newEmbeddings[i]);
     });
 
+    // Last-moment guard: embedding can take minutes; give the caller one
+    // chance to verify the document still wants THIS content before we
+    // touch the stored vectors.
+    if (beforeSwap && !(await beforeSwap())) {
+      console.log(`[VectorStore] Sync of ${documentId} aborted before swap (superseded/archived)`);
+      return {
+        chunkCount: 0,
+        embeddedChunks: toEmbedIndexes.length,
+        reusedChunks: 0,
+        deletedChunks: 0,
+        charCount: text.length,
+        aborted: true
+      };
+    }
+
     const timestamp = Date.now();
     const ids = textChunks.map((_, index) => `${documentId}_chunk_${index}`);
     await collection.upsert({
@@ -575,6 +613,7 @@ export class VectorStoreManager {
         chunkIndex: index,
         totalChunks: textChunks.length,
         chunkHash: hashes[index],
+        embeddingModel: this.embeddingModel,
         timestamp
       }))
     });

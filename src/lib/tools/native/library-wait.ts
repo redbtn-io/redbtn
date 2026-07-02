@@ -51,10 +51,17 @@ export async function waitForDocumentProcessing(
   const deadline = Date.now() + Math.max(timeoutMs, POLL_INTERVAL_MS);
   let last: DocumentProcessingStatus = { processingStatus: 'pending' };
 
+  // Permanent HTTP statuses end the poll immediately: the doc was deleted
+  // (404) or the credentials are bad (401/403) — waiting cannot fix either,
+  // and stalling a graph run for the full budget on them is pure waste.
+  const PERMANENT_STATUSES = new Set([401, 403, 404]);
+  let consecutivePermanent = 0;
+
   for (;;) {
     try {
       const response = await fetch(url, { method: 'GET', headers });
       if (response.ok) {
+        consecutivePermanent = 0;
         const data = (await response.json()) as Record<string, unknown>;
         last = {
           processingStatus:
@@ -68,8 +75,20 @@ export async function waitForDocumentProcessing(
         if (last.processingStatus === 'completed' || last.processingStatus === 'failed') {
           return last;
         }
+      } else if (PERMANENT_STATUSES.has(response.status)) {
+        // Two in a row guards against a single poll racing a routing blip.
+        consecutivePermanent += 1;
+        if (consecutivePermanent >= 2) {
+          return {
+            ...last,
+            processingStatus: 'failed',
+            processingError: `status poll returned ${response.status} — document gone or access revoked`,
+          };
+        }
+      } else {
+        consecutivePermanent = 0;
+        // Other non-OK responses (5xx, 429) are transient — keep polling.
       }
-      // Non-OK poll responses are transient — keep polling until the budget runs out.
     } catch {
       // Network hiccup — keep polling.
     }
