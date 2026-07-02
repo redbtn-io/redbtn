@@ -1474,17 +1474,23 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
 
     // Flush any images returned this iteration as a single vision `user` turn,
     // AFTER every tool message (so tool_call/tool_result pairing stays valid).
+    // Use a real HumanMessage (not a plain {role,content} object) so LangChain
+    // routes the image_url parts through the provider's multimodal path — the
+    // same construction the known-working attachment path uses
+    // (buildMultimodalMessage). A plain object with array content is not
+    // reliably coerced to a multimodal message, so the image would be dropped.
     if (pendingImages.length) {
-      messages.push({
-        role: 'user',
-        content: [
-          ...pendingImages.map((url) => ({ type: 'image_url', image_url: { url } })),
-          {
-            type: 'text',
-            text: `The image(s) above are the visual result of the preceding tool call(s). Look at them and use them to answer.`,
-          },
-        ],
-      } as any);
+      messages.push(
+        new HumanMessage({
+          content: [
+            ...pendingImages.map((url) => ({ type: 'image_url', image_url: { url } })),
+            {
+              type: 'text',
+              text: `The image(s) above are the visual result of the preceding tool call(s). Look at them and use them to answer.`,
+            },
+          ] as any,
+        }),
+      );
     }
   }
 
@@ -1554,33 +1560,61 @@ function stripInlineImageData(s: string): string {
  */
 export function formatToolResultForModel(result: unknown): { text: string; images: string[] } {
   const images: string[] = [];
-  const content =
-    result && typeof result === 'object' ? (result as { content?: unknown }).content : undefined;
 
-  if (Array.isArray(content)) {
-    const textPieces: string[] = [];
-    for (const block of content as Array<Record<string, unknown>>) {
-      if (block && typeof block === 'object') {
-        if (block.type === 'image' && typeof block.data === 'string' && block.data) {
-          const mime = typeof block.mimeType === 'string' ? block.mimeType : 'image/png';
-          images.push(
-            (block.data as string).startsWith('data:')
-              ? (block.data as string)
-              : `data:${mime};base64,${block.data}`,
-          );
-          continue;
+  if (result && typeof result === 'object') {
+    const obj = result as Record<string, unknown>;
+
+    // Shape 1: raw MCP result with a content-block array
+    // ({content:[{type:'image',data,mimeType},{type:'text',text}]}).
+    if (Array.isArray(obj.content)) {
+      const textPieces: string[] = [];
+      for (const block of obj.content as Array<Record<string, unknown>>) {
+        if (block && typeof block === 'object') {
+          if (block.type === 'image' && typeof block.data === 'string' && block.data) {
+            const mime = typeof block.mimeType === 'string' ? block.mimeType : 'image/png';
+            images.push(
+              (block.data as string).startsWith('data:')
+                ? (block.data as string)
+                : `data:${mime};base64,${block.data}`,
+            );
+            continue;
+          }
+          if (block.type === 'text' && typeof block.text === 'string') {
+            textPieces.push(stripInlineImageData(block.text));
+            continue;
+          }
         }
-        if (block.type === 'text' && typeof block.text === 'string') {
-          textPieces.push(stripInlineImageData(block.text));
-          continue;
-        }
+        textPieces.push(stripInlineImageData(safeStringify(block)));
       }
-      textPieces.push(stripInlineImageData(safeStringify(block)));
+      const text =
+        textPieces.join('\n').trim() ||
+        (images.length ? `[${images.length} image(s) returned — provided to you below]` : '(no content)');
+      return { text: text.slice(0, MAX_TOOL_TEXT), images };
     }
-    const text =
-      textPieces.join('\n').trim() ||
-      (images.length ? `[${images.length} image(s) returned — provided to you below]` : '(no content)');
-    return { text: text.slice(0, MAX_TOOL_TEXT), images };
+
+    // Shape 2: UNWRAPPED image result. tool-resolver.ts strips the MCP wrapper
+    // and returns the text block's parsed JSON — so desktop_screenshot arrives
+    // here as {ok,format,width,height,mimeType,dataUrl,base64} and the image
+    // block is already gone. Recover the pixels from dataUrl / base64 so vision
+    // still works, and emit compact metadata with those heavy fields removed.
+    const dataUrl =
+      typeof obj.dataUrl === 'string' && (obj.dataUrl as string).startsWith('data:')
+        ? (obj.dataUrl as string)
+        : null;
+    const b64 = typeof obj.base64 === 'string' && (obj.base64 as string).length > 80 ? (obj.base64 as string) : null;
+    if (dataUrl || b64) {
+      if (dataUrl) {
+        images.push(dataUrl);
+      } else {
+        const mime =
+          (typeof obj.mimeType === 'string' && obj.mimeType) ||
+          (typeof obj.format === 'string' ? `image/${obj.format}` : 'image/png');
+        images.push(`data:${mime};base64,${b64}`);
+      }
+      const { base64: _b, dataUrl: _d, data: _dat, ...rest } = obj;
+      void _b; void _d; void _dat;
+      return { text: stripInlineImageData(safeStringify(rest)).slice(0, MAX_TOOL_TEXT), images };
+    }
   }
 
   const raw = typeof result === 'string' ? result : safeStringify(result);
