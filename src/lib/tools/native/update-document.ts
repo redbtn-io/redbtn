@@ -18,6 +18,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { waitForDocumentProcessing, WAIT_SCHEMA_PROPERTIES } from './library-wait';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -28,6 +29,8 @@ interface UpdateDocumentArgs {
   content?: string;
   metadata?: Record<string, unknown>;
   title?: string;
+  wait?: boolean;
+  waitTimeoutMs?: number;
 }
 
 function getBaseUrl(): string {
@@ -81,6 +84,7 @@ const updateDocumentTool: NativeToolDefinition = {
         type: 'string',
         description: 'Optional new title.',
       },
+      ...WAIT_SCHEMA_PROPERTIES,
     },
     required: ['libraryId', 'documentId'],
   },
@@ -170,6 +174,64 @@ const updateDocumentTool: NativeToolDefinition = {
       }
 
       const data = (await response.json().catch(() => ({}))) as AnyObject;
+
+      // Async ingestion (202): re-embed queued on the background worker.
+      // Poll to completion unless the caller opted out with wait:false.
+      if (data?.reprocessed === 'queued' || data?.processingStatus === 'pending') {
+        if (args.wait === false) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  ok: true,
+                  reprocessed: 'queued',
+                  processingStatus: 'pending',
+                  jobId: data.jobId,
+                  note: 'Re-embed runs in the background; poll reprocess status until processingStatus is completed.',
+                }),
+              },
+            ],
+          };
+        }
+        const final = await waitForDocumentProcessing(
+          baseUrl,
+          libraryId,
+          documentId,
+          buildHeaders(context),
+          typeof args.waitTimeoutMs === 'number' ? args.waitTimeoutMs : undefined
+        );
+        if (final.processingStatus === 'failed') {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: final.processingError || 'Document re-processing failed',
+                  processingStatus: 'failed',
+                  jobId: final.jobId ?? data.jobId,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                ok: true,
+                reprocessed: final.processingStatus === 'completed',
+                processingStatus: final.processingStatus,
+                chunks: final.chunkCount,
+                ...(final.timedOut ? { timedOut: true } : {}),
+              }),
+            },
+          ],
+        };
+      }
+
       const reprocessed =
         typeof data?.reprocessed === 'boolean' ? data.reprocessed : content !== undefined;
 

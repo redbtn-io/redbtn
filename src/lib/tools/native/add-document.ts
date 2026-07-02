@@ -28,6 +28,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { resolveIngestionOutcome, WAIT_SCHEMA_PROPERTIES } from './library-wait';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -41,6 +42,8 @@ interface AddDocumentArgs {
   metadata?: Record<string, unknown>;
   sourceType?: string;
   title?: string;
+  wait?: boolean;
+  waitTimeoutMs?: number;
 }
 
 function getBaseUrl(): string {
@@ -69,6 +72,30 @@ function buildHeaders(context: NativeToolContext, contentType: string | null): R
   if (internalKey) headers['X-Internal-Key'] = internalKey;
 
   return headers;
+}
+
+/**
+ * Wrap the webapp ingestion response, waiting for background embedding to
+ * finish when the response is deferred (202/pending) and `wait` !== false.
+ */
+async function finishIngestionResult(
+  doc: AnyObject,
+  args: Partial<AddDocumentArgs>,
+  context: NativeToolContext,
+  baseUrl: string,
+  libraryId: string
+): Promise<NativeMcpResult> {
+  const { payload, isError } = await resolveIngestionOutcome(
+    doc,
+    { wait: args.wait, waitTimeoutMs: args.waitTimeoutMs },
+    baseUrl,
+    libraryId,
+    buildHeaders(context, null)
+  );
+  return {
+    content: [{ type: 'text', text: JSON.stringify(payload) }],
+    ...(isError ? { isError: true } : {}),
+  };
 }
 
 const addDocument: NativeToolDefinition = {
@@ -117,6 +144,7 @@ const addDocument: NativeToolDefinition = {
         description:
           'Optional title for the document. Defaults to the filename (without extension) for files, or a generated label for text.',
       },
+      ...WAIT_SCHEMA_PROPERTIES,
     },
     required: ['libraryId'],
   },
@@ -228,17 +256,7 @@ const addDocument: NativeToolDefinition = {
 
         const data = (await response.json()) as AnyObject;
         const doc = (data?.document as AnyObject) ?? {};
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                documentId: doc.documentId ?? null,
-                chunks: typeof doc.chunkCount === 'number' ? doc.chunkCount : 0,
-              }),
-            },
-          ],
-        };
+        return finishIngestionResult(doc, args, context, baseUrl, libraryId);
       }
 
       // ── Binary path → POST /upload (multipart) ────────────────────────────
@@ -319,17 +337,7 @@ const addDocument: NativeToolDefinition = {
 
       const data = (await response.json()) as AnyObject;
       const doc = (data?.document as AnyObject) ?? {};
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              documentId: doc.documentId ?? null,
-              chunks: typeof doc.chunkCount === 'number' ? doc.chunkCount : 0,
-            }),
-          },
-        ],
-      };
+      return finishIngestionResult(doc, args, context, baseUrl, libraryId);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return {

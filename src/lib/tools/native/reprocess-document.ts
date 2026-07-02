@@ -18,6 +18,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { waitForDocumentProcessing, WAIT_SCHEMA_PROPERTIES } from './library-wait';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -25,6 +26,8 @@ type AnyObject = Record<string, any>;
 interface ReprocessDocumentArgs {
   libraryId: string;
   documentId: string;
+  wait?: boolean;
+  waitTimeoutMs?: number;
 }
 
 function getBaseUrl(): string {
@@ -64,6 +67,7 @@ const reprocessDocumentTool: NativeToolDefinition = {
         type: 'string',
         description: 'Document id to reprocess.',
       },
+      ...WAIT_SCHEMA_PROPERTIES,
     },
     required: ['libraryId', 'documentId'],
   },
@@ -123,6 +127,62 @@ const reprocessDocumentTool: NativeToolDefinition = {
       }
 
       const data = (await response.json().catch(() => ({}))) as AnyObject;
+
+      // Async ingestion (202): the reprocess is queued on the background
+      // worker. Poll to completion unless the caller opted out.
+      if (data?.processingStatus === 'pending' && data?.jobId) {
+        if (args.wait === false) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  ok: true,
+                  processingStatus: 'pending',
+                  jobId: data.jobId,
+                  note: 'Reprocess runs in the background; poll status until processingStatus is completed.',
+                }),
+              },
+            ],
+          };
+        }
+        const final = await waitForDocumentProcessing(
+          baseUrl,
+          libraryId,
+          documentId,
+          buildHeaders(context),
+          typeof args.waitTimeoutMs === 'number' ? args.waitTimeoutMs : undefined
+        );
+        if (final.processingStatus === 'failed') {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: final.processingError || 'Document reprocessing failed',
+                  processingStatus: 'failed',
+                  jobId: final.jobId ?? data.jobId,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                ok: final.processingStatus === 'completed',
+                chunks: final.chunkCount ?? 0,
+                processingStatus: final.processingStatus,
+                ...(final.timedOut ? { timedOut: true } : {}),
+              }),
+            },
+          ],
+        };
+      }
+
       const chunks =
         typeof data?.chunkCount === 'number'
           ? data.chunkCount

@@ -22,6 +22,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { resolveIngestionOutcome, WAIT_SCHEMA_PROPERTIES } from './library-wait';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -31,6 +32,8 @@ interface UploadToLibraryArgs {
   fileBase64: string;
   filename: string;
   mimeType: string;
+  wait?: boolean;
+  waitTimeoutMs?: number;
 }
 
 function getBaseUrl(): string {
@@ -79,6 +82,7 @@ const uploadToLibraryTool: NativeToolDefinition = {
         type: 'string',
         description: 'MIME type, e.g. "application/pdf" or "image/png".',
       },
+      ...WAIT_SCHEMA_PROPERTIES,
     },
     required: ['libraryId', 'fileBase64', 'filename', 'mimeType'],
   },
@@ -168,16 +172,16 @@ const uploadToLibraryTool: NativeToolDefinition = {
       const data = (await response.json()) as AnyObject;
       const doc = (data?.document as AnyObject) ?? {};
 
+      const { payload, isError } = await resolveIngestionOutcome(
+        doc,
+        { wait: args.wait, waitTimeoutMs: args.waitTimeoutMs },
+        baseUrl,
+        libraryId,
+        buildHeaders(context)
+      );
       return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              documentId: doc.documentId ?? null,
-              chunks: typeof doc.chunkCount === 'number' ? doc.chunkCount : 0,
-            }),
-          },
-        ],
+        content: [{ type: 'text', text: JSON.stringify(payload) }],
+        ...(isError ? { isError: true } : {}),
       };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
