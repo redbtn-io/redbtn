@@ -22,6 +22,8 @@ import type {
 type AnyObject = Record<string, any>;
 
 interface ListDocumentsArgs {
+  includeArchived?: boolean;
+  archivedOnly?: boolean;
   libraryId: string;
   limit?: number;
   offset?: number;
@@ -71,6 +73,14 @@ const listDocumentsTool: NativeToolDefinition = {
         description: 'Pagination offset (default 0). Translated server-side into a page index.',
         minimum: 0,
       },
+      includeArchived: {
+        type: 'boolean',
+        description: 'Include archived documents in the listing (default false).',
+      },
+      archivedOnly: {
+        type: 'boolean',
+        description: 'List ONLY archived documents (default false).',
+      },
     },
     required: ['libraryId'],
   },
@@ -106,7 +116,10 @@ const listDocumentsTool: NativeToolDefinition = {
     const page = Math.floor(offset / limit) + 1;
 
     const baseUrl = getBaseUrl();
-    const url = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}?page=${page}&limit=${limit}`;
+    const archivedParams =
+      (args.archivedOnly === true ? '&archivedOnly=true' : '') +
+      (args.includeArchived === true ? '&includeArchived=true' : '');
+    const url = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}?page=${page}&limit=${limit}${archivedParams}`;
 
     try {
       const response = await fetch(url, { headers: buildHeaders(context) });
@@ -146,6 +159,7 @@ const listDocumentsTool: NativeToolDefinition = {
             : null,
         chunks: typeof d?.chunkCount === 'number' ? d.chunkCount : 0,
         createdAt: d?.addedAt ?? d?.createdAt ?? null,
+        ...(d?.isArchived === true ? { isArchived: true } : {}),
       }));
 
       const total =

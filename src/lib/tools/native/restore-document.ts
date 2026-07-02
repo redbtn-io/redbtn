@@ -1,17 +1,11 @@
 /**
- * Delete Document — Native Library Tool
+ * Restore Document — Native Library Tool
  *
- * Removes a document from a Knowledge Library (and its vectors) via the
- * webapp API (`DELETE /api/v1/libraries/:libraryId/documents/:documentId`).
- *
- * Spec: TOOL-HANDOFF.md §4.4
- *   - inputs: libraryId (required), documentId (required)
- *   - output: { ok: true }
- *
- * The webapp also supports the legacy form
- *   `DELETE /api/v1/libraries/:libraryId/documents?documentId=…`
- * — we use the REST-shaped per-id route added alongside this pack so the
- * action surface is consistent.
+ * Restores an archived document via the webapp API
+ * (`POST /api/v1/libraries/:libraryId/documents/:documentId/restore`).
+ * The document re-embeds from its stored source through the
+ * document-processing queue; by default the tool waits for embedding to
+ * complete (same wait semantics as add_document).
  */
 
 import type {
@@ -19,14 +13,16 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { waitForDocumentProcessing, WAIT_SCHEMA_PROPERTIES } from './library-wait';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
-interface DeleteDocumentArgs {
+interface RestoreDocumentArgs {
   libraryId: string;
   documentId: string;
-  permanent?: boolean;
+  wait?: boolean;
+  waitTimeoutMs?: number;
 }
 
 function getBaseUrl(): string {
@@ -51,9 +47,9 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
   return headers;
 }
 
-const deleteDocumentTool: NativeToolDefinition = {
+const restoreDocumentTool: NativeToolDefinition = {
   description:
-    'Delete a document from a Knowledge Library. By default this ARCHIVES it (vectors removed from search, raw source retained — reversible with restore_document). Pass permanent: true to destroy it for good.',
+    'Restore an archived Knowledge Library document. Re-embeds it from the stored source; the document becomes searchable again when processing completes (waited on by default).',
   server: 'library',
   inputSchema: {
     type: 'object',
@@ -64,19 +60,15 @@ const deleteDocumentTool: NativeToolDefinition = {
       },
       documentId: {
         type: 'string',
-        description: 'Document id to delete.',
+        description: 'Archived document id to restore.',
       },
-      permanent: {
-        type: 'boolean',
-        description:
-          'true = permanently destroy the document (record, vectors, stored source). Default false = archive (reversible).',
-      },
+      ...WAIT_SCHEMA_PROPERTIES,
     },
     required: ['libraryId', 'documentId'],
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
-    const args = rawArgs as Partial<DeleteDocumentArgs>;
+    const args = rawArgs as Partial<RestoreDocumentArgs>;
     const libraryId =
       typeof args.libraryId === 'string' ? args.libraryId.trim() : '';
     const documentId =
@@ -98,21 +90,13 @@ const deleteDocumentTool: NativeToolDefinition = {
     }
 
     const baseUrl = getBaseUrl();
-    const docBase = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}/documents/${encodeURIComponent(documentId)}`;
+    const url = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}/documents/${encodeURIComponent(documentId)}/restore`;
 
     try {
-      let response: Response;
-      if (args.permanent === true) {
-        // The webapp's DELETE is archive-first (a live doc gets archived,
-        // an archived doc gets purged), so permanent = archive, then DELETE.
-        await fetch(`${docBase}/archive`, { method: 'POST', headers: buildHeaders(context) }).catch(() => {});
-        response = await fetch(docBase, { method: 'DELETE', headers: buildHeaders(context) });
-      } else {
-        response = await fetch(`${docBase}/archive`, {
-          method: 'POST',
-          headers: buildHeaders(context),
-        });
-      }
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: buildHeaders(context),
+      });
 
       if (!response.ok) {
         let errBody = '';
@@ -127,7 +111,7 @@ const deleteDocumentTool: NativeToolDefinition = {
               type: 'text',
               text: JSON.stringify({
                 error:
-                  `Library document API ${response.status} ${response.statusText}` +
+                  `Library restore API ${response.status} ${response.statusText}` +
                   (errBody ? `: ${errBody.slice(0, 200)}` : ''),
                 status: response.status,
               }),
@@ -137,21 +121,58 @@ const deleteDocumentTool: NativeToolDefinition = {
         };
       }
 
-      try {
-        await response.json();
-      } catch {
-        /* ignore */
+      const data = (await response.json().catch(() => ({}))) as AnyObject;
+
+      if (args.wait === false) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                ok: true,
+                restored: true,
+                processingStatus: 'pending',
+                jobId: data.jobId,
+                note: 'Re-embed runs in the background; poll reprocess status until processingStatus is completed.',
+              }),
+            },
+          ],
+        };
       }
 
+      const final = await waitForDocumentProcessing(
+        baseUrl,
+        libraryId,
+        documentId,
+        buildHeaders(context),
+        typeof args.waitTimeoutMs === 'number' ? args.waitTimeoutMs : undefined
+      );
+      if (final.processingStatus === 'failed') {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: final.processingError || 'Restore re-embed failed',
+                processingStatus: 'failed',
+                jobId: final.jobId ?? data.jobId,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(
-              args.permanent === true
-                ? { ok: true, deleted: true }
-                : { ok: true, archived: true, note: 'Archived (reversible). Use restore_document to bring it back, or permanent: true to destroy.' }
-            ),
+            text: JSON.stringify({
+              ok: true,
+              restored: final.processingStatus === 'completed',
+              processingStatus: final.processingStatus,
+              chunks: final.chunkCount ?? 0,
+              ...(final.timedOut ? { timedOut: true } : {}),
+            }),
           },
         ],
       };
@@ -167,5 +188,5 @@ const deleteDocumentTool: NativeToolDefinition = {
   },
 };
 
-export default deleteDocumentTool;
-module.exports = deleteDocumentTool;
+export default restoreDocumentTool;
+module.exports = restoreDocumentTool;

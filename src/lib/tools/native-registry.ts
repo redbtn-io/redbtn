@@ -933,7 +933,7 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   }
 
   try {
-    // Delete Library — DELETE /api/v1/libraries/:libraryId?permanent=true
+    // Delete Library — archive by default; permanent=true purges
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const deleteLibrary = require('./native/delete-library.js');
     registry.register('delete_library', deleteLibrary.default || deleteLibrary);
@@ -941,6 +941,28 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register delete_library:', msg);
+  }
+
+  try {
+    // Restore Library — POST /api/v1/libraries/:libraryId/restore
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const restoreLibrary = require('./native/restore-library.js');
+    registry.register('restore_library', restoreLibrary.default || restoreLibrary);
+    console.log('[NativeRegistry] Registered built-in tool: restore_library');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register restore_library:', msg);
+  }
+
+  try {
+    // Restore Document — POST /api/v1/libraries/:id/documents/:docId/restore
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const restoreDocument = require('./native/restore-document.js');
+    registry.register('restore_document', restoreDocument.default || restoreDocument);
+    console.log('[NativeRegistry] Registered built-in tool: restore_document');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register restore_document:', msg);
   }
 
   try {
