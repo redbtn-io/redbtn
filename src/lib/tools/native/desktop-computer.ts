@@ -423,7 +423,7 @@ const desktopScreenInfoTool: NativeToolDefinition = {
 
 const desktopListTool: NativeToolDefinition = {
   description:
-    "List the registered desktop agent environments (redAgent) for the current user, showing their environmentId, name, installId, connection status (online/offline), and capabilities.",
+    "List the registered desktop/CLI connector environments (redAgent desktop + redbtn CLI) for the current user, showing their environmentId, name, installId, machineId, connection status (online/offline), and capabilities.",
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -444,9 +444,9 @@ const desktopListTool: NativeToolDefinition = {
         return textResult({ ok: false, error: { code: 'computer_failed', message: 'Database connection not available.' } }, true);
       }
 
-      // 1. Fetch environments from DB
+      // 1. Fetch push-connector environments from DB (redAgent desktop + redbtn CLI)
       const docs = await db.collection('environments')
-        .find({ userId, kind: 'desktop-agent' })
+        .find({ userId, kind: { $in: ['desktop-agent', 'cli'] } })
         .sort({ updatedAt: -1 })
         .toArray();
 
@@ -483,7 +483,9 @@ const desktopListTool: NativeToolDefinition = {
         return {
           environmentId: doc.environmentId,
           name: doc.name || '',
+          kind: doc.kind || 'desktop-agent',
           installId,
+          machineId: doc.machineId || null,
           online: present,
           lastSeenAt: doc.lastSeenAt || doc.updatedAt || null,
           capabilities: doc.capabilities || [],

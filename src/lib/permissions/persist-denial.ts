@@ -40,7 +40,7 @@ import type { CapabilityDeniedError } from './types';
  * matches `get-global-state.ts`/`set-global-state.ts`. We still treat an empty
  * string as "unavailable" and skip.
  */
-function resolveWebappBase(): string | undefined {
+export function resolveWebappBase(): string | undefined {
   const raw = process.env.WEBAPP_URL || 'http://localhost:3000';
   const trimmed = raw.trim();
   return trimmed ? trimmed : undefined;
@@ -57,7 +57,7 @@ function resolveWebappBase(): string | undefined {
  * at all (a Bearer token, OR an internal key paired with a user id). When false
  * we skip the POST (the console.warn in the gate remains the fallback record).
  */
-function buildAuthHeaders(context: NativeToolContext): {
+export function buildAuthHeaders(context: NativeToolContext): {
   headers: Record<string, string>;
   canAuth: boolean;
 } {
@@ -84,7 +84,7 @@ function buildAuthHeaders(context: NativeToolContext): {
  * resolution chain the universal-node tool executor uses:
  *   `state.<field>` → `state.data.<field>` → `state.data.options.<field>`.
  */
-function resolveField(context: NativeToolContext, field: string): string | undefined {
+export function resolveField(context: NativeToolContext, field: string): string | undefined {
   const state = context?.state as Record<string, any> | undefined;
   const v =
     state?.[field] ??

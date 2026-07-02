@@ -33,6 +33,8 @@ import * as path from 'path';
 import mongoose from 'mongoose';
 import { environmentManager } from '../../environments/EnvironmentManager';
 import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
+import { getCapabilityProfile } from '../../run/contextLookup';
+import { enforceToolCapability } from '../../permissions/enforce';
 
 // Use GridFSBucket and ObjectId from mongoose's bundled mongodb to avoid BSON version mismatch
 const { GridFSBucket } = mongoose.mongo;
@@ -83,12 +85,62 @@ interface FileToTransfer {
   buffer: Buffer;
 }
 
+function getBaseUrl(): string {
+  return process.env.WEBAPP_URL || 'http://localhost:3000';
+}
+
+function buildLibraryAccessHeaders(context: NativeToolContext): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const authToken =
+    (context?.state?.authToken as string | undefined) ||
+    (context?.state?.data?.authToken as string | undefined);
+  const userId =
+    (context?.state?.userId as string | undefined) ||
+    (context?.state?.data?.userId as string | undefined);
+  const internalKey = process.env.INTERNAL_SERVICE_KEY;
+
+  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+  if (userId) headers['X-User-Id'] = userId;
+  if (internalKey) headers['X-Internal-Key'] = internalKey;
+
+  return headers;
+}
+
+async function verifyLibraryReadAccess(libraryId: string | undefined, context: NativeToolContext): Promise<void> {
+  if (!libraryId) return;
+
+  const profile = getCapabilityProfile(context?.state);
+  enforceToolCapability(profile ?? null, 'get_document', { libraryId });
+
+  const url = `${getBaseUrl()}/api/v1/libraries/${encodeURIComponent(libraryId)}?limit=1`;
+  const response = await fetch(url, { headers: buildLibraryAccessHeaders(context) });
+  if (!response.ok) {
+    let errBody = '';
+    try {
+      errBody = await response.text();
+    } catch {
+      /* ignore */
+    }
+    throw new Error(
+      `Knowledge Library access denied for ${libraryId}: ${response.status} ${response.statusText}` +
+      (errBody ? `: ${errBody.slice(0, 200)}` : ''),
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Content resolution helpers
 // ---------------------------------------------------------------------------
 
-async function resolveFromLibrary(args: SshCopyArgs, publisher: AnyObject | null, nodeId: string): Promise<FileToTransfer[]> {
+async function resolveFromLibrary(
+  args: SshCopyArgs,
+  publisher: AnyObject | null,
+  nodeId: string,
+  context: NativeToolContext,
+): Promise<FileToTransfer[]> {
   const { libraryId, documentId, since } = args;
+  await verifyLibraryReadAccess(libraryId, context);
+
   const db = mongoose.connection.db;
   if (!db) throw new Error('MongoDB connection not available — cannot read Knowledge Library');
 
@@ -348,7 +400,7 @@ const sshCopy: NativeToolDefinition = {
       let files: FileToTransfer[];
       try {
         if (args.libraryId) {
-          files = await resolveFromLibrary(args, publisher, nodeId);
+          files = await resolveFromLibrary(args, publisher, nodeId, context);
         } else if (args.sourceUrl) {
           files = await resolveFromUrl(args);
         } else if (args.content !== undefined) {
@@ -402,7 +454,7 @@ const sshCopy: NativeToolDefinition = {
     let files: FileToTransfer[];
     try {
       if (args.libraryId) {
-        files = await resolveFromLibrary(args, publisher, nodeId);
+        files = await resolveFromLibrary(args, publisher, nodeId, context);
       } else if (args.sourceUrl) {
         files = await resolveFromUrl(args);
       } else if (args.content !== undefined) {

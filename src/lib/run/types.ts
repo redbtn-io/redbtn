@@ -179,6 +179,17 @@ export interface RunCompleteEvent extends BaseEvent {
   type: 'run_complete';
   metadata?: TokenMetadata;
   /**
+   * Process-style exit code for the run. Terminal bindings (the CLI / webapp
+   * console) map this directly to a shell exit status:
+   *   - `0`   — run completed successfully
+   *   - `1`   — run failed (mirrored on `run_error`)
+   *   - `130` — run interrupted (mirrored on `run_interrupted`)
+   * A graph node may force a non-zero exit by writing `state.exitCode`
+   * (any non-zero number) — `RunPublisher.complete()` honours it. Non-terminal
+   * consumers can ignore this field entirely; it defaults to `0` on success.
+   */
+  exitCode?: number;
+  /**
    * Final run output — the FULL final graph state.
    *
    * This is the complete state object as returned by the graph's terminal node.
@@ -226,6 +237,8 @@ export interface RunErrorEvent extends BaseEvent {
   errorStack?: string;
   /** Run identifier — included on failure events for correlation */
   runId?: string;
+  /** Process-style exit code — defaults to `1` for failures. See RunCompleteEvent.exitCode. */
+  exitCode?: number;
 }
 
 /**
@@ -256,6 +269,8 @@ export interface RunInterruptedEvent extends BaseEvent {
    * 'user-cancelled', 'god-stream-correction'). Free-form string.
    */
   reason?: string;
+  /** Process-style exit code — defaults to `130` for interrupts. See RunCompleteEvent.exitCode. */
+  exitCode?: number;
 }
 
 /**
@@ -419,6 +434,28 @@ export interface AudioChunkEvent extends BaseEvent {
 }
 
 /**
+ * Structured terminal output events (Terminal binding).
+ *
+ * The graph engine itself rarely emits these directly — the Terminal binding
+ * (webapp `/api/terminal/*`) usually derives `stdout`/`stderr` by mapping
+ * `chunk`/`*_error` events. They exist so a graph node CAN emit explicit
+ * stdout/stderr via `RunPublisher.stdout()` / `.stderr()` when it wants
+ * shell-accurate output framing (e.g. a command node that distinguishes a
+ * tool's stdout from its stderr).
+ */
+export interface StdoutEvent extends BaseEvent {
+  type: 'stdout';
+  /** Text chunk written to standard output. */
+  chunk: string;
+}
+
+export interface StderrEvent extends BaseEvent {
+  type: 'stderr';
+  /** Text chunk written to standard error. */
+  chunk: string;
+}
+
+/**
  * Reconnection replay event
  */
 export interface InitEvent extends BaseEvent {
@@ -512,6 +549,8 @@ export type RunEvent =
   | ToolOutputEvent
   | ToolCompleteEvent
   | ToolErrorEvent
+  | StdoutEvent
+  | StderrEvent
   | AudioChunkEvent
   | InitEvent
   | AttachmentEvent

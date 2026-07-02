@@ -9,13 +9,14 @@
  */
 
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
-import { VectorStoreManager, SearchConfig } from '../../memory/vectors';
+import mongoose from 'mongoose';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
 interface SearchDocumentsArgs {
   query: string;
+  libraryId?: string;
   collection?: string;
   topK?: number;
   threshold?: number;
@@ -23,15 +24,51 @@ interface SearchDocumentsArgs {
   mergeChunks?: boolean;
 }
 
-let _vectorStore: VectorStoreManager | null = null;
+function getBaseUrl(): string {
+  return process.env.WEBAPP_URL || 'http://localhost:3000';
+}
 
-function getVectorStore(): VectorStoreManager {
-  if (!_vectorStore) {
-    const chromaUrl = process.env.CHROMA_URL || 'http://localhost:8024';
-    const ollamaUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
-    _vectorStore = new VectorStoreManager(chromaUrl, ollamaUrl);
+function buildHeaders(context: NativeToolContext): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const authToken =
+    (context?.state?.authToken as string | undefined) ||
+    (context?.state?.data?.authToken as string | undefined);
+  const userId =
+    (context?.state?.userId as string | undefined) ||
+    (context?.state?.data?.userId as string | undefined);
+  const internalKey = process.env.INTERNAL_SERVICE_KEY;
+
+  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+  if (userId) headers['X-User-Id'] = userId;
+  if (internalKey) headers['X-Internal-Key'] = internalKey;
+
+  return headers;
+}
+
+async function resolveLibraryId(args: SearchDocumentsArgs): Promise<string> {
+  if (typeof args.libraryId === 'string' && args.libraryId.trim()) {
+    return args.libraryId.trim();
   }
-  return _vectorStore;
+
+  const collection = typeof args.collection === 'string' ? args.collection.trim() : '';
+  if (!collection) {
+    throw new Error('libraryId is required. Raw collection search is disabled for library authorization.');
+  }
+
+  const db = mongoose.connection.db;
+  if (!db) {
+    throw new Error('MongoDB connection not available to resolve collection to library');
+  }
+
+  const library = await db.collection('libraries').findOne(
+    { vectorCollection: collection, isArchived: { $ne: true } },
+    { projection: { libraryId: 1 } },
+  );
+  if (!library?.libraryId) {
+    throw new Error(`No active Knowledge Library found for collection: ${collection}`);
+  }
+
+  return String(library.libraryId);
 }
 
 /**
@@ -130,10 +167,13 @@ const searchDocuments: NativeToolDefinition = {
         type: 'string',
         description: 'The search query (natural language question or keywords)',
       },
+      libraryId: {
+        type: 'string',
+        description: 'Knowledge Library id to search. Preferred over collection because it preserves library authorization.',
+      },
       collection: {
         type: 'string',
-        description: 'Collection name to search in (default: "general")',
-        default: 'general',
+        description: 'Legacy Chroma collection name. Resolved to an active Knowledge Library before search.',
       },
       topK: {
         type: 'number',
@@ -163,7 +203,7 @@ const searchDocuments: NativeToolDefinition = {
     const args = rawArgs as SearchDocumentsArgs;
     const {
       query,
-      collection = 'general',
+      collection,
       topK = 5,
       threshold = 0.7,
       filter,
@@ -174,7 +214,7 @@ const searchDocuments: NativeToolDefinition = {
     const nodeId = context?.nodeId || 'search_documents';
     const startTime = Date.now();
 
-    console.log(`[search_documents] query="${query.substring(0, 80)}", collection=${collection}`);
+    console.log(`[search_documents] query="${query.substring(0, 80)}", libraryId=${args.libraryId || ''}, collection=${collection || ''}`);
 
     if (!query || query.trim().length === 0) {
       return {
@@ -184,17 +224,36 @@ const searchDocuments: NativeToolDefinition = {
     }
 
     try {
-      const vs = getVectorStore();
+      const libraryId = await resolveLibraryId(args);
+      const response = await fetch(
+        `${getBaseUrl()}/api/v1/libraries/${encodeURIComponent(libraryId)}/search`,
+        {
+          method: 'POST',
+          headers: buildHeaders(context),
+          body: JSON.stringify({
+            query,
+            limit: topK,
+            threshold,
+            ...(filter ? { filter } : {}),
+          }),
+        },
+      );
 
-      // Health check
-      const isHealthy = await vs.healthCheck();
-      if (!isHealthy) {
-        throw new Error('ChromaDB is not accessible');
+      if (!response.ok) {
+        let errBody = '';
+        try {
+          errBody = await response.text();
+        } catch {
+          /* ignore */
+        }
+        throw new Error(
+          `Library search API ${response.status} ${response.statusText}` +
+          (errBody ? `: ${errBody.slice(0, 200)}` : ''),
+        );
       }
 
-      // Perform search
-      const searchConfig: SearchConfig = { topK, threshold, filter };
-      const results = await vs.search(collection, query, searchConfig);
+      const body = (await response.json()) as AnyObject;
+      const results = Array.isArray(body?.results) ? body.results as AnyObject[] : [];
 
       // Merge chunks if requested
       let processedResults = results as AnyObject[];
@@ -214,7 +273,7 @@ const searchDocuments: NativeToolDefinition = {
             type: 'tool_output',
             nodeId,
             data: {
-              chunk: `[search_documents] ${processedResults.length} results from "${collection}" (${duration}ms)\n`,
+              chunk: `[search_documents] ${processedResults.length} results from library "${libraryId}" (${duration}ms)\n`,
               stream: 'stdout',
             },
           });
@@ -226,7 +285,7 @@ const searchDocuments: NativeToolDefinition = {
           content: [
             {
               type: 'text',
-              text: `No relevant documents found in collection "${collection}" for query: "${query}"`,
+              text: `No relevant documents found in library "${libraryId}" for query: "${query}"`,
             },
           ],
         };
@@ -234,7 +293,7 @@ const searchDocuments: NativeToolDefinition = {
 
       // Build formatted response (same format as rag-sse.ts)
       let resultText = `# Search Results for: "${query}"\n\n`;
-      resultText += `Found ${processedResults.length} relevant document(s) in collection "${collection}":\n\n`;
+      resultText += `Found ${processedResults.length} relevant document(s) in library "${libraryId}":\n\n`;
 
       for (let i = 0; i < processedResults.length; i++) {
         const result = processedResults[i];

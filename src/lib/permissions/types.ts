@@ -36,11 +36,30 @@
  * @module lib/permissions/types
  */
 
-/** Data domains a capability can cover. Extend (automations/graphs/nodes) later. */
-export type CapabilityResource = 'state' | 'knowledge';
+/**
+ * Domains a capability can cover.
+ *   - `state` / `knowledge` — DATA resources. FAIL-OPEN: no profile ⇒ unrestricted
+ *     (backward-compatible; see enforce.ts).
+ *   - `exec` / `computer` / `environment` — HIGH-RISK resources. FAIL-CLOSED: denied
+ *     unless a profile explicitly grants them (a deliberate departure from the data
+ *     default — running shell / controlling a machine is too dangerous to inherit the
+ *     permissive default). See `FAIL_CLOSED_RESOURCES` in enforce.ts.
+ */
+export type CapabilityResource =
+  | 'state'
+  | 'knowledge'
+  | 'exec'         // run commands / file I/O via an env session (run_command, ssh_shell, read_file, ssh_copy, desktop_exec)
+  | 'computer'     // screen/mouse/keyboard (desktop_* computer-use tools)
+  | 'environment'; // reserved: managing env configs (not gated yet)
 
-/** Verbs. Every data tool maps to exactly one of these. */
-export type CapabilityAction = 'read' | 'write' | 'create' | 'delete';
+/** Verbs. Every mapped tool declares exactly one. */
+export type CapabilityAction =
+  | 'read'
+  | 'write'
+  | 'create'
+  | 'delete'
+  | 'execute'  // exec resource
+  | 'control'; // computer resource
 
 /**
  * A single grant: "this resource + action is allowed for addresses matching
