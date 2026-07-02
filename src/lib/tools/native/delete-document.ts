@@ -105,7 +105,29 @@ const deleteDocumentTool: NativeToolDefinition = {
       if (args.permanent === true) {
         // The webapp's DELETE is archive-first (a live doc gets archived,
         // an archived doc gets purged), so permanent = archive, then DELETE.
-        await fetch(`${docBase}/archive`, { method: 'POST', headers: buildHeaders(context) }).catch(() => {});
+        // The archive step MUST succeed — silently proceeding would let the
+        // DELETE merely archive a still-live doc while we report deleted.
+        const archiveResp = await fetch(`${docBase}/archive`, {
+          method: 'POST',
+          headers: buildHeaders(context),
+        });
+        if (!archiveResp.ok) {
+          const errBody = await archiveResp.text().catch(() => '');
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error:
+                    `Archive step before permanent delete failed: ${archiveResp.status} ${archiveResp.statusText}` +
+                    (errBody ? `: ${errBody.slice(0, 200)}` : ''),
+                  status: archiveResp.status,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
         response = await fetch(docBase, { method: 'DELETE', headers: buildHeaders(context) });
       } else {
         response = await fetch(`${docBase}/archive`, {
@@ -137,10 +159,29 @@ const deleteDocumentTool: NativeToolDefinition = {
         };
       }
 
+      let data: AnyObject = {};
       try {
-        await response.json();
+        data = (await response.json()) as AnyObject;
       } catch {
         /* ignore */
+      }
+
+      // Permanent path: the webapp DELETE is archive-first, so verify it
+      // actually purged rather than archived — anything else is a failure
+      // we must not report as deletion.
+      if (args.permanent === true && data?.deleted === false) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'Permanent delete did not purge — the API archived the document instead. Retry.',
+                archived: data?.archived === true,
+              }),
+            },
+          ],
+          isError: true,
+        };
       }
 
       return {

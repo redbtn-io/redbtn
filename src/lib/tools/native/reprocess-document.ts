@@ -130,7 +130,7 @@ const reprocessDocumentTool: NativeToolDefinition = {
 
       // Async ingestion (202): the reprocess is queued on the background
       // worker. Poll to completion unless the caller opted out.
-      if (data?.processingStatus === 'pending' && data?.jobId) {
+      if (data?.processingStatus === 'pending' || data?.processingStatus === 'processing') {
         if (args.wait === false) {
           return {
             content: [

@@ -111,8 +111,31 @@ const deleteLibraryTool: NativeToolDefinition = {
     try {
       let response: Response;
       if (args.permanent === true) {
-        // Permanent deletion requires the archived state — archive first.
-        await fetch(`${libBase}/archive`, { method: 'POST', headers: buildHeaders(context) }).catch(() => {});
+        // Permanent deletion requires the archived state — archive first,
+        // and FAIL LOUD if that step doesn't succeed (a swallowed failure
+        // here would let the DELETE be rejected or downgraded to archive
+        // while we report deleted).
+        const archiveResp = await fetch(`${libBase}/archive`, {
+          method: 'POST',
+          headers: buildHeaders(context),
+        });
+        if (!archiveResp.ok) {
+          const errBody = await archiveResp.text().catch(() => '');
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error:
+                    `Archive step before permanent delete failed: ${archiveResp.status} ${archiveResp.statusText}` +
+                    (errBody ? `: ${errBody.slice(0, 200)}` : ''),
+                  status: archiveResp.status,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
         response = await fetch(`${libBase}?permanent=true`, {
           method: 'DELETE',
           headers: buildHeaders(context),
@@ -147,10 +170,28 @@ const deleteLibraryTool: NativeToolDefinition = {
         };
       }
 
+      let data: AnyObject = {};
       try {
-        await response.json();
+        data = (await response.json()) as AnyObject;
       } catch {
         /* ignore */
+      }
+
+      // Permanent path: verify the API actually purged (archive-first DELETE
+      // reports { archived: true } when it merely archived).
+      if (args.permanent === true && data?.deleted !== true) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'Permanent delete did not purge — the API archived the library instead. Retry.',
+                archived: data?.archived === true,
+              }),
+            },
+          ],
+          isError: true,
+        };
       }
 
       return {
