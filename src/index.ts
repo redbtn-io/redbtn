@@ -39,7 +39,9 @@ export {
   SearchResult,
   ChunkingConfig,
   SearchConfig,
-  CollectionStats
+  CollectionStats,
+  SyncDocumentResult,
+  EmbeddingProgressCallback
 } from "./lib/memory/vectors";
 
 // Export document parser (PDF / DOCX / XLSX / CSV / JSON / text / markdown)
