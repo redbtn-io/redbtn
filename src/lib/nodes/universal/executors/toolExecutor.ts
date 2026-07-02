@@ -79,6 +79,35 @@ const DEFAULT_MCP_TOOL_IDLE_TIMEOUT_MS = Number(
     || 30 * 60 * 1000
 );
 
+function getMcpErrorMessage(result: any, toolName: string): string | null {
+    if (!result || typeof result !== 'object' || result.isError !== true) {
+        return null;
+    }
+
+    let detail = '';
+    if (Array.isArray(result.content)) {
+        const textBlock = result.content.find((block: any) => block?.type === 'text' && typeof block.text === 'string');
+        if (textBlock?.text) {
+            try {
+                const parsed = JSON.parse(textBlock.text);
+                detail = parsed?.error || parsed?.message || textBlock.text;
+            } catch {
+                detail = textBlock.text;
+            }
+        }
+    }
+
+    if (!detail) {
+        try {
+            detail = JSON.stringify(result);
+        } catch {
+            detail = String(result);
+        }
+    }
+
+    return `MCP tool "${toolName}" returned error: ${detail.substring(0, 1000)}`;
+}
+
 /**
  * Normalize tool step config by converting legacy inputMapping format to parameters format
  *
@@ -688,6 +717,10 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     toolId,
                     resolveMcpToolIdleTimeoutMs(config),
                 );
+                const mcpError = getMcpErrorMessage(result, config.toolName);
+                if (mcpError) {
+                    throw new Error(mcpError);
+                }
                 if (DEBUG)
                     console.log(`[ToolExecutor] mcpClient.callTool returned for ${config.toolName}`);
                 if (DEBUG)

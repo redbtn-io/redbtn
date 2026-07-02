@@ -27,6 +27,35 @@ export type ParserToolExecutor = (
     parameters: Record<string, any>,
 ) => Promise<any>;
 
+function getToolResultErrorMessage(result: any, toolName: string): string | null {
+    if (!result || typeof result !== 'object' || result.isError !== true) {
+        return null;
+    }
+
+    let detail = '';
+    if (Array.isArray(result.content)) {
+        const textBlock = result.content.find((block: any) => block?.type === 'text' && typeof block.text === 'string');
+        if (textBlock?.text) {
+            try {
+                const parsed = JSON.parse(textBlock.text);
+                detail = parsed?.error || parsed?.message || textBlock.text;
+            } catch {
+                detail = textBlock.text;
+            }
+        }
+    }
+
+    if (!detail) {
+        try {
+            detail = JSON.stringify(result);
+        } catch {
+            detail = String(result);
+        }
+    }
+
+    return `Parser tool "${toolName}" returned error: ${detail.substring(0, 1000)}`;
+}
+
 export class ParserExecutor {
     private steps: UniversalStep[];
     private inputField: string;
@@ -1064,6 +1093,10 @@ export class ParserExecutor {
                     if (outputField) {
                         try {
                             const result = await this._executeTool(toolName, rendered);
+                            const toolError = getToolResultErrorMessage(result, toolName);
+                            if (toolError) {
+                                throw new Error(toolError);
+                            }
                             // Unwrap common result shapes: MCP { content: [{text: jsonStr}] } or plain
                             let extracted: any = result;
                             if (result && typeof result === 'object' && Array.isArray((result as any).content)) {
@@ -1088,7 +1121,12 @@ export class ParserExecutor {
                             console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
                         }
                     } else {
-                        this._executeTool(toolName, rendered).catch((err: any) => {
+                        this._executeTool(toolName, rendered).then((result: any) => {
+                            const toolError = getToolResultErrorMessage(result, toolName);
+                            if (toolError) {
+                                throw new Error(toolError);
+                            }
+                        }).catch((err: any) => {
                             console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
                         });
                     }
