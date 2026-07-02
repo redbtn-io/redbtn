@@ -97,6 +97,12 @@ function libraryIdsFilter(args: Record<string, unknown>): ExtractedAddress {
   return { addresses: ids };
 }
 
+function searchDocumentsAddress(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.libraryId);
+  if (id) return { addresses: [id] };
+  return { addresses: [], unscoped: true };
+}
+
 /**
  * Address extractor for exec + computer tools — keys on `environmentId` (the
  * env/connector the op targets). Selectors are authored as environmentIds so an
@@ -151,12 +157,12 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   get_document: { resource: 'knowledge', action: 'read', extract: libraryId },
   list_documents: { resource: 'knowledge', action: 'read', extract: libraryId },
   search_documents: {
-    // search_documents keys on a Chroma `collection`, not a library id. It does
-    // not address a user library namespace by id/name, so we map it as an
-    // unscoped knowledge read (a jail must grant a wildcard read to use it).
+    // `libraryId` is the safe scoped path. Legacy `collection` calls are still
+    // treated as unscoped because the capability layer cannot resolve a Chroma
+    // collection name to a library id without I/O.
     resource: 'knowledge',
     action: 'read',
-    extract: () => ({ addresses: [], unscoped: true }),
+    extract: searchDocumentsAddress,
   },
   search_all_libraries: {
     resource: 'knowledge',

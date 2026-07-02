@@ -97,6 +97,8 @@ describe('search_all_libraries — happy path', () => {
     expect(body.results[0].libraryId).toBe('libB');
     expect(body.results[1].documentId).toBe('docA1');
     expect(body.results[2].documentId).toBe('docA2');
+    expect(body.failures).toEqual([]);
+    expect(body.partial).toBe(false);
     // Confirms it called both library search endpoints
     expect(calls.some(u => u.includes('/libA/search'))).toBe(true);
     expect(calls.some(u => u.includes('/libB/search'))).toBe(true);
@@ -128,6 +130,7 @@ describe('search_all_libraries — happy path', () => {
     expect(listCalled).toBe(false);
     const body = JSON.parse(r.content[0].text);
     expect(body.results.length).toBe(2);
+    expect(body.partial).toBe(false);
   });
 
   test('minScore filters out below-threshold results', async () => {
@@ -158,6 +161,38 @@ describe('search_all_libraries — happy path', () => {
     const body = JSON.parse(r.content[0].text);
     expect(body.results).toHaveLength(1);
     expect(body.results[0].documentId).toBe('d1');
+  });
+
+  test('reports per-library failures while returning successful results', async () => {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const u = typeof input === 'string' ? input : (input as URL).toString();
+      const url = new URL(u);
+      if (url.pathname === '/api/v1/libraries/lib-ok/search') {
+        return new Response(
+          JSON.stringify({
+            results: [{ id: '1', text: 'ok', score: 0.9, metadata: { documentId: 'd1' } }],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.pathname === '/api/v1/libraries/lib-denied/search') {
+        return new Response('forbidden', { status: 403, statusText: 'Forbidden' });
+      }
+      return new Response('not found', { status: 404 });
+    }) as unknown as typeof globalThis.fetch;
+
+    const r = await searchAllLibrariesTool.handler(
+      { query: 'q', libraryIds: ['lib-ok', 'lib-denied'] },
+      makeMockContext(),
+    );
+
+    expect(r.isError).toBeFalsy();
+    const body = JSON.parse(r.content[0].text);
+    expect(body.results).toHaveLength(1);
+    expect(body.partial).toBe(true);
+    expect(body.failures).toEqual([
+      { libraryId: 'lib-denied', status: 403, error: '403 Forbidden' },
+    ]);
   });
 });
 

@@ -180,6 +180,7 @@ const searchAllLibrariesTool: NativeToolDefinition = {
       // Step 2: fan out search calls in parallel (cap concurrency at 8).
       const perLibLimit = Math.max(1, Math.min(50, limit));
       const allResults: AnyObject[] = [];
+      const failures: Array<{ libraryId: string; status?: number; error: string }> = [];
 
       const runOne = async (libraryId: string): Promise<void> => {
         const searchUrl = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}/search`;
@@ -193,7 +194,14 @@ const searchAllLibrariesTool: NativeToolDefinition = {
               ...(minScore !== null ? { threshold: minScore } : {}),
             }),
           });
-          if (!r.ok) return;
+          if (!r.ok) {
+            failures.push({
+              libraryId,
+              status: r.status,
+              error: `${r.status} ${r.statusText}`.trim(),
+            });
+            return;
+          }
           const j = (await r.json()) as AnyObject;
           const items = Array.isArray(j?.results) ? j.results : [];
           for (const it of items) {
@@ -206,8 +214,11 @@ const searchAllLibrariesTool: NativeToolDefinition = {
               metadata: meta,
             });
           }
-        } catch {
-          // Per-library failure is non-fatal — keep going across the rest.
+        } catch (error) {
+          failures.push({
+            libraryId,
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       };
 
@@ -232,7 +243,11 @@ const searchAllLibrariesTool: NativeToolDefinition = {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ results: trimmed }),
+            text: JSON.stringify({
+              results: trimmed,
+              failures,
+              partial: failures.length > 0,
+            }),
           },
         ],
       };
