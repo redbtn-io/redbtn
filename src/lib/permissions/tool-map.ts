@@ -206,6 +206,10 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   desktop_type: { resource: 'computer', action: 'control', extract: envId },
   desktop_key: { resource: 'computer', action: 'control', extract: envId },
   desktop_scroll: { resource: 'computer', action: 'control', extract: envId },
+  desktop_windows: { resource: 'computer', action: 'control', extract: envId },
+  desktop_window_screenshot: { resource: 'computer', action: 'control', extract: envId },
+  desktop_window_focus: { resource: 'computer', action: 'control', extract: envId },
+  desktop_window_control: { resource: 'computer', action: 'control', extract: envId },
 };
 
 /** Is this tool name a gated data tool? */

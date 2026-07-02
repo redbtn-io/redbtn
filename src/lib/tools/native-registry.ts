@@ -550,8 +550,12 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     registry.register('desktop_settings', desktop.desktopSettings);
     registry.register('desktop_list', desktop.desktopList);
     registry.register('desktop_ping', desktop.desktopPing);
+    registry.register('desktop_windows', desktop.desktopWindows);
+    registry.register('desktop_window_screenshot', desktop.desktopWindowScreenshot);
+    registry.register('desktop_window_focus', desktop.desktopWindowFocus);
+    registry.register('desktop_window_control', desktop.desktopWindowControl);
     console.log(
-      '[NativeRegistry] Registered built-in tools: desktop_screenshot, desktop_click, desktop_move, desktop_type, desktop_key, desktop_scroll, desktop_screen_info, desktop_exec, desktop_settings, desktop_list, desktop_ping',
+      '[NativeRegistry] Registered built-in tools: desktop_screenshot, desktop_click, desktop_move, desktop_type, desktop_key, desktop_scroll, desktop_screen_info, desktop_exec, desktop_settings, desktop_list, desktop_ping, desktop_windows, desktop_window_screenshot, desktop_window_focus, desktop_window_control',
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

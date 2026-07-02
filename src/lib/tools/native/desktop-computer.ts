@@ -234,6 +234,11 @@ const desktopClickTool: NativeToolDefinition = {
         default: 'left',
       },
       double: { type: 'boolean', description: 'Perform a double-click. Default false.' },
+      windowId: {
+        type: 'string',
+        description:
+          'Optional target window (from desktop_windows). When set, x,y are interpreted in THAT window\'s click space (from desktop_window_screenshot) and the window is focused first.',
+      },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
     required: ['environmentId', 'x', 'y'],
@@ -247,9 +252,10 @@ const desktopClickTool: NativeToolDefinition = {
     }
     const button: 'left' | 'right' | 'middle' =
       rawArgs?.button === 'right' ? 'right' : rawArgs?.button === 'middle' ? 'middle' : 'left';
+    const windowId = typeof rawArgs?.windowId === 'string' ? rawArgs.windowId : undefined;
     const result = await runAction(
       context,
-      { action: 'mouse', op: 'click', x, y, button, double: rawArgs?.double === true },
+      { action: 'mouse', op: 'click', x, y, button, double: rawArgs?.double === true, ...(windowId ? { windowId } : {}) },
       rawArgs,
     );
     if (!result) return noUserResult();
@@ -303,6 +309,10 @@ const desktopTypeTool: NativeToolDefinition = {
         description: 'environmentId of the target desktop agent.',
       },
       text: { type: 'string', description: 'Literal text to type. Required.' },
+      windowId: {
+        type: 'string',
+        description: 'Optional target window (from desktop_windows) to focus before typing.',
+      },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
     required: ['environmentId', 'text'],
@@ -313,7 +323,8 @@ const desktopTypeTool: NativeToolDefinition = {
     if (!text) {
       return textResult({ ok: false, error: { code: 'computer_failed', message: 'text is required' } }, true);
     }
-    const result = await runAction(context, { action: 'keyboard', op: 'type', text }, rawArgs);
+    const windowId = typeof rawArgs?.windowId === 'string' ? rawArgs.windowId : undefined;
+    const result = await runAction(context, { action: 'keyboard', op: 'type', text, ...(windowId ? { windowId } : {}) }, rawArgs);
     if (!result) return noUserResult();
     return textResult({ ok: result.ok, ...(result.error ? { error: result.error } : {}) });
   },
@@ -505,6 +516,157 @@ const desktopListTool: NativeToolDefinition = {
   }
 };
 
+// ─── desktop_windows ─────────────────────────────────────────────────────────
+
+const desktopWindowsTool: NativeToolDefinition = {
+  description:
+    "List the open windows on the current user's connected desktop (redAgent) — each window's title (use as windowId for window_* tools), bounds {x,y,w,h} in logical pixels, and whether it is focused. Use this to target a specific app window.",
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: { type: 'string', description: 'environmentId of the target desktop agent.' },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
+    },
+    required: ['environmentId'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const result = await runAction(context, { action: 'list_windows' }, rawArgs);
+    if (!result) return noUserResult();
+    return textResult({
+      ok: result.ok,
+      ...(result.windows ? { windows: result.windows } : {}),
+      ...(result.error ? { error: result.error } : {}),
+    });
+  },
+};
+
+// ─── desktop_window_screenshot ───────────────────────────────────────────────
+
+const desktopWindowScreenshotTool: NativeToolDefinition = {
+  description:
+    "Capture a single window (by windowId from desktop_windows) on the current user's connected desktop (redAgent) at native resolution — just that window, no desktop clutter. Returns an image you can view + a click space for window-relative desktop_click.",
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: { type: 'string', description: 'environmentId of the target desktop agent.' },
+      windowId: { type: 'string', description: 'Window handle (title) from desktop_windows. Required.' },
+      format: { type: 'string', enum: ['png', 'jpeg'], description: 'Image format. Default png.' },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
+    },
+    required: ['environmentId', 'windowId'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const windowId = typeof rawArgs?.windowId === 'string' ? rawArgs.windowId : '';
+    if (!windowId) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'windowId is required' } }, true);
+    }
+    const format: 'png' | 'jpeg' = rawArgs?.format === 'jpeg' ? 'jpeg' : 'png';
+    const result = await runAction(context, { action: 'window_screenshot', windowId, format }, rawArgs);
+    if (!result) return noUserResult();
+    if (!result.ok || !result.image) {
+      return textResult({
+        ok: false,
+        error: result.error || { code: 'computer_failed', message: 'window screenshot failed (no image returned)' },
+      });
+    }
+    const img = result.image;
+    const mimeType = img.format === 'jpeg' ? 'image/jpeg' : 'image/png';
+    const dataUrl = `data:${mimeType};base64,${img.base64}`;
+    return {
+      content: [
+        { type: 'image', data: img.base64, mimeType },
+        {
+          type: 'text',
+          text: JSON.stringify({
+            ok: true,
+            windowId,
+            format: img.format,
+            width: img.width,
+            height: img.height,
+            mimeType,
+            dataUrl,
+            base64: img.base64,
+          }),
+        },
+      ],
+    };
+  },
+};
+
+// ─── desktop_window_focus ────────────────────────────────────────────────────
+
+const desktopWindowFocusTool: NativeToolDefinition = {
+  description:
+    "Bring a window (by windowId from desktop_windows) to the foreground on the current user's connected desktop (redAgent). Use before window-scoped typing/clicking.",
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: { type: 'string', description: 'environmentId of the target desktop agent.' },
+      windowId: { type: 'string', description: 'Window handle (title) from desktop_windows. Required.' },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
+    },
+    required: ['environmentId', 'windowId'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const windowId = typeof rawArgs?.windowId === 'string' ? rawArgs.windowId : '';
+    if (!windowId) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'windowId is required' } }, true);
+    }
+    const result = await runAction(context, { action: 'window_focus', windowId }, rawArgs);
+    if (!result) return noUserResult();
+    return textResult({ ok: result.ok, ...(result.error ? { error: result.error } : {}) });
+  },
+};
+
+// ─── desktop_window_control ──────────────────────────────────────────────────
+
+const desktopWindowControlTool: NativeToolDefinition = {
+  description:
+    "Manipulate a window (by windowId from desktop_windows) on the current user's connected desktop (redAgent): move/resize to x,y,w,h (logical px), or minimize/restore/maximize/close. `close` is best-effort (sends the OS close chord).",
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: { type: 'string', description: 'environmentId of the target desktop agent.' },
+      windowId: { type: 'string', description: 'Window handle (title) from desktop_windows. Required.' },
+      op: {
+        type: 'string',
+        enum: ['move', 'resize', 'minimize', 'restore', 'maximize', 'close'],
+        description: 'Window operation. Required.',
+      },
+      x: { type: 'number', description: 'For move: new left (logical px).' },
+      y: { type: 'number', description: 'For move: new top (logical px).' },
+      w: { type: 'number', description: 'For resize: new width (logical px).' },
+      h: { type: 'number', description: 'For resize: new height (logical px).' },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
+    },
+    required: ['environmentId', 'windowId', 'op'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const windowId = typeof rawArgs?.windowId === 'string' ? rawArgs.windowId : '';
+    const op = rawArgs?.op as 'move' | 'resize' | 'minimize' | 'restore' | 'maximize' | 'close';
+    const VALID = ['move', 'resize', 'minimize', 'restore', 'maximize', 'close'];
+    if (!windowId || !VALID.includes(op)) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'windowId and a valid op are required' } }, true);
+    }
+    const num = (v: unknown): number | undefined => (Number.isFinite(Number(v)) ? Number(v) : undefined);
+    const result = await runAction(
+      context,
+      { action: 'window_control', windowId, op, x: num(rawArgs?.x), y: num(rawArgs?.y), w: num(rawArgs?.w), h: num(rawArgs?.h) },
+      rawArgs,
+    );
+    if (!result) return noUserResult();
+    return textResult({ ok: result.ok, ...(result.error ? { error: result.error } : {}) });
+  },
+};
+
 // ─── Exports ─────────────────────────────────────────────────────────────────
 
 export const desktopScreenshot = desktopScreenshotTool;
@@ -515,6 +677,10 @@ export const desktopKey = desktopKeyTool;
 export const desktopScroll = desktopScrollTool;
 export const desktopScreenInfo = desktopScreenInfoTool;
 export const desktopList = desktopListTool;
+export const desktopWindows = desktopWindowsTool;
+export const desktopWindowScreenshot = desktopWindowScreenshotTool;
+export const desktopWindowFocus = desktopWindowFocusTool;
+export const desktopWindowControl = desktopWindowControlTool;
 
 
 
@@ -752,4 +918,4 @@ export const desktopExec = desktopExecTool;
 export const desktopSettings = desktopSettingsTool;
 export const desktopPing = desktopPingTool;
 
-module.exports = { desktopScreenshot: desktopScreenshotTool, desktopClick: desktopClickTool, desktopMove: desktopMoveTool, desktopType: desktopTypeTool, desktopKey: desktopKeyTool, desktopScroll: desktopScrollTool, desktopScreenInfo: desktopScreenInfoTool, desktopExec: desktopExecTool, desktopSettings: desktopSettingsTool, desktopList: desktopListTool, desktopPing: desktopPingTool };
+module.exports = { desktopScreenshot: desktopScreenshotTool, desktopClick: desktopClickTool, desktopMove: desktopMoveTool, desktopType: desktopTypeTool, desktopKey: desktopKeyTool, desktopScroll: desktopScrollTool, desktopScreenInfo: desktopScreenInfoTool, desktopExec: desktopExecTool, desktopSettings: desktopSettingsTool, desktopList: desktopListTool, desktopPing: desktopPingTool, desktopWindows: desktopWindowsTool, desktopWindowScreenshot: desktopWindowScreenshotTool, desktopWindowFocus: desktopWindowFocusTool, desktopWindowControl: desktopWindowControlTool };

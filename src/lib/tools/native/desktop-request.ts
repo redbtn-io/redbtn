@@ -61,9 +61,23 @@ export type ComputerAction =
       double?: boolean;
       dx?: number;
       dy?: number;
+      /** Window-relative targeting: x,y are in the window's click space. */
+      windowId?: string;
     }
-  | { action: 'keyboard'; op: 'type' | 'tap'; text?: string; keys?: string[] }
-  | { action: 'screen_info' };
+  | { action: 'keyboard'; op: 'type' | 'tap'; text?: string; keys?: string[]; windowId?: string }
+  | { action: 'screen_info' }
+  | { action: 'list_windows' }
+  | { action: 'window_screenshot'; windowId: string; format?: 'png' | 'jpeg' }
+  | { action: 'window_focus'; windowId: string }
+  | {
+      action: 'window_control';
+      windowId: string;
+      op: 'move' | 'resize' | 'minimize' | 'restore' | 'maximize' | 'close';
+      x?: number;
+      y?: number;
+      w?: number;
+      h?: number;
+    };
 
 /**
  * Result of a computer-use action — mirrors redAgent
@@ -91,6 +105,12 @@ export interface ComputerResultMessage {
       primary: boolean;
     }>;
   };
+  windows?: Array<{
+    windowId: string;
+    title: string;
+    bounds: { x: number; y: number; w: number; h: number };
+    focused: boolean;
+  }>;
   error?: { code: string; message: string };
 }
 
