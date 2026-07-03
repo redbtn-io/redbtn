@@ -206,10 +206,13 @@ export class VectorStoreManager {
         if (!response.ok) {
           const errorText = await response.text();
           const error = new Error(`Ollama embeddings error: ${response.status} - ${errorText}`);
-          // 4xx responses are permanent (missing model, oversize input,
-          // malformed request) — retrying just hammers Ollama with doomed
-          // calls and delays the terminal failure.
-          if (response.status >= 400 && response.status < 500) {
+          // Permanent (no-retry) errors: any 4xx (missing model, malformed
+          // request) AND the context-length rejection Ollama reports as a
+          // 500 — the local countTokens pre-check can under-count for some
+          // inputs, so this is the real backstop. Retrying either just
+          // hammers Ollama with doomed calls and delays the terminal failure.
+          const contextOverflow = /context length|input length exceeds/i.test(errorText);
+          if ((response.status >= 400 && response.status < 500) || contextOverflow) {
             Object.assign(error, { permanent: true });
           }
           throw error;
