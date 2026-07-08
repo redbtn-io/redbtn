@@ -86,6 +86,38 @@ export function getMeteringClient(state: any): any | undefined {
  * cannot be tampered with by anything that mutates LangGraph state.
  */
 export function getCapabilityProfile(state: any): any | undefined {
+  // Subgraph-scoped override: a TRUSTED subgraph (system, or owned by the run's
+  // user) that declares its OWN `capabilities` runs under that profile for the
+  // duration of its invocation. graphExecutor registers it keyed by a unique
+  // per-invocation scopeId and stamps that id into the subgraph's
+  // `state.data._capabilityScope`. We resolve it here FIRST so the subgraph's
+  // nodes are enforced against the subgraph's profile, not the parent's — while
+  // still surviving checkpoints (only the primitive scopeId flows through state)
+  // and staying tamper-resistant (state carries the lookup KEY, never the
+  // profile itself; an unknown/cleared scope falls back to the parent profile).
+  const scope = state?.data?._capabilityScope;
+  if (typeof scope === 'string' && subgraphProfiles.has(scope)) {
+    return subgraphProfiles.get(scope);
+  }
   const ctx = runControlRegistry.get(resolveRunId(state));
   return ctx?.capabilityProfile ?? state?.capabilityProfile;
+}
+
+/**
+ * Registry of subgraph-scoped capability profiles, keyed by a unique
+ * per-invocation scopeId (the subgraph's ephemeral thread_id). Written by
+ * graphExecutor around a subgraph invocation and cleared in its `finally`.
+ * Concurrency-safe: each subgraph invocation has its own scopeId, so parallel
+ * subgraph steps never clobber each other's profile.
+ */
+const subgraphProfiles = new Map<string, any>();
+
+/** Register a trusted subgraph's own capability profile for its invocation scope. */
+export function setSubgraphProfile(scopeId: string, profile: any): void {
+  if (scopeId) subgraphProfiles.set(scopeId, profile);
+}
+
+/** Clear a subgraph-scoped profile once its invocation returns. */
+export function clearSubgraphProfile(scopeId: string): void {
+  if (scopeId) subgraphProfiles.delete(scopeId);
 }
