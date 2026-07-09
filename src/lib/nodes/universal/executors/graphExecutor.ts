@@ -14,7 +14,12 @@
 // not circular — toolExecutor imports the same helper statically). Replaces an
 // earlier module-top `require`, which couldn't resolve the extensionless `.ts`
 // when the source is loaded directly under vitest.
-import { getGraphRegistry } from '../../../run/contextLookup';
+import {
+    getGraphRegistry,
+    setSubgraphProfile,
+    clearSubgraphProfile,
+} from '../../../run/contextLookup';
+import { resolveCapabilityProfile } from '../../../permissions/resolve';
 
 export interface GraphStepConfig {
     /** ID of the graph to invoke (must exist in MongoDB graphs collection) */
@@ -317,26 +322,73 @@ export async function executeGraph(
     }
 
     // Use a unique ephemeral thread_id so the subgraph checkpointer doesn't
-    // collide with the parent run's checkpoint.
+    // collide with the parent run's checkpoint. Doubles as the capability
+    // scopeId below (unique per invocation → concurrency-safe).
     const threadId = `subgraph_${graphId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const invokeConfig = { configurable: { thread_id: threadId } };
+
+    // -----------------------------------------------------------------------
+    // SUBGRAPH-SCOPED CAPABILITY PROFILE.
+    //
+    // By default a subgraph is enforced against the PARENT run's profile
+    // (resolved once at run-start, keyed by the shared runId). That couples a
+    // reusable subgraph's permissions to every caller — the parent must
+    // pre-grant everything the subgraph needs. Instead: when the subgraph
+    // declares its OWN `capabilities` AND is TRUSTED (a system graph, or owned
+    // by the same user as the run), apply ITS profile for the duration of the
+    // invocation, restoring the parent's when it returns.
+    //
+    // Trust gate: an untrusted (third-party / public) subgraph can NEVER
+    // self-widen on a caller's machine — it inherits the parent profile. A
+    // trusted subgraph MAY widen, because its `capabilities` field is itself a
+    // grant authored by the account owner (or the system).
+    // -----------------------------------------------------------------------
+    let capabilityScopeId: string | undefined;
+    try {
+        const subConfig: any = (compiledGraph as any)?.config
+            || (typeof graphRegistry.getConfig === 'function'
+                ? await graphRegistry.getConfig(graphId, userId)
+                : undefined);
+        const subProfile = resolveCapabilityProfile(subConfig);
+        if (subProfile && subConfig) {
+            const trusted =
+                subConfig.isSystem === true
+                || (subConfig.userId != null && String(subConfig.userId) === String(userId));
+            if (trusted) {
+                capabilityScopeId = threadId;
+                setSubgraphProfile(capabilityScopeId, subProfile);
+                subInput.data._capabilityScope = capabilityScopeId;
+                console.log(`[GraphExecutor] Subgraph '${graphId}' running under its OWN capability profile (trusted).`);
+            } else {
+                console.warn(`[GraphExecutor] Subgraph '${graphId}' declares a capability profile but is neither system nor owned by the run user — inheriting parent profile (no self-widen).`);
+            }
+        }
+    } catch (e) {
+        // Never let profile resolution break a subgraph invocation — fall back
+        // to inheriting the parent profile (fail-safe: exec stays fail-closed).
+        console.warn(`[GraphExecutor] Subgraph '${graphId}' capability-scope resolution failed (inheriting parent): ${e instanceof Error ? e.message : String(e)}`);
+    }
 
     let result: any;
     const t0 = Date.now();
 
-    if (timeout && timeout > 0) {
-        const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(
-                () => reject(new Error(`Subgraph '${graphId}' timed out after ${timeout}ms`)),
-                timeout
-            )
-        );
-        result = await Promise.race([
-            compiledGraph.graph.invoke(subInput, invokeConfig),
-            timeoutPromise,
-        ]);
-    } else {
-        result = await compiledGraph.graph.invoke(subInput, invokeConfig);
+    try {
+        if (timeout && timeout > 0) {
+            const timeoutPromise = new Promise<never>((_, reject) =>
+                setTimeout(
+                    () => reject(new Error(`Subgraph '${graphId}' timed out after ${timeout}ms`)),
+                    timeout
+                )
+            );
+            result = await Promise.race([
+                compiledGraph.graph.invoke(subInput, invokeConfig),
+                timeoutPromise,
+            ]);
+        } else {
+            result = await compiledGraph.graph.invoke(subInput, invokeConfig);
+        }
+    } finally {
+        if (capabilityScopeId) clearSubgraphProfile(capabilityScopeId);
     }
 
     const elapsed = Date.now() - t0;

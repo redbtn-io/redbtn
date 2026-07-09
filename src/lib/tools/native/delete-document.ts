@@ -26,6 +26,7 @@ type AnyObject = Record<string, any>;
 interface DeleteDocumentArgs {
   libraryId: string;
   documentId: string;
+  permanent?: boolean;
 }
 
 function getBaseUrl(): string {
@@ -52,7 +53,7 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
 
 const deleteDocumentTool: NativeToolDefinition = {
   description:
-    'Delete a single document from a Knowledge Library. Removes both the document record and its vector chunks. Destructive — there is no undo.',
+    'Delete a document from a Knowledge Library. By default this ARCHIVES it (vectors removed from search, raw source retained — reversible with restore_document). Pass permanent: true to destroy it for good.',
   server: 'library',
   inputSchema: {
     type: 'object',
@@ -64,6 +65,11 @@ const deleteDocumentTool: NativeToolDefinition = {
       documentId: {
         type: 'string',
         description: 'Document id to delete.',
+      },
+      permanent: {
+        type: 'boolean',
+        description:
+          'true = permanently destroy the document (record, vectors, stored source). Default false = archive (reversible).',
       },
     },
     required: ['libraryId', 'documentId'],
@@ -92,13 +98,43 @@ const deleteDocumentTool: NativeToolDefinition = {
     }
 
     const baseUrl = getBaseUrl();
-    const url = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}/documents/${encodeURIComponent(documentId)}`;
+    const docBase = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}/documents/${encodeURIComponent(documentId)}`;
 
     try {
-      const response = await fetch(url, {
-        method: 'DELETE',
-        headers: buildHeaders(context),
-      });
+      let response: Response;
+      if (args.permanent === true) {
+        // The webapp's DELETE is archive-first (a live doc gets archived,
+        // an archived doc gets purged), so permanent = archive, then DELETE.
+        // The archive step MUST succeed — silently proceeding would let the
+        // DELETE merely archive a still-live doc while we report deleted.
+        const archiveResp = await fetch(`${docBase}/archive`, {
+          method: 'POST',
+          headers: buildHeaders(context),
+        });
+        if (!archiveResp.ok) {
+          const errBody = await archiveResp.text().catch(() => '');
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error:
+                    `Archive step before permanent delete failed: ${archiveResp.status} ${archiveResp.statusText}` +
+                    (errBody ? `: ${errBody.slice(0, 200)}` : ''),
+                  status: archiveResp.status,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        response = await fetch(docBase, { method: 'DELETE', headers: buildHeaders(context) });
+      } else {
+        response = await fetch(`${docBase}/archive`, {
+          method: 'POST',
+          headers: buildHeaders(context),
+        });
+      }
 
       if (!response.ok) {
         let errBody = '';
@@ -123,14 +159,42 @@ const deleteDocumentTool: NativeToolDefinition = {
         };
       }
 
+      let data: AnyObject = {};
       try {
-        await response.json();
+        data = (await response.json()) as AnyObject;
       } catch {
         /* ignore */
       }
 
+      // Permanent path: the webapp DELETE is archive-first, so verify it
+      // actually purged rather than archived — anything else is a failure
+      // we must not report as deletion.
+      if (args.permanent === true && data?.deleted === false) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'Permanent delete did not purge — the API archived the document instead. Retry.',
+                archived: data?.archived === true,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
       return {
-        content: [{ type: 'text', text: JSON.stringify({ ok: true }) }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              args.permanent === true
+                ? { ok: true, deleted: true }
+                : { ok: true, archived: true, note: 'Archived (reversible). Use restore_document to bring it back, or permanent: true to destroy.' }
+            ),
+          },
+        ],
       };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);

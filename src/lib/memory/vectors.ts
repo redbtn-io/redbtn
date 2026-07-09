@@ -12,6 +12,7 @@
  */
 
 import { ChromaClient, Collection } from 'chromadb';
+import { createHash } from 'node:crypto';
 import { countTokens } from '../utils/tokenizer';
 
 // --- Configuration Constants ---
@@ -51,6 +52,14 @@ const DEFAULT_SIMILARITY_THRESHOLD = 0.7;
  * Maximum tokens for embedding model (nomic-embed-text limit)
  */
 const MAX_EMBEDDING_TOKENS = 8192;
+
+/**
+ * Retry settings for embedding calls. One flaky Ollama response must not fail
+ * a multi-thousand-chunk job at 95% — each call retries with jittered
+ * exponential backoff before the error propagates.
+ */
+const EMBEDDING_RETRY_ATTEMPTS = 3;
+const EMBEDDING_RETRY_BASE_DELAY_MS = 1000;
 
 // --- Type Definitions ---
 
@@ -111,6 +120,25 @@ export interface CollectionStats {
   metadata?: Record<string, any>;
 }
 
+/**
+ * Progress callback for long-running embed operations.
+ * Reports after each completed embedding batch.
+ */
+export type EmbeddingProgressCallback = (completed: number, total: number) => void;
+
+/**
+ * Result of a syncDocument() call
+ */
+export interface SyncDocumentResult {
+  chunkCount: number;      // Total chunks the document now has
+  embeddedChunks: number;  // Chunks that required a new embedding call
+  reusedChunks: number;    // Chunks whose stored vector was reused (hash match)
+  deletedChunks: number;   // Stale chunk ids removed (shrink / legacy ids)
+  charCount: number;       // Length of the source text
+  /** True when beforeSwap vetoed the write — stored vectors were untouched */
+  aborted?: boolean;
+}
+
 // --- Vector Store Manager ---
 
 /**
@@ -152,47 +180,71 @@ export class VectorStoreManager {
    * @returns Embedding vector (array of floats)
    */
   async generateEmbedding(text: string): Promise<number[]> {
-    try {
-      // Check token count before embedding
-      const tokens = await countTokens(text);
-      if (tokens > MAX_EMBEDDING_TOKENS) {
-        throw new Error(
-          `Text too long for embedding: ${tokens} tokens (max: ${MAX_EMBEDDING_TOKENS}). ` +
-          `Consider chunking the text first.`
-        );
-      }
-
-      // Call Ollama embeddings API
-      const response = await fetch(`${this.ollamaUrl}/api/embeddings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: this.embeddingModel,
-          prompt: text
-        })
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Ollama embeddings error: ${response.status} - ${errorText}`);
-      }
-
-      const data = await response.json();
-      
-      if (!data.embedding || !Array.isArray(data.embedding)) {
-        throw new Error('Invalid embedding response from Ollama');
-      }
-
-      console.log(
-        `[VectorStore] Generated embedding: ${data.embedding.length} dimensions, ` +
-        `${tokens} tokens`
+    // Check token count before embedding — a too-long input is a permanent
+    // error, so it is not retried.
+    const tokens = await countTokens(text);
+    if (tokens > MAX_EMBEDDING_TOKENS) {
+      throw new Error(
+        `Text too long for embedding: ${tokens} tokens (max: ${MAX_EMBEDDING_TOKENS}). ` +
+        `Consider chunking the text first.`
       );
-
-      return data.embedding;
-    } catch (error) {
-      console.error('[VectorStore] Embedding generation failed:', error);
-      throw error;
     }
+
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= EMBEDDING_RETRY_ATTEMPTS; attempt++) {
+      try {
+        // Call Ollama embeddings API
+        const response = await fetch(`${this.ollamaUrl}/api/embeddings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: this.embeddingModel,
+            prompt: text
+          })
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          const error = new Error(`Ollama embeddings error: ${response.status} - ${errorText}`);
+          // Permanent (no-retry) errors: any 4xx (missing model, malformed
+          // request) AND the context-length rejection Ollama reports as a
+          // 500 — the local countTokens pre-check can under-count for some
+          // inputs, so this is the real backstop. Retrying either just
+          // hammers Ollama with doomed calls and delays the terminal failure.
+          const contextOverflow = /context length|input length exceeds/i.test(errorText);
+          if ((response.status >= 400 && response.status < 500) || contextOverflow) {
+            Object.assign(error, { permanent: true });
+          }
+          throw error;
+        }
+
+        const data = await response.json();
+
+        if (!data.embedding || !Array.isArray(data.embedding)) {
+          throw new Error('Invalid embedding response from Ollama');
+        }
+
+        return data.embedding;
+      } catch (error) {
+        if ((error as { permanent?: boolean })?.permanent === true) {
+          console.error('[VectorStore] Embedding failed permanently (not retried):', error instanceof Error ? error.message : error);
+          throw error;
+        }
+        lastError = error;
+        if (attempt < EMBEDDING_RETRY_ATTEMPTS) {
+          const delay = EMBEDDING_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) * (1 + Math.random());
+          console.warn(
+            `[VectorStore] Embedding attempt ${attempt}/${EMBEDDING_RETRY_ATTEMPTS} failed, ` +
+            `retrying in ${Math.round(delay)}ms:`,
+            error instanceof Error ? error.message : error
+          );
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    console.error('[VectorStore] Embedding generation failed after retries:', lastError);
+    throw lastError;
   }
 
   /**
@@ -200,9 +252,12 @@ export class VectorStoreManager {
    * @param texts Array of texts to embed
    * @returns Array of embedding vectors
    */
-  async generateEmbeddings(texts: string[]): Promise<number[][]> {
+  async generateEmbeddings(
+    texts: string[],
+    onProgress?: EmbeddingProgressCallback
+  ): Promise<number[][]> {
     const embeddings: number[][] = [];
-    
+
     // Process in batches to avoid overwhelming the server
     const batchSize = 10;
     for (let i = 0; i < texts.length; i += batchSize) {
@@ -211,13 +266,23 @@ export class VectorStoreManager {
         batch.map(text => this.generateEmbedding(text))
       );
       embeddings.push(...batchEmbeddings);
-      
+
       console.log(
         `[VectorStore] Generated embeddings for batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(texts.length / batchSize)}`
       );
+      onProgress?.(embeddings.length, texts.length);
     }
-    
+
     return embeddings;
+  }
+
+  /**
+   * Compute the content hash used for chunk-level embedding reuse.
+   * @param text Chunk text
+   * @returns sha256 hex digest
+   */
+  static chunkHash(text: string): string {
+    return createHash('sha256').update(text).digest('hex');
   }
 
   /**
@@ -441,6 +506,141 @@ export class VectorStoreManager {
       console.error('[VectorStore] Failed to add document:', error);
       throw error;
     }
+  }
+
+  /**
+   * Synchronize a document's chunks into a collection (idempotent).
+   *
+   * Unlike addDocument, this:
+   * - uses deterministic chunk ids (`${documentId}_chunk_${index}`) so re-runs
+   *   upsert instead of duplicating,
+   * - stores a sha256 `chunkHash` in each chunk's metadata and reuses the
+   *   stored embedding for any new chunk whose hash already exists on the
+   *   document — an append-mostly update embeds only the new tail instead of
+   *   re-embedding everything,
+   * - keeps the previous chunks in place until the new set is upserted, then
+   *   removes stale ids (shrink case and legacy timestamped ids), so the
+   *   document stays searchable throughout.
+   *
+   * @param collectionName Name of the collection
+   * @param documentId Stable document identifier (also written to metadata)
+   * @param text Full document text
+   * @param metadata Document metadata applied to every chunk
+   * @param chunkingConfig Optional chunking configuration
+   * @param onProgress Optional progress callback for the embedding phase
+   * @param beforeSwap Optional guard called after embedding, immediately
+   *   before the vector swap. Return false to abort the swap (result comes
+   *   back with `aborted: true`) — callers use this to re-verify the
+   *   document wasn't superseded or archived while embedding ran, so a
+   *   stale job can never clobber a newer job's vectors.
+   * @returns Sync statistics
+   */
+  async syncDocument(
+    collectionName: string,
+    documentId: string,
+    text: string,
+    metadata: Record<string, any>,
+    chunkingConfig?: ChunkingConfig,
+    onProgress?: EmbeddingProgressCallback,
+    beforeSwap?: () => Promise<boolean>
+  ): Promise<SyncDocumentResult> {
+    const collection = await this.getOrCreateCollection(collectionName);
+    const textChunks = await this.chunkText(text, chunkingConfig);
+    const hashes = textChunks.map(chunk => VectorStoreManager.chunkHash(chunk));
+
+    // Fetch the document's existing chunks (paged — a large doc with
+    // embeddings included is a multi-MB payload) and index their vectors by
+    // content hash for reuse. Reuse is gated on the embedding model that
+    // produced the stored vector — mixing models in one document would make
+    // similarity scores meaningless.
+    const existingIds: string[] = [];
+    const embeddingByHash = new Map<string, number[]>();
+    const pageSize = 500;
+    for (let offset = 0; ; offset += pageSize) {
+      const page = await collection.get({
+        where: { documentId },
+        include: ['metadatas', 'embeddings'] as any,
+        limit: pageSize,
+        offset
+      });
+      const ids = page.ids ?? [];
+      for (let i = 0; i < ids.length; i++) {
+        existingIds.push(ids[i]);
+        const md = (page.metadatas?.[i] as Record<string, any> | null) ?? {};
+        const hash = md.chunkHash;
+        const embedding = page.embeddings?.[i];
+        const sameModel = md.embeddingModel === undefined || md.embeddingModel === this.embeddingModel;
+        if (typeof hash === 'string' && sameModel && Array.isArray(embedding) && embedding.length > 0) {
+          embeddingByHash.set(hash, embedding as number[]);
+        }
+      }
+      if (ids.length < pageSize) break;
+    }
+
+    // Embed only the chunks whose hash has no stored vector.
+    const toEmbedIndexes = textChunks
+      .map((_, index) => index)
+      .filter(index => !embeddingByHash.has(hashes[index]));
+    const newEmbeddings = await this.generateEmbeddings(
+      toEmbedIndexes.map(index => textChunks[index]),
+      onProgress
+    );
+    toEmbedIndexes.forEach((chunkIndex, i) => {
+      embeddingByHash.set(hashes[chunkIndex], newEmbeddings[i]);
+    });
+
+    // Last-moment guard: embedding can take minutes; give the caller one
+    // chance to verify the document still wants THIS content before we
+    // touch the stored vectors.
+    if (beforeSwap && !(await beforeSwap())) {
+      console.log(`[VectorStore] Sync of ${documentId} aborted before swap (superseded/archived)`);
+      return {
+        chunkCount: 0,
+        embeddedChunks: toEmbedIndexes.length,
+        reusedChunks: 0,
+        deletedChunks: 0,
+        charCount: text.length,
+        aborted: true
+      };
+    }
+
+    const timestamp = Date.now();
+    const ids = textChunks.map((_, index) => `${documentId}_chunk_${index}`);
+    await collection.upsert({
+      ids,
+      embeddings: textChunks.map((_, index) => embeddingByHash.get(hashes[index])!),
+      documents: textChunks,
+      metadatas: textChunks.map((_, index) => ({
+        ...metadata,
+        documentId,
+        chunkIndex: index,
+        totalChunks: textChunks.length,
+        chunkHash: hashes[index],
+        embeddingModel: this.embeddingModel,
+        timestamp
+      }))
+    });
+
+    // Remove chunks that are no longer part of the document.
+    const keep = new Set(ids);
+    const staleIds = existingIds.filter(id => !keep.has(id));
+    if (staleIds.length > 0) {
+      await collection.delete({ ids: staleIds });
+    }
+
+    const result: SyncDocumentResult = {
+      chunkCount: textChunks.length,
+      embeddedChunks: toEmbedIndexes.length,
+      reusedChunks: textChunks.length - toEmbedIndexes.length,
+      deletedChunks: staleIds.length,
+      charCount: text.length
+    };
+    console.log(
+      `[VectorStore] Synced ${documentId} in ${collectionName}: ` +
+      `${result.chunkCount} chunks (${result.embeddedChunks} embedded, ` +
+      `${result.reusedChunks} reused, ${result.deletedChunks} stale removed)`
+    );
+    return result;
   }
 
   /**

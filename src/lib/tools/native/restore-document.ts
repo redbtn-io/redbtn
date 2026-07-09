@@ -1,16 +1,11 @@
 /**
- * Reprocess Document — Native Library Tool
+ * Restore Document — Native Library Tool
  *
- * Re-runs OCR / parsing / re-embedding for an existing document via the
- * webapp API (`POST /api/v1/libraries/:libraryId/documents/:documentId/process`).
- *
- * Spec: TOOL-HANDOFF.md §4.4
- *   - inputs: libraryId (required), documentId (required)
- *   - output: { ok: true, chunks: number }
- *
- * The webapp /process route currently focuses on image OCR (and is gated
- * behind a 503 if the OCR pipeline isn't wired). It returns information
- * about the new chunk count when it succeeds; we surface that here.
+ * Restores an archived document via the webapp API
+ * (`POST /api/v1/libraries/:libraryId/documents/:documentId/restore`).
+ * The document re-embeds from its stored source through the
+ * document-processing queue; by default the tool waits for embedding to
+ * complete (same wait semantics as add_document).
  */
 
 import type {
@@ -23,7 +18,7 @@ import { waitForDocumentProcessing, WAIT_SCHEMA_PROPERTIES } from './library-wai
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
-interface ReprocessDocumentArgs {
+interface RestoreDocumentArgs {
   libraryId: string;
   documentId: string;
   wait?: boolean;
@@ -52,9 +47,9 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
   return headers;
 }
 
-const reprocessDocumentTool: NativeToolDefinition = {
+const restoreDocumentTool: NativeToolDefinition = {
   description:
-    'Reprocess a document — re-run parsing/OCR and re-embed its chunks. Useful after the source file changed or when an earlier process failed.',
+    'Restore an archived Knowledge Library document. Re-embeds it from the stored source; the document becomes searchable again when processing completes (waited on by default).',
   server: 'library',
   inputSchema: {
     type: 'object',
@@ -65,7 +60,7 @@ const reprocessDocumentTool: NativeToolDefinition = {
       },
       documentId: {
         type: 'string',
-        description: 'Document id to reprocess.',
+        description: 'Archived document id to restore.',
       },
       ...WAIT_SCHEMA_PROPERTIES,
     },
@@ -73,7 +68,7 @@ const reprocessDocumentTool: NativeToolDefinition = {
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
-    const args = rawArgs as Partial<ReprocessDocumentArgs>;
+    const args = rawArgs as Partial<RestoreDocumentArgs>;
     const libraryId =
       typeof args.libraryId === 'string' ? args.libraryId.trim() : '';
     const documentId =
@@ -95,7 +90,7 @@ const reprocessDocumentTool: NativeToolDefinition = {
     }
 
     const baseUrl = getBaseUrl();
-    const url = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}/documents/${encodeURIComponent(documentId)}/process`;
+    const url = `${baseUrl}/api/v1/libraries/${encodeURIComponent(libraryId)}/documents/${encodeURIComponent(documentId)}/restore`;
 
     try {
       const response = await fetch(url, {
@@ -116,7 +111,7 @@ const reprocessDocumentTool: NativeToolDefinition = {
               type: 'text',
               text: JSON.stringify({
                 error:
-                  `Library reprocess API ${response.status} ${response.statusText}` +
+                  `Library restore API ${response.status} ${response.statusText}` +
                   (errBody ? `: ${errBody.slice(0, 200)}` : ''),
                 status: response.status,
               }),
@@ -128,73 +123,56 @@ const reprocessDocumentTool: NativeToolDefinition = {
 
       const data = (await response.json().catch(() => ({}))) as AnyObject;
 
-      // Async ingestion (202): the reprocess is queued on the background
-      // worker. Poll to completion unless the caller opted out.
-      if (data?.processingStatus === 'pending' || data?.processingStatus === 'processing') {
-        if (args.wait === false) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  ok: true,
-                  processingStatus: 'pending',
-                  jobId: data.jobId,
-                  note: 'Reprocess runs in the background; poll status until processingStatus is completed.',
-                }),
-              },
-            ],
-          };
-        }
-        const final = await waitForDocumentProcessing(
-          baseUrl,
-          libraryId,
-          documentId,
-          buildHeaders(context),
-          typeof args.waitTimeoutMs === 'number' ? args.waitTimeoutMs : undefined
-        );
-        if (final.processingStatus === 'failed') {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  error: final.processingError || 'Document reprocessing failed',
-                  processingStatus: 'failed',
-                  jobId: final.jobId ?? data.jobId,
-                }),
-              },
-            ],
-            isError: true,
-          };
-        }
+      if (args.wait === false) {
         return {
           content: [
             {
               type: 'text',
               text: JSON.stringify({
-                ok: final.processingStatus === 'completed',
-                chunks: final.chunkCount ?? 0,
-                processingStatus: final.processingStatus,
-                ...(final.timedOut ? { timedOut: true } : {}),
+                ok: true,
+                restored: true,
+                processingStatus: 'pending',
+                jobId: data.jobId,
+                note: 'Re-embed runs in the background; poll reprocess status until processingStatus is completed.',
               }),
             },
           ],
         };
       }
 
-      const chunks =
-        typeof data?.chunkCount === 'number'
-          ? data.chunkCount
-          : typeof data?.chunks === 'number'
-          ? data.chunks
-          : 0;
-
+      const final = await waitForDocumentProcessing(
+        baseUrl,
+        libraryId,
+        documentId,
+        buildHeaders(context),
+        typeof args.waitTimeoutMs === 'number' ? args.waitTimeoutMs : undefined
+      );
+      if (final.processingStatus === 'failed') {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: final.processingError || 'Restore re-embed failed',
+                processingStatus: 'failed',
+                jobId: final.jobId ?? data.jobId,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ ok: true, chunks }),
+            text: JSON.stringify({
+              ok: true,
+              restored: final.processingStatus === 'completed',
+              processingStatus: final.processingStatus,
+              chunks: final.chunkCount ?? 0,
+              ...(final.timedOut ? { timedOut: true } : {}),
+            }),
           },
         ],
       };
@@ -210,5 +188,5 @@ const reprocessDocumentTool: NativeToolDefinition = {
   },
 };
 
-export default reprocessDocumentTool;
-module.exports = reprocessDocumentTool;
+export default restoreDocumentTool;
+module.exports = restoreDocumentTool;
