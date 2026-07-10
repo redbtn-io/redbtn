@@ -114,6 +114,16 @@ export interface ConnectionFetcher {
 
 export interface RunOptions {
   userId: string;
+  /**
+   * Run-as-caller delegation (RUN-AS-CALLER-DELEGATION-SPEC.md). When set, user
+   * OAuth CONNECTIONS resolve against THIS user (the triggering caller) instead
+   * of `userId` (the owner) — so a service-owned graph can act on each caller's
+   * own accounts. Secrets, LLM/compute and metering stay on `userId` (owner).
+   * Absent ⇒ owner-resolved (today's behaviour). Unspoofable (set server-side
+   * from the caller's verified auth); resolution is fail-closed (a missing
+   * caller connection never falls back to the owner's).
+   */
+  connectionIdentityUserId?: string;
   graphId?: string;
   conversationId?: string;
   threadId?: string;
@@ -1493,8 +1503,12 @@ export async function run(
   // replaced with a 69-byte placeholder, breaking every checkpoint resume.
   let runCtxConnectionManager: ConnectionManager | undefined;
   if (options.connectionFetcher) {
+    // Run-as-caller delegation: the ConnectionManager's ownership gate
+    // (`connection.userId !== this.userId` ⇒ reject) must key on the CALLER
+    // when delegating, matching the caller-scoped connectionFetcher the worker
+    // builds. Secrets/LLM/metering stay on `options.userId` (owner).
     runCtxConnectionManager = new ConnectionManager({
-      userId: options.userId,
+      userId: options.connectionIdentityUserId ?? options.userId,
       fetchConnection: options.connectionFetcher.fetchConnection,
       fetchDefaultConnection: options.connectionFetcher.fetchDefaultConnection,
       refreshConnection: options.connectionFetcher.refreshConnection,
