@@ -1068,7 +1068,7 @@ async function buildBaseMessagesForToolLoop(
 /**
  * Inputs for the native tool-use loop.
  */
-interface NativeToolUseLoopArgs {
+export interface NativeToolUseLoopArgs {
   config: NeuronStepConfig;
   state: any;
   /** The base LangChain model — bindTools will be called on it inside the loop */
@@ -1163,7 +1163,7 @@ function generateToolId(toolName: string, iteration: number): string {
  *         message per result, then loop.
  *   3. If the loop exhausts iterations, synthesize a wrap-up message.
  */
-async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string> {
+export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string> {
   const {
     config,
     state,
@@ -1317,6 +1317,28 @@ async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string
         ? safeParseJson(rawArgs)
         : (rawArgs && typeof rawArgs === 'object' ? rawArgs : {});
       const toolCallId: string | undefined = toolCall?.id;
+
+      // Optional narration prop: the LLM may attach `message_user` to ANY
+      // tool call's args to narrate what it's about to do (e.g. "Searching
+      // your files..."). It is never a real tool argument, so it's always
+      // stripped here — before schema coercion, env auto-injection, and
+      // dispatch — regardless of tool source (native/MCP/graph all dispatch
+      // through the same `resolved.invoke()` below). If present and a
+      // non-empty string, publish it to the conversation BEFORE the tool
+      // runs, via the same runPublisher.chunk() path used for streamed
+      // assistant text elsewhere in this loop.
+      const rawMessageUser = parsedArgs.message_user;
+      if ('message_user' in parsedArgs) {
+        delete parsedArgs.message_user;
+      }
+      const messageUser = typeof rawMessageUser === 'string' ? rawMessageUser : undefined;
+      if (messageUser && runPublisher) {
+        try {
+          await runPublisher.chunk(messageUser);
+        } catch (chunkErr: any) {
+          console.warn('[NeuronExecutor] Failed to publish message_user narration:', chunkErr?.message ?? chunkErr);
+        }
+      }
 
       const resolved = resolvedTools.find((t) => t.name === toolName);
       const toolId = generateToolId(toolName, iteration);
