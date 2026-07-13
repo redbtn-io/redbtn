@@ -325,7 +325,7 @@ describe('EnvironmentSession — exec()', () => {
     });
     await session.open();
     await session.exec('ls');
-    expect(captured).toContain('cd "/repo/foo"');
+    expect(captured).toContain("cd '/repo/foo'");
     expect(captured).toContain('ls');
   });
 
@@ -342,8 +342,8 @@ describe('EnvironmentSession — exec()', () => {
     });
     await session.open();
     await session.exec('ls', { cwd: '/repo/bar' });
-    expect(captured).toContain('cd "/repo/bar"');
-    expect(captured).not.toContain('cd "/repo/foo"');
+    expect(captured).toContain("cd '/repo/bar'");
+    expect(captured).not.toContain("cd '/repo/foo'");
   });
 
   it('exec() injects opts.env exports', async () => {
@@ -356,7 +356,71 @@ describe('EnvironmentSession — exec()', () => {
     const { session } = buildSession({ client });
     await session.open();
     await session.exec('printenv FOO', { env: { FOO: 'bar' } });
-    expect(captured).toContain('export FOO="bar"');
+    expect(captured).toContain("export FOO='bar'");
+  });
+
+  // ── Regression: cwd/env must be shell-quoted, not JSON.stringify'd ──────
+  // JSON.stringify produces a double-quoted string; bash still expands
+  // `$(...)`/backticks INSIDE double quotes. Only single-quoting (shQuote)
+  // makes every byte but `'` literal. cwd/env ultimately come from
+  // LLM-controlled tool args (run_command's cwd/env, glob's basePath,
+  // ssh_shell's environmentId-mode workingDir/env).
+  it('cwd containing a command substitution is NOT executable — single-quoted literally', async () => {
+    const client = new MockSshClient();
+    let captured = '';
+    client.behaviour.onExec = (cmd, ch) => {
+      captured = cmd;
+      ch.finish(0);
+    };
+    const { session } = buildSession({ client });
+    await session.open();
+    const malicious = '/tmp/$(touch /tmp/pwned)';
+    await session.exec('ls', { cwd: malicious });
+    // Single-quoted: `cd '/tmp/$(touch /tmp/pwned)'` — bash treats this as a
+    // literal (nonexistent) directory name, never invoking touch.
+    expect(captured).toContain(`cd '${malicious}'`);
+    expect(captured).not.toContain('cd "');
+  });
+
+  it('cwd containing an embedded single quote is escaped, not broken out of', async () => {
+    const client = new MockSshClient();
+    let captured = '';
+    client.behaviour.onExec = (cmd, ch) => {
+      captured = cmd;
+      ch.finish(0);
+    };
+    const { session } = buildSession({ client });
+    await session.open();
+    await session.exec('ls', { cwd: "/tmp/foo'; touch /tmp/pwned; echo '" });
+    expect(captured).toContain(`cd '/tmp/foo'\\''; touch /tmp/pwned; echo '\\'''`);
+  });
+
+  it('env value containing a command substitution is NOT executable — single-quoted literally', async () => {
+    const client = new MockSshClient();
+    let captured = '';
+    client.behaviour.onExec = (cmd, ch) => {
+      captured = cmd;
+      ch.finish(0);
+    };
+    const { session } = buildSession({ client });
+    await session.open();
+    const malicious = '$(touch /tmp/pwned)';
+    await session.exec('ls', { env: { FOO: malicious } });
+    expect(captured).toContain(`export FOO='${malicious}'`);
+  });
+
+  it('env keys that are not valid POSIX identifiers are dropped, not interpolated', async () => {
+    const client = new MockSshClient();
+    let captured = '';
+    client.behaviour.onExec = (cmd, ch) => {
+      captured = cmd;
+      ch.finish(0);
+    };
+    const { session } = buildSession({ client });
+    await session.open();
+    await session.exec('ls', { env: { 'FOO; touch /tmp/pwned #': 'x', GOOD: 'ok' } });
+    expect(captured).not.toContain('pwned');
+    expect(captured).toContain("export GOOD='ok'");
   });
 });
 

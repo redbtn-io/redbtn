@@ -258,6 +258,16 @@ function sftpWriteFile(sftp: SFTPWrapper, remotePath: string, buffer: Buffer): P
   });
 }
 
+/**
+ * Bash-safe single-quote escape — same idiom as `shQuote` in ssh-shell.ts /
+ * ssh-run-async.ts / grep-files.ts / EnvironmentSession.ts. `JSON.stringify`
+ * is NOT a substitute: it's double-quoted, and bash still expands `$(...)` /
+ * backticks inside a double-quoted argument.
+ */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 function sftpMkdir(sftp: SFTPWrapper, dirPath: string): Promise<void> {
   return new Promise((resolve) => {
     sftp.mkdir(dirPath, (err) => {
@@ -713,9 +723,16 @@ async function executeViaEnvironment(args: ExecuteViaEnvironmentArgs): Promise<N
   // and best-effort mkdirs each one (EEXIST tolerated). We use exec + mkdir
   // -p instead of session.sftpReaddir because EnvironmentSession.sftpReaddir
   // doesn't expose mkdir directly. exec is portable enough for this.
+  //
+  // SECURITY: `dir` can be `fileParent`, derived from `file.filename` — which,
+  // for the `sourceUrl` source, comes from the THIRD-PARTY server's
+  // Content-Disposition response header (see resolveFilename above), not
+  // from the graph author. shQuote (NOT JSON.stringify, which is
+  // double-quoted and leaves `$(...)`/backticks live to bash) is required so
+  // a malicious filename can't inject a command into `mkdir -p`.
   const ensureRemoteDir = async (dir: string) => {
     try {
-      await session.exec(`mkdir -p ${JSON.stringify(dir)}`);
+      await session.exec(`mkdir -p ${shQuote(dir)}`);
     } catch (err) {
       // Surface the failure so the caller knows the parent dir creation
       // failed — otherwise a write to a missing dir returns a confusing

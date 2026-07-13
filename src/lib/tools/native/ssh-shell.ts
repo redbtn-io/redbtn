@@ -60,6 +60,15 @@ function shQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * POSIX portable environment-variable name: `[A-Za-z_][A-Za-z0-9_]*`. Env
+ * var KEYS sit on the left of `export NAME=...` — outside any quoting — so
+ * they can't be shQuote'd the way values can. A key that isn't a valid
+ * identifier is dropped rather than interpolated: accepting it would let a
+ * key like `FOO; rm -rf /` break out of the export statement entirely.
+ */
+const SAFE_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
@@ -217,9 +226,12 @@ const sshShell: NativeToolDefinition = {
 
     if (env && Object.keys(env).length > 0) {
       const envExports = Object.entries(env)
+        .filter(([k]) => SAFE_ENV_KEY.test(k))
         .map(([k, v]) => `export ${k}=${shQuote(String(v))}`)
         .join(' && ');
-      fullCommand = `${envExports} && ${fullCommand}`;
+      if (envExports) {
+        fullCommand = `${envExports} && ${fullCommand}`;
+      }
     }
 
     // Wrap the user command so we can (a) capture the remote PID for
