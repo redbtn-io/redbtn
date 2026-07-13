@@ -4,6 +4,17 @@ import { buildHeaders } from './_task-helpers';
 
 type AnyObject = Record<string, unknown>;
 
+// Hard cap on bytes read from the response body, mirroring download-file.ts's
+// streaming-with-cap pattern. `response.text()` buffers the ENTIRE body into
+// memory before the 500,000-character display truncation below ever runs —
+// against an arbitrary attacker-controlled URL (fetch_url's whole purpose),
+// an oversized or slow-drip response is a memory-exhaustion vector. This cap
+// is read at the byte level and is intentionally well above the 500,000-char
+// display truncation (worst-case ~4 bytes/char in UTF-8) so it only ever
+// kicks in for genuinely oversized bodies, not ordinary large-but-legitimate
+// responses.
+const MAX_RESPONSE_BODY_BYTES = 8 * 1024 * 1024; // 8 MB
+
 const fetchUrlTool: NativeToolDefinition = {
   description: 'Make an HTTP request to a URL. Supports all REST methods with custom headers, body, auth, and redirect control. Returns status, response headers, and body.',
   inputSchema: {
@@ -190,10 +201,55 @@ const fetchUrlTool: NativeToolDefinition = {
         responseHeaders[key] = value;
       });
 
-      // HEAD and OPTIONS don't need body
+      // HEAD and OPTIONS don't need body. Stream + cap instead of
+      // response.text() (which buffers the whole body into memory before
+      // ANY size check runs) — see MAX_RESPONSE_BODY_BYTES above.
       let responseBody = '';
+      let bodyCapped = false;
       if (method !== 'HEAD') {
-        responseBody = await response.text();
+        const bodyStream = response.body;
+        if (bodyStream) {
+          const reader = bodyStream.getReader();
+          const chunks: Uint8Array[] = [];
+          let received = 0;
+          try {
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (value) {
+                received += value.byteLength;
+                if (received > MAX_RESPONSE_BODY_BYTES) {
+                  bodyCapped = true;
+                  try {
+                    await reader.cancel();
+                  } catch {
+                    /* ignore */
+                  }
+                  break;
+                }
+                chunks.push(value);
+              }
+            }
+          } finally {
+            try {
+              reader.releaseLock();
+            } catch {
+              /* ignore */
+            }
+          }
+          responseBody = Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8');
+        } else {
+          // Some fetch implementations / mocks return no streamable body —
+          // fall back to the buffered path and cap after the fact.
+          const full = await response.text();
+          if (Buffer.byteLength(full, 'utf8') > MAX_RESPONSE_BODY_BYTES) {
+            bodyCapped = true;
+            responseBody = Buffer.from(full, 'utf8').subarray(0, MAX_RESPONSE_BODY_BYTES).toString('utf8');
+          } else {
+            responseBody = full;
+          }
+        }
       }
 
       // Try to pretty-print JSON
@@ -208,6 +264,8 @@ const fetchUrlTool: NativeToolDefinition = {
       // Truncate large responses
       if (output.length > 500000) {
         output = output.slice(0, 500000) + '...(truncated)';
+      } else if (bodyCapped) {
+        output += `...(truncated - response body exceeded ${MAX_RESPONSE_BODY_BYTES} bytes)`;
       }
 
       console.log('[fetch_url]', `fetch_url ${method} ${url} → ${response.status}`);
