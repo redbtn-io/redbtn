@@ -88,6 +88,21 @@ const fetchUrlTool: NativeToolDefinition = {
       // never leak to a third party. A header the caller set explicitly is
       // never overwritten (case-insensitive check), so an explicit
       // Authorization header always wins.
+      //
+      // SECURITY (redirect hop): `isInternalHost` is only checked against
+      // THIS url. `fetch()`'s automatic redirect-follow forwards `X-User-Id` /
+      // `X-Internal-Key` on cross-origin hops (they're plain headers, not on
+      // the fetch spec's cross-origin-strip list the way `Authorization` is —
+      // verified empirically). If the internal host ever has an open-redirect
+      // endpoint, that forwards the run owner's identity AND the shared
+      // service secret to whatever the redirect points to. So the moment we
+      // attach internal auth we force manual redirect handling for this
+      // request, regardless of the caller's `followRedirects` — the 3xx comes
+      // back to the caller as-is instead of being auto-followed. A caller
+      // that wants the redirect target's content issues it as a fresh
+      // fetch_url call, which re-checks isInternalHost on the NEW url and
+      // only reattaches credentials if that host is internal too.
+      let attachedInternalAuth = false;
       if (isInternalHost(url)) {
         const hasHeader = (name: string): boolean => {
           const lower = name.toLowerCase();
@@ -98,9 +113,11 @@ const fetchUrlTool: NativeToolDefinition = {
           const value = authHeaders[key];
           if (value && !hasHeader(key)) {
             fetchHeaders[key] = value;
+            attachedInternalAuth = true;
           }
         }
       }
+      const effectiveRedirect = attachedInternalAuth ? 'manual' : (followRedirects ? 'follow' : 'manual');
 
       const MAX_RETRIES = 2;
       const BACKOFF = [2_000, 5_000];
@@ -133,7 +150,7 @@ const fetchUrlTool: NativeToolDefinition = {
             headers: fetchHeaders,
             body: method !== 'GET' && method !== 'HEAD' ? (body || undefined) : undefined,
             signal: controller.signal,
-            redirect: followRedirects ? 'follow' : 'manual',
+            redirect: effectiveRedirect,
           });
           clearTimeout(timer);
           if (runAbortSignal && runAbortListener) {

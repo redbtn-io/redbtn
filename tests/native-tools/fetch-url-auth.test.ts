@@ -29,13 +29,13 @@ function headerKeysLower(h: Record<string, string>): string[] {
 
 describe('fetch_url — run-owner auth attachment', () => {
   let originalFetch: typeof globalThis.fetch;
-  let captured: { url: string; headers: Record<string, string> }[];
+  let captured: { url: string; headers: Record<string, string>; redirect?: string }[];
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;
     captured = [];
     globalThis.fetch = vi.fn(async (url: any, init: any) => {
-      captured.push({ url: String(url), headers: { ...(init?.headers || {}) } });
+      captured.push({ url: String(url), headers: { ...(init?.headers || {}) }, redirect: init?.redirect });
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
@@ -146,6 +146,47 @@ describe('fetch_url — run-owner auth attachment', () => {
       if (prev === undefined) delete process.env.WEBAPP_URL;
       else process.env.WEBAPP_URL = prev;
     }
+  });
+
+  test('forces manual redirect handling when internal credentials are attached, even with followRedirects unset (default true)', async () => {
+    // Regression: fetch() auto-follows redirects and forwards plain headers
+    // like X-User-Id/X-Internal-Key on cross-origin hops (Authorization is
+    // spec-stripped, these are not) — verified empirically against Node's
+    // fetch. If app.redbtn.io/run.redbtn.io/WEBAPP_URL ever has an
+    // open-redirect endpoint, auto-following would leak the run owner's
+    // identity and the shared internal service key to the redirect target.
+    process.env.INTERNAL_SERVICE_KEY = 'svc-key';
+    await fetchUrlTool.handler(
+      { url: 'https://app.redbtn.io/api/something' },
+      ctx({ authToken: 'jwt-abc', userId: 'user-1' }),
+    );
+    expect(captured[0].redirect).toBe('manual');
+  });
+
+  test('forces manual redirect handling when internal credentials are attached, even with followRedirects: true explicitly', async () => {
+    process.env.INTERNAL_SERVICE_KEY = 'svc-key';
+    await fetchUrlTool.handler(
+      { url: 'https://run.redbtn.io/api/workspaces', followRedirects: true },
+      ctx({ authToken: 'jwt-run', userId: 'user-2' }),
+    );
+    expect(captured[0].redirect).toBe('manual');
+  });
+
+  test('a non-internal host still auto-follows redirects by default (behavior unchanged)', async () => {
+    await fetchUrlTool.handler(
+      { url: 'https://example.com/x' },
+      ctx({ authToken: 'jwt-abc', userId: 'user-1' }),
+    );
+    expect(captured[0].redirect).toBe('follow');
+  });
+
+  test('a public internal endpoint with no run credentials still auto-follows (no auth was attached)', async () => {
+    const res = await fetchUrlTool.handler(
+      { url: 'https://app.redbtn.io/health' },
+      ctx({}),
+    );
+    expect(captured[0].redirect).toBe('follow');
+    expect(res.isError).not.toBe(true);
   });
 
   test('a public internal endpoint with no run credentials still succeeds', async () => {
