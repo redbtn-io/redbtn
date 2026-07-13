@@ -49,11 +49,27 @@ describe('exec/computer — FAIL-CLOSED when unprofiled', () => {
         .toThrow(CapabilityDeniedError);
     }
   });
+  it('DENIES the rest of the fs pack (write_file/edit_file/glob/grep_files/list_dir) with no profile', () => {
+    for (const t of ['write_file', 'edit_file', 'glob', 'grep_files', 'list_dir']) {
+      expect(() => enforceToolCapability(null, t, { environmentId: ENV, path: '/x', pattern: '*' }))
+        .toThrow(CapabilityDeniedError);
+    }
+  });
+  it('DENIES the process pack (ssh_run_async/ssh_kill/ssh_tail) with no profile', () => {
+    for (const t of ['ssh_run_async', 'ssh_kill', 'ssh_tail']) {
+      expect(() => enforceToolCapability(null, t, { environmentId: ENV, command: 'x', jobId: 'job_x' }))
+        .toThrow(CapabilityDeniedError);
+    }
+  });
   it('DENIES desktop computer-use tools with no profile', () => {
     for (const t of ['desktop_screenshot', 'desktop_click', 'desktop_type', 'desktop_key']) {
       expect(() => enforceToolCapability(null, t, { environmentId: ENV }))
         .toThrow(CapabilityDeniedError);
     }
+  });
+  it('DENIES desktop_settings with no profile', () => {
+    expect(() => enforceToolCapability(null, 'desktop_settings', { environmentId: ENV, op: 'set', patch: {} }))
+      .toThrow(CapabilityDeniedError);
   });
 });
 
@@ -98,6 +114,22 @@ describe('exec — scoped grant', () => {
     expect(() => enforceToolCapability(execScoped, 'read_file', { environmentId: ENV, path: '/x' }))
       .not.toThrow();
   });
+  it('ALLOWS the rest of the fs pack on the granted env; DENIES on a different env', () => {
+    for (const t of ['write_file', 'edit_file', 'glob', 'grep_files', 'list_dir']) {
+      expect(() => enforceToolCapability(execScoped, t, { environmentId: ENV, path: '/x', pattern: '*' }))
+        .not.toThrow();
+      expect(() => enforceToolCapability(execScoped, t, { environmentId: OTHER, path: '/x', pattern: '*' }))
+        .toThrow(CapabilityDeniedError);
+    }
+  });
+  it('ALLOWS the process pack on the granted env; DENIES on a different env', () => {
+    for (const t of ['ssh_run_async', 'ssh_kill', 'ssh_tail']) {
+      expect(() => enforceToolCapability(execScoped, t, { environmentId: ENV, command: 'x', jobId: 'job_x' }))
+        .not.toThrow();
+      expect(() => enforceToolCapability(execScoped, t, { environmentId: OTHER, command: 'x', jobId: 'job_x' }))
+        .toThrow(CapabilityDeniedError);
+    }
+  });
 });
 
 describe('exec — unscoped (inline ssh_shell / no environmentId) requires wildcard', () => {
@@ -121,6 +153,12 @@ describe('computer — scoped grant', () => {
   });
   it('a computer grant does NOT satisfy exec', () => {
     expect(() => enforceToolCapability(computerScoped, 'run_command', { environmentId: ENV, command: 'ls' }))
+      .toThrow(CapabilityDeniedError);
+  });
+  it('ALLOWS desktop_settings on the granted env, DENIES on another', () => {
+    expect(() => enforceToolCapability(computerScoped, 'desktop_settings', { environmentId: ENV, op: 'set', patch: {} }))
+      .not.toThrow();
+    expect(() => enforceToolCapability(computerScoped, 'desktop_settings', { environmentId: OTHER, op: 'get' }))
       .toThrow(CapabilityDeniedError);
   });
 });

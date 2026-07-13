@@ -196,6 +196,24 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   read_file: { resource: 'exec', action: 'execute', extract: envId },
   ssh_copy: { resource: 'exec', action: 'execute', extract: envId },
   desktop_exec: { resource: 'exec', action: 'execute', extract: envId },
+  // The rest of the "fs pack" (Env Phase C) — same EnvironmentSession/SFTP
+  // authority as read_file above, just missed when the fs pack's other five
+  // tools shipped alongside read_file. write_file/edit_file mutate the
+  // filesystem directly; glob/grep_files shell out via session.exec(); all
+  // five require the exact same `exec:execute` grant read_file does.
+  write_file: { resource: 'exec', action: 'execute', extract: envId },
+  edit_file: { resource: 'exec', action: 'execute', extract: envId },
+  glob: { resource: 'exec', action: 'execute', extract: envId },
+  grep_files: { resource: 'exec', action: 'execute', extract: envId },
+  list_dir: { resource: 'exec', action: 'execute', extract: envId },
+  // The "process pack" (Env Phase D) — ssh_run_async executes an arbitrary
+  // shell command (identical authority to run_command/ssh_shell); ssh_kill
+  // and ssh_tail both issue their own session.exec() calls against the same
+  // pooled SSH session. All three were missed when desktop_exec/run_command/
+  // ssh_shell were mapped, leaving them ungated even in profiled runs.
+  ssh_run_async: { resource: 'exec', action: 'execute', extract: envId },
+  ssh_kill: { resource: 'exec', action: 'execute', extract: envId },
+  ssh_tail: { resource: 'exec', action: 'execute', extract: envId },
 
   // ── Computer-use: screen + mouse/keyboard (desktop connectors) ────────────
   // FAIL-CLOSED. Grant `computer:control` scoped to the desktop's environmentId.
@@ -206,6 +224,10 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   desktop_type: { resource: 'computer', action: 'control', extract: envId },
   desktop_key: { resource: 'computer', action: 'control', extract: envId },
   desktop_scroll: { resource: 'computer', action: 'control', extract: envId },
+  // desktop_settings' `op:'set'` can toggle the agent's own computer-use/exec
+  // enable flags — a control-plane action over the same desktop connector as
+  // the tools above, so it shares their grant.
+  desktop_settings: { resource: 'computer', action: 'control', extract: envId },
 };
 
 /** Is this tool name a gated data tool? */
