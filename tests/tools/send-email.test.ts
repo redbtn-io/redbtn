@@ -348,6 +348,37 @@ describe('send_email — happy path', () => {
     expect(a.contentType).toBe('text/plain');
   });
 
+  test('disableFileAccess + disableUrlAccess are always set on the outgoing message', async () => {
+    // Regression: nodemailer natively resolves an attachment's `path` via
+    // fs.createReadStream (arbitrary local file read) and `href` via its own
+    // unrestricted fetch (SSRF) — both LLM-controlled, both auto-exfiltrated
+    // to an LLM-controlled `to` address. These two flags tell nodemailer to
+    // reject that resolution outright instead of performing it.
+    await sendEmailTool.handler(
+      { to: 'r@x.com', subject: 's', body: 'b' },
+      makeMockContext(),
+    );
+    expect(lastSendMailCall!.disableFileAccess).toBe(true);
+    expect(lastSendMailCall!.disableUrlAccess).toBe(true);
+  });
+
+  test('disableFileAccess/disableUrlAccess are set even when a path/href attachment is supplied', async () => {
+    await sendEmailTool.handler(
+      {
+        to: 'r@x.com',
+        subject: 's',
+        body: 'b',
+        attachments: [
+          { filename: 'evil.txt', path: '/etc/passwd' },
+          { filename: 'ssrf.txt', href: 'http://169.254.169.254/latest/meta-data/' },
+        ],
+      },
+      makeMockContext(),
+    );
+    expect(lastSendMailCall!.disableFileAccess).toBe(true);
+    expect(lastSendMailCall!.disableUrlAccess).toBe(true);
+  });
+
   test('attachments with no content/path/href are dropped', async () => {
     await sendEmailTool.handler(
       {
