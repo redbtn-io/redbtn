@@ -31,6 +31,17 @@ vi.mock('../../src/lib/tools/native-registry', async () => {
         })),
       get: (name: string) => mockRegistry.get(name),
       has: (name: string) => mockRegistry.has(name),
+      // Mirrors the dispatch half of the real NativeToolRegistry.callTool()
+      // (lookup + invoke) for these mock-registry tests, which are about
+      // invoke_tool's OWN logic (recursion guard, allow/deny, audit, error
+      // wrapping) — not capability enforcement. The
+      // "routes through the real capability gate" describe block below uses
+      // the REAL registry (unmocked) to prove enforcement actually happens.
+      callTool: async (name: string, args: Record<string, unknown>, ctx: NativeToolContext) => {
+        const tool = mockRegistry.get(name);
+        if (!tool) throw new Error(`Native tool not found: ${name}`);
+        return tool.handler(args, ctx);
+      },
     }),
   };
 });

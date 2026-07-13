@@ -25,6 +25,15 @@
  *     tool's handler. That means publisher / runId / state / abortSignal /
  *     credentials all flow through transparently — the dispatched tool
  *     behaves exactly as it would if called directly via the registry.
+ *
+ * Capability enforcement:
+ *   - Dispatch MUST go through `NativeToolRegistry.callTool()` — the single
+ *     chokepoint that runs `enforceToolCapability` (fail-closed exec/computer
+ *     jail) and `runExecGuard` (kill switch / rate limit / durable audit)
+ *     before the handler runs. Calling `tool.handler()` directly here would
+ *     let any graph that wires up `invoke_tool` reach `ssh_shell`/`run_command`/
+ *     etc. with the capability profile fully unenforced — defeating the jail
+ *     for every gated tool, not just this one.
  */
 
 import type {
@@ -134,8 +143,8 @@ const invokeToolTool: NativeToolDefinition = {
       return errorResult('TOOL_NOT_FOUND', `Tool not found: ${toolName}`);
     }
 
-    const tool = getNativeRegistry().get(toolName);
-    if (!tool) {
+    const registry = getNativeRegistry();
+    if (!registry.has(toolName)) {
       return errorResult('TOOL_NOT_FOUND', `Tool not found: ${toolName}`);
     }
 
@@ -147,9 +156,12 @@ const invokeToolTool: NativeToolDefinition = {
     );
 
     try {
-      // Pass the context through unchanged — the dispatched tool sees the same
-      // publisher / state / runId / abortSignal it would if called directly.
-      const result = await tool.handler(innerArgs, context);
+      // Dispatch via callTool() — NOT tool.handler() directly — so the
+      // capability profile gate + exec-guard (kill switch/rate-limit/audit)
+      // run exactly as they would for a direct tool call. The context flows
+      // through unchanged; the dispatched tool sees the same publisher /
+      // state / runId / abortSignal it would if called directly.
+      const result = await registry.callTool(toolName, innerArgs, context);
       return result;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
