@@ -1,0 +1,347 @@
+{
+  "nodeId": "red-ops-triage",
+  "config": {
+    "name": "Red Ops Triage",
+    "description": "Quiet-tick triage gate for Red Ops. Sits between the Red Ops Gate and the CLI Coordinator. Deterministic steps fetch /api/board + red-ops/state and diff them against the red-ops/triage baseline; clear cases (operator directive, failed/finished worker runs, inbox cards with capacity, new human comments) route straight to the coordinator, a fully quiet tick ends the run for free, and only AMBIGUOUS changes cost one gemini-2.5-flash call to adjudicate. Fails OPEN to the coordinator on any error. Guardrails: daily gemini spend/call budget with a one-per-day @george alert, and iteration caps on both fetch loops.",
+    "tags": [
+      "red-ops",
+      "coordinator",
+      "triage",
+      "gate"
+    ],
+    "steps": [
+      {
+        "type": "transform",
+        "config": {
+          "operation": "get-global",
+          "namespace": "red-ops",
+          "key": "config",
+          "outputField": "data.triageCfg"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "get-global",
+          "namespace": "red-ops",
+          "key": "state",
+          "outputField": "data.triageOpsState"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "get-global",
+          "namespace": "red-ops",
+          "key": "triage",
+          "outputField": "data.triageMemoIn"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageToken",
+          "value": "{{(function(){var i=(state.data&&state.data.input)||{};var s=i._secrets||{};var ctl=(state.data&&(state.data.ctl||state.data.opsCfg))||{};var cfg=(state.data&&state.data.triageCfg)||{};return s.ATLAS_TOKEN||i.atlasToken||i.ATLAS_TOKEN||(state.data&&state.data.atlasToken)||ctl.atlasToken||cfg.atlasToken||'';})()}}"
+        }
+      },
+      {
+        "type": "tool",
+        "config": {
+          "toolName": "fetch_url",
+          "parameters": {
+            "url": "{{parameters.atlasBase}}/api/board?status=inbox,claimed,working,pr-open,blocked,needs-input,done",
+            "method": "GET",
+            "headers": {
+              "Authorization": "Bearer {{state.data.triageToken}}"
+            },
+            "timeout": 30000
+          },
+          "outputField": "data.triageBoardRaw",
+          "errorHandling": {
+            "retry": 1,
+            "retryDelay": 1000,
+            "onError": "fallback",
+            "fallbackValue": {
+              "error": "board fetch failed"
+            }
+          }
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageBoard",
+          "value": "{{(function(){var r=state.data.triageBoardRaw;var txt='';if(r&&r.content&&r.content[0]&&r.content[0].text)txt=String(r.content[0].text);else if(typeof r==='string')txt=r;var items=null;var status=0;try{var p=JSON.parse(txt);status=Number(p.status)||0;var body=(p.body!==undefined)?p.body:p;if(typeof body==='string'){try{body=JSON.parse(body);}catch(e){body=null;}}if(body&&Array.isArray(body.items))items=body.items;else if(Array.isArray(body))items=body;}catch(e){}var ok=Array.isArray(items)&&(status===0||status<400);return {ok:ok,status:status,items:ok?items:[]};})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageBase",
+          "value": "{{(function(){ var cfg=state.data.triageCfg||{}; var memo=state.data.triageMemoIn||{}; var seen=(memo&&memo.seen&&typeof memo.seen==='object')?memo.seen:null; var board=state.data.triageBoard||{ok:false,items:[]}; var ctl=state.data.ctl||{}; var P=state.parameters||{}; var num=function(v,d){var n=Number(v);return isFinite(n)&&n>0?n:d;}; var maxProbes=num(cfg.triageMaxRunProbes,num(P.maxRunProbes,4)); var maxComments=num(cfg.triageMaxCommentFetches,num(P.maxCommentFetches,4)); var agentAuthors=Array.isArray(cfg.agentAuthors)?cfg.agentAuthors:['agent@redbtn.io']; var doneWindowMs=num(cfg.triageDoneWindowHours,168)*3600000; var enabled=!(cfg.triage===false||cfg.triageEnabled===false); var firstRun=!seen; var nowMs=new Date().getTime(); var ops=state.data.triageOpsState||{}; var disp=Array.isArray(ops.dispatched)?ops.dispatched:[]; var surfaced=(memo.surfacedRuns&&typeof memo.surfacedRuns==='object')?memo.surfacedRuns:{}; var judged=(memo.judged&&typeof memo.judged==='object')?memo.judged:{}; var lastAt=memo.updatedAt?new Date(memo.updatedAt).getTime():0; if(!isFinite(lastAt))lastAt=0; var items=[];var inbox=0,blocked=0,working=0,prOpen=0,doneRecent=0;var ambiguous=[];var changedCount=0; for(var n=0;n<board.items.length;n++){ var it=board.items[n]||{}; var id=String(it.id||''); if(!id)continue; var st=String(it.status||''); var cc=Number(it.commentCount||0); var up=String(it.updatedAt||''); if(st==='done'||st==='archived'){ var upMs=0;try{upMs=new Date(up).getTime();}catch(e){upMs=0;} if(!isFinite(upMs)||(nowMs-upMs)>doneWindowMs)continue; doneRecent++; } var prev=seen?seen[id]:null; var isNew=!prev; var commentDelta=prev?(cc-Number(prev.c||0)):cc; var statusChanged=prev?(String(prev.s||'')!==st):false; var touched=prev?(String(prev.u||'')!==up):true; var changed=isNew||statusChanged||commentDelta!==0||touched; if(st==='inbox')inbox++; else if(st==='blocked'||st==='needs-input')blocked++; else if(st==='working'||st==='claimed')working++; else if(st==='pr-open')prOpen++; var runId=(it.dispatch&&it.dispatch.workerRunId)?String(it.dispatch.workerRunId):''; var row={id:id,title:String(it.title||'').slice(0,140),status:st,slug:String(it.slug||''),tags:Array.isArray(it.tags)?it.tags:[],urgent:it.urgent===true,commentCount:cc,updatedAt:up,runId:runId,isNew:isNew,statusChanged:statusChanged,commentDelta:commentDelta,changed:changed}; items.push(row); if(changed&&!firstRun)changedCount++; var sig=st+'|'+cc+'|'+up; var alreadyJudgedNo=(judged[id]===sig); row.sig=sig; if(!firstRun&&(changed||st==='blocked'||st==='needs-input')&&(cc>0)&&!alreadyJudgedNo)ambiguous.push(row); } ambiguous.sort(function(a,b){return String(b.updatedAt||'').localeCompare(String(a.updatedAt||''));}); var commentsTruncated=ambiguous.length>maxComments; var commentItemIds=ambiguous.slice(0,maxComments).map(function(r){return r.id;}); var probes=[];var pushProbe=function(rid){rid=String(rid||'');if(!rid)return;if(surfaced[rid])return;if(probes.indexOf(rid)===-1)probes.push(rid);}; for(var d=0;d<disp.length;d++){var e=disp[d]||{};var st2=String(e.status||'');if(st2==='dispatched'||st2==='running')pushProbe(e.workerRunId);} for(var m=0;m<items.length;m++){var r2=items[m];if((r2.status==='working'||r2.status==='claimed')&&r2.runId)pushProbe(r2.runId);} var probeRunIds=probes.slice(0,maxProbes); var probesTruncated=probes.length>maxProbes; return {enabled:enabled,firstRun:firstRun,boardOk:board.ok===true,boardStatus:board.status||0, items:items,counts:{inbox:inbox,blocked:blocked,working:working,prOpen:prOpen,doneRecent:doneRecent,changed:changedCount,total:items.length}, probeRunIds:probeRunIds,probesTruncated:probesTruncated, commentItemIds:commentItemIds,commentsTruncated:commentsTruncated, lastTriageAt:lastAt,agentAuthors:agentAuthors, operatorDirected:ctl.operatorDirected===true,directive:String(ctl.directive||''), target:Number(ctl.target||2),inFlightEstimate:Number(ctl.inFlight||0), maxProbes:maxProbes,maxComments:maxComments}; })()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageProbes",
+          "value": "{{[]}}"
+        }
+      },
+      {
+        "type": "loop",
+        "condition": "{{(state.data.triageBase && (state.data.triageBase.probeRunIds||[]).length > 0) === true}}",
+        "config": {
+          "maxIterations": "{{parameters.maxRunProbes}}",
+          "exitCondition": "state.data.loopIteration >= (state.data.triageBase.probeRunIds || []).length",
+          "onMaxIterations": "continue",
+          "steps": [
+            {
+              "type": "tool",
+              "condition": "{{!!(((state.data.triageBase||{}).probeRunIds||[])[(Number(state.data.loopIteration)||1)-1])}}",
+              "config": {
+                "toolName": "get_run",
+                "parameters": {
+                  "runId": "{{((state.data.triageBase||{}).probeRunIds||[])[(Number(state.data.loopIteration)||1)-1]}}"
+                },
+                "outputField": "data.triageProbeRaw",
+                "errorHandling": {
+                  "retry": 0,
+                  "onError": "fallback",
+                  "fallbackValue": {
+                    "error": "probe failed"
+                  }
+                }
+              }
+            },
+            {
+              "type": "transform",
+              "config": {
+                "operation": "set",
+                "outputField": "data.triageProbes",
+                "value": "{{(function(){ var acc=Array.isArray(state.data.triageProbes)?state.data.triageProbes.slice():[]; var base=state.data.triageBase||{};var ids=base.probeRunIds||[]; var idx=(Number(state.data.loopIteration)||1)-1; var runId=String(ids[idx]||''); if(!runId)return acc; var r=state.data.triageProbeRaw;var txt=''; if(r&&r.content&&r.content[0]&&r.content[0].text)txt=String(r.content[0].text);else if(typeof r==='string')txt=r; var status='unknown'; try{var p=JSON.parse(txt);if(p&&p.run&&p.run.status)status=String(p.run.status);else if(p&&p.error)status='unknown';}catch(e){} var norm='unknown'; if(status==='completed'||status==='complete'||status==='success')norm='done'; else if(status==='error'||status==='failed'||status==='cancelled'||status==='canceled'||status==='interrupted')norm='failed'; else if(status==='running'||status==='pending'||status==='queued'||status==='streaming')norm='running'; acc.push({runId:runId,raw:status,state:norm}); return acc;})()}}"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageComments",
+          "value": "{{[]}}"
+        }
+      },
+      {
+        "type": "loop",
+        "condition": "{{(state.data.triageBase && (state.data.triageBase.commentItemIds||[]).length > 0) === true}}",
+        "config": {
+          "maxIterations": "{{parameters.maxCommentFetches}}",
+          "exitCondition": "state.data.loopIteration >= (state.data.triageBase.commentItemIds || []).length",
+          "onMaxIterations": "continue",
+          "steps": [
+            {
+              "type": "tool",
+              "condition": "{{!!(((state.data.triageBase||{}).commentItemIds||[])[(Number(state.data.loopIteration)||1)-1])}}",
+              "config": {
+                "toolName": "fetch_url",
+                "parameters": {
+                  "url": "{{((state.parameters||{}).atlasBase||\"https://dev.redbtn.io\")+\"/api/board/\"+(((state.data.triageBase||{}).commentItemIds||[])[(Number(state.data.loopIteration)||1)-1]||\"\")+\"/comments\"}}",
+                  "method": "GET",
+                  "headers": {
+                    "Authorization": "Bearer {{state.data.triageToken}}"
+                  },
+                  "timeout": 30000
+                },
+                "outputField": "data.triageCommentsRaw",
+                "errorHandling": {
+                  "retry": 0,
+                  "onError": "fallback",
+                  "fallbackValue": {
+                    "error": "comments fetch failed"
+                  }
+                }
+              }
+            },
+            {
+              "type": "transform",
+              "config": {
+                "operation": "set",
+                "outputField": "data.triageComments",
+                "value": "{{(function(){ var acc=Array.isArray(state.data.triageComments)?state.data.triageComments.slice():[]; var base=state.data.triageBase||{};var ids=base.commentItemIds||[]; var idx=(Number(state.data.loopIteration)||1)-1; var itemId=String(ids[idx]||''); if(!itemId)return acc; var r=state.data.triageCommentsRaw;var txt=''; if(r&&r.content&&r.content[0]&&r.content[0].text)txt=String(r.content[0].text);else if(typeof r==='string')txt=r; var list=[]; try{var p=JSON.parse(txt);var body=(p.body!==undefined)?p.body:p;if(typeof body==='string'){try{body=JSON.parse(body);}catch(e){body=null;}}if(body&&Array.isArray(body.comments))list=body.comments;}catch(e){} var lastAt=Number(base.lastTriageAt||0); var delta=0;var itemsB=base.items||[]; for(var b=0;b<itemsB.length;b++){if(itemsB[b].id===itemId)delta=Number(itemsB[b].commentDelta||0);} var out=[]; for(var i=0;i<list.length;i++){var c=list[i]||{};var t=0;try{t=new Date(c.createdAt).getTime();}catch(e){t=0;}if(!isFinite(t))t=0; var byTime=(lastAt>0&&t>lastAt); var byDelta=(delta>0&&i>=(list.length-delta)); out.push({author:String(c.author||''),body:String(c.body||'').slice(0,400),createdAt:String(c.createdAt||''),isNew:(byTime||byDelta)});} out=out.slice(-5); acc.push({itemId:itemId,comments:out}); return acc;})()}}"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageSignals",
+          "value": "{{(function(){ var base=state.data.triageBase||{}; var probes=Array.isArray(state.data.triageProbes)?state.data.triageProbes:[]; var threads=Array.isArray(state.data.triageComments)?state.data.triageComments:[]; var counts=base.counts||{}; var agents=base.agentAuthors||['agent@redbtn.io']; var isAgent=function(a){return agents.indexOf(String(a||''))!==-1;}; var failedRuns=[],doneRuns=[],running=0; for(var i=0;i<probes.length;i++){var p=probes[i];if(p.state==='failed')failedRuns.push(p.runId);else if(p.state==='done')doneRuns.push(p.runId);else if(p.state==='running')running++;} var humanComments=[]; for(var t=0;t<threads.length;t++){var th=threads[t]||{};var cs=th.comments||[]; for(var c=0;c<cs.length;c++){var cm=cs[c];if(cm.isNew===true&&!isAgent(cm.author))humanComments.push({itemId:th.itemId,author:cm.author,body:String(cm.body||'').slice(0,160)});}} var capacity=Math.max(0,Number(base.target||2)-running); var sig={failedRuns:failedRuns,doneRuns:doneRuns,running:running,capacity:capacity,humanComments:humanComments, inbox:Number(counts.inbox||0),blocked:Number(counts.blocked||0),changed:Number(counts.changed||0), probesTruncated:base.probesTruncated===true,commentsTruncated:base.commentsTruncated===true}; var decide=function(){ if(base.enabled===false)return {route:'run',via:'disabled',reason:'triage disabled in red-ops/config',needsBrain:false}; if(base.operatorDirected===true)return {route:'run',via:'deterministic',reason:'operator-directed tick',needsBrain:false}; if(base.boardOk!==true)return {route:'run',via:'failopen',reason:'board fetch failed (status '+(base.boardStatus||0)+') — failing open',needsBrain:false}; if(base.firstRun===true)return {route:'run',via:'deterministic',reason:'no triage baseline yet (first run)',needsBrain:false}; if(failedRuns.length>0)return {route:'run',via:'deterministic',reason:'failed worker run(s) to recover: '+failedRuns.join(','),needsBrain:false}; if(humanComments.length>0)return {route:'run',via:'deterministic',reason:'new human comment(s) on '+humanComments.length+' card(s)',needsBrain:false}; if(sig.commentsTruncated||sig.probesTruncated)return {route:'run',via:'failopen',reason:'more changed cards/runs than the fetch cap — cannot rule out work',needsBrain:false}; if(doneRuns.length>0)return {route:'run',via:'deterministic',reason:'worker run(s) finished — reconcile + refill: '+doneRuns.join(','),needsBrain:false}; if(sig.inbox>0&&capacity>0)return {route:'run',via:'deterministic',reason:sig.inbox+' inbox card(s) with capacity '+capacity,needsBrain:false}; if(sig.changed>0||threads.length>0)return {route:'stop',via:'neuron',reason:'ambiguous changes — asking triage neuron',needsBrain:true}; return {route:'stop',via:'deterministic',reason:'quiet tick — nothing new on board, '+running+' worker(s) still running',needsBrain:false}; }; var d=decide(); sig.route=d.route;sig.via=d.via;sig.reason=d.reason;sig.needsBrain=d.needsBrain===true; return sig;})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageSpendState",
+          "value": "{{(function(){ var cfg=state.data.triageCfg||{}; var memo=state.data.triageMemoIn||{}; var P=state.parameters||{}; var num=function(v,d){var n=Number(v);return isFinite(n)&&n>0?n:d;}; var budget=num(cfg.geminiDailyBudgetUsd,num(P.dailyBudgetUsd,1)); var callCap=num(cfg.geminiDailyCallCap,num(P.dailyCallCap,300)); var day=new Date().toISOString().slice(0,10); var prev=(memo.spend&&typeof memo.spend==='object')?memo.spend:{}; var sameDay=String(prev.day||'')===day; var calls=sameDay?Number(prev.calls||0):0; var estUsd=sameDay?Number(prev.estUsd||0):0; if(!isFinite(calls))calls=0;if(!isFinite(estUsd))estUsd=0; var alertedDay=String(prev.alertedDay||''); var over=(estUsd>=budget)||(calls>=callCap); var alertNeeded=over&&(alertedDay!==day); return {day:day,calls:calls,estUsd:estUsd,budget:budget,callCap:callCap,overBudget:over,alertNeeded:alertNeeded,alertedDay:alertedDay};})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "condition": "{{(state.data.triageSignals||{}).needsBrain === true && (state.data.triageSpendState||{}).overBudget !== true}}",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageSystem",
+          "value": "{{(function(){ var cfg=state.data.triageCfg||{};var q=String.fromCharCode(10); return ['You are the Red Ops quiet-tick triage gate — the cheap outer layer in front of an expensive CLI coordinator session. The coordinator fires every 15 minutes; most ticks have nothing to do. Your ONE job: decide whether ANYTHING on the board is actionable RIGHT NOW by an autonomous coding worker or by the coordinator.','', 'ORG CONTEXT: '+(cfg.context||'redbtn is a multi-project org. Workers branch from beta and open PRs; they never merge or deploy. Cards live on a board (inbox / claimed / working / pr-open / blocked / needs-input).'),'', 'The deterministic layer ALREADY handled the clear cases (inbox cards with capacity, failed runs, finished runs, NEW HUMAN comments anywhere — including on done cards — and operator directives). If any of those were present you would not have been called. You are the tiebreaker for AMBIGUOUS changes only: cards that changed, and blocked/needs-input threads. Everything you see is agent chatter or a status/metadata change.','', 'ACTIONABLE (answer true) means at least one of:','- a blocked / needs-input card whose thread an AGENT can actually resolve now (the question is answerable from the repo/codebase, not waiting on George or on an external party),','- a card whose latest comments show a worker handed off unfinished, bounded work that another worker can pick up now,','- a card that clearly needs dispatching and is being missed.','', 'NOT actionable (answer false) — the common case:','- a worker posted a progress/HANDOFF comment on a card that is still being worked,','- a card is in pr-open and simply awaits human review,','- a card is blocked/needs-input waiting on GEORGE or an external decision,','- informational chatter, reactions, cosmetic edits, no real change.','', 'Bias: when the change is only informational, answer false — a false \"yes\" burns an expensive CLI session, and a genuinely urgent item will re-surface on the next tick anyway. When a thread plainly contains bounded work an agent can do now, answer true.','', 'Respond with ONE JSON object and NOTHING else — no markdown, no code fences:','{\"actionable\":false,\"reason\":\"one sentence\",\"focus\":\"\"}','','focus = short hint for the coordinator (card title / what to do) when actionable is true, else empty.'].join(q);})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "condition": "{{(state.data.triageSignals||{}).needsBrain === true && (state.data.triageSpendState||{}).overBudget !== true}}",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageUser",
+          "value": "{{(function(){ var base=state.data.triageBase||{};var sig=state.data.triageSignals||{}; var threads=Array.isArray(state.data.triageComments)?state.data.triageComments:[]; var q=String.fromCharCode(10);var L=[]; L.push('TICK STATE'); L.push('workers running: '+(sig.running||0)+' / soft target '+(base.target||2)+' (capacity '+(sig.capacity||0)+')'); var c=base.counts||{}; L.push('board: '+(c.total||0)+' cards in view — inbox '+(c.inbox||0)+', working/claimed '+(c.working||0)+', pr-open '+(c.prOpen||0)+', blocked/needs-input '+(c.blocked||0)+', recently-done '+(c.doneRecent||0)); L.push('');L.push('CHANGED / BLOCKED CARDS'); var items=base.items||[]; for(var i=0;i<items.length;i++){var it=items[i]; if(!(it.changed||it.status==='blocked'||it.status==='needs-input'))continue; var flags=[];if(it.isNew)flags.push('NEW');if(it.statusChanged)flags.push('status changed');if(it.commentDelta>0)flags.push('+'+it.commentDelta+' comment(s)');if(it.urgent)flags.push('URGENT'); L.push('- ['+it.status+'] '+it.title+' (project '+(it.slug||'?')+(flags.length?('; '+flags.join('; ')):'')+')');} if(threads.length){L.push('');L.push('RECENT COMMENTS ON THOSE CARDS (newest last)'); for(var t=0;t<threads.length;t++){var th=threads[t]||{};var title=th.itemId; for(var k=0;k<items.length;k++){if(items[k].id===th.itemId)title=items[k].title;} L.push('');L.push('card: '+title); var cs=th.comments||[]; for(var m=0;m<cs.length;m++){var cm=cs[m];L.push('  '+(cm.isNew?'[new] ':'')+cm.author+': '+String(cm.body||'').replace(new RegExp(String.fromCharCode(10),'g'),' ').slice(0,300));}}} L.push('');L.push('Is there anything actionable this tick? Return only the JSON object.'); return L.join(q);})()}}"
+        }
+      },
+      {
+        "type": "neuron",
+        "condition": "{{(state.data.triageSignals||{}).needsBrain === true && (state.data.triageSpendState||{}).overBudget !== true}}",
+        "config": {
+          "neuronId": "become-gemma",
+          "systemPrompt": "{{state.data.triageSystem}}",
+          "userPrompt": "{{state.data.triageUser}}",
+          "outputField": "data.triageRaw",
+          "temperature": 0.1,
+          "maxTokens": 512,
+          "stream": false,
+          "maxToolIterations": 1,
+          "errorHandling": {
+            "retry": 1,
+            "retryDelay": 1000,
+            "onError": "fallback",
+            "fallbackValue": ""
+          }
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageDecision",
+          "value": "{{(function(){ var sig=state.data.triageSignals||{}; var spend=state.data.triageSpendState||{}; if(sig.needsBrain!==true)return {route:sig.route||'run',via:sig.via||'deterministic',reason:sig.reason||'',focus:'',neuron:false}; if(spend.overBudget===true)return {route:'run',via:'failopen',reason:'gemini daily budget exhausted (est $'+(spend.estUsd||0).toFixed(4)+' >= $'+spend.budget+') — skipping triage neuron, failing open to coordinator',focus:'',neuron:false}; var raw=state.data.triageRaw; var out=null; if(raw&&typeof raw==='object'&&raw.actionable!==undefined)out=raw; else if(typeof raw==='string'&&raw.trim()){ var s=raw.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim(); try{out=JSON.parse(s);}catch(e){var a=s.indexOf('{'),b=s.lastIndexOf('}');if(a!==-1&&b>a){try{out=JSON.parse(s.slice(a,b+1));}catch(e2){out=null;}}}} if(!out||typeof out!=='object')return {route:'run',via:'failopen',reason:'triage neuron produced no parseable verdict — failing open to coordinator',focus:'',neuron:true}; var act=(out.actionable===true||out.actionable==='true'); return {route:act?'run':'stop',via:'neuron',reason:String(out.reason||(act?'neuron: actionable':'neuron: nothing actionable')).slice(0,240),focus:String(out.focus||'').slice(0,240),neuron:true};})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageRoute",
+          "value": "{{(state.data.triageDecision||{}).route || \"run\"}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.triageMemoOut",
+          "value": "{{(function(){ var base=state.data.triageBase||{}; var sig=state.data.triageSignals||{}; var dec=state.data.triageDecision||{}; var spend=state.data.triageSpendState||{}; var memo=state.data.triageMemoIn||{}; var now=new Date().toISOString(); var seen={};var items=base.items||[]; for(var i=0;i<items.length;i++){var it=items[i];seen[it.id]={s:it.status,c:it.commentCount,u:it.updatedAt};} var surfaced={};var prevS=(memo.surfacedRuns&&typeof memo.surfacedRuns==='object')?memo.surfacedRuns:{}; var keys=Object.keys(prevS).slice(-60); for(var k=0;k<keys.length;k++)surfaced[keys[k]]=prevS[keys[k]]; var probes=Array.isArray(state.data.triageProbes)?state.data.triageProbes:[]; for(var p=0;p<probes.length;p++){if(probes[p].state==='done'||probes[p].state==='failed')surfaced[probes[p].runId]=probes[p].state;} var calls=Number(spend.calls||0);var est=Number(spend.estUsd||0); if(dec.neuron===true){ var inChars=String(state.data.triageSystem||'').length+String(state.data.triageUser||'').length; var outChars=(typeof state.data.triageRaw==='string')?state.data.triageRaw.length:200; var inTok=Math.ceil(inChars/4);var outTok=Math.ceil(outChars/4); est=est+(inTok/1000000)*0.30+(outTok/1000000)*2.50; calls=calls+1;} var judgedPrev=(memo.judged&&typeof memo.judged==='object')?memo.judged:{}; var judgedOut={}; for(var j=0;j<items.length;j++){var itj=items[j];if(judgedPrev[itj.id]===itj.sig)judgedOut[itj.id]=itj.sig;} if(dec.neuron===true&&dec.route==='stop'){ var threadsJ=Array.isArray(state.data.triageComments)?state.data.triageComments:[]; for(var q=0;q<threadsJ.length;q++){var tid=threadsJ[q].itemId; for(var w=0;w<items.length;w++){if(items[w].id===tid)judgedOut[tid]=items[w].sig;}}} var alertedDay=String(spend.alertedDay||''); if(spend.alertNeeded===true)alertedDay=String(spend.day||''); var ranCoordinator=(dec.route==='run'); return {v:1,updatedAt:now, ticks:Number(memo.ticks||0)+1, skipped:Number(memo.skipped||0)+(ranCoordinator?0:1), escalated:Number(memo.escalated||0)+(ranCoordinator?1:0), seen:seen,surfacedRuns:surfaced,judged:judgedOut, spend:{day:spend.day||now.slice(0,10),calls:calls,estUsd:Math.round(est*1000000)/1000000,alertedDay:alertedDay}, last:{at:now,route:dec.route||'run',via:dec.via||'',reason:String(dec.reason||'').slice(0,240),focus:String(dec.focus||'').slice(0,240), running:Number(sig.running||0),inbox:Number(sig.inbox||0),changed:Number(sig.changed||0), coordinatorRunId:String(state.data.runId||'')}};})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set-global",
+          "namespace": "red-ops",
+          "key": "triage",
+          "inputField": "data.triageMemoOut"
+        }
+      },
+      {
+        "type": "tool",
+        "condition": "{{(state.data.triageSpendState||{}).alertNeeded === true}}",
+        "config": {
+          "toolName": "fetch_url",
+          "parameters": {
+            "url": "{{parameters.atlasBase}}/api/notes",
+            "method": "POST",
+            "headers": {
+              "Authorization": "Bearer {{state.data.triageToken}}",
+              "Content-Type": "application/json"
+            },
+            "body": "{{(function(){ var s=state.data.triageSpendState||{};var q=String.fromCharCode(10); var body='@george — Red Ops SPEND ALERT: the gemini triage key passed its daily guardrail ('+(s.calls||0)+' calls, est $'+Number(s.estUsd||0).toFixed(4)+' vs budget $'+s.budget+' / cap '+s.callCap+' calls). The gemini key is pay-per-use and fails OPEN, so this is an estimate-based tripwire, not a hard vendor cap — check the Google AI Studio billing page. The triage neuron is now DISABLED for the rest of the day: ticks fall back to deterministic-only triage and fail open to the CLI coordinator. Raise geminiDailyBudgetUsd / geminiDailyCallCap in red-ops/config to re-arm.'; return JSON.stringify({slug:'redatlas',body:body});})()}}",
+            "timeout": 30000
+          },
+          "outputField": "data.triageAlertResult",
+          "errorHandling": {
+            "retry": 1,
+            "onError": "continue",
+            "fallbackValue": {
+              "error": "spend alert post failed"
+            }
+          }
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.response",
+          "value": "{{(function(){var d=state.data.triageDecision||{};var s=state.data.triageSignals||{};return (d.route===\"run\"?\"PROCEED to coordinator\":\"QUIET TICK — coordinator skipped\")+\" [\"+(d.via||\"\")+\"] \"+(d.reason||\"\")+(d.focus?(\" | focus: \"+d.focus):\"\");})()}}"
+        }
+      }
+    ],
+    "parameters": {
+      "atlasBase": {
+        "type": "string",
+        "default": "https://dev.redbtn.io",
+        "description": "redAtlas base URL (board + notes API)."
+      },
+      "triageNeuronId": {
+        "type": "string",
+        "default": "become-gemma",
+        "description": "Cheap triage neuron (google/gemini-2.5-flash). NOTE: the neuron step pins this id literally — see the comment in the neuron step."
+      },
+      "maxRunProbes": {
+        "type": "number",
+        "default": 8,
+        "description": "Iteration cap: get_run probes of in-flight worker/reviewer runs per tick. The live fleet routinely has 5+ in flight; too low a cap truncates and fails open on every tick."
+      },
+      "maxCommentFetches": {
+        "type": "number",
+        "default": 4,
+        "description": "Iteration cap: board-comment fetches per tick. Exceeding it fails open to the coordinator."
+      },
+      "dailyBudgetUsd": {
+        "type": "number",
+        "default": 1,
+        "description": "Hard daily estimated-spend guardrail for the triage neuron (USD). Overridable via red-ops/config.geminiDailyBudgetUsd."
+      },
+      "dailyCallCap": {
+        "type": "number",
+        "default": 300,
+        "description": "Hard daily call guardrail for the triage neuron. Overridable via red-ops/config.geminiDailyCallCap."
+      }
+    },
+    "metadata": {
+      "icon": "Filter",
+      "color": "#e3a93b",
+      "inputs": [
+        "state"
+      ],
+      "outputs": [
+        "state"
+      ]
+    },
+    "isPublic": true
+  }
+}
