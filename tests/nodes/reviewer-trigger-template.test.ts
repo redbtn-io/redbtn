@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { resolveValue } from '../../src/lib/nodes/universal/templateRenderer';
+import { executeTransform } from '../../src/lib/nodes/universal/executors/transformExecutor';
+import type { TransformStepConfig } from '../../src/lib/nodes/universal/types';
 
 const REVIEWER_INPUT = {
   prUrl: 'https://github.com/redbtn-io/redbtn/pull/255',
@@ -28,6 +30,17 @@ const REVIEW_PROMPT_TEMPLATE = `{{(function(){
   return ['mode: ' + mode, 'PR: ' + r.prUrl, 'repo: ' + r.repo].join('\\n');
 })()}}`;
 
+/**
+ * The exact failure shape that broke red-reviewer-auto: a ternary branch
+ * followed by a stray `)` makes the IIFE invalid. Before this fix, the raw
+ * {{...}} source was written to data.cliPrompt and handed to the reviewer CLI
+ * as its prompt on every single run.
+ */
+const MALFORMED_PROMPT_TEMPLATE = `{{(function(){
+  var r = state.data.rev || {};
+  return [r.prUrl ? 'has-pr' : 'missing-pr'), 'continue'].join('\\n');
+})()}}`;
+
 describe('reviewer explicit-trigger input regression', () => {
   it('normalizes an explicit trigger_automation input into data.rev before rendering the prompt', async () => {
     const state: any = { data: { input: REVIEWER_INPUT } };
@@ -45,16 +58,62 @@ describe('reviewer explicit-trigger input regression', () => {
   });
 
   it('fails loudly instead of persisting an unrendered malformed prompt template', async () => {
-    // Mirrors the failure shape that broke red-reviewer-auto: the extra `)`
-    // makes the IIFE invalid. Before this guard, the raw {{...}} source was
-    // written to data.cliPrompt and handed to the reviewer as its prompt.
-    const malformedPrompt = `{{(function(){
-      var r = state.data.rev || {};
-      return [r.prUrl ? 'has-pr' : 'missing-pr'), 'continue'].join('\\n');
-    })()}}`;
-
     expect(() =>
-      resolveValue(malformedPrompt, { data: { rev: REVIEWER_INPUT } }, { throwOnError: true }),
+      resolveValue(MALFORMED_PROMPT_TEMPLATE, { data: { rev: REVIEWER_INPUT } }, { throwOnError: true }),
     ).toThrow(/template expression failed to evaluate/i);
+  });
+});
+
+/**
+ * The tests above pin `resolveValue`, but production never calls it directly —
+ * the reviewer node runs two `set` transform steps through `executeTransform`,
+ * which is what actually writes `data.rev` and `data.cliPrompt` into graph state.
+ * These drive that executor so the fix is verified on the path it really runs on.
+ */
+describe('reviewer prompt persistence — through the transform executor', () => {
+  const setStep = (outputField: string, value: string): TransformStepConfig =>
+    ({ operation: 'set', outputField, value }) as TransformStepConfig;
+
+  it('renders data.rev then data.cliPrompt, leaving no literal template in the persisted patch', async () => {
+    const state: any = { data: { input: REVIEWER_INPUT } };
+
+    // Step 1 — the node's `set data.rev` step.
+    const revPatch = await executeTransform(setStep('data.rev', REVIEW_INPUT_TEMPLATE), state);
+    expect(revPatch['data.rev']).toEqual(REVIEWER_INPUT);
+
+    // Feed step 1's output forward exactly as the engine merges it.
+    state.data.rev = revPatch['data.rev'];
+
+    // Step 2 — the `set data.cliPrompt` step that handed the CLI its prompt.
+    const promptPatch = await executeTransform(setStep('data.cliPrompt', REVIEW_PROMPT_TEMPLATE), state);
+    const cliPrompt = promptPatch['data.cliPrompt'];
+
+    expect(cliPrompt).toContain('mode: REVIEW-ONLY');
+    expect(cliPrompt).toContain(REVIEWER_INPUT.prUrl);
+    expect(cliPrompt).not.toContain('{{');
+  });
+
+  it('aborts the step rather than returning the raw template for persistence', async () => {
+    const state = { data: { rev: REVIEWER_INPUT } };
+    const config = setStep('data.cliPrompt', MALFORMED_PROMPT_TEMPLATE);
+
+    // The regression: this used to *resolve* with { 'data.cliPrompt': '{{(function(){...' },
+    // which the engine merged into state and passed to the reviewer CLI verbatim.
+    await expect(executeTransform(config, state)).rejects.toThrow(/Transform step failed/);
+
+    // The error must name the field that would have been poisoned and quote the
+    // offending template, so the failing run says what to fix.
+    await expect(executeTransform(config, state)).rejects.toThrow(/data\.cliPrompt/);
+    await expect(executeTransform(config, state)).rejects.toThrow(/template:/);
+  });
+
+  it('still fails closed when the malformed set targets global state', async () => {
+    // `set` with a globalState.* outputField persists across runs — the raw
+    // template must not reach the global-state client.
+    const config = setStep('globalState.reviewer.cliPrompt', MALFORMED_PROMPT_TEMPLATE);
+
+    await expect(executeTransform(config, { data: { rev: REVIEWER_INPUT } })).rejects.toThrow(
+      /Transform step failed/,
+    );
   });
 });
