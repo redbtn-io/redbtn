@@ -135,6 +135,33 @@ describe('trigger_automation — wait:false (default)', () => {
     expect(capturedBody).toEqual({ input: { topic: 'cooking', count: 5 } });
   });
 
+  test('reviewer handoff preserves every explicit review input field', async () => {
+    let capturedBody: unknown = null;
+    globalThis.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedBody = init?.body ? JSON.parse(String(init.body)) : null;
+      return new Response(
+        JSON.stringify({ runId: 'run_reviewer', run: { status: 'queued' } }),
+        { status: 200 },
+      );
+    }) as unknown as typeof globalThis.fetch;
+
+    const reviewerInput = {
+      prUrl: 'https://github.com/redbtn-io/redbtn/pull/255',
+      repo: 'redbtn-io/redbtn',
+      base: 'beta',
+      project: 'redbtn-engine',
+      slug: 'redbtn-engine',
+      reviewOnly: true,
+    };
+
+    await triggerAutomationTool.handler(
+      { automationId: 'red-reviewer-auto', input: reviewerInput },
+      makeMockContext(),
+    );
+
+    expect(capturedBody).toEqual({ input: reviewerInput });
+  });
+
   test('Authorization header from state.authToken is forwarded', async () => {
     let capturedHeaders: Record<string, string> = {};
     globalThis.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {

@@ -430,15 +430,22 @@ function executeSetOperation(config: TransformStepConfig, state: any): any {
     if (DEBUG)
         console.log('[SetOperation] Processing value:', config.value);
     // Delegate entirely to resolveValue — it handles primitives, pure expressions,
-    // and mixed strings with type preservation.
+    // and mixed strings with type preservation. A set operation mutates graph
+    // state, so it must fail closed for malformed pure expressions. Returning the
+    // original `{{ ... }}` source here turns a syntax error into apparently valid
+    // state and lets downstream tools execute or display the raw template.
     try {
-        const result = resolveValue(config.value, state);
+        const result = resolveValue(config.value, state, { throwOnError: true });
         if (DEBUG)
             console.log('[SetOperation] Result type:', typeof result);
         return result;
     } catch (error) {
         console.error('[SetOperation] Evaluation failed:', error);
-        throw new Error(`Failed to evaluate set value: ${config.value} - ${error instanceof Error ? error.message : String(error)}`);
+        const target = config.outputField || 'unnamed output';
+        throw new Error(
+            `Failed to evaluate set template for ${target}: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
     }
 }
 
