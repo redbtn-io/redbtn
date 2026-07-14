@@ -1,0 +1,64 @@
+{
+  "graphId": "tHXXSTFtOuM9",
+  "name": "Red Coordinator",
+  "graphType": "workflow",
+  "tags": [
+    "red-fleet",
+    "coordinator",
+    "autonomous"
+  ],
+  "nodes": [
+    {
+      "id": "gate",
+      "neuronId": null,
+      "config": {
+        "nodeId": "red-ops-gate",
+        "name": "Gate"
+      }
+    },
+    {
+      "id": "coordinator",
+      "neuronId": null,
+      "config": {
+        "nodeId": "red-ops-coordinator",
+        "name": "Coordinator"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "__start__",
+      "to": "gate"
+    },
+    {
+      "from": "gate",
+      "condition": "data.route",
+      "targets": {
+        "run": "coordinator"
+      },
+      "fallback": "__end__"
+    },
+    {
+      "from": "coordinator",
+      "to": "__end__"
+    }
+  ],
+  "layout": {
+    "__start__": {
+      "x": -160,
+      "y": 160
+    },
+    "gate": {
+      "x": 60,
+      "y": 160
+    },
+    "coordinator": {
+      "x": 320,
+      "y": 160
+    },
+    "__end__": {
+      "x": 580,
+      "y": 160
+    }
+  }
+}
