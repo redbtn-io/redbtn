@@ -62,6 +62,38 @@ describe('reviewer explicit-trigger input regression', () => {
       resolveValue(MALFORMED_PROMPT_TEMPLATE, { data: { rev: REVIEWER_INPUT } }, { throwOnError: true }),
     ).toThrow(/template expression failed to evaluate/i);
   });
+
+  it('renders the AUTO-MERGE branch when reviewOnly is false', () => {
+    // The bug was in the `reviewOnly ? ... : ...` ternary, so both branches of the
+    // real template need pinning — a fix that only ever exercises REVIEW-ONLY would
+    // not notice the auto-merge arm regressing.
+    const autoMergeInput = { ...REVIEWER_INPUT, reviewOnly: false };
+    const state: any = { data: { input: autoMergeInput } };
+
+    const rev = resolveValue(REVIEW_INPUT_TEMPLATE, state, { throwOnError: true });
+    expect(rev.reviewOnly).toBe(false);
+
+    state.data.rev = rev;
+    const prompt = resolveValue(REVIEW_PROMPT_TEMPLATE, state, { throwOnError: true });
+
+    expect(prompt).toContain('mode: AUTO-MERGE');
+    expect(prompt).not.toContain('REVIEW-ONLY');
+    expect(prompt).not.toContain('{{');
+  });
+
+  it('leaves resolveValue lenient by default, so non-set callers keep their behaviour', () => {
+    // `throwOnError` is opt-in on purpose: only the state-mutating `set` path takes
+    // it. renderParameters, step conditions and get-global still get the documented
+    // lenient fallback (raw source returned, no throw). This pins that contract so
+    // the fail-closed change stays scoped to what persists state.
+    const state = { data: { rev: REVIEWER_INPUT } };
+
+    expect(() => resolveValue(MALFORMED_PROMPT_TEMPLATE, state)).not.toThrow();
+    expect(resolveValue(MALFORMED_PROMPT_TEMPLATE, state)).toBe(MALFORMED_PROMPT_TEMPLATE);
+
+    // A well-formed template is unaffected either way.
+    expect(resolveValue(REVIEW_PROMPT_TEMPLATE, state)).toContain('mode: REVIEW-ONLY');
+  });
 });
 
 /**
