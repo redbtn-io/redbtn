@@ -169,6 +169,13 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   'delete_global_state',
   'delete_namespace',
 
+  // ── State Records (per-record store under a namespace) ──
+  'create_state_record',
+  'get_state_record',
+  'query_state_records',
+  'update_state_record',
+  'delete_state_record',
+
   // ── Automations ──
   'list_automations',
   'get_automation',
@@ -737,6 +744,28 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register delete_namespace:', msg);
+  }
+
+  // ─── State Records pack ───────────────────────────────────────────────────
+  // The append-and-query half of Global State: one doc per record, individually
+  // searchable, no shared size ceiling. Additive — the key-value tools above are
+  // unchanged, and a namespace can use both. See webapp docs/state-records.md.
+  for (const [name, file] of [
+    ['create_state_record', './native/create-state-record.js'],
+    ['get_state_record', './native/get-state-record.js'],
+    ['query_state_records', './native/query-state-records.js'],
+    ['update_state_record', './native/update-state-record.js'],
+    ['delete_state_record', './native/delete-state-record.js'],
+  ] as const) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const mod = require(file);
+      registry.register(name, mod.default || mod);
+      console.log(`[NativeRegistry] Registered built-in tool: ${name}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[NativeRegistry] Failed to register ${name}:`, msg);
+    }
   }
 
   // ─── Conversation pack (TOOL-HANDOFF.md §4.3) ─────────────────────────────
