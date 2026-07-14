@@ -59,6 +59,154 @@ import { assertChatComponentSpec } from '../chat-components/spec-schema';
 const DEBUG = false;
 
 /**
+ * Run state and redlog are both user-readable diagnostic surfaces. Execution
+ * receives the original trigger input separately, so never retain credential
+ * material in either persistence boundary just to make a run easier to debug.
+ */
+const SENSITIVE_INPUT_KEY = /token|password|secret|privatekey|apikey|sshkey|credential|authorization/i;
+const REDACTED_VALUE = '[REDACTED]';
+const RECOGNIZABLE_SECRET_PATTERNS = [
+  /-----BEGIN(?: [A-Z]+)? PRIVATE KEY-----[\s\S]*?-----END(?: [A-Z]+)? PRIVATE KEY-----/gi,
+  /\brpat_[A-Za-z0-9_-]+\b/g,
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+];
+
+function isSensitiveInputKey(key: string): boolean {
+  // Inputs often use snake_case (`api_key`, `private_key`) while graph inputs
+  // commonly use camelCase. Normalize separators so both forms are protected.
+  return SENSITIVE_INPUT_KEY.test(key.replace(/[^a-z0-9]/gi, ''));
+}
+
+function isPlainRecord(value: object): value is Record<string, unknown> {
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function redactRecognizableSecretPatterns(value: string): { value: string; redacted: boolean } {
+  let safeValue = value;
+  for (const pattern of RECOGNIZABLE_SECRET_PATTERNS) {
+    safeValue = safeValue.replace(pattern, REDACTED_VALUE);
+  }
+  return { value: safeValue, redacted: safeValue !== value };
+}
+
+function collectSensitiveValues(value: unknown, values = new Set<string>(), ancestors = new WeakSet<object>()): Set<string> {
+  const leafAncestors = new WeakSet<object>();
+  const collectLeafStrings = (candidate: unknown): void => {
+    if (typeof candidate === 'string') {
+      if (candidate) values.add(candidate);
+      return;
+    }
+    if (Array.isArray(candidate)) {
+      if (leafAncestors.has(candidate)) return;
+      leafAncestors.add(candidate);
+      for (const item of candidate) collectLeafStrings(item);
+      leafAncestors.delete(candidate);
+      return;
+    }
+    if (candidate && typeof candidate === 'object' && isPlainRecord(candidate)) {
+      if (leafAncestors.has(candidate)) return;
+      leafAncestors.add(candidate);
+      for (const child of Object.values(candidate)) collectLeafStrings(child);
+      leafAncestors.delete(candidate);
+    }
+  };
+
+  const visit = (current: unknown): void => {
+    if (Array.isArray(current)) {
+      if (ancestors.has(current)) return;
+      ancestors.add(current);
+      for (const item of current) visit(item);
+      ancestors.delete(current);
+      return;
+    }
+    if (!current || typeof current !== 'object' || !isPlainRecord(current)) return;
+    if (ancestors.has(current)) return;
+    ancestors.add(current);
+    for (const [key, child] of Object.entries(current)) {
+      if (key.toLowerCase() === '_secrets' || isSensitiveInputKey(key)) {
+        collectLeafStrings(child);
+      } else {
+        visit(child);
+      }
+    }
+    ancestors.delete(current);
+  };
+
+  visit(value);
+  return values;
+}
+
+/**
+ * Create a JSON-safe, non-mutating copy suitable for logs and persisted run
+ * state. `_secrets` is an execution-only bag and is intentionally replaced as
+ * a whole, rather than preserving even its key names.
+ */
+function redactSensitiveData(
+  value: unknown,
+  knownSensitiveValues: ReadonlySet<string> = new Set(),
+): { value: unknown; redacted: boolean } {
+  const ancestors = new WeakSet<object>();
+  const sensitiveValues = collectSensitiveValues(value, new Set(knownSensitiveValues));
+
+  const containsKnownSensitiveValue = (current: string): boolean => {
+    for (const sensitiveValue of sensitiveValues) {
+      // Exact matches catch short credentials; substring matches also protect
+      // generated command strings such as `export TOKEN=<value>` in tool logs.
+      if (current === sensitiveValue || (sensitiveValue.length >= 8 && current.includes(sensitiveValue))) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const redact = (current: unknown): { value: unknown; redacted: boolean } => {
+    if (typeof current === 'string') {
+      if (containsKnownSensitiveValue(current)) {
+        return { value: REDACTED_VALUE, redacted: true };
+      }
+      return redactRecognizableSecretPatterns(current);
+    }
+
+    if (Array.isArray(current)) {
+      if (ancestors.has(current)) return { value: REDACTED_VALUE, redacted: true };
+      ancestors.add(current);
+      let redacted = false;
+      const safe = current.map((item) => {
+        const result = redact(item);
+        redacted ||= result.redacted;
+        return result.value;
+      });
+      ancestors.delete(current);
+      return { value: safe, redacted };
+    }
+
+    if (current && typeof current === 'object' && isPlainRecord(current)) {
+      if (ancestors.has(current)) return { value: REDACTED_VALUE, redacted: true };
+      ancestors.add(current);
+      let redacted = false;
+      const safe: Record<string, unknown> = {};
+      for (const [key, child] of Object.entries(current)) {
+        if (key.toLowerCase() === '_secrets' || isSensitiveInputKey(key)) {
+          safe[key] = REDACTED_VALUE;
+          redacted = true;
+          continue;
+        }
+        const result = redact(child);
+        safe[key] = result.value;
+        redacted ||= result.redacted;
+      }
+      ancestors.delete(current);
+      return { value: safe, redacted };
+    }
+
+    return { value: current, redacted: false };
+  };
+
+  return redact(value);
+}
+
+/**
  * Turn-by-turn output is how a conversation works — not a toggle. It is ALWAYS
  * on for every conversation run (any run with a ConversationPublisher); there is
  * deliberately no way to disable it. Single-turn graphs are unaffected because
@@ -180,6 +328,8 @@ export class RunPublisher {
   private readonly generationsCollection?: GenerationsCollection;
   private readonly stateTtl: number;
   private readonly redlog?: RedLog;
+  /** Values resolved from the trigger that must not reappear in later tool logs. */
+  private sensitiveInputValues = new Set<string>();
   private state: RunState | null = null;
   private initialized = false;
   /** ConversationPublisher for forwarding events to the chat UI */
@@ -247,6 +397,7 @@ export class RunPublisher {
       graphName: this.state?.graphName,
       ...params.metadata,
     };
+    const { value: safeMetadata } = redactSensitiveData(meta, this.sensitiveInputValues);
     if (!this.redlog) return;
     try {
       await this.redlog.log({
@@ -257,7 +408,7 @@ export class RunPublisher {
           conversationId: this.state?.conversationId,
           generationId: this.runId,
         },
-        metadata: meta,
+        metadata: safeMetadata as Record<string, unknown>,
       });
     } catch (error) {
       if (DEBUG) console.error('[RunPublisher] redlog error:', error);
@@ -296,12 +447,18 @@ export class RunPublisher {
     if (triggerType && !(input as Record<string, any>)._trigger) {
       resolvedInput = { ...input, _trigger: { type: triggerType } };
     }
+    this.sensitiveInputValues = collectSensitiveValues(resolvedInput);
+    const { value: safeInputValue, redacted: hadSensitiveInput } = redactSensitiveData(
+      resolvedInput,
+      this.sensitiveInputValues,
+    );
+    const safeInput = safeInputValue as Record<string, unknown>;
     this.state = createInitialRunState({
       runId: this.runId,
       userId: this.userId,
       graphId,
       graphName,
-      input: resolvedInput,
+      input: safeInput,
       conversationId,
     });
     await this.saveState();
@@ -346,7 +503,12 @@ export class RunPublisher {
       level: 'info',
       category: 'run',
       message: `Run started: ${graphName}`,
-      metadata: { graphId, graphName, input },
+      metadata: {
+        graphId,
+        graphName,
+        input: safeInput,
+        ...(hadSensitiveInput ? { hadSensitiveInput: true } : {}),
+      },
     });
     this.initialized = true;
   }
@@ -1343,7 +1505,8 @@ export class RunPublisher {
 
   private async saveState(): Promise<void> {
     if (!this.state) return;
-    await this.redis.set(RunKeys.state(this.runId), JSON.stringify(this.state), 'EX', this.stateTtl);
+    const { value: safeState } = redactSensitiveData(this.state, this.sensitiveInputValues);
+    await this.redis.set(RunKeys.state(this.runId), JSON.stringify(safeState), 'EX', this.stateTtl);
   }
 
   async publish(event: RunEvent): Promise<void> {

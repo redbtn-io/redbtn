@@ -47,6 +47,7 @@
     "@redbtn/redsecrets": "^0.1.0",
     "@redbtn/redtoken": "^0.0.5-alpha",
     "adm-zip": "^0.5.16",
+    "bullmq": "5.70.1",
     "chromadb": "^3.1.8",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
