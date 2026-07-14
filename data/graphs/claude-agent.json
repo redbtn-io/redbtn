@@ -19,7 +19,7 @@
             "config": {
               "operation": "set",
               "outputField": "data.requestBody",
-              "value": "{{JSON.stringify({host: state.data.input.host, port: state.data.input.port, user: state.data.input.user || 'alpha', sshKeyPath: state.data.input.sshKeyPath || '/home/alpha/s', prompt: state.data.input.prompt, model: state.data.input.model || 'sonnet', maxTurns: state.data.input.maxTurns || 50, timeout: state.data.input.timeout || 900000, workingDir: state.data.input.workingDir})}}"
+              "value": "{{JSON.stringify({host: state.data.input.host, port: state.data.input.port, user: state.data.input.user || 'alpha', sshKeyPath: state.data.input.sshKeyPath, prompt: state.data.input.prompt, model: state.data.input.model || 'sonnet', maxTurns: state.data.input.maxTurns || 50, timeout: state.data.input.timeout || 900000, workingDir: state.data.input.workingDir})}}"
             }
           },
           {
@@ -119,12 +119,12 @@
     { "key": "host", "label": "SSH Host", "type": "text", "required": true, "placeholder": "e.g. server.example.com", "helpText": "Hostname or IP of the target machine" },
     { "key": "port", "label": "SSH Port", "type": "number", "required": false, "default": 22, "placeholder": "22" },
     { "key": "user", "label": "SSH User", "type": "text", "required": false, "default": "alpha", "placeholder": "alpha" },
-    { "key": "sshKeyPath", "label": "SSH Key Path", "type": "text", "required": false, "default": "/home/alpha/s", "placeholder": "/home/alpha/s", "helpText": "Path to SSH private key on the worker" },
+    { "key": "sshKeyPath", "label": "SSH Key Path", "type": "text", "required": true, "placeholder": "~/.ssh/id_ed25519", "helpText": "Path to the SSH private key on the worker. Required — there is deliberately no default, so a key path is never inherited from whoever happened to author this graph." },
     { "key": "prompt", "label": "Agent Prompt", "type": "textarea", "required": true, "placeholder": "You are an agent that...", "helpText": "The full prompt/directive for the Claude agent" },
     { "key": "model", "label": "Model", "type": "select", "required": false, "options": ["sonnet", "opus", "haiku"], "default": "sonnet" },
     { "key": "maxTurns", "label": "Max Turns", "type": "number", "required": false, "default": 50, "placeholder": "50", "helpText": "Maximum tool-use turns for Claude" },
     { "key": "timeout", "label": "Timeout (ms)", "type": "number", "required": false, "default": 900000, "placeholder": "900000", "helpText": "Max execution time in milliseconds" },
-    { "key": "workingDir", "label": "Working Directory", "type": "text", "required": false, "placeholder": "/home/alpha/project", "helpText": "Directory to cd into before running Claude" },
+    { "key": "workingDir", "label": "Working Directory", "type": "text", "required": false, "placeholder": "/path/to/project", "helpText": "Directory to cd into before running Claude" },
     { "key": "email", "label": "Email Report To", "type": "text", "required": false, "placeholder": "user@example.com", "helpText": "Send the agent output to this email via the send-email cloud function (leave empty to skip)" },
     { "key": "invokeUrl", "label": "Invoke URL", "type": "text", "required": true, "default": "https://run.redbtn.io", "placeholder": "https://run.redbtn.io", "helpText": "RedRun API endpoint URL" },
     { "key": "apiKey", "label": "API Key", "type": "password", "required": true, "placeholder": "Your RedRun API key", "helpText": "x-api-key for authenticating with the invoke endpoint", "secret": true }

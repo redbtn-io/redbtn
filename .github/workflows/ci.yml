@@ -15,6 +15,25 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
+    # The conversation-attribution tests assert on documents that actually land
+    # in Mongo, so CI runs a real MongoDB rather than skipping them. Without this
+    # the suite would only ever prove itself against mocks.
+    services:
+      mongodb:
+        image: mongo:8
+        ports:
+          - 27017:27017
+        env:
+          MONGO_INITDB_ROOT_USERNAME: ci
+          MONGO_INITDB_ROOT_PASSWORD: ci
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 20s
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,6 +69,9 @@ jobs:
 
       - name: Test
         env:
+          # Points at the MongoDB service container above. Tests that need a real
+          # database read MONGODB_TEST_URI first, so they run for real here.
+          MONGODB_TEST_URI: mongodb://ci:ci@localhost:27017/redbtn_test?authSource=admin
           MONGODB_URI: mongodb://placeholder/ci
           REDIS_URL: redis://placeholder
           CHROMA_URL: http://placeholder:9999

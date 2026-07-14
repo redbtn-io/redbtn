@@ -30,19 +30,9 @@
  * // Returns: "API Key: sk-xxx..." (fetched from persistent storage)
  */
 
-// Minimal interface for the GlobalStateClient methods used in this module.
-// The full implementation lives in dist/lib/globalState/ (dist-only module).
-interface IGlobalStateClient {
-    resolveTemplatePath(path: string): Promise<any>;
-    prefetch(namespace: string): Promise<void>;
-}
+import { getGlobalStateClient } from '../../globalState';
 
-function getTemplateGlobalStateClient(): IGlobalStateClient {
-    // This import resolves from the dist/ directory at runtime — it is a
-    // hand-maintained module that has no source counterpart in src/. Keep it
-    // lazy so synchronous template resolution does not require global state.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { getGlobalStateClient } = require('../../globalState') as { getGlobalStateClient: (options?: Record<string, unknown>) => IGlobalStateClient };
+function getTemplateGlobalStateClient() {
     return getGlobalStateClient();
 }
 
