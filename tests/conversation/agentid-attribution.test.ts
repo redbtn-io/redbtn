@@ -21,6 +21,11 @@ const MONGO_URI =
   process.env.MONGODB_TEST_URI ||
   process.env.MONGODB_URI ||
   'mongodb://alpha:redbtnioai@localhost:27017/redbtn_test?authSource=admin';
+const MONGO_CONNECT_OPTIONS = {
+  serverSelectionTimeoutMS: 5000,
+  connectTimeoutMS: 5000,
+  socketTimeoutMS: 5000,
+};
 
 const COL = 'user_conversations';
 const CONV_PREFIX = 'conv-agentid-test-';
@@ -80,7 +85,7 @@ async function cleanupTestConversations(): Promise<void> {
 
 beforeAll(async () => {
   if (mongoose.connection.readyState !== 1) {
-    await mongoose.connect(MONGO_URI);
+    await mongoose.connect(MONGO_URI, MONGO_CONNECT_OPTIONS);
   }
   await cleanupTestConversations();
 });

@@ -299,6 +299,7 @@ describe('run progress watchdog', () => {
     const { run } = await import('../../src/functions/run');
     const { redis, values } = makeRedis();
     process.env.RUN_PROGRESS_WATCHDOG_INTERVAL_MS = '100000';
+    process.env.RUN_CONFIG_TIMEOUT_MS = '300000';
     const compiledGraph = {
       config: {
         name: 'Default Timeout Graph',

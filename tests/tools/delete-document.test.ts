@@ -60,9 +60,14 @@ describe('delete_document — happy path', () => {
       makeMockContext(),
     );
     expect(r.isError).toBeFalsy();
-    expect(JSON.parse(r.content[0].text)).toEqual({ ok: true });
+    expect(JSON.parse(r.content[0].text)).toEqual({
+      ok: true,
+      archived: true,
+      note: 'Archived (reversible). Use restore_document to bring it back, or permanent: true to destroy.',
+    });
     expect(urlSeen).toContain('/api/v1/libraries/lib1/documents/d1');
-    expect(methodSeen).toBe('DELETE');
+    expect(urlSeen).toContain('/archive');
+    expect(methodSeen).toBe('POST');
   });
 });
 

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const repoRoot = path.resolve(__dirname, '../../..');
+const sharedRepoRoot = path.resolve(__dirname, '../../../redbtn');
 
 function collectToolNames(value: unknown, out = new Set<string>()): Set<string> {
   if (!value || typeof value !== 'object') return out;
@@ -23,7 +23,7 @@ function collectToolNames(value: unknown, out = new Set<string>()): Set<string> 
 }
 
 function registeredNativeTools(): Set<string> {
-  const registryPath = path.join(repoRoot, 'redbtn/src/lib/tools/native-registry.ts');
+  const registryPath = path.join(sharedRepoRoot, 'src/lib/tools/native-registry.ts');
   const source = fs.readFileSync(registryPath, 'utf8');
   const names = new Set<string>();
   for (const match of source.matchAll(/registry\.register\(\s*['"]([^'"]+)['"]/g)) {
@@ -40,11 +40,11 @@ describe('seed node configs', () => {
   test('only reference registered native tool names', () => {
     const registered = registeredNativeTools();
     const seedFiles = [
-      path.join(repoRoot, 'data/nodes.json'),
+      path.join(sharedRepoRoot, 'data/nodes.json'),
       ...fs
-        .readdirSync(path.join(repoRoot, 'data/nodes'))
+        .readdirSync(path.join(sharedRepoRoot, 'data/nodes'))
         .filter((name) => name.endsWith('.json'))
-        .map((name) => path.join(repoRoot, 'data/nodes', name)),
+        .map((name) => path.join(sharedRepoRoot, 'data/nodes', name)),
     ];
 
     const unknown = new Map<string, string[]>();
@@ -52,7 +52,7 @@ describe('seed node configs', () => {
       const toolNames = collectToolNames(readJson(file));
       const missing = [...toolNames].filter((name) => !registered.has(name));
       if (missing.length > 0) {
-        unknown.set(path.relative(repoRoot, file), missing);
+        unknown.set(path.relative(sharedRepoRoot, file), missing);
       }
     }
 

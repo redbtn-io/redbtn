@@ -40,7 +40,7 @@ describe('delete_library — happy path', () => {
     vi.restoreAllMocks();
   });
 
-  test('peeks library doc count, then DELETEs (permanent), reports deletedDocuments', async () => {
+  test('peeks library doc count, then defaults to archive, reports archived status', async () => {
     let deleteUrlSeen = '';
     let methodSeen = '';
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -71,10 +71,12 @@ describe('delete_library — happy path', () => {
     expect(r.isError).toBeFalsy();
     expect(JSON.parse(r.content[0].text)).toEqual({
       ok: true,
-      deletedDocuments: 7,
+      archived: true,
+      documents: 7,
+      note: 'Archived (reversible). Use restore_library to bring it back, or permanent: true to destroy.',
     });
-    expect(deleteUrlSeen).toContain('permanent=true');
-    expect(methodSeen).toBe('DELETE');
+    expect(deleteUrlSeen).toContain('/archive');
+    expect(methodSeen).toBe('POST');
   });
 
   test('reports 0 deletedDocuments when peek fails', async () => {
@@ -93,7 +95,9 @@ describe('delete_library — happy path', () => {
     expect(r.isError).toBeFalsy();
     expect(JSON.parse(r.content[0].text)).toEqual({
       ok: true,
-      deletedDocuments: 0,
+      archived: true,
+      documents: 0,
+      note: 'Archived (reversible). Use restore_library to bring it back, or permanent: true to destroy.',
     });
   });
 });

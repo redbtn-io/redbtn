@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - beta
+  push:
+    branches:
+      - beta
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Authenticate to @redbtn registry
+        env:
+          REDBTN_NPM_TOKEN: ${{ secrets.REDBTN_NPM_TOKEN }}
+        run: |
+          if [ -n "${REDBTN_NPM_TOKEN}" ]; then
+            printf '//registry.redbtn.io/:_authToken=%s\n' "$REDBTN_NPM_TOKEN" >> .npmrc
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (eslint, no autofix)
+        run: npm run lint:check
+
+      - name: Build
+        env:
+          MONGODB_URI: mongodb://placeholder/ci
+          REDIS_URL: redis://placeholder
+          JWT_SECRET: ci-build-placeholder-do-not-use
+          NODE_ENV: test
+          NEXTAUTH_SECRET: ci-build-placeholder-do-not-use
+        run: npm run build
+
+      - name: Test
+        env:
+          MONGODB_URI: mongodb://placeholder/ci
+          REDIS_URL: redis://placeholder
+          CHROMA_URL: http://placeholder:9999
+          JWT_SECRET: ci-build-placeholder-do-not-use
+          NODE_ENV: test
+          NEXTAUTH_SECRET: ci-build-placeholder-do-not-use
+        run: npm test
