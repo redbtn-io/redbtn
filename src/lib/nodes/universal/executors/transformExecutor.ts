@@ -6,8 +6,12 @@
  */
 import { renderTemplate, resolveValue } from '../templateRenderer';
 import { extractJSON } from '../../../utils/json-extractor';
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const { getGlobalStateClient } = require('../../../globalState') as { getGlobalStateClient: (opts?: any) => any };
+// `../../../globalState` is a plain re-export of the GlobalStateClient class —
+// no module-level side effects, so a static import is safe. It used to be a
+// top-level `require()`, which Node cannot resolve from src/ (the module is
+// TS-only), making this executor un-importable outside a built dist/ tree —
+// that is why the transform persistence path had no test coverage.
+import { getGlobalStateClient } from '../../../globalState';
 import type { TransformStepConfig } from '../types';
 import { executeBuildMessagesOperation as buildMessagesOpExternal } from './buildMessagesOperation';
 import { getRunPublisher } from '../../../run/contextLookup';
@@ -430,15 +434,56 @@ function executeSetOperation(config: TransformStepConfig, state: any): any {
     if (DEBUG)
         console.log('[SetOperation] Processing value:', config.value);
     // Delegate entirely to resolveValue — it handles primitives, pure expressions,
-    // and mixed strings with type preservation.
+    // and mixed strings with type preservation. A set operation mutates graph
+    // state, so it must fail closed for malformed pure expressions. Returning the
+    // original `{{ ... }}` source here turns a syntax error into apparently valid
+    // state and lets downstream tools execute or display the raw template.
     try {
-        const result = resolveValue(config.value, state);
+        const result = resolveValue(config.value, state, { throwOnError: true });
         if (DEBUG)
             console.log('[SetOperation] Result type:', typeof result);
         return result;
     } catch (error) {
-        console.error('[SetOperation] Evaluation failed:', error);
-        throw new Error(`Failed to evaluate set value: ${config.value} - ${error instanceof Error ? error.message : String(error)}`);
+        // resolveValue already logged the underlying evaluation error; re-raise
+        // with the target field and the offending template so the run's error
+        // says which step broke and what source failed to compile.
+        const target = config.outputField || 'unnamed output';
+        throw new Error(
+            `Failed to evaluate set template for ${target}: ` +
+            `${error instanceof Error ? error.message : String(error)} ` +
+            `(template: ${summarizeTemplate(config.value)})`,
+        );
+    }
+}
+
+/**
+ * Collapse a template to a single-line, bounded snippet for error messages.
+ * Set templates are frequently multi-line IIFEs — the raw source would bury
+ * the actual error in a run log.
+ */
+function summarizeTemplate(value: any): string {
+    const source = typeof value === 'string' ? value : JSON.stringify(value);
+    const singleLine = String(source).replace(/\s+/g, ' ').trim();
+    return singleLine.length > 160 ? `${singleLine.slice(0, 160)}…` : singleLine;
+}
+
+/**
+ * Resolve a template that feeds a state-mutating global operation.
+ *
+ * Same fail-closed reasoning as `executeSetOperation`: `set-global` writes to
+ * persistent, cross-run storage, so a malformed template must abort the step
+ * rather than silently addressing the wrong slot (namespace/key) or storing the
+ * raw `{{ ... }}` source as if it were a rendered value.
+ */
+function resolveMutatingTemplate(value: any, state: any, field: string): any {
+    try {
+        return resolveValue(value, state, { throwOnError: true });
+    } catch (error) {
+        throw new Error(
+            `Failed to evaluate set-global ${field} template: ` +
+            `${error instanceof Error ? error.message : String(error)} ` +
+            `(template: ${summarizeTemplate(value)})`,
+        );
     }
 }
 
@@ -656,13 +701,16 @@ async function executeSetGlobalOperation(config: TransformStepConfig, inputData:
     if (!config.key) {
         throw new Error('set-global operation requires key');
     }
-    // Resolve templates in namespace and key (type-preserving)
-    const namespace = resolveValue(config.namespace, state);
-    const key = resolveValue(config.key, state);
+    // Resolve templates in namespace and key (type-preserving).
+    // These address the storage slot, so a malformed template must not fall back
+    // to the literal `{{ ... }}` source — that would write to a namespace/key
+    // named after the template itself.
+    const namespace = resolveMutatingTemplate(config.namespace, state, 'namespace');
+    const key = resolveMutatingTemplate(config.key, state, 'key');
     // Get value from inputData, config.value, or resolve as template (type-preserving)
     let valueToSet: any = inputData;
     if (valueToSet === undefined && config.value !== undefined) {
-        valueToSet = resolveValue(config.value, state);
+        valueToSet = resolveMutatingTemplate(config.value, state, 'value');
     }
     if (valueToSet === undefined) {
         console.warn(`[SetGlobalOperation] No value to set for ${namespace}.${key}`);

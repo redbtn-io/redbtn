@@ -258,9 +258,27 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // Run identifier — needed by callNeuron for direct cancellation.
     const callRunId: string | undefined = state?.runId || state?.data?.runId;
 
-    // Determine which neuron ID to use
-    const neuronId = config.neuronId || state.defaultNeuronId || state.data?.defaultNeuronId;
-    if (!neuronId) {
+    // Determine which neuron ID to use.
+    //
+    // `neuronId` goes through resolveConfigValue like every other templated
+    // config field. It previously did NOT: a config authored as
+    // `neuronId: "{{parameters.triageNeuronId}}"` was handed to the registry
+    // as that literal string, the lookup missed, and the step threw — so a
+    // node that parameterised its model (the obvious way to make a node
+    // reusable) failed at runtime, and any step with an onError fallback
+    // swallowed it silently. A template that resolves to nothing falls back to
+    // the state defaults rather than being used as a garbage id.
+    // A template that cannot be resolved comes back as its own raw source
+    // (resolveConfigValue's documented "return as-is"), so an unresolved
+    // `{{...}}` must be treated as absent — using it as an id would just
+    // guarantee a registry miss.
+    const resolvedNeuronId = resolveConfigValue(config.neuronId, state);
+    const usableNeuronId =
+      typeof resolvedNeuronId === 'string' && resolvedNeuronId.includes('{{')
+        ? undefined
+        : resolvedNeuronId;
+    const neuronId = usableNeuronId || state.defaultNeuronId || state.data?.defaultNeuronId;
+    if (!neuronId || typeof neuronId !== 'string') {
       throw new Error('No neuron available: config.neuronId not set and no default neuron in state');
     }
 

@@ -1,0 +1,85 @@
+{
+  "graphId": "tHXXSTFtOuM9",
+  "name": "Red Coordinator",
+  "graphType": "workflow",
+  "tags": [
+    "red-fleet",
+    "coordinator",
+    "autonomous"
+  ],
+  "nodes": [
+    {
+      "id": "gate",
+      "neuronId": null,
+      "config": {
+        "nodeId": "red-ops-gate",
+        "name": "Gate"
+      }
+    },
+    {
+      "id": "triage",
+      "neuronId": null,
+      "config": {
+        "nodeId": "red-ops-triage",
+        "name": "Triage"
+      }
+    },
+    {
+      "id": "coordinator",
+      "neuronId": null,
+      "config": {
+        "nodeId": "red-ops-coordinator",
+        "name": "Coordinator"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "__start__",
+      "to": "gate"
+    },
+    {
+      "from": "gate",
+      "condition": "data.route",
+      "targets": {
+        "run": "triage"
+      },
+      "fallback": "__end__"
+    },
+    {
+      "from": "triage",
+      "condition": "data.triageRoute",
+      "targets": {
+        "run": "coordinator"
+      },
+      "fallback": "__end__"
+    },
+    {
+      "from": "coordinator",
+      "to": "__end__"
+    }
+  ],
+  "layout": {
+    "__start__": {
+      "x": -160,
+      "y": 160
+    },
+    "gate": {
+      "x": 60,
+      "y": 160
+    },
+    "triage": {
+      "x": 300,
+      "y": 160
+    },
+    "coordinator": {
+      "x": 540,
+      "y": 160
+    },
+    "__end__": {
+      "x": 780,
+      "y": 160
+    }
+  },
+  "description": "Config-driven singleton orchestrator + backbone. Gate node reads red-ops/config and deterministically routes run/stop (mode off|always|windows + until + enabled). On run, the Triage node (cheap tier) diffs /api/board + red-ops/state against its baseline and ends the tick for free when nothing is actionable; only an actionable tick reaches the CLI Coordinator, which discovers working-tagged projects, dispatches Red Workers, records red-ops/state, posts notes, and reaches out to @george when it needs direction. All steering editable live in red-ops/config."
+}

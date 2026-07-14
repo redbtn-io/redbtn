@@ -193,7 +193,20 @@ export function getNestedProperty(obj: any, path: string): any {
  * @param state - Current graph state (includes `parameters` sub-object).
  * @returns Resolved value, type-preserving for pure expressions.
  */
-export function resolveValue(value: any, state: any): any {
+export interface ResolveValueOptions {
+    /**
+     * Re-throw errors raised while evaluating a pure `{{ ... }}` expression.
+     *
+     * The historic default deliberately remains lenient for backwards
+     * compatibility: callers that render display text can retain the original
+     * template when a value is unavailable. State-mutating operations should
+     * opt in so a malformed expression cannot be persisted as executable
+     * source and consumed as ordinary data later in the run.
+     */
+    throwOnError?: boolean;
+}
+
+export function resolveValue(value: any, state: any, options: ResolveValueOptions = {}): any {
     // Rule 1: non-strings pass through unchanged
     if (typeof value !== 'string') {
         return value;
@@ -243,6 +256,10 @@ export function resolveValue(value: any, state: any): any {
             return evalFunc(state);
         } catch (error) {
             console.error('[TemplateRenderer] resolveValue: failed to evaluate expression:', expression, error);
+            if (options.throwOnError) {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new Error(`Template expression failed to evaluate: ${message}`);
+            }
             // Return the original string on error so callers see something useful
             return value;
         }
