@@ -140,13 +140,23 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
     extract: () => ({ addresses: [], unscoped: true }),
   },
 
+  // ── State Records: reads ──────────────────────────────────────────────────
+  // Records live under a namespace and are addressed by it, so the SAME
+  // namespace-keyed extractor applies — an agent jailed to namespace X by an
+  // existing selector is jailed for records in X too, with no new grant syntax.
+  get_state_record: { resource: 'state', action: 'read', extract: stateNamespace },
+  query_state_records: { resource: 'state', action: 'read', extract: stateNamespace },
+
   // ── State: writes ─────────────────────────────────────────────────────────
   set_global_state: { resource: 'state', action: 'write', extract: stateNamespace },
   state_patch: { resource: 'state', action: 'write', extract: stateNamespace },
+  create_state_record: { resource: 'state', action: 'write', extract: stateNamespace },
+  update_state_record: { resource: 'state', action: 'write', extract: stateNamespace },
 
   // ── State: deletes ────────────────────────────────────────────────────────
   delete_global_state: { resource: 'state', action: 'delete', extract: stateNamespace },
   delete_namespace: { resource: 'state', action: 'delete', extract: stateNamespace },
+  delete_state_record: { resource: 'state', action: 'delete', extract: stateNamespace },
 
   // ── Knowledge: reads ──────────────────────────────────────────────────────
   list_libraries: {
