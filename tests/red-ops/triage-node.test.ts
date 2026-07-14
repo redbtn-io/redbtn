@@ -26,8 +26,6 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { resolveValue } from '../../src/lib/nodes/universal/templateRenderer';
-import { executeTransform } from '../../src/lib/nodes/universal/executors/transformExecutor';
-import type { TransformStepConfig } from '../../src/lib/nodes/universal/types';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Any = any;
@@ -83,9 +81,15 @@ function setPath(state: Any, path: string, value: Any): void {
   cur[parts[parts.length - 1]] = value;
 }
 
-/** MCP-shaped result, as a native tool returns it. */
-const mcp = (payload: Any) => ({ content: [{ type: 'text', text: JSON.stringify(payload) }] });
-/** fetch_url wraps the HTTP body as a STRING inside its JSON envelope. */
+/**
+ * What a tool STEP actually sees. `toolExecutor` extracts `content[0].text` from
+ * the MCP result and JSON.parses it before writing the outputField, so the step
+ * gets the DECODED payload — not the `{content:[...]}` envelope. Modelling the
+ * envelope here is what let the first deploy pass its tests and still fall open
+ * in production on a perfectly good HTTP 200. Mirror the executor exactly.
+ */
+const mcp = (payload: Any) => payload;
+/** fetch_url still wraps the HTTP body as a STRING inside its own payload. */
 const httpOk = (body: Any) => mcp({ status: 200, statusText: 'OK', headers: {}, body: JSON.stringify(body) });
 
 /**
@@ -157,7 +161,7 @@ async function runTick(opts: TickOpts = {}): Promise<TickResult> {
     if (!shouldRun(step, s)) return;
 
     if (step.type === 'transform') {
-      const cfgT = step.config as TransformStepConfig & Any;
+      const cfgT = step.config as Any;
       if (cfgT.operation === 'get-global') {
         setPath(s, cfgT.outputField, globals[`${cfgT.namespace}/${cfgT.key}`] ?? undefined);
         return;
@@ -170,9 +174,11 @@ async function runTick(opts: TickOpts = {}): Promise<TickResult> {
         globalWrites.push({ namespace: cfgT.namespace, key: cfgT.key, value });
         return;
       }
-      // Real executor — keeps the fail-closed `set` semantics honest.
-      const update = await executeTransform(cfgT, s);
-      for (const [k, v] of Object.entries(update)) setPath(s, k, v);
+      // `set` — same call the transform executor makes (executeSetOperation
+      // delegates straight to resolveValue), including its fail-closed
+      // throwOnError, so a malformed template blows up here exactly as it
+      // would in a run rather than persisting its own raw source.
+      setPath(s, cfgT.outputField, resolveValue(cfgT.value, s, { throwOnError: true }));
       return;
     }
 
