@@ -69,6 +69,10 @@ interface TickOpts {
   neuronOutput?: string;
   /** false → the automation injected no _secrets (token must fall back to red-ops/config). */
   secrets?: boolean;
+  /** runIds whose get_run probe call throws (engine applies the step's errorHandling.fallbackValue). */
+  failProbes?: string[];
+  /** card ids whose comment-fetch call throws (engine applies the step's errorHandling.fallbackValue). */
+  failCommentFetches?: string[];
 }
 
 function setPath(state: Any, path: string, value: Any): void {
@@ -110,6 +114,8 @@ async function runTick(opts: TickOpts = {}): Promise<TickResult> {
     opsState = { dispatched: [] },
     neuronOutput,
     secrets = true,
+    failProbes = [],
+    failCommentFetches = [],
   } = opts;
 
   const globals: Record<string, Any> = {
@@ -134,6 +140,10 @@ async function runTick(opts: TickOpts = {}): Promise<TickResult> {
   const callTool = (toolName: string, params: Any): Any => {
     toolCalls.push({ tool: toolName, params });
     if (toolName === 'get_run') {
+      // Simulates a real transport failure (timeout/5xx/etc) — the engine's
+      // errorHandling.onError:'fallback' is what turns this into fallbackValue,
+      // not a resolved "not found" response. See execStep's tool-step handling.
+      if (failProbes.includes(String(params.runId))) throw new Error('get_run transport failure');
       const status = runs[String(params.runId)];
       if (!status) return mcp({ error: 'not found', runId: params.runId });
       return mcp({ run: { runId: params.runId, status } });
@@ -148,7 +158,10 @@ async function runTick(opts: TickOpts = {}): Promise<TickResult> {
         return httpOk({ items });
       }
       const m = url.match(/\/api\/board\/([^/]+)\/comments$/);
-      if (m) return httpOk({ comments: comments[m[1]] || [] });
+      if (m) {
+        if (failCommentFetches.includes(m[1])) throw new Error('comment fetch transport failure');
+        return httpOk({ comments: comments[m[1]] || [] });
+      }
       if (url.endsWith('/api/notes')) return httpOk({ ok: true });
     }
     return mcp({ error: `unstubbed tool ${toolName}` });
@@ -186,7 +199,17 @@ async function runTick(opts: TickOpts = {}): Promise<TickResult> {
       const params = JSON.parse(JSON.stringify(step.config.parameters), (_k, v) =>
         typeof v === 'string' ? resolveValue(v, s) : v,
       );
-      setPath(s, step.config.outputField, callTool(step.config.toolName, params));
+      // Mirrors executeWithErrorHandling: a thrown tool call resolves to the
+      // step's own errorHandling.fallbackValue, exactly as production does.
+      let result: Any;
+      try {
+        result = callTool(step.config.toolName, params);
+      } catch (err) {
+        const eh = step.config.errorHandling;
+        if (eh && eh.onError === 'fallback') result = eh.fallbackValue;
+        else throw err;
+      }
+      setPath(s, step.config.outputField, result);
       return;
     }
 
@@ -576,6 +599,48 @@ describe('red-ops-triage — fail-open guarantees', () => {
 
     expect(r.route).toBe('run');
     expect(r.decision.via).toBe('disabled');
+    expect(r.neuronCalls).toBe(0);
+  });
+
+  /**
+   * The bug this pins: get_run/comment-fetch failures use `errorHandling:
+   * {onError:'fallback', fallbackValue:{error:...}}`. The fallback object has
+   * no `.run.status` / `.body`, so it previously decoded to state 'unknown' /
+   * an empty comments array — data the router treats exactly like "nothing
+   * happened", not like "we don't know what happened". A quiet-looking board
+   * with a probe or comment fetch that actually FAILED must still fail open,
+   * not silently reach 'stop' on data it never really saw.
+   */
+  it('fails OPEN when a get_run probe transport-fails, instead of silently dropping it as unknown', async () => {
+    const r = await runTick({
+      items: [card()], // otherwise a settled, quiet-tick board
+      runs: { run_w1: 'running' },
+      memo: settledMemo(),
+      failProbes: ['run_w1'],
+    });
+
+    expect(r.route).toBe('run');
+    expect(r.decision.via).toBe('failopen');
+    expect(r.decision.reason).toContain('fetch failed');
+    expect(r.signals.probeFetchFailed).toEqual(['run_w1']);
+    expect(r.signals.running).toBe(0); // not silently counted as a healthy running probe either
+    expect(r.neuronCalls).toBe(0); // deterministic — never adjudicates on data we know is missing
+  });
+
+  it('fails OPEN when a comment fetch transport-fails on a changed card, without asking the neuron on missing data', async () => {
+    const r = await runTick({
+      items: [card({ commentCount: 3, updatedAt: T1 })], // a changed, ambiguous card
+      runs: { run_w1: 'running' },
+      memo: settledMemo(),
+      failCommentFetches: ['card1'],
+    });
+
+    expect(r.route).toBe('run');
+    expect(r.decision.via).toBe('failopen');
+    expect(r.decision.reason).toContain('fetch failed');
+    expect(r.signals.commentFetchFailed).toEqual(['card1']);
+    // Pre-fix this fell through to the neuron with an empty (failed) comment
+    // thread and the stub's default "not actionable" verdict silently won.
     expect(r.neuronCalls).toBe(0);
   });
 });
