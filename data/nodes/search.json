@@ -1,0 +1,197 @@
+{
+  "_id": "696c6b5c4bfb50eb115d3252",
+  "nodeId": "search",
+  "name": "Web Search with Iteration",
+  "description": "Executes web searches via MCP with intelligent query analysis, multi-query parallel execution, and iterative result evaluation",
+  "version": "2.0.0",
+  "steps": [
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{ state.data?.currentStep?.searchQuery || state.data?.currentStep?.args?.q || state.data?.currentStep?.args?.query || state.data?.currentStep?.arguments?.query || state.data?.currentStep?.arguments?.q || state.data.query.message }}",
+        "outputField": "data.searchQuery"
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{state.data.searchIterations}} == undefined",
+        "setField": "data.searchIterations",
+        "trueValue": 0,
+        "falseValue": "{{state.data.searchIterations}}"
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{ new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) }}",
+        "outputField": "data.currentDate"
+      }
+    },
+    {
+      "type": "neuron",
+      "config": {
+        "neuronId": "red-neuron",
+        "systemPrompt": "Output ONLY valid JSON. No explanations or markdown.",
+        "userPrompt": "Analyze this search request and create an optimized search plan with 2-3 parallel query variants.\n\nUser's Question: {{state.data.searchQuery}}\nToday's Date: {{state.data.currentDate}}\n\nRespond with this JSON structure:\n{\n  \"classification\": {\n    \"realtime\": true/false,\n    \"temporal\": \"today|this_week|this_month|this_year|historical|timeless\",\n    \"domain\": \"sports|news|tech|science|finance|health|entertainment|general\",\n    \"intent\": \"score_lookup|news|how_to|fact_check|price_check|weather|comparison|general_info\",\n    \"entities\": [\"entity1\", \"entity2\"]\n  },\n  \"queries\": [\n    {\n      \"query\": \"optimized search string\",\n      \"dateRestrict\": \"d1\",\n      \"siteSearch\": \"espn.com\",\n      \"exactTerms\": \"Chiefs\"\n    }\n  ]\n}\n\nRULES:\n- Generate 2-3 queries approaching from different angles\n- Each query: 3-8 words, optimized for Google (no question marks, no filler)\n- For time-sensitive queries: include the date in at least one query, use dateRestrict (d1=past day, w1=past week, m1=past month, y1=past year)\n- siteSearch: target authoritative domains (sports→espn.com, news→reuters.com, tech→arstechnica.com, finance→bloomberg.com)\n- exactTerms: specific names/entities that MUST appear\n- One query should be broad, one narrow/specific, one from an alternative angle\n- dateRestrict, siteSearch, exactTerms are all optional per query — only include when they add value",
+        "outputField": "data.queryPlanRaw",
+        "stream": false,
+        "temperature": 0.3,
+        "errorHandling": {
+          "retry": 1,
+          "fallbackValue": "{\"classification\":{\"realtime\":false,\"temporal\":\"timeless\",\"domain\":\"general\",\"intent\":\"general_info\",\"entities\":[]},\"queries\":[]}",
+          "onError": "fallback"
+        }
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "parse-json",
+        "inputField": "data.queryPlanRaw",
+        "outputField": "data.queryPlan"
+      }
+    },
+    {
+      "type": "loop",
+      "config": {
+        "maxIterations": "{{parameters.maxIterations}}",
+        "exitCondition": "state.data.searchSufficient === true",
+        "onMaxIterations": "continue",
+        "steps": [
+          {
+            "type": "tool",
+            "config": {
+              "toolName": "web_search",
+              "parameters": {
+                "query": "{{state.data.searchQuery}}",
+                "queryPlan": "{{state.data.queryPlan}}",
+                "count": 10
+              },
+              "outputField": "data.searchResult",
+              "errorHandling": {
+                "retry": 2,
+                "retryDelay": 1000,
+                "onError": "throw"
+              }
+            }
+          },
+          {
+            "type": "neuron",
+            "config": {
+              "neuronId": "red-neuron",
+              "systemPrompt": "Analyze search results and respond ONLY with valid JSON.",
+              "userPrompt": "You are an AI search evaluator. Analyze the search results to determine if there is enough information to answer the user's query.\n\nUser Query: {{state.data.query.message}}\n\nSearch Results:\n\n\nCurrent Iteration: {{state.data.loopIteration}} of 5\n\nEvaluate:\n1. Do the search results contain relevant information to answer the query?\n2. Is the information complete enough for a satisfactory answer?\n3. If not sufficient, what specific aspect should the next search focus on?\n\nRespond with a JSON object:\n{\n  \"sufficient\": true/false,\n  \"reasoning\": \"Brief explanation of your decision\",\n  \"newSearchQuery\": \"If not sufficient, provide a refined search query focusing on missing information\"\n}\n\nBe practical: If results provide ANY useful information, consider it sufficient. Only request more searches if critical information is completely missing.",
+              "outputField": "data.evaluationRaw",
+              "stream": false,
+              "temperature": "{{parameters.evaluationTemperature}}",
+              "errorHandling": {
+                "retry": 1,
+                "fallbackValue": "{\"sufficient\": true, \"reasoning\": \"Evaluation failed, using available results\"}",
+                "onError": "fallback"
+              }
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "parse-json",
+              "inputField": "data.evaluationRaw",
+              "outputField": "data.evaluation"
+            }
+          },
+          {
+            "type": "conditional",
+            "config": {
+              "condition": "{{state.data.evaluation.sufficient}} == true",
+              "setField": "data.searchSufficient",
+              "trueValue": true,
+              "falseValue": false
+            }
+          },
+          {
+            "type": "conditional",
+            "config": {
+              "condition": "{{state.data.searchSufficient}} == false",
+              "setField": "data.searchQuery",
+              "trueValue": "{{state.data.evaluation.newSearchQuery}}",
+              "falseValue": "{{state.data.searchQuery}}"
+            }
+          },
+          {
+            "type": "conditional",
+            "config": {
+              "condition": "{{state.data.searchSufficient}} == false",
+              "setField": "data.queryPlan",
+              "trueValue": null,
+              "falseValue": "{{state.data.queryPlan}}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{[{ role: \"user\", content: \"Here are the search results to help answer my question:\\n\\n<web_search>\\n\" + (typeof state.data.searchResult === 'string' ? state.data.searchResult : JSON.stringify(state.data.searchResult, null, 2)) + \"\\n</web_search>\\n\\nPlease use these results to answer my original question.\" }]}}",
+        "outputField": "data.searchResultMessage"
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "concat",
+        "inputField": "data.messages",
+        "concatWith": "searchResultMessage",
+        "outputField": "data.messages"
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "executor",
+        "outputField": "data.nextGraph"
+      }
+    }
+  ],
+  "isImmutable": true,
+  "tags": [
+    "utility"
+  ],
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  },
+  "metadata": {
+    "color": "#0EA5E9",
+    "icon": "Search"
+  },
+  "parameters": {
+    "evaluationTemperature": {
+      "type": "number",
+      "default": 0.3,
+      "min": 0,
+      "max": 2,
+      "description": "LLM temperature for evaluating search result sufficiency.",
+      "stepIndex": 0,
+      "configPath": "loop.steps[1].config.temperature"
+    },
+    "maxIterations": {
+      "type": "number",
+      "default": 5,
+      "min": 1,
+      "max": 10,
+      "description": "Maximum search iterations before giving up."
+    }
+  },
+  "updatedAt": "2026-02-19T21:24:14.627Z",
+  "isSystem": true,
+  "userId": "system"
+}

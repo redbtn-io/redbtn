@@ -53,11 +53,11 @@ describe('delete_library — happy path', () => {
           { status: 200 },
         );
       }
-      if (method === 'DELETE') {
+      if (method === 'POST' && url.pathname.endsWith('/archive')) {
         deleteUrlSeen = u;
         methodSeen = method;
         return new Response(
-          JSON.stringify({ success: true, deleted: true }),
+          JSON.stringify({ success: true, archived: true }),
           { status: 200 },
         );
       }

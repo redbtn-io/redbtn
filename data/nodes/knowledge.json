@@ -1,0 +1,149 @@
+{
+  "_id": "69497d28ba24187bbc694d3f",
+  "nodeId": "knowledge",
+  "createdAt": "2025-01-20T00:00:00.000Z",
+  "description": "Searches user's knowledge libraries for relevant context using RAG",
+  "isImmutable": false,
+  "isPublic": true,
+  "metadata": {
+    "tags": [
+      "rag",
+      "knowledge",
+      "retrieval",
+      "vector",
+      "library"
+    ],
+    "color": "#8B5CF6",
+    "icon": "Library"
+  },
+  "name": "Knowledge Library Search",
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  },
+  "steps": [
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{ state.data?.currentStep?.searchQuery || state.data?.currentStep?.args?.query || state.data?.query?.message }}",
+        "outputField": "data.knowledgeQuery"
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{state.data.currentStep?.args?.libraryId}} != undefined",
+        "setField": "data.searchMode",
+        "trueValue": "single",
+        "falseValue": "all"
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{state.data.searchMode}} == 'single'",
+        "steps": {
+          "true": [
+            {
+              "type": "tool",
+              "config": {
+                "toolName": "search_all_libraries",
+                "parameters": {
+                  "libraryIds": [
+                    "{{state.data.currentStep.args.libraryId}}"
+                  ],
+                  "query": "{{state.data.knowledgeQuery}}",
+                  "limit": 5,
+                  "minScore": 0.6
+                },
+                "outputField": "data.knowledgeResults",
+                "errorHandling": {
+                  "retry": 2,
+                  "retryDelay": 500,
+                  "onError": "continue"
+                }
+              }
+            }
+          ],
+          "false": [
+            {
+              "type": "tool",
+              "config": {
+                "toolName": "search_all_libraries",
+                "parameters": {
+                  "userId": "{{state.data.options.userId}}",
+                  "query": "{{state.data.knowledgeQuery}}",
+                  "limit": 3,
+                  "threshold": 0.6,
+                  "includeShared": true
+                },
+                "outputField": "data.knowledgeResults",
+                "errorHandling": {
+                  "retry": 2,
+                  "retryDelay": 500,
+                  "onError": "continue"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{state.data.knowledgeResults}} != undefined && \"{{state.data.knowledgeResults.isError}}\" != \"true\"",
+        "setField": "data.hasKnowledge",
+        "trueValue": true,
+        "falseValue": false
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{state.data.hasKnowledge}} == true",
+        "steps": {
+          "true": [
+            {
+              "type": "transform",
+              "config": {
+                "operation": "set",
+                "value": "\n## Knowledge Library Context\n\n{{state.data.knowledgeResults.content[0].text}}\n\n---\n\n",
+                "outputField": "data.knowledgeContext"
+              }
+            },
+            {
+              "type": "transform",
+              "config": {
+                "operation": "prepend",
+                "inputField": "data.query.message",
+                "prependWith": "data.knowledgeContext",
+                "outputField": "data.query.enrichedMessage"
+              }
+            }
+          ],
+          "false": [
+            {
+              "type": "transform",
+              "config": {
+                "operation": "set",
+                "value": "",
+                "outputField": "data.knowledgeContext"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "tags": [
+    "rag",
+    "knowledge"
+  ],
+  "updatedAt": "2025-01-20T00:00:00.000Z",
+  "version": "1.0.0",
+  "isSystem": true
+}

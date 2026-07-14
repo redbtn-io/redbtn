@@ -1,0 +1,33 @@
+{
+  "_id": "691de97a40bbab3ecb92b300",
+  "nodeId": "emit-demo-component",
+  "name": "Emit Demo Component",
+  "description": "Demonstrates the emit_component native tool by publishing a button-group chat component inline on the agent message. Used to exercise the config-driven emission path end-to-end (chat-interactive-widgets phase 5).",
+  "userId": "system",
+  "isSystem": true,
+  "isPublic": true,
+  "version": 1,
+  "steps": [
+    {
+      "type": "tool",
+      "config": {
+        "toolName": "emit_component",
+        "parameters": {
+          "type": "button-group",
+          "config": {
+            "label": "Continue?",
+            "buttons": [
+              { "label": "Yes" },
+              { "label": "No" }
+            ]
+          },
+          "interaction": {
+            "channel": "followup",
+            "text": "{{state.data.followupText}}"
+          }
+        },
+        "outputField": "data.demoComponent"
+      }
+    }
+  ]
+}

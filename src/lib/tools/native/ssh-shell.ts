@@ -770,6 +770,5 @@ async function executeViaEnvironment(args: ExecuteViaEnvironmentArgs): Promise<N
 }
 
 export default sshShell;
-export { __setSshClientFactoryForTests };
 // Also export as module.exports for CJS require() compatibility (the .js files use require())
 module.exports = sshShell;

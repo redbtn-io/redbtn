@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const sharedRepoRoot = path.resolve(__dirname, '../../../redbtn');
+const sharedRepoRoot = path.resolve(__dirname, '../..');
 
 function collectToolNames(value: unknown, out = new Set<string>()): Set<string> {
   if (!value || typeof value !== 'object') return out;

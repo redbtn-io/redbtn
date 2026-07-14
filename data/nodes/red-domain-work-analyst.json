@@ -1,0 +1,115 @@
+{
+  "nodeId": "red-domain-work-analyst",
+  "name": "Red Domain Work Analyst",
+  "description": "Work-domain specialist analyst. Clone of red-domain-neuron-analyst (same gemma4-director defaults) with a focused toolset: direct_worker (graph) to direct the 3 autonomous workers, automation + global-state readers to inspect worker state, the Work knowledge libraries, and calendar context.",
+  "parameters": {
+    "neuronId": {
+      "type": "string",
+      "default": "gemma4-director",
+      "description": "Neuron to run for domain response."
+    },
+    "temperature": {
+      "type": "number",
+      "default": 0.4,
+      "min": 0,
+      "max": 2,
+      "description": "LLM temperature."
+    },
+    "maxTokens": {
+      "type": "number",
+      "default": 1600,
+      "min": 100,
+      "max": 16000,
+      "description": "Max output tokens."
+    }
+  },
+  "metadata": {
+    "tags": [
+      "assistant",
+      "domain",
+      "neuron"
+    ],
+    "color": "#7C3AED",
+    "icon": "BrainCircuit"
+  },
+  "tags": [
+    "assistant",
+    "domain",
+    "neuron"
+  ],
+  "isPublic": false,
+  "steps": [
+    {
+      "type": "neuron",
+      "config": {
+        "neuronId": "{{parameters.neuronId}}",
+        "systemPrompt": "{{state.data.systemPrompt}}",
+        "userPrompt": "{{state.data.userMessage}}",
+        "temperature": "{{parameters.temperature}}",
+        "maxTokens": "{{parameters.maxTokens}}",
+        "stream": false,
+        "outputField": "data.response",
+        "errorHandling": {
+          "retry": 1,
+          "retryDelay": 1000,
+          "onError": "fallback",
+          "fallbackValue": "I could not reach the domain model right now. Please try again in a moment."
+        },
+        "toolStrategy": "native",
+        "maxToolIterations": 50,
+        "tools": [
+          {
+            "source": "graph",
+            "name": "direct-worker-tool",
+            "description": "Send a directive to one of the autonomous workers (redbtn / become / eliteEntries): queue a one-shot run, set a strategic directive, or enable/disable the worker."
+          },
+          {
+            "source": "native",
+            "name": "list_automations",
+            "description": "List automations the caller can access (including the autonomous workers)."
+          },
+          {
+            "source": "native",
+            "name": "get_automation",
+            "description": "Get a single automation config and status by automationId."
+          },
+          {
+            "source": "native",
+            "name": "get_global_state",
+            "description": "Read a single value from a global-state namespace."
+          },
+          {
+            "source": "native",
+            "name": "list_global_state",
+            "description": "List all key/value pairs in a global-state namespace."
+          },
+          {
+            "source": "native",
+            "name": "list_namespaces",
+            "description": "List all accessible global-state namespaces."
+          },
+          {
+            "source": "native",
+            "name": "search_all_libraries",
+            "description": "Search every accessible Knowledge Library."
+          },
+          {
+            "source": "native",
+            "name": "list_libraries",
+            "description": "List Knowledge Libraries the caller can access."
+          },
+          {
+            "source": "mcp",
+            "name": "gcal_events_list",
+            "description": "List calendar events."
+          },
+          {
+            "source": "mcp",
+            "name": "gcal_events_get",
+            "description": "Get a calendar event."
+          }
+        ]
+      }
+    }
+  ]
+}

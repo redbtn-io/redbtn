@@ -1,0 +1,77 @@
+{
+  "_id": "691de97a40bbab3ecb92b250",
+  "nodeId": "summarizer",
+  "name": "Content Summarizer",
+  "description": "Extracts and summarizes key information from search results or long content",
+  "userId": "system",
+  "isSystem": true,
+  "version": 1,
+  "steps": [
+    {
+      "type": "neuron",
+      "config": {
+        "neuronId": "red-neuron",
+        "systemPrompt": "Extract key facts and data to answer the user's query accurately and concisely.\n\nIMPORTANT: Do NOT repeat or rephrase the query - only provide the facts and information.",
+        "userPrompt": "User Query: {{state.data.originalQuery || data.query.message}}\n\nSearch Results:\n{{state.data.searchResults || data.scrapedContent}}\n\nExtract and summarize the key information that answers this query. Start directly with the facts - do NOT repeat the query:",
+        "outputField": "data.summary",
+        "stream": false,
+        "temperature": "{{parameters.temperature}}",
+        "maxTokens": "{{parameters.maxTokens}}",
+        "errorHandling": {
+          "retry": 2,
+          "retryDelay": 1000,
+          "fallbackValue": "Unable to summarize the search results.",
+          "onError": "fallback"
+        }
+      }
+    }
+  ],
+  "metadata": {
+    "originalFile": "src/lib/nodes/search/optimizer.ts (summarizeSearchResults)",
+    "migratedAt": "2025-11-19T15:59:54.409Z",
+    "linesReduced": 47,
+    "tags": [
+      "summarization",
+      "extraction",
+      "search"
+    ],
+    "color": "#A855F7",
+    "icon": "FileText"
+  },
+  "createdAt": "2025-11-19T15:59:54.414Z",
+  "updatedAt": "2026-02-19T21:24:14.626Z",
+  "__v": 0,
+  "isImmutable": true,
+  "tags": [
+    "transformation"
+  ],
+  "abandonedAt": null,
+  "creatorId": "system",
+  "scheduledDeletionAt": null,
+  "status": "active",
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  },
+  "parameters": {
+    "temperature": {
+      "type": "number",
+      "default": 0.3,
+      "min": 0,
+      "max": 2,
+      "description": "LLM temperature for summarization.",
+      "stepIndex": 0,
+      "configPath": "config.temperature"
+    },
+    "maxTokens": {
+      "type": "number",
+      "default": 500,
+      "min": 100,
+      "max": 2000,
+      "description": "Maximum tokens for summary."
+    }
+  }
+}

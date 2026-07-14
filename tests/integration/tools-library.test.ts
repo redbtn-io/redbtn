@@ -766,7 +766,7 @@ describe('library pack integration — registration + chained execution', () => 
     );
     expect(JSON.parse(listAfter.content[0].text).total).toBe(0);
 
-    // 8. delete_library (permanent)
+    // 8. delete_library (default: archive)
     const deleteLibResult = await registry.callTool(
       'delete_library',
       { libraryId },
@@ -776,7 +776,7 @@ describe('library pack integration — registration + chained execution', () => 
     const delLibBody = JSON.parse(deleteLibResult.content[0].text);
     expect(delLibBody.ok).toBe(true);
     expect(delLibBody.archived).toBe(true);
-    expect(delLibBody.deletedDocuments).toBe(0);
+    expect(delLibBody.documents).toBe(0);
 
     // 9. list_libraries no longer shows the deleted library
     const listLibsResult = await registry.callTool(

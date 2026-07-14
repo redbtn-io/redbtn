@@ -1,0 +1,135 @@
+{
+  "nodeId": "god-director-node",
+  "name": "Generative Orchestration Director",
+  "description": "GOD director node using the local red-neuron granite model with the same state, conversation, and knowledge tools as the GOD stream.",
+  "userId": "system",
+  "isSystem": true,
+  "isImmutable": true,
+  "isPublic": true,
+  "version": 1,
+  "status": "active",
+  "creatorId": "system",
+  "tags": [
+    "director",
+    "assistant",
+    "state",
+    "knowledge"
+  ],
+  "metadata": {
+    "tags": [
+      "director",
+      "assistant",
+      "state",
+      "knowledge"
+    ],
+    "color": "#7C3AED",
+    "icon": "BrainCircuit"
+  },
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  },
+  "parameters": {
+    "temperature": {
+      "type": "number",
+      "default": 0.4,
+      "min": 0,
+      "max": 2,
+      "description": "LLM temperature for GOD responses."
+    },
+    "maxTokens": {
+      "type": "number",
+      "default": 4096,
+      "min": 100,
+      "max": 16000
+    }
+  },
+  "steps": [
+    {
+      "type": "neuron",
+      "config": {
+        "neuronId": "gemma4-director",
+        "systemPrompt": "You are GOD, the Generative Orchestration Director for the redbtn ecosystem. You are the T1 director for state, conversations, and knowledge. Use the attached tools proactively when you need grounded context or persistence. Prefer state tools for global state, conversation tools for session history, and knowledge tools for library/context retrieval. Be concise, direct, and practical. Do not invent state or knowledge; verify it with tools.\n\nYou are operating in the Projects working space. Red-Projects is the project workspace; Red-Personal, Red-Work, Red-Home, and similar namespaces are domain-specific working contexts.\n\nWhen the user asks for an action or updated context, use tools first and then answer. When the answer is simple and already grounded, respond directly.",
+        "userPrompt": "{{state.data.messages}}",
+        "temperature": "{{parameters.temperature}}",
+        "maxTokens": "{{parameters.maxTokens}}",
+        "stream": true,
+        "toolStrategy": "native",
+        "maxToolIterations": 8,
+        "tools": [
+          {
+            "source": "native",
+            "name": "get_global_state",
+            "description": "Read a single value from a global-state namespace."
+          },
+          {
+            "source": "native",
+            "name": "set_global_state",
+            "description": "Write a value into a global-state namespace."
+          },
+          {
+            "source": "native",
+            "name": "list_global_state",
+            "description": "List all key/value pairs in a global-state namespace."
+          },
+          {
+            "source": "native",
+            "name": "list_namespaces",
+            "description": "List all accessible global-state namespaces."
+          },
+          {
+            "source": "native",
+            "name": "delete_global_state",
+            "description": "Delete a single key from a global-state namespace."
+          },
+          {
+            "source": "native",
+            "name": "list_conversations",
+            "description": "List conversations visible to the caller."
+          },
+          {
+            "source": "native",
+            "name": "get_messages",
+            "description": "Read messages from a conversation."
+          },
+          {
+            "source": "native",
+            "name": "list_libraries",
+            "description": "List Knowledge Libraries the caller can access."
+          },
+          {
+            "source": "native",
+            "name": "search_all_libraries",
+            "description": "Search every accessible Knowledge Library."
+          },
+          {
+            "source": "native",
+            "name": "list_documents",
+            "description": "List documents in a specific Knowledge Library."
+          },
+          {
+            "source": "native",
+            "name": "get_document",
+            "description": "Fetch one document from a Knowledge Library."
+          }
+        ],
+        "outputField": "data.response",
+        "errorHandling": {
+          "retry": 2,
+          "retryDelay": 1000,
+          "onError": "fallback",
+          "fallbackValue": "I couldn't complete that director pass right now. Try again in a moment."
+        }
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{state.data.response}}",
+        "outputField": "response"
+      }
+    }
+  ]
+}

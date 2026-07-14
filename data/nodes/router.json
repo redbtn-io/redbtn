@@ -1,0 +1,121 @@
+{
+  "_id": "691de97a40bbab3ecb92b24c",
+  "nodeId": "router",
+  "name": "Intelligent Router",
+  "description": "Routes queries to appropriate handlers (plan/respond) with confidence scoring",
+  "userId": "system",
+  "isSystem": true,
+  "version": 4,
+  "steps": [
+    {
+      "type": "neuron",
+      "config": {
+        "neuronId": "red-neuron",
+        "systemPrompt": "Your job is to route the user's request to the correct handler.\n\nYou will receive conversation history when available. Use it to make informed routing decisions and to generate accurate directResponse answers for context-dependent questions.\n\nOPTIONS:\n1. PLAN: Use this for complex queries, web searches, commands, or multi-step reasoning. If the user asks for current information, news, sports scores, or something you don't know, CHOOSE PLAN. Even if you think you know the answer to a \"current\" question, you MUST choose PLAN to verify it.\n2. RESPOND: Use this ONLY for simple greetings, small talk, or questions you can answer IMMEDIATELY from the conversation context or general knowledge (e.g. \"What is the capital of France?\" or \"What is my name?\" when context shows it).\n\nOUTPUT SCHEMA:\n{\n  \"decision\": \"plan\" | \"respond\",\n  \"confidence\": 0.0-1.0,\n  \"reasoning\": \"why you chose this path\",\n  \"directResponse\": \"(optional) a short response for simple queries\"\n}",
+        "userPrompt": "Conversation history:\n{{state.data.contextMessages}}\n\nCurrent user message: {{state.data.query.message}}",
+        "outputField": "data.routingDecision",
+        "temperature": "{{parameters.temperature}}",
+        "stream": false,
+        "structuredOutput": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "decision": {
+                "type": "string",
+                "enum": [
+                  "plan",
+                  "respond"
+                ]
+              },
+              "confidence": {
+                "type": "number"
+              },
+              "reasoning": {
+                "type": "string"
+              },
+              "directResponse": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "decision",
+              "confidence",
+              "reasoning"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "errorHandling": {
+          "retry": 2,
+          "retryDelay": 1000,
+          "onError": "fallback",
+          "fallbackValue": {
+            "decision": "plan",
+            "confidence": 0,
+            "reasoning": "Error during routing, defaulting to plan"
+          }
+        }
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{state.data.routingDecision?.decision === \"plan\"}}",
+        "setField": "data.nextGraph",
+        "trueValue": "plan",
+        "falseValue": "respond"
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{state.data.routingDecision?.directResponse != null && state.data.routingDecision?.directResponse !== \"\"}}",
+        "setField": "data.directResponse",
+        "trueValue": "{{state.data.routingDecision?.directResponse}}",
+        "falseValue": null
+      }
+    }
+  ],
+  "metadata": {
+    "color": "#8B5CF6",
+    "icon": "GitBranch"
+  },
+  "createdAt": "2025-11-19T15:59:54.390Z",
+  "updatedAt": "2026-02-19T21:24:14.622Z",
+  "__v": 0,
+  "isImmutable": true,
+  "tags": [
+    "routing"
+  ],
+  "parameters": {
+    "temperature": {
+      "type": "number",
+      "default": 0.1,
+      "min": 0,
+      "max": 2,
+      "description": "LLM temperature for routing decisions. Lower = more deterministic.",
+      "stepIndex": 0,
+      "configPath": "config.temperature"
+    },
+    "fallbackDecision": {
+      "type": "select",
+      "default": "plan",
+      "enum": [
+        "plan",
+        "respond"
+      ],
+      "description": "Default routing decision when error occurs"
+    }
+  },
+  "abandonedAt": null,
+  "creatorId": "system",
+  "scheduledDeletionAt": null,
+  "status": "active",
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  }
+}
