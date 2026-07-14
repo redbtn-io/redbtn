@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { executeTool } from '../../src/lib/nodes/universal/executors/toolExecutor';
 import { getNativeRegistry } from '../../src/lib/tools/native-registry';
 import { ToolHangError } from '../../src/lib/tools/tool-idle-watchdog';
+import createStateRecord from '../../src/lib/tools/native/create-state-record';
 
 function registerNativeTool(name: string, handler: any) {
   getNativeRegistry().register(name, {
@@ -52,6 +53,97 @@ describe('native tool idle watchdog integration', () => {
         { runId: 'run-success' },
       ),
     ).resolves.toEqual({ result: { ok: true } });
+  });
+
+  it('fails a create_state_record validation envelope instead of completing the graph step', async () => {
+    const runPublisher = makeRunPublisher();
+    // Built-in registration uses production's compiled `.js` modules. Register
+    // the source definition explicitly so this source-level Vitest test drives
+    // the real State Records validation handler too.
+    getNativeRegistry().register('create_state_record', createStateRecord);
+
+    await expect(
+      executeTool(
+        {
+          toolName: 'create_state_record',
+          parameters: {},
+          outputField: 'result',
+        },
+        { runId: 'run-state-record-validation', runPublisher },
+      ),
+    ).rejects.toThrow(/Native tool "create_state_record" returned error: namespace is required/);
+
+    expect(runPublisher.toolComplete).not.toHaveBeenCalled();
+    expect(runPublisher.toolError).toHaveBeenCalledTimes(1);
+    expect(runPublisher.toolError).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.stringContaining('namespace is required'),
+    );
+  });
+
+  it('retries native isError envelopes and only completes after a successful retry', async () => {
+    const toolName = `test_native_error_retry_${Date.now()}`;
+    const runPublisher = makeRunPublisher();
+    const handler = vi.fn(async () => {
+      if (handler.mock.calls.length === 1) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: { message: 'try again' } }) }],
+          isError: true,
+        };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true }) }] };
+    });
+    registerNativeTool(toolName, handler);
+
+    const result = executeTool(
+      {
+        toolName,
+        parameters: {},
+        outputField: 'result',
+        retryOnError: true,
+        maxRetries: 1,
+      },
+      { runId: 'run-native-error-retry', runPublisher },
+    );
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(result).resolves.toEqual({ result: { ok: true } });
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(runPublisher.toolProgress).toHaveBeenCalledWith(
+      expect.any(String),
+      'retry_1',
+      expect.objectContaining({ data: { attempt: 1, maxRetries: 1 } }),
+    );
+    expect(runPublisher.toolComplete).toHaveBeenCalledTimes(1);
+    expect(runPublisher.toolError).not.toHaveBeenCalled();
+  });
+
+  it('lets errorHandling recover from a native isError envelope', async () => {
+    const toolName = `test_native_error_fallback_${Date.now()}`;
+    const runPublisher = makeRunPublisher();
+    registerNativeTool(toolName, async () => ({
+      content: [{ type: 'text', text: JSON.stringify({ error: { message: 'denied' } }) }],
+      isError: true,
+    }));
+
+    await expect(
+      executeTool(
+        {
+          toolName,
+          parameters: {},
+          outputField: 'result',
+          errorHandling: {
+            onError: 'fallback',
+            fallbackValue: { recovered: true },
+          },
+        },
+        { runId: 'run-native-error-fallback', runPublisher },
+      ),
+    ).resolves.toEqual({ recovered: true });
+
+    expect(runPublisher.toolComplete).not.toHaveBeenCalled();
+    expect(runPublisher.toolError).toHaveBeenCalledTimes(1);
   });
 
   it('aborts and rejects a silent native tool as ToolHangError after the idle window', async () => {
