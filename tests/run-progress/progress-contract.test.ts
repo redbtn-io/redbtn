@@ -21,6 +21,7 @@ describe('run progress heartbeat contract', () => {
   it('rejects missing, null, invalid, and non-finite heartbeat values', () => {
     expect(normalizeLastProgressAt(undefined)).toBeUndefined();
     expect(normalizeLastProgressAt(null)).toBeUndefined();
+    expect(normalizeLastProgressAt('')).toBeUndefined();
     expect(normalizeLastProgressAt('not-a-date')).toBeUndefined();
     expect(normalizeLastProgressAt(Number.NaN)).toBeUndefined();
     expect(normalizeLastProgressAt(new Date('not-a-date'))).toBeUndefined();

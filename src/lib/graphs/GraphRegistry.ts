@@ -34,6 +34,7 @@ const SYSTEM_OWNER_BRANCHES: Array<Record<string, unknown>> = [
   { userId: SYSTEM_USER_ID },
   { userId: LEGACY_SYSTEM_USER_ID },
 ];
+const GRAPH_REGISTRY_CACHE_TTL_MS = 5 * 60 * 1000;
 
 type PartialRedConfig = Pick<RedConfig, 'databaseUrl'> & Partial<Omit<RedConfig, 'databaseUrl'>>;
 
@@ -56,11 +57,11 @@ export class GraphRegistry {
     this.db = getDatabase(config.databaseUrl);
     this.compiledCache = new LRUCache<string, CompiledGraph>({
       max: 50,
-      ttl: 5 * 60 * 1000,
+      ttl: GRAPH_REGISTRY_CACHE_TTL_MS,
     });
     this.configCache = new LRUCache<string, GraphConfig>({
       max: 100,
-      ttl: 5 * 60 * 1000,
+      ttl: GRAPH_REGISTRY_CACHE_TTL_MS,
     });
   }
 
