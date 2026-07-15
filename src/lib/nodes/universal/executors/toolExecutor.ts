@@ -9,6 +9,7 @@ import { renderParameters, renderTemplate } from '../templateRenderer';
 import { executeWithErrorHandling } from './errorHandler';
 import { getParserRegistry } from './parserRegistry';
 import { ParserExecutor } from './parserExecutor';
+import { getToolResultErrorMessage } from './toolResultError';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
 import { getRunPublisher, getMcpClient, getConnectionManager, getGraphRegistry, getMeteringClient } from '../../../run/contextLookup';
 import { ToolHangError, withToolIdleWatchdog, type ToolIdleWatchdogHandle } from '../../../tools/tool-idle-watchdog';
@@ -175,6 +176,13 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
 
     // Generate unique tool execution ID
     const toolId = `tool_${config.toolName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    let toolErrorEmitted = false;
+
+    async function emitToolError(errorMessage: string): Promise<void> {
+        if (!runPublisher || toolErrorEmitted) return;
+        toolErrorEmitted = true;
+        await runPublisher.toolError(toolId, errorMessage);
+    }
 
     // redToken usage metering — one event per successful tool call. The
     // consumer maps the tool to a cost class (scrape / web-search / storage-op /
@@ -574,6 +582,10 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                         nativeContext,
                         resolveNativeToolIdleTimeoutMs(config),
                     );
+                    const nativeError = getToolResultErrorMessage(nativeResult, config.toolName, 'Native');
+                    if (nativeError) {
+                        throw new Error(nativeError);
+                    }
                     // Extract result content using the same logic as the MCP path
                     let extractedNativeResult: any = nativeResult;
                     if (nativeResult && !nativeResult.isError && nativeResult.content && Array.isArray(nativeResult.content)) {
@@ -613,9 +625,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
             }
             // All retries exhausted
             const nativeErrMsg = lastNativeError?.message || 'Native tool call failed';
-            if (runPublisher) {
-                await runPublisher.toolError(toolId, nativeErrMsg);
-            }
+            await emitToolError(nativeErrMsg);
             await cleanupConversationStream();
             throw lastNativeError || new Error(nativeErrMsg);
         }
@@ -688,6 +698,10 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     toolId,
                     resolveMcpToolIdleTimeoutMs(config),
                 );
+                const mcpError = getToolResultErrorMessage(result, config.toolName, 'MCP');
+                if (mcpError) {
+                    throw new Error(mcpError);
+                }
                 if (DEBUG)
                     console.log(`[ToolExecutor] mcpClient.callTool returned for ${config.toolName}`);
                 if (DEBUG)
@@ -790,9 +804,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
 
         // All retries exhausted - emit tool_error
         const errorMessage = lastError?.message || 'Tool call failed';
-        if (runPublisher) {
-            await runPublisher.toolError(toolId, errorMessage);
-        }
+        await emitToolError(errorMessage);
         await cleanupConversationStream();
         console.error('[ToolExecutor] Tool step failed after retries', {
             toolName: config.toolName,
@@ -805,9 +817,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
     } catch (error: any) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         // Emit tool_error if not already emitted (for non-retry errors)
-        if (runPublisher) {
-            await runPublisher.toolError(toolId, errorMessage);
-        }
+        await emitToolError(errorMessage);
         await cleanupConversationStream();
         console.error('[ToolExecutor] Tool step failed', {
             toolName: config.toolName,
