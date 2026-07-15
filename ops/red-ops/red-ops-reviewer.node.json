@@ -1,0 +1,240 @@
+{
+  "nodeId": "red-ops-reviewer",
+  "config": {
+    "name": "Red Ops Reviewer",
+    "description": "Independent review-merge-promote gate. Given a PR, an opus agent re-runs tests + reviews the diff, requires green CI, squash-merges to base, promotes beta->main (prod), verifies the deploy, and reaches out to @george on any failure. The last gate before prod; never the author of the code it merges.",
+    "tags": [
+      "red-ops",
+      "reviewer",
+      "autonomous"
+    ],
+    "steps": [
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.ns",
+          "value": "{{'red-ops-reviewer:' + (state.data.runId || 'unknown')}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.resolvedSshKey",
+          "value": "{{(function(){var i=(state.data&&state.data.input)||{};var s=i._secrets||{};var p=state.previousRun||((state.data&&state.data.previousRun)||{});var ps=(((p.state||{}).data||{}).input||{})._secrets||{};return s.SSH_KEY||i.sshKey||i.SSH_KEY||(state.data&&state.data.resolvedSshKey)||ps.SSH_KEY||'';})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.atlasToken",
+          "value": "{{(function(){var i=(state.data&&state.data.input)||{};var s=i._secrets||{};return s.ATLAS_TOKEN||i.atlasToken||i.ATLAS_TOKEN||(state.data&&state.data.atlasToken)||'';})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.rev",
+          "value": "{{(function(){var i=(state.data&&state.data.input)||{};if(i&&i['0']!==undefined&&i.prUrl===undefined&&i.repo===undefined){var s='';for(var k=0;i[k]!==undefined;k++)s+=i[k];try{var pj=JSON.parse(s);i=Object.assign({},pj,i);}catch(e){}}return {prUrl:i.prUrl||i.pr||'',repo:i.repo||'',base:i.base||'beta',project:i.project||i.slug||'',slug:i.slug||i.project||'',reviewOnly:(i.reviewOnly===true||i.reviewOnly==='true')};})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "get-global",
+          "namespace": "red-ops",
+          "key": "config",
+          "outputField": "data.opsCfg"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.cliSel",
+          "value": "{{(function(){var r=(state.data&&state.data.rev)||{};var cfg=(state.data&&state.data.opsCfg)||{};var clis=cfg.reviewerClis||cfg.clis;if(typeof clis==='string'){try{clis=JSON.parse(clis);}catch(e){clis=null;}}if(!Array.isArray(clis)||clis.length===0)clis=[{cli:'codex',model:'gpt-5.6-terra'},{cli:'claude',model:'opus'}];function dft(c){return c==='codex'?'gpt-5.6-terra':'opus';}function modelFor(c){var h=clis.filter(function(x){return x.cli===c;})[0];return (h&&h.model)||dft(c);}var cli=r.cli;var out;if(cli){out={cli:String(cli),model:String(r.model||modelFor(cli))};}else{var rid=String(state.data.runId||'');var h=0;for(var k=0;k<rid.length;k++){h=((h<<5)-h+rid.charCodeAt(k))|0;}var sel=clis[Math.abs(h)%clis.length]||clis[0];out={cli:String(sel.cli||'claude'),model:String(sel.model||dft(sel.cli))};}var claudeM=/(sonnet|opus|haiku)/i.test(out.model);if(out.cli==='codex'&&claudeM)out.model=modelFor('codex');if(out.cli==='claude'&&!claudeM)out.model=modelFor('claude');return out;})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.model",
+          "value": "{{(state.data.cliSel && state.data.cliSel.model) || 'gpt-5.6-terra'}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.cliPrompt",
+          "value": "{{(function(){var r=state.data.rev||{};var q=String.fromCharCode(10);var repo=String(r.repo||'');var am=(r.reviewOnly!==true);var mode=am?'AUTO-MERGE':'REVIEW-ONLY';var fence=String.fromCharCode(96)+String.fromCharCode(96)+String.fromCharCode(96);return ['You are the Red Ops Reviewer \u2014 the INDEPENDENT last gate before code ships. You run as the GitHub bot red-by-redbtn[bot] (distinct from the PR author). Be rigorous; when in doubt request changes and flag @george.','','MODE CONTRACT (input-authoritative): '+mode+'. The reviewOnly input is the only authority for this mode. AUTO-MERGE is binding; when reviewOnly is false you MUST NOT stop after APPROVE.','','PR: '+(r.prUrl||'(none)')+'   repo: '+(repo||'?')+'   base: '+(r.base||'beta')+'   project: '+(r.project||'?'),'','Do this, in order.','1. INSPECT: gh pr view '+(r.prUrl||'<pr>')+' --json title,body,headRefName,headRefOid,baseRefName,mergeable,state,files ; gh pr diff '+(r.prUrl||'<pr>')+'.','','2. REVIEW rigorously: correctness, safety, scope, and that meaningful TESTS exist. Check out the branch and RUN the repo build + tests + typecheck yourself (per CLAUDE.md) \u2014 do not trust CI alone.','','3. CI: poll inline with a hard timeout (900s). Never end a command with & , nohup, disown, tmux, or any background wait and then wait for another run. Use bounded polling loops in this session. Required checks MUST be green before step 4. If timeout hits, emit verdict merged-verify-pending and exact remaining work.','','4. FORMAL REVIEW AS THE BOT:','   - BLOCK: gh pr review '+(r.prUrl||'<pr>')+' --request-changes -b \"<specifics>\". Leave OPEN, post an @george redAtlas note, and STOP.','   - APPROVE: gh pr review '+(r.prUrl||'<pr>')+' --approve. In AUTO-MERGE, continue to step 5; you are forbidden to stop after this command.',am ? '5. REQUIRED AUTO-MERGE: capture head SHA with gh pr view '+(r.prUrl||'<pr>')+' --json headRefOid; then execute gh pr merge '+(r.prUrl||'<pr>')+' --squash --delete-branch --match-head-commit <headRefOid> and verify MERGED state before step 6. If merge command, merge queue, or verification fails, report BLOCKED with merged:false and blocker. If base was beta, also open/verify promote beta->main, then verify RedRun deploy for self-deploy repos.':'5. REVIEW-ONLY: do NOT merge/promote/deploy. APPROVE is the terminal green light; post @george note ready to merge.','6. NOTE: curl -s -X POST https://dev.redbtn.io/api/notes -H \"Authorization: Bearer $ATLAS_TOKEN\" -H \"Content-Type: application/json\" with JSON {slug:\"'+(r.slug||r.project||'redbtn')+'\", body:\"<result + blocked reasons or verified statuses; prefix @george when needed>\"}.','','END your reply with this shape and nothing after it:',fence+'json','{ \"verdict\": \"merged|promoted|deployed|merged-verify-pending|approved|blocked\", \"merged\": false, \"promoted\": false, \"deployed\": false, \"reviewOnly\": '+(am?'false':'true')+', \"prUrl\": \"...\", \"reason\": \"one sentence\", \"needsGeorge\": false }',fence,'In AUTO-MERGE, approved is invalid until verification is complete. Use merged-verify-pending when verified work remains (CI/deploy still running, merge not confirmed, etc).'].join(q);})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.cliCommand",
+          "value": "{{(function(){var sq=String.fromCharCode(39);function shq(s){return sq+String(s||'').replace(new RegExp(sq,'g'),sq+String.fromCharCode(92)+sq+sq)+sq;}var sel=state.data.cliSel||{cli:'claude',model:'sonnet'};var prompt=state.data.cliPrompt||'';var tok=state.data.atlasToken||((state.data.opsCfg||{}).atlasToken)||'';var ghSetup=' && export GH_TOKEN=$(KEY_FILE=/home/alpha/.red-gh-app/key.pem APP_ID=4292525 INST_ID=146426922 bash ~/.red-gh-app/mint.sh 2>/dev/null) && export GH_HOST=github.com';var PATH='export PATH=\"/home/alpha/.nvm/versions/node/v24.13.1/bin:/home/alpha/.local/bin:/home/alpha/.claude/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"';var b64=Buffer.from(prompt,'utf8').toString('base64');var pre=PATH+' && export ATLAS_TOKEN='+shq(tok)+ghSetup+' && echo '+b64+' | base64 -d | ';if(sel.cli==='codex'){return pre+'codex exec - --dangerously-bypass-approvals-and-sandbox -m '+shq(sel.model)+' --json 2>&1';}return pre+'claude -p - --dangerously-skip-permissions --output-format stream-json --verbose --model '+shq(sel.model)+' 2>&1';})()}}"
+        }
+      },
+      {
+        "type": "tool",
+        "config": {
+          "toolName": "ssh_shell",
+          "parameters": {
+            "host": "{{parameters.sshHost}}",
+            "port": "{{parameters.sshPort}}",
+            "user": "{{parameters.sshUser}}",
+            "command": "{{state.data.cliCommand}}",
+            "workingDir": "{{parameters.workingDir}}",
+            "timeout": "{{parameters.analysisTimeout}}",
+            "sshKey": "{{state.data.resolvedSshKey}}"
+          },
+          "outputField": "data.cliResult",
+          "errorHandling": {
+            "retry": 0,
+            "onError": "continue",
+            "fallbackValue": {
+              "success": false,
+              "error": "ssh_shell failed"
+            }
+          },
+          "streamToConversation": true,
+          "streamFilter": "stdout",
+          "streamParser": "cli-stream-json"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.finalText",
+          "value": "{{(function(){var raw='';var r=state.data.cliResult;if(r&&r.content&&r.content[0]&&r.content[0].text){try{var p=JSON.parse(r.content[0].text);raw=p.stdout||'';}catch(e){raw=r.content[0].text;}}else if(r&&typeof r==='object'&&r.stdout!==undefined){raw=r.stdout||'';}else if(typeof r==='string'){raw=r;}if(r&&typeof r==='object'&&r.success===false&&!raw){return '[CLI failed at SSH: '+String(r.error||'ssh_shell failed')+']';}if(r&&r.isError&&r.content&&r.content[0]&&r.content[0].text&&!raw){return '[tool error: '+String(r.content[0].text).slice(0,240)+']';}var finalText='';var codexLast='';var lines=String(raw||'').split(String.fromCharCode(10));for(var i2=0;i2<lines.length;i2++){var line=lines[i2].trim();if(!line)continue;try{var evt=JSON.parse(line);if(evt&&evt.type==='result'&&evt.result)finalText=String(evt.result);if(evt&&evt.type==='item.completed'&&evt.item&&evt.item.type==='agent_message'&&evt.item.text)codexLast=String(evt.item.text);if(evt&&evt.type==='item'&&evt.item&&evt.item.content&&evt.item.content.type==='text')codexLast=String(evt.item.content.text);}catch(e){}}finalText=finalText||codexLast;if(finalText){finalText=finalText.split('').filter(function(c){var n=c.charCodeAt(0);return !((n<=8)||(n>=11&&n<=31)||n===127);}).join('').trim();return finalText;}return String(raw||'').trim()||'[no final assistant text; raw bytes: '+String(raw||'').length+']';})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.result",
+          "value": "{{(function(){function scrub(s){return String(s||'').split('').filter(function(c){var n=c.charCodeAt(0);return !((n<=8)||(n>=11&&n<=31)||n===127);}).join('').trim();}function parseVerdictText(s){if(!s||typeof s!=='string')return null;var t=String(s).trim();if(!t)return null;try{var p=JSON.parse(t);if(p&&typeof p==='object'&&typeof p.verdict==='string')return p;}catch(e){}var fence='```';if(t.startsWith(fence)){var end=t.indexOf(fence,3);if(end>3){var b=t.slice(t.slice(0,3).toLowerCase()==='```'&&(/^```json/i.test(t)?7:3),end);try{var pp=JSON.parse(b);if(pp&&typeof pp==='object'&&typeof pp.verdict==='string')return pp;}catch(e2){}}}return null;}function collectFromText(text,out){if(!text)return;var t=String(text);var r=/```(?:json|JSON)?[\\r\\n]([\\s\\S]*?)```/g;var m;while((m=r.exec(t))!==null){var b=(m[1]||'').trim();var p=parseVerdictText(b);if(p)out.push(p);}var lines=t.split(String.fromCharCode(10));for(var i=0;i<lines.length;i++){var p=parseVerdictText(lines[i]);if(p)out.push(p);}}function collectFromAny(source,out){if(source===undefined||source===null)return;if(typeof source==='string'){collectFromText(source,out);return;}if(Array.isArray(source)){for(var i=0;i<source.length;i++)collectFromAny(source[i],out);return;}if(typeof source==='object'){if(typeof source.text==='string')collectFromText(source.text,out);if(typeof source.content==='string')collectFromText(source.content,out);if(Array.isArray(source.content))collectFromAny(source.content,out);if(typeof source.stdout==='string')collectFromText(source.stdout,out);if(typeof source.stderr==='string')collectFromText(source.stderr,out);if(source.content&&Array.isArray(source.content)&&source.content.length&&typeof source.content[0]==='string')collectFromText(source.content[0],out);} }var r={verdict:'unknown',merged:false,promoted:false,deployed:false,prUrl:(state.data.rev&&state.data.rev.prUrl)||'',reason:'',needsGeorge:false};var base=state.data.result;if(base&&typeof base==='object'){for(var k in base){r[k]=base[k];}}var out=[];var cliState=state.data.cliResult;if(cliState){if(typeof cliState==='string')collectFromText(cliState,out);if(typeof cliState.text==='string')collectFromText(cliState.text,out);if(typeof cliState.stdout==='string')collectFromText(cliState.stdout,out);if(typeof cliState.stderr==='string')collectFromText(cliState.stderr,out);if(Array.isArray(cliState.content))collectFromAny(cliState.content,out);}collectFromText(state.data.finalText,out);var verdictCandidate=out.length?out[out.length-1]:null;if(verdictCandidate){for(var kk in verdictCandidate){r[kk]=verdictCandidate[kk];}}var reviewOnly=((state.data.rev||{}).reviewOnly===true);r.reviewOnly=reviewOnly;r.autoMergeRequired=!reviewOnly;r.runId=(state.data.runId||'');if(typeof r.reason!=='string'||!r.reason)r.reason=scrub(String(state.data.finalText||'')).slice(-400);if(r.reason.length>400)r.reason=r.reason.slice(-400);if(typeof r.needsGeorge!=='boolean')r.needsGeorge=false;if(typeof r.verdict!=='string')r.verdict='unknown';r.finishedAt=new Date().toISOString();return r;})()}}"
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.mergeGuardCommand",
+          "value": "{{(function(){var r=state.data.rev||{};var sq=String.fromCharCode(39);function shq(s){return sq+String(s||'').replace(new RegExp(sq,'g'),sq+String.fromCharCode(92)+sq+sq)+sq;}if(r.reviewOnly===true)return 'echo MERGE_GUARD:REVIEW_ONLY';if(!r.prUrl||!r.repo)return 'echo MERGE_GUARD:MISSING_PR';var pre='export PATH=\"/home/alpha/.nvm/versions/node/v24.13.1/bin:/home/alpha/.local/bin:/home/alpha/.claude/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\" && export GH_TOKEN=$(KEY_FILE=/home/alpha/.red-gh-app/key.pem APP_ID=4292525 INST_ID=146426922 bash ~/.red-gh-app/mint.sh 2>/dev/null) && export GH_HOST=github.com';var q=shq(r.prUrl);var cmd='S=$(gh pr view '+q+' --json state --jq .state 2>/dev/null || echo QUERY_FAIL); if [ \"$S\" = \"MERGED\" ]; then echo MERGE_GUARD:MERGED; elif [ \"$S\" = \"OPEN\" ]; then echo MERGE_GUARD:OPEN; elif [ \"$S\" = \"QUERY_FAIL\" ] || [ -z \"$S\" ]; then echo MERGE_GUARD:ERROR; else echo MERGE_GUARD:NOT_OPEN; fi';return pre+' && '+cmd;})()}}"
+        }
+      },
+      {
+        "type": "tool",
+        "config": {
+          "toolName": "ssh_shell",
+          "parameters": {
+            "host": "{{parameters.sshHost}}",
+            "port": "{{parameters.sshPort}}",
+            "user": "{{parameters.sshUser}}",
+            "command": "{{state.data.mergeGuardCommand}}",
+            "workingDir": "{{parameters.workingDir}}",
+            "timeout": "{{parameters.analysisTimeout}}",
+            "sshKey": "{{state.data.resolvedSshKey}}"
+          },
+          "outputField": "data.mergeGuard",
+          "errorHandling": {
+            "retry": 0,
+            "onError": "continue",
+            "fallbackValue": {
+              "success": false,
+              "error": "merge guard failed"
+            }
+          },
+          "streamToConversation": false
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.result",
+          "value": "{{(function(){var r=Object.assign({},state.data.result||{});var g=state.data.mergeGuard;var raw='';if(g&&g.content&&g.content[0]&&g.content[0].text){try{var p=JSON.parse(g.content[0].text);raw=String(p.stdout||p.error||'');}catch(e){raw=String(g.content[0].text);}}else if(g&&typeof g==='object'){raw=String(g.stdout||g.error||'');}else if(typeof g==='string'){raw=g;}var m=raw.match(/MERGE_GUARD:([A-Z_]+)/);var status=m?m[1]:'ERROR';r.mergeGuardStatus=status;var mv=String(r.verdict||'unknown');r.modelVerdict=mv;function guard(v,reason,ng){r.guardVerdict=v;r.guardReason=String(reason||'').slice(0,400);if(ng===true)r.needsGeorge=true;}function fin(){r.reason=String(r.reason||'').slice(0,400);return r;}if(r.reviewOnly===true){guard('review-only','Review-only run; merge guard not applied',false);return fin();}if(status==='MERGED'){r.merged=true;if(mv!=='promoted'&&mv!=='deployed')r.verdict='merged';r.needsGeorge=false;guard('merged','GitHub confirms MERGED',false);return fin();}var claimed=(mv==='merged'||mv==='promoted'||mv==='deployed');if(status==='OPEN'){if(claimed){r.verdict='merged-verify-pending';r.merged=false;guard('merge-not-confirmed','Model reported '+mv+' but GitHub still shows OPEN',false);}else if(mv==='approved'){r.verdict='blocked';r.merged=false;guard('approved-not-merged','Approved but auto-merge did not complete',true);}else{r.verdict='blocked';r.merged=false;guard('model-not-approved','No in-run verdict confirmed merge; PR still OPEN',true);}return fin();}if(status==='NOT_OPEN'){r.verdict='blocked';r.merged=false;guard('closed-unmerged','PR closed without merge',true);return fin();}if(status==='ERROR'){if(claimed){r.verdict='merged-verify-pending';r.merged=false;guard('unverifiable','Guard could not verify GitHub state',false);}else{r.verdict='blocked';r.merged=false;guard('unverifiable','Guard could not verify GitHub state before merge confirmation',true);}return fin();}r.verdict='blocked';r.merged=false;guard('unknown-status','Unrecognized guard status: '+status,true);return fin();})()}}"
+        }
+      },
+      {
+        "type": "tool",
+        "config": {
+          "toolName": "set_global_state",
+          "parameters": {
+            "namespace": "{{state.data.ns}}",
+            "key": "result",
+            "value": "{{state.data.result}}",
+            "ttlSeconds": 604800
+          },
+          "outputField": "data.resultWrite",
+          "errorHandling": {
+            "retry": 1,
+            "onError": "continue",
+            "fallbackValue": {
+              "ok": false
+            }
+          }
+        }
+      },
+      {
+        "type": "transform",
+        "config": {
+          "operation": "set",
+          "outputField": "data.response",
+          "value": "{{(function(){var text=String(state.data.finalText||'');var r=state.data.result||{};if(r.reviewOnly!==true&&r.verdict==='blocked'){var nl=String.fromCharCode(10);var lbl='AUTO-MERGE GUARD blocked ['+String(r.mergeGuardStatus||'?')+']: '+String(r.guardReason||r.guardVerdict||'blocked');if(r.reason)lbl+=nl+'model: '+String(r.reason);return text+nl+nl+lbl;}return text;})()}}"
+        }
+      }
+    ],
+    "parameters": {
+      "model": {
+        "type": "string",
+        "default": "opus"
+      },
+      "sshHost": {
+        "type": "string",
+        "default": "server.georgeanthony.net"
+      },
+      "sshPort": {
+        "type": "number",
+        "default": 2222
+      },
+      "sshUser": {
+        "type": "string",
+        "default": "alpha"
+      },
+      "workingDir": {
+        "type": "string",
+        "default": "/home/alpha/code"
+      },
+      "analysisTimeout": {
+        "type": "number",
+        "default": 2700000
+      },
+      "atlasBase": {
+        "type": "string",
+        "default": "https://dev.redbtn.io"
+      }
+    },
+    "metadata": {
+      "icon": "ShieldCheck",
+      "color": "#54c26e",
+      "inputs": [
+        "state"
+      ],
+      "outputs": [
+        "state"
+      ]
+    },
+    "isPublic": true
+  }
+}

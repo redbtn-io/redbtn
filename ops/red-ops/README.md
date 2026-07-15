@@ -79,8 +79,27 @@ open cards would have silently swallowed that direction on every quiet tick.
 | File | What it is |
 |---|---|
 | `red-ops-triage.node.json` | The `red-ops-triage` node, exactly as deployed. |
+| `red-ops-reviewer.node.json` | The `red-ops-reviewer` node, exactly as deployed. |
 | `red-coordinator.graph.after.json` | Graph `tHXXSTFtOuM9` as it is now. |
 | `red-coordinator.graph.before.json` | Graph as it was — the rollback target. |
+
+## The reviewer node (`red-ops-reviewer`)
+
+The INDEPENDENT last gate before prod: given a PR it re-runs CI, reviews the diff,
+squash-merges to base, promotes `beta`→`main`, verifies the deploy, and flags
+`@george` on any failure. Like the triage node it is entirely `{{...}}` templates,
+so `tests/red-ops/reviewer-result-parser.test.ts` drives the ACTUAL step
+expressions in `red-ops-reviewer.node.json` through the engine's own `resolveValue`
+— the test guards the shipping logic, not a copy.
+
+**Merge guard never overwrites the model's reason.** When the guard blocks a real
+failure it PRESERVES the model's own `reason` verbatim and records its own decision
+in separate fields (`guardVerdict` / `guardReason`), so the coordinator and board
+see the actionable reason (e.g. "promotion PR conflicting") — not a generic guard
+label. Any AUTO-MERGE block that is not a clean merged / verify-pending state also
+sets `needsGeorge`. The live MCP node embeds this same JS as template strings; this
+JSON is the source of truth and the two are kept in sync (deploy with the same
+`PUT /api/v1/nodes/red-ops-reviewer` used for the triage node, or `node_patch`).
 
 ## Deploying / rolling back
 
