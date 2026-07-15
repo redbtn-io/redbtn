@@ -1,0 +1,122 @@
+{
+  "_id": "691f675c59c094bc28ce5f47",
+  "nodeId": "planner",
+  "name": "Execution Planner",
+  "description": "Analyzes queries and creates multi-step execution plans",
+  "userId": "system",
+  "isSystem": true,
+  "version": 3,
+  "steps": [
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{ !state.data.planningError }}",
+        "setField": "data.planRetryCount",
+        "trueValue": 0,
+        "falseValue": "{{state.data.planRetryCount}}"
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{ !!state.data.planningError }}",
+        "setField": "data.errorContext",
+        "trueValue": "{{ 'PREVIOUS PLAN ERROR: ' + state.data.planningError }}",
+        "falseValue": ""
+      }
+    },
+    {
+      "type": "neuron",
+      "config": {
+        "neuronId": "red-neuron",
+        "systemPrompt": "Your ONLY job is to output a simple plan with steps.\nYou DO NOT know any current events, sports scores, or news.\nYou MUST ALWAYS use a 'search' step first for ANY factual question.\n\nRULES:\n1. NEVER guess or assume specific details (team names, scores, dates) - you don't know them.\n2. Keep the 'purpose' field generic (e.g., 'Find the answer' not 'Find Chiefs score').\n3. ALWAYS output search first, then respond.\n4. CRITICAL: Every 'search' step MUST include a 'searchQuery' field with an optimized web search query. NEVER omit searchQuery for search steps.\n\nOutput format:\n{\n  \"reasoning\": \"I need to search\",\n  \"steps\": [\n    { \"type\": \"search\", \"purpose\": \"Find information\", \"searchQuery\": \"NFL football games today January 2026\" },\n    { \"type\": \"respond\", \"purpose\": \"Answer user\", \"searchQuery\": \"\" }\n  ]\n}\n\n{{state.data.errorContext}}",
+        "userPrompt": "{{state.data.messages}}",
+        "outputField": "data.executionPlan",
+        "temperature": "{{parameters.temperature}}",
+        "stream": false,
+        "structuredOutput": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "reasoning": {
+                "type": "string"
+              },
+              "steps": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "search",
+                        "respond"
+                      ]
+                    },
+                    "purpose": {
+                      "type": "string"
+                    },
+                    "searchQuery": {
+                      "type": "string",
+                      "description": "The optimized search query to use for web search. REQUIRED for search steps - include specific keywords, context, and time frame."
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "purpose",
+                    "searchQuery"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "reasoning",
+              "steps"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "true",
+        "setField": "data.currentStepIndex",
+        "trueValue": 0,
+        "falseValue": 0
+      }
+    }
+  ],
+  "metadata": {
+    "color": "#EC4899",
+    "icon": "ListTodo"
+  },
+  "createdAt": "2025-11-20T19:09:16.653Z",
+  "updatedAt": "2026-02-19T21:24:14.623Z",
+  "isImmutable": true,
+  "tags": [
+    "planning"
+  ],
+  "abandonedAt": null,
+  "creatorId": "system",
+  "scheduledDeletionAt": null,
+  "status": "active",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 1,
+    "lastUsedAt": null
+  },
+  "isPublic": true,
+  "ownerName": "System",
+  "parameters": {
+    "temperature": {
+      "type": "number",
+      "default": 0.1,
+      "min": 0,
+      "max": 2,
+      "description": "LLM temperature for planning. Lower = more deterministic plans.",
+      "stepIndex": 2,
+      "configPath": "config.temperature"
+    }
+  }
+}

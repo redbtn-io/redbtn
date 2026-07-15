@@ -1,0 +1,87 @@
+{
+  "nodeId": "direct-worker-main",
+  "name": "Direct Worker Main",
+  "description": "Middle-management dispatch: validates a {worker,on,value} directive and routes it to one of the autonomous workers (redbtn/become/eliteEntries) — queues nextTurn/nextStrategic via global state, or enables/disables the worker automation.",
+  "parameters": {},
+  "metadata": {
+    "tags": [
+      "worker",
+      "dispatch",
+      "direct-worker"
+    ],
+    "color": "#EF4444",
+    "icon": "Send"
+  },
+  "tags": [
+    "worker",
+    "dispatch",
+    "direct-worker"
+  ],
+  "isPublic": false,
+  "steps": [
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "outputField": "data",
+        "value": "{{(function(){var i=(state.data&&state.data.input)||{};var w=i.worker;var on=i.on;var v=i.value;var W={redbtn:{namespace:'worker',automationId:'copilot-worker-auto-1778813652',displayName:'redbtn Worker — Claude'},become:{namespace:'become-worker',automationId:'worker-become-claude-1779819849075',displayName:'Become Worker — Claude'},eliteEntries:{namespace:'ee-worker',automationId:'worker-ee-codex-1779819849075',displayName:'Elite Entries Worker — Codex'}};var ONS=['run','strategic','enable','disable'];var WK=['redbtn','become','eliteEntries'];var t=W[w]||null;var e=null;if(!t){e={success:false,error:\"Unknown worker '\"+String(w)+\"'. Must be one of: \"+WK.join(', ')+\".\",accepted:WK};}else if(ONS.indexOf(on)===-1){e={success:false,error:\"Unknown action '\"+String(on)+\"'. Must be one of: \"+ONS.join(', ')+\".\",accepted:ONS};}else if((on==='run'||on==='strategic')&&(v===undefined||v===null||String(v).trim()==='')){e={success:false,error:\"Action '\"+on+\"' requires a non-empty 'value' (the directive text).\",accepted:WK};}return {target:t,errorResult:e};})()}}"
+      }
+    },
+    {
+      "type": "tool",
+      "condition": "{{state.data.input.on === 'run' && !state.data.errorResult}}",
+      "config": {
+        "toolName": "set_global_state",
+        "parameters": {
+          "namespace": "{{state.data.target.namespace}}",
+          "key": "nextTurn",
+          "value": "{{state.data.input.value}}"
+        },
+        "outputField": "data.setNextTurnResult"
+      }
+    },
+    {
+      "type": "tool",
+      "condition": "{{state.data.input.on === 'strategic' && !state.data.errorResult}}",
+      "config": {
+        "toolName": "set_global_state",
+        "parameters": {
+          "namespace": "{{state.data.target.namespace}}",
+          "key": "nextStrategic",
+          "value": "{{state.data.input.value}}"
+        },
+        "outputField": "data.setNextStrategicResult"
+      }
+    },
+    {
+      "type": "tool",
+      "condition": "{{state.data.input.on === 'enable' && !state.data.errorResult}}",
+      "config": {
+        "toolName": "enable_automation",
+        "parameters": {
+          "automationId": "{{state.data.target.automationId}}"
+        },
+        "outputField": "data.enableResult"
+      }
+    },
+    {
+      "type": "tool",
+      "condition": "{{state.data.input.on === 'disable' && !state.data.errorResult}}",
+      "config": {
+        "toolName": "disable_automation",
+        "parameters": {
+          "automationId": "{{state.data.target.automationId}}"
+        },
+        "outputField": "data.disableResult"
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "outputField": "data.output",
+        "value": "{{(function(){var d=state.data||{};if(d.errorResult) return d.errorResult;var i=d.input||{};var out={success:true,worker:i.worker,on:i.on,target:d.target,at:new Date().toISOString()};if(i.on==='run'||i.on==='strategic'){out.value=i.value;}return out;})()}}"
+      }
+    }
+  ]
+}

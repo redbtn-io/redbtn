@@ -41,6 +41,12 @@ import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvi
 const MAX_RETURN_BYTES = Infinity;
 const MAX_STDERR_BYTES = Infinity;
 const MAX_BUFFER_BYTES = Infinity;
+type SshClientFactory = () => Client;
+let sshClientFactory: SshClientFactory = () => new Client();
+
+export function __setSshClientFactoryForTests(factory: SshClientFactory | null): void {
+  sshClientFactory = factory ?? (() => new Client());
+}
 
 /**
  * Bash-safe single-quote escape. Wraps the input in `'...'` and turns each
@@ -235,7 +241,7 @@ const sshShell: NativeToolDefinition = {
     fullCommand = `set -m; echo ${PID_MARKER}$$ 1>&2; exec bash -c ${shQuote(fullCommand)}`;
 
     return new Promise((resolve) => {
-      const conn = new Client();
+      const conn = sshClientFactory();
       let stdout = '';
       let stderr = '';
       let exitCode: number | null = null;

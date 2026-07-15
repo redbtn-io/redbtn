@@ -6,7 +6,7 @@ import type { GraphConfig } from '../../src/lib/types/graph';
 
 describe('worker-style graph timeout config', () => {
   test('claude-agent seed keeps a generous run timeout and validates', async () => {
-    const graphPath = resolve(__dirname, '../../../data/graphs/claude-agent.json');
+    const graphPath = resolve(__dirname, '../../data/graphs/claude-agent.json');
     const config = JSON.parse(readFileSync(graphPath, 'utf8')) as GraphConfig;
 
     expect(config.graphId).toBe('claude-agent');

@@ -21,6 +21,11 @@ const MONGO_URI =
   process.env.MONGODB_TEST_URI ||
   process.env.MONGODB_URI ||
   'mongodb://alpha:redbtnioai@localhost:27017/redbtn_test?authSource=admin';
+const MONGO_CONNECT_OPTIONS = {
+  serverSelectionTimeoutMS: 5000,
+  connectTimeoutMS: 5000,
+  socketTimeoutMS: 5000,
+};
 
 const COL = 'user_conversations';
 const CONV_PREFIX = 'conv-agentid-test-';
@@ -78,14 +83,42 @@ async function cleanupTestConversations(): Promise<void> {
   await db.collection(COL).deleteMany({ conversationId: { $regex: `^${CONV_PREFIX}` } });
 }
 
-beforeAll(async () => {
-  if (mongoose.connection.readyState !== 1) {
-    await mongoose.connect(MONGO_URI);
+/**
+ * These tests need a real MongoDB — they assert on what actually lands in the
+ * `user_conversations` documents, which a mock cannot prove.
+ *
+ * CI provisions a MongoDB service container and points MONGODB_TEST_URI at it
+ * (see the `verify` job in .github/workflows/ci.yml), so this suite runs for
+ * real on every PR. On a dev box with no reachable Mongo we skip instead of
+ * failing: an unreachable database is an environment gap, not a code defect,
+ * and hard-failing here would make the whole local suite red for anyone who
+ * simply hasn't started a local Mongo.
+ */
+const mongoAvailable = await (async (): Promise<boolean> => {
+  try {
+    if (mongoose.connection.readyState !== 1) {
+      await mongoose.connect(MONGO_URI, MONGO_CONNECT_OPTIONS);
+    }
+    return true;
+  } catch {
+    return false;
   }
+})();
+
+if (!mongoAvailable) {
+  console.warn(
+    `[agentid-attribution] Skipping: no MongoDB reachable at ${MONGO_URI.replace(/\/\/[^@]*@/, '//***@')}. ` +
+      'Set MONGODB_TEST_URI to a live Mongo to run these tests.',
+  );
+}
+
+beforeAll(async () => {
+  if (!mongoAvailable) return;
   await cleanupTestConversations();
 });
 
 afterAll(async () => {
+  if (!mongoAvailable) return;
   await cleanupTestConversations();
   await mongoose.disconnect();
 });
@@ -94,7 +127,7 @@ afterAll(async () => {
 // Tests
 // =============================================================================
 
-describe('agentId attribution — ConversationPublisher.persistMessage', () => {
+describe.skipIf(!mongoAvailable)('agentId attribution — ConversationPublisher.persistMessage', () => {
   describe('publishRunComplete with agentId', () => {
     it('stamps metadata.agentId on the $push document (new message row)', async () => {
       const convId = `${CONV_PREFIX}001`;
@@ -258,7 +291,7 @@ describe('agentId attribution — ConversationPublisher.persistMessage', () => {
   });
 });
 
-describe('agentId attribution — RunPublisher.agentId option', () => {
+describe.skipIf(!mongoAvailable)('agentId attribution — RunPublisher.agentId option', () => {
   it('RunPublisher accepts agentId in options without throwing', () => {
     const redis = createMockRedis();
     expect(() => {

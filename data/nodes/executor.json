@@ -1,0 +1,174 @@
+{
+  "_id": "691de97a40bbab3ecb92b253",
+  "nodeId": "executor",
+  "name": "Plan Executor",
+  "description": "Orchestrates execution plan steps",
+  "userId": "system",
+  "isSystem": true,
+  "version": 2,
+  "steps": [
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{ !state.data.executionPlan || !state.data.executionPlan.steps || !Array.isArray(state.data.executionPlan.steps) }}",
+        "setField": "data.planningError",
+        "trueValue": "Invalid plan format. Expected JSON object with 'steps' array. Received: {{JSON.stringify(state.data.executionPlan)}}",
+        "falseValue": null
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{ !!state.data.planningError }}",
+        "setField": "data.planRetryCount",
+        "trueValue": "{{(state.data.planRetryCount || 0) + 1}}",
+        "falseValue": "{{state.data.planRetryCount || 0}}"
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{ !!state.data.planningError && (state.data.planRetryCount || 0) > 3 }}",
+        "setField": "data.nextGraph",
+        "trueValue": "error_handler",
+        "falseValue": "undecided"
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{ !!state.data.planningError && (state.data.planRetryCount || 0) > 3 }}",
+        "setField": "data.error",
+        "trueValue": "Planner failed to generate valid plan after multiple attempts. Last error: {{state.data.planningError}}",
+        "falseValue": null
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{ !!state.data.planningError && (state.data.planRetryCount || 0) <= 3 }}",
+        "setField": "data.nextGraph",
+        "trueValue": "planner",
+        "falseValue": "{{state.data.nextGraph}}"
+      }
+    },
+    {
+      "type": "transform",
+      "condition": "{{!state.data.planningError}}",
+      "config": {
+        "operation": "set",
+        "value": "{{state.data.planningError ? null : (state.data.executionPlan && state.data.executionPlan.steps ? state.data.executionPlan.steps[state.data.currentStepIndex || 0] : null)}}",
+        "outputField": "data.currentStep"
+      }
+    },
+    {
+      "type": "conditional",
+      "condition": "{{!state.data.planningError}}",
+      "config": {
+        "condition": "{{ state.data.currentStep && state.data.currentStep.type == 'search' && !state.data.currentStep.searchQuery }}",
+        "setField": "data.planningError",
+        "trueValue": "Search step is missing required 'searchQuery' field. Each search step MUST include a searchQuery. Received step: {{JSON.stringify(state.data.currentStep)}}",
+        "falseValue": null
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{ !!state.data.planningError && state.data.nextGraph == 'undecided' }}",
+        "setField": "data.planRetryCount",
+        "trueValue": "{{(state.data.planRetryCount || 0) + 1}}",
+        "falseValue": "{{state.data.planRetryCount || 0}}"
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{ !!state.data.planningError && state.data.nextGraph == 'undecided' && (state.data.planRetryCount || 0) <= 3 }}",
+        "setField": "data.nextGraph",
+        "trueValue": "planner",
+        "falseValue": "{{state.data.nextGraph}}"
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{ !!state.data.planningError && (state.data.planRetryCount || 0) > 3 }}",
+        "setField": "data.nextGraph",
+        "trueValue": "respond",
+        "falseValue": "{{state.data.nextGraph}}"
+      }
+    },
+    {
+      "type": "conditional",
+      "condition": "{{!state.data.planningError}}",
+      "config": {
+        "condition": "{{!state.data.planningError && state.data.currentStep && state.data.currentStep.type == 'search'}}",
+        "setField": "data.nextGraph",
+        "trueValue": "search",
+        "falseValue": "{{state.data.nextGraph}}"
+      }
+    },
+    {
+      "type": "conditional",
+      "condition": "{{!state.data.planningError}}",
+      "config": {
+        "condition": "{{!state.data.planningError && state.data.nextGraph == 'search'}}",
+        "setField": "data.toolParam",
+        "trueValue": "{{state.data.query.message}}",
+        "falseValue": ""
+      }
+    },
+    {
+      "type": "conditional",
+      "condition": "{{!state.data.planningError}}",
+      "config": {
+        "condition": "{{!state.data.planningError && state.data.currentStep && state.data.currentStep.type == 'command' && state.data.nextGraph == 'undecided'}}",
+        "setField": "data.nextGraph",
+        "trueValue": "command",
+        "falseValue": "{{state.data.nextGraph}}"
+      }
+    },
+    {
+      "type": "conditional",
+      "condition": "{{!state.data.planningError}}",
+      "config": {
+        "condition": "{{!state.data.planningError && state.data.currentStep && state.data.currentStep.type == 'respond' && state.data.nextGraph == 'undecided'}}",
+        "setField": "data.nextGraph",
+        "trueValue": "respond",
+        "falseValue": "{{state.data.nextGraph}}"
+      }
+    },
+    {
+      "type": "conditional",
+      "condition": "{{!state.data.planningError}}",
+      "config": {
+        "condition": "true",
+        "setField": "data.currentStepIndex",
+        "trueValue": "{{(state.data.currentStepIndex || 0) + 1}}",
+        "falseValue": 0
+      }
+    }
+  ],
+  "metadata": {
+    "color": "#EF4444",
+    "icon": "Play"
+  },
+  "createdAt": "2025-11-19T15:59:54.451Z",
+  "updatedAt": "2026-01-18T03:16:09.836Z",
+  "__v": 0,
+  "isImmutable": true,
+  "tags": [
+    "execution"
+  ],
+  "abandonedAt": null,
+  "creatorId": "system",
+  "scheduledDeletionAt": null,
+  "status": "active",
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  }
+}

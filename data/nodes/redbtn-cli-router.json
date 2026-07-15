@@ -1,0 +1,145 @@
+{
+  "nodeId": "redbtn-cli-router",
+  "name": "redbtn CLI Router",
+  "description": "Classifies a terminal command line: known verbs route deterministically (no LLM) to the command path; everything else is classified by a gated neuron and falls back to the chat assistant. Sets data.route, data.command, data.exitCode, data.directResponse (for instant verbs) and data.systemMessage (CLI execution/assistant context).",
+  "userId": "system",
+  "isSystem": true,
+  "version": 1,
+  "steps": [
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{((state.data.query.message || '').trim().split(/\\s+/)[0] || '').toLowerCase()}}",
+        "outputField": "data.verb"
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{['help','status','graphs','runs','deploy','logs','version','whoami'].includes((((state.data.query.message || '').trim().split(/\\s+/)[0]) || '').toLowerCase())}}",
+        "outputField": "data.isKnownVerb"
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{(function(){var l=(state.data.query.message||'').trim();var k=['help','status','graphs','runs','deploy','logs','version','whoami'];return l.length>0 && !(/\\s/).test(l) && k.indexOf(l.toLowerCase())===-1;})()}}",
+        "outputField": "data.isUnknownWordCommand"
+      }
+    },
+    {
+      "type": "neuron",
+      "condition": "{{!state.data.isKnownVerb && !state.data.isUnknownWordCommand}}",
+      "config": {
+        "neuronId": "red-neuron",
+        "systemPrompt": "You are the redbtn CLI router. Decide whether the user's line should run as a platform COMMAND or be answered as CHAT.\n\nKnown commands: help, status, graphs, runs, deploy, logs, version, whoami.\n\n- If the line clearly maps to one of the known commands (even phrased in natural language, e.g. \"show me recent runs\" -> runs), choose route \"command\" and set `command` to the matching verb.\n- Otherwise choose route \"chat\".\n\nOUTPUT SCHEMA: { \"route\": \"command\" | \"chat\", \"command\": \"(optional verb)\", \"args\": { } }",
+        "userPrompt": "Command line: {{state.data.query.message}}",
+        "outputField": "data.cliRouting",
+        "temperature": 0,
+        "stream": false,
+        "structuredOutput": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "route": { "type": "string", "enum": ["command", "chat"] },
+              "command": { "type": "string" },
+              "args": { "type": "object", "additionalProperties": true }
+            },
+            "required": ["route"],
+            "additionalProperties": false
+          }
+        },
+        "errorHandling": {
+          "retry": 1,
+          "retryDelay": 500,
+          "onError": "fallback",
+          "fallbackValue": { "route": "chat" }
+        }
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{(state.data.isKnownVerb || state.data.isUnknownWordCommand) ? 'command' : ((state.data.cliRouting && state.data.cliRouting.route) ? state.data.cliRouting.route : 'chat')}}",
+        "outputField": "data.route"
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{(state.data.isKnownVerb || state.data.isUnknownWordCommand) ? state.data.verb : ((state.data.cliRouting && state.data.cliRouting.command) ? String(state.data.cliRouting.command).toLowerCase() : '')}}",
+        "outputField": "data.command"
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{state.data.route === 'command' && !['help','status','graphs','runs','deploy','logs','version','whoami'].includes((state.data.command || '').toLowerCase())}}",
+        "setField": "data.exitCode",
+        "trueValue": 127,
+        "falseValue": 0
+      }
+    },
+    {
+      "type": "transform",
+      "condition": "{{state.data.verb === 'help'}}",
+      "config": {
+        "operation": "set",
+        "value": "redbtn CLI — commands:\n  help               show this help\n  status             platform status\n  graphs             list selectable graphs\n  runs               recent runs\n  deploy             deploy helpers\n  logs               recent logs\n  version            CLI version\n  whoami             current user\nLines starting with -- are meta-commands handled by the terminal (try --help).\nAny other line runs the selected graph.",
+        "outputField": "data.directResponse"
+      }
+    },
+    {
+      "type": "transform",
+      "condition": "{{state.data.verb === 'version'}}",
+      "config": {
+        "operation": "set",
+        "value": "redbtn CLI — terminal binding v1 (graph: redbtn-cli)",
+        "outputField": "data.directResponse"
+      }
+    },
+    {
+      "type": "transform",
+      "condition": "{{state.data.verb === 'whoami'}}",
+      "config": {
+        "operation": "set",
+        "value": "{{state.data.userId || state.userId || 'unknown'}}",
+        "outputField": "data.directResponse"
+      }
+    },
+    {
+      "type": "transform",
+      "condition": "{{state.data.exitCode === 127}}",
+      "config": {
+        "operation": "set",
+        "value": "redbtn: command not found: {{state.data.command}}",
+        "outputField": "data.directResponse"
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "You are redbtn CLI, a command-line interface to the redbtn platform. Mode: {{state.data.route}}. The user's command line is: \"{{state.data.query.message}}\". If mode is 'command', execute the command \"{{state.data.command}}\" and return concise, plain-text output suitable for a terminal (no markdown headers, no preamble, no closing pleasantries). Known commands: help, status, graphs, runs, deploy, logs, version, whoami. If mode is 'chat', answer the request helpfully and concisely as a terminal assistant.",
+        "outputField": "data.systemMessage"
+      }
+    }
+  ],
+  "metadata": {
+    "color": "#22C55E",
+    "icon": "Terminal",
+    "tags": ["terminal", "cli", "routing"]
+  },
+  "isImmutable": false,
+  "tags": ["routing", "terminal"],
+  "creatorId": "system",
+  "status": "active",
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": { "usageCount": 0, "forkCount": 0, "lastUsedAt": null }
+}

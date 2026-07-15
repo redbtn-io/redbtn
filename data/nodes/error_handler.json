@@ -1,0 +1,62 @@
+{
+  "_id": "69337af25cc62ee4ef6e5b6f",
+  "nodeId": "error_handler",
+  "description": "Handles system errors and provides user-friendly feedback",
+  "isSystem": true,
+  "name": "Global Error Handler",
+  "steps": [
+    {
+      "type": "neuron",
+      "config": {
+        "neuronId": "red-neuron",
+        "systemPrompt": "A system error has occurred during the execution of the user's request.\n\nYour job is to:\n1. Apologize to the user.\n2. Briefly explain that an internal error occurred.\n3. Provide the error details if they are safe to share.\n4. Suggest they try again or rephrase.\n\nBe helpful and concise.",
+        "userPrompt": "Error Details: {{state.data.error}}\n\nOriginal Request: {{state.data.query.message}}",
+        "outputField": "data.response",
+        "stream": true,
+        "temperature": "{{parameters.temperature}}",
+        "maxTokens": 500
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{({ content: state.data.response })}}",
+        "outputField": "data.response"
+      }
+    }
+  ],
+  "userId": "system",
+  "version": 1,
+  "updatedAt": "2026-02-19T21:24:14.625Z",
+  "isImmutable": true,
+  "metadata": {
+    "color": "#F59E0B",
+    "icon": "Zap"
+  },
+  "tags": [
+    "system"
+  ],
+  "abandonedAt": null,
+  "creatorId": "system",
+  "scheduledDeletionAt": null,
+  "status": "active",
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  },
+  "parameters": {
+    "temperature": {
+      "type": "number",
+      "default": 0.3,
+      "min": 0,
+      "max": 2,
+      "description": "LLM temperature for error messages.",
+      "stepIndex": 0,
+      "configPath": "config.temperature"
+    }
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "_id": "691de97a40bbab3ecb92b249",
+  "nodeId": "browse",
+  "name": "Web Browser/Scraper",
+  "description": "Fetches and extracts content from URLs using MCP scrape_url tool",
+  "userId": "system",
+  "isSystem": true,
+  "version": 1,
+  "steps": [
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "true",
+        "setField": "targetUrl",
+        "trueValue": "{{toolParam}}",
+        "falseValue": "{{query.message}}"
+      }
+    },
+    {
+      "type": "tool",
+      "config": {
+        "toolName": "scrape_url",
+        "parameters": {
+          "url": "{{targetUrl}}"
+        },
+        "outputField": "data.scrapedContent",
+        "errorHandling": {
+          "retry": 2,
+          "retryDelay": 2000,
+          "fallbackValue": "Error: Unable to fetch URL content",
+          "onError": "fallback"
+        }
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "true",
+        "setField": "nextGraph",
+        "trueValue": "responder",
+        "falseValue": ""
+      }
+    }
+  ],
+  "metadata": {
+    "originalFile": "src/lib/nodes/scrape/index.ts",
+    "migratedAt": "2025-11-19T15:59:54.331Z",
+    "linesReduced": 235,
+    "tags": [
+      "web",
+      "scraping",
+      "mcp-tool"
+    ],
+    "color": "#14B8A6",
+    "icon": "Globe"
+  },
+  "createdAt": "2025-11-19T15:59:54.343Z",
+  "updatedAt": "2025-11-19T15:59:54.347Z",
+  "__v": 0,
+  "isImmutable": true,
+  "tags": [
+    "utility"
+  ],
+  "abandonedAt": null,
+  "creatorId": "system",
+  "scheduledDeletionAt": null,
+  "status": "active",
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  }
+}

@@ -74,6 +74,7 @@ interface MockDoc {
   content: string;
   chunkCount: number;
   charCount: number;
+  isArchived?: boolean;
   source?: string;
   metadata: Record<string, unknown>;
   addedAt: string;
@@ -100,6 +101,7 @@ interface MockLibrary {
  *   GET    /api/v1/libraries
  *   POST   /api/v1/libraries
  *   GET    /api/v1/libraries/:id
+ *   POST   /api/v1/libraries/:id/archive
  *   PATCH  /api/v1/libraries/:id
  *   DELETE /api/v1/libraries/:id?permanent=true
  *   POST   /api/v1/libraries/:id/documents             (json)
@@ -107,6 +109,7 @@ interface MockLibrary {
  *   POST   /api/v1/libraries/:id/search                (json)
  *   GET    /api/v1/libraries/:id/documents/:docId
  *   PATCH  /api/v1/libraries/:id/documents/:docId
+ *   POST   /api/v1/libraries/:id/documents/:docId/archive
  *   DELETE /api/v1/libraries/:id/documents/:docId
  *   GET    /api/v1/libraries/:id/documents/:docId/full
  *   GET    /api/v1/libraries/:id/documents/:docId/chunks
@@ -136,7 +139,7 @@ function createMockLibrariesApi(): typeof globalThis.fetch {
       if (!lib || lib.isDeleted) {
         return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 });
       }
-      const doc = lib.documents.find((d) => d.documentId === docId);
+      const doc = lib.documents.find((d) => d.documentId === docId && !d.isArchived);
       if (!doc) {
         return new Response(JSON.stringify({ error: 'Doc not found' }), { status: 404 });
       }
@@ -162,7 +165,7 @@ function createMockLibrariesApi(): typeof globalThis.fetch {
       if (!lib || lib.isDeleted) {
         return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 });
       }
-      const doc = lib.documents.find((d) => d.documentId === docId);
+      const doc = lib.documents.find((d) => d.documentId === docId && !d.isArchived);
       if (!doc) {
         return new Response(JSON.stringify({ error: 'Doc not found' }), { status: 404 });
       }
@@ -200,7 +203,7 @@ function createMockLibrariesApi(): typeof globalThis.fetch {
       if (!lib || lib.isDeleted) {
         return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 });
       }
-      const doc = lib.documents.find((d) => d.documentId === docId);
+      const doc = lib.documents.find((d) => d.documentId === docId && !d.isArchived);
       if (!doc) {
         return new Response(JSON.stringify({ error: 'Doc not found' }), { status: 404 });
       }
@@ -225,7 +228,7 @@ function createMockLibrariesApi(): typeof globalThis.fetch {
       if (!lib || lib.isDeleted) {
         return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 });
       }
-      const doc = lib.documents.find((d) => d.documentId === docId);
+      const doc = lib.documents.find((d) => d.documentId === docId && !d.isArchived);
 
       if (method === 'GET') {
         if (!doc) {
@@ -277,6 +280,30 @@ function createMockLibrariesApi(): typeof globalThis.fetch {
         lib.totalChunks -= doc.chunkCount;
         return new Response(
           JSON.stringify({ success: true, deleted: docId }),
+          { status: 200 },
+        );
+      }
+    }
+
+    // ── /api/v1/libraries/:id/documents/:docId/archive ──
+    m = path.match(/^\/api\/v1\/libraries\/([^/]+)\/documents\/([^/]+)\/archive$/);
+    if (m) {
+      const id = decodeURIComponent(m[1]);
+      const docId = decodeURIComponent(m[2]);
+      const lib = libraries[id];
+      if (!lib || lib.isDeleted) {
+        return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 });
+      }
+      const doc = lib.documents.find((d) => d.documentId === docId && !d.isArchived);
+      if (!doc) {
+        return new Response(JSON.stringify({ error: 'Doc not found' }), { status: 404 });
+      }
+      if (method === 'POST') {
+        doc.isArchived = true;
+        lib.documentCount -= 1;
+        lib.totalChunks -= doc.chunkCount;
+        return new Response(
+          JSON.stringify({ success: true, archived: true, documentId: docId }),
           { status: 200 },
         );
       }
@@ -385,6 +412,7 @@ function createMockLibrariesApi(): typeof globalThis.fetch {
         const q = String(body.query || '').toLowerCase();
         // Score = ratio of substring hits in title/content
         const results = lib.documents
+          .filter((d) => !d.isArchived)
           .map((d) => {
             const text = (d.title + ' ' + d.content).toLowerCase();
             const hits = q ? text.split(q).length - 1 : 0;
@@ -410,6 +438,24 @@ function createMockLibrariesApi(): typeof globalThis.fetch {
       }
     }
 
+    // ── /api/v1/libraries/:id/archive ──
+    m = path.match(/^\/api\/v1\/libraries\/([^/]+)\/archive$/);
+    if (m) {
+      const id = decodeURIComponent(m[1]);
+      const lib = libraries[id];
+      if (!lib || lib.isDeleted) {
+        return new Response(JSON.stringify({ error: 'Not found' }), { status: 404 });
+      }
+      if (method === 'POST') {
+        lib.isArchived = true;
+        return new Response(
+          JSON.stringify({ success: true, archived: true, libraryId: id }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405 });
+    }
+
     // ── /api/v1/libraries/:id ──
     m = path.match(/^\/api\/v1\/libraries\/([^/]+)$/);
     if (m) {
@@ -422,7 +468,8 @@ function createMockLibrariesApi(): typeof globalThis.fetch {
         const limit = Number(url.searchParams.get('limit') || '50');
         const page = Number(url.searchParams.get('page') || '1');
         const offset = (page - 1) * limit;
-        const sliced = lib.documents
+        const visibleDocuments = lib.documents.filter((d) => !d.isArchived);
+        const sliced = visibleDocuments
           .slice()
           .sort((a, b) => (a.addedAt < b.addedAt ? 1 : -1))
           .slice(offset, offset + limit)
@@ -445,10 +492,10 @@ function createMockLibrariesApi(): typeof globalThis.fetch {
             totalChunks: lib.totalChunks,
             totalSize: lib.totalSize,
             pagination: {
-              total: lib.documents.length,
+              total: visibleDocuments.length,
               page,
               limit,
-              totalPages: Math.ceil(lib.documents.length / limit),
+              totalPages: Math.ceil(visibleDocuments.length / limit),
             },
           }),
           { status: 200 },
@@ -705,7 +752,11 @@ describe('library pack integration — registration + chained execution', () => 
       ctx,
     );
     expect(deleteDocResult.isError).toBeFalsy();
-    expect(JSON.parse(deleteDocResult.content[0].text)).toEqual({ ok: true });
+    expect(JSON.parse(deleteDocResult.content[0].text)).toEqual({
+      ok: true,
+      archived: true,
+      note: 'Archived (reversible). Use restore_document to bring it back, or permanent: true to destroy.',
+    });
 
     // 7. list_documents now shows total = 0
     const listAfter = await registry.callTool(
@@ -715,7 +766,7 @@ describe('library pack integration — registration + chained execution', () => 
     );
     expect(JSON.parse(listAfter.content[0].text).total).toBe(0);
 
-    // 8. delete_library (permanent)
+    // 8. delete_library (default: archive)
     const deleteLibResult = await registry.callTool(
       'delete_library',
       { libraryId },
@@ -724,7 +775,8 @@ describe('library pack integration — registration + chained execution', () => 
     expect(deleteLibResult.isError).toBeFalsy();
     const delLibBody = JSON.parse(deleteLibResult.content[0].text);
     expect(delLibBody.ok).toBe(true);
-    expect(delLibBody.deletedDocuments).toBe(0);
+    expect(delLibBody.archived).toBe(true);
+    expect(delLibBody.documents).toBe(0);
 
     // 9. list_libraries no longer shows the deleted library
     const listLibsResult = await registry.callTool(
