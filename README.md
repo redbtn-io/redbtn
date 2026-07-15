@@ -187,7 +187,7 @@ import { RunPublisher, RunLock, acquireRunLock } from '@redbtn/redbtn';
 import { ConnectionManager, decryptCredentials } from '@redbtn/redbtn';
 
 // Document parsing
-import { DocumentParser, PDFParser, DocxParser } from '@redbtn/redbtn';
+import { DocumentParser } from '@redbtn/redbtn';
 
 // Logging (re-exported from @redbtn/redlog)
 import { RedLog, LogReader, LogStream } from '@redbtn/redbtn';
