@@ -101,6 +101,23 @@ sets `needsGeorge`. The live MCP node embeds this same JS as template strings; t
 JSON is the source of truth and the two are kept in sync (deploy with the same
 `PUT /api/v1/nodes/red-ops-reviewer` used for the triage node, or `node_patch`).
 
+**Promotion must never delete the base branch (2026-07-15).** The AUTO-MERGE step
+used to run `gh pr merge <pr> --squash --delete-branch` unconditionally. A promote
+`beta`→`main` PR's HEAD ref **is** `beta`, so `--delete-branch` deleted `refs/heads/beta`
+outright — twice on 2026-07-15 (PR #455, #457), which broke the "workers branch from
+beta" convention and RedRun's beta-track autoDeploy. Two guards now prevent this:
+
+1. **Prompt rule (prevention).** Step 5 forbids `--delete-branch` on any *permanent*
+   branch (`beta`/`main`/`master`/`prod`); a permanent head is merged with the plain
+   `gh pr merge --squash --match-head-commit` form. Only disposable feature branches
+   are cleaned up.
+2. **Branch-protection guard (self-heal).** After the merge guard confirms a merge, a
+   deterministic `data.betaGuardCommand` / `data.betaGuard` / `data.result` triple
+   checks whether the merged PR's permanent head branch still exists and, if it was
+   deleted, **recreates it at the base-branch tip** (a create-ref — it never deletes)
+   and sets `needsGeorge` with `betaGuardStatus=RECREATED`. `tests/red-ops/reviewer-result-parser.test.ts`
+   covers both guards.
+
 ## Deploying / rolling back
 
 Deploy the node (`nodeId` at the top level, config fields flattened alongside it):

@@ -10,6 +10,7 @@
  * Error-isolated: parser failures never crash the tool execution.
  */
 import type { NodeConfig, UniversalStep } from '../types';
+import { getToolResultErrorMessage } from './toolResultError';
 
 interface ParserConfig {
     inputField?: string;
@@ -1064,6 +1065,10 @@ export class ParserExecutor {
                     if (outputField) {
                         try {
                             const result = await this._executeTool(toolName, rendered);
+                            const toolError = getToolResultErrorMessage(result, toolName, 'Parser');
+                            if (toolError) {
+                                throw new Error(toolError);
+                            }
                             // Unwrap common result shapes: MCP { content: [{text: jsonStr}] } or plain
                             let extracted: any = result;
                             if (result && typeof result === 'object' && Array.isArray((result as any).content)) {
@@ -1088,7 +1093,12 @@ export class ParserExecutor {
                             console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
                         }
                     } else {
-                        this._executeTool(toolName, rendered).catch((err: any) => {
+                        this._executeTool(toolName, rendered).then((result: any) => {
+                            const toolError = getToolResultErrorMessage(result, toolName, 'Parser');
+                            if (toolError) {
+                                throw new Error(toolError);
+                            }
+                        }).catch((err: any) => {
                             console.warn(`[ParserExecutor] Tool step "${toolName}" failed:`, err.message);
                         });
                     }

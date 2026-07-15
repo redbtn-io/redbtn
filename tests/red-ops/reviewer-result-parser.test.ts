@@ -57,14 +57,21 @@ const only = (field: string): Any => {
   return hits[0];
 };
 
-// `data.result` is written twice: first the parser, then the merge guard.
+// `data.result` is written three times: the parser, then the merge guard, then
+// the branch-protection guard (which self-heals a permanent branch a promote
+// merge would otherwise have deleted).
 const RESULT_WRITERS = transformsWriting('data.result');
-if (RESULT_WRITERS.length !== 2) {
-  throw new Error(`expected 2 data.result writers (parse + guard), got ${RESULT_WRITERS.length}`);
+if (RESULT_WRITERS.length !== 3) {
+  throw new Error(
+    `expected 3 data.result writers (parse + merge-guard + branch-guard), got ${RESULT_WRITERS.length}`,
+  );
 }
 const PARSE_STEP = RESULT_WRITERS[0];
 const GUARD_STEP = RESULT_WRITERS[1];
+const BETA_FOLD_STEP = RESULT_WRITERS[2];
 const MERGE_GUARD_CMD_STEP = only('data.mergeGuardCommand');
+const BETA_GUARD_CMD_STEP = only('data.betaGuardCommand');
+const PROMPT_STEP = only('data.cliPrompt');
 const RESPONSE_STEP = only('data.response');
 
 function setPath(state: Any, path: string, value: Any): void {
@@ -114,6 +121,31 @@ function guard(result: Any, status: string, rev: Any = { prUrl: PR, reviewOnly: 
   // {stdout} object — mirror the decoded form the tool executor writes.
   state.data.mergeGuard = { stdout: `MERGE_GUARD:${status}` };
   evalSet(GUARD_STEP, state);
+  return state.data.result;
+}
+
+/** Render the real CLI prompt (step `data.cliPrompt`) for a given input. */
+function promptFor(rev: Any): string {
+  const state = baseState(rev);
+  evalSet(PROMPT_STEP, state);
+  return String(state.data.cliPrompt);
+}
+
+/** Render the real branch-guard command (step `data.betaGuardCommand`). */
+function betaCmd(rev: Any, result: Any): string {
+  const state = baseState(rev);
+  state.data.result = result;
+  evalSet(BETA_GUARD_CMD_STEP, state);
+  return String(state.data.betaGuardCommand);
+}
+
+/** Drive the real branch-guard fold (step 3 of `data.result`) over a guard line. */
+function betaFold(result: Any, stdout: string, rev: Any = { prUrl: PR, repo: 'redbtn-io/redrun', reviewOnly: false }): Any {
+  const state = baseState(rev);
+  if (typeof result.needsGeorge !== 'boolean') result.needsGeorge = false;
+  state.data.result = result;
+  state.data.betaGuard = { stdout };
+  evalSet(BETA_FOLD_STEP, state);
   return state.data.result;
 }
 
@@ -237,6 +269,115 @@ describe('red-ops-reviewer — merge guard clean paths', () => {
     expect(final.verdict).toBe('approved');
     expect(final.needsGeorge).toBe(false);
     expect(final.guardVerdict).toBe('review-only');
+  });
+});
+
+// Regression for the 2026-07-15 incident: red-by-redbtn[bot] deleted refs/heads/beta
+// twice while merging promote (beta->main) PRs, because the AUTO-MERGE instruction
+// ran `gh pr merge <pr> --squash --delete-branch` unconditionally — and a promote
+// PR's HEAD ref IS `beta`. Promotion must never delete the base branch it merged from.
+describe('red-ops-reviewer — promotion never deletes the base branch (prompt guard)', () => {
+  const REPO = 'redbtn-io/redrun';
+
+  it('AUTO-MERGE prompt forbids --delete-branch on permanent branches', () => {
+    const p = promptFor({ prUrl: PR, repo: REPO, base: 'main', reviewOnly: false });
+    expect(p).toContain('NEVER pass --delete-branch when the head ref is a PERMANENT branch');
+    expect(p).toMatch(/beta, main, master, prod/);
+    expect(p).toContain('Promotion must NEVER delete the base branch it just merged from');
+    // The permanent-head merge uses the no-delete form of the command.
+    expect(p).toContain('--squash --match-head-commit <headRefOid>');
+    // The promote sub-step is explicitly called out as head=beta, merged WITHOUT delete.
+    expect(p).toContain('promote beta->main (its head IS beta, so merge it WITHOUT --delete-branch)');
+    // headRefName is captured so the agent can tell whether the head is permanent.
+    expect(p).toContain('--json headRefName,headRefOid,baseRefName');
+  });
+
+  it('REVIEW-ONLY prompt never merges or deletes anything', () => {
+    const p = promptFor({ prUrl: PR, repo: REPO, base: 'beta', reviewOnly: true });
+    expect(p).toContain('REVIEW-ONLY: do NOT merge/promote/deploy');
+    expect(p).not.toContain('--delete-branch');
+  });
+});
+
+describe('red-ops-reviewer — branch-protection guard command', () => {
+  const REPO = 'redbtn-io/redrun';
+
+  it('is a no-op on a review-only run', () => {
+    expect(betaCmd({ prUrl: PR, repo: REPO, reviewOnly: true }, { merged: false }))
+      .toBe('echo BETA_GUARD:REVIEW_ONLY');
+  });
+
+  it('is a no-op when nothing merged', () => {
+    expect(betaCmd({ prUrl: PR, repo: REPO, reviewOnly: false }, { merged: false }))
+      .toBe('echo BETA_GUARD:NOT_MERGED');
+  });
+
+  it('recreates a missing permanent head branch from the base tip, and NEVER deletes', () => {
+    const cmd = betaCmd({ prUrl: PR, repo: REPO, reviewOnly: false }, { merged: true });
+    // Only permanent heads are eligible for recreation.
+    expect(cmd).toContain('case "$H" in beta|main|master|prod)');
+    expect(cmd).toContain('HEAD_NOT_PERMANENT');
+    // Present branch → confirmed, no mutation.
+    expect(cmd).toContain('BETA_GUARD:PRESENT');
+    // Missing branch → recreate at the base branch tip via a create-ref (idempotent).
+    expect(cmd).toContain('gh api "repos/$REPO/branches/$B"');
+    expect(cmd).toContain('gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$H"');
+    expect(cmd).toContain('BETA_GUARD:RECREATED');
+    // Hard invariant: the guard must never delete a ref.
+    expect(cmd).not.toMatch(/--delete-branch/);
+    expect(cmd).not.toMatch(/-X DELETE/);
+    expect(cmd).not.toMatch(/git push[^\n]*--delete/);
+  });
+});
+
+describe('red-ops-reviewer — branch-protection guard fold', () => {
+  it('flags @george and records recovery when a permanent branch was recreated', () => {
+    const final = betaFold(
+      { verdict: 'merged', merged: true, needsGeorge: false, reviewOnly: false, reason: 'promoted' },
+      'BETA_GUARD:RECREATED:beta@482989127e34895e4660513ff385d8c249b5e2f3',
+    );
+    expect(final.betaGuardStatus).toBe('RECREATED');
+    expect(final.betaGuardDetail).toBe('beta@482989127e34895e4660513ff385d8c249b5e2f3');
+    expect(final.needsGeorge).toBe(true);
+    expect(final.guardReason).toMatch(/auto-recreated/i);
+    // Never clobbers the merge verdict or the model's reason.
+    expect(final.verdict).toBe('merged');
+    expect(final.reason).toBe('promoted');
+  });
+
+  it('leaves a clean run untouched when the permanent branch is still present', () => {
+    const final = betaFold(
+      { verdict: 'merged', merged: true, needsGeorge: false, reviewOnly: false },
+      'BETA_GUARD:PRESENT:beta',
+    );
+    expect(final.betaGuardStatus).toBe('PRESENT');
+    expect(final.needsGeorge).toBe(false);
+  });
+
+  it('does nothing on a disposable (feature) head', () => {
+    const final = betaFold(
+      { verdict: 'merged', merged: true, needsGeorge: false, reviewOnly: false },
+      'BETA_GUARD:HEAD_NOT_PERMANENT:agent/foo',
+    );
+    expect(final.betaGuardStatus).toBe('HEAD_NOT_PERMANENT');
+    expect(final.needsGeorge).toBe(false);
+  });
+
+  it('escalates when a permanent branch could not be restored', () => {
+    const final = betaFold(
+      { verdict: 'merged', merged: true, needsGeorge: false, reviewOnly: false },
+      'BETA_GUARD:RECREATE_FAILED:beta',
+    );
+    expect(final.needsGeorge).toBe(true);
+    expect(final.guardReason).toMatch(/restore it immediately/i);
+  });
+
+  it('is a no-op for review-only runs', () => {
+    const final = betaFold(
+      { verdict: 'approved', reviewOnly: true, needsGeorge: false },
+      'BETA_GUARD:REVIEW_ONLY',
+    );
+    expect(final.betaGuardStatus).toBeUndefined();
   });
 });
 
