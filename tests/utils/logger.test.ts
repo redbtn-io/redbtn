@@ -49,10 +49,43 @@ describe('logger level parsing', () => {
     const infoSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const logger = createLogger('Logger');
+    logger.error('error');
     logger.info('info');
     logger.debug('debug');
-    expect(infoSpy).toHaveBeenCalled();
+    // Invalid value falls back to INFO in production: error + info emit,
+    // debug is suppressed. errorSpy asserts on console.error, which only
+    // logger.error() writes — so we must actually call it.
     expect(errorSpy).toHaveBeenCalled();
+    expect(infoSpy).toHaveBeenCalled();
     expect(infoSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test('empty LOG_LEVEL falls through to default instead of ERROR', () => {
+    // Regression: an empty LOG_LEVEL (e.g. `LOG_LEVEL=` in .env/compose)
+    // trims to '' and used to resolve to LogLevel.ERROR via Number('')===0,
+    // silencing warn/info/debug/trace engine-wide. It must default to INFO
+    // in production instead.
+    setEnv('', 'production');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const logger = createLogger('Logger');
+    logger.warn('warn');
+    logger.info('info');
+    expect(warnSpy).toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalled();
+  });
+
+  test('whitespace-only LOG_LEVEL falls through to default instead of ERROR', () => {
+    // Same regression via a whitespace-only value, which also trims to ''.
+    setEnv('   ', 'development');
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const logger = createLogger('Logger');
+    logger.warn('warn');
+    logger.info('info');
+    logger.debug('debug');
+    // Development default is DEBUG: warn, info, and debug all emit.
+    expect(warnSpy).toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalled();
   });
 });

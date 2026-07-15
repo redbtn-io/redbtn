@@ -29,8 +29,11 @@ const LOG_LEVEL_NAMES: Record<LogLevel, string> = {
  */
 function getCurrentLogLevel(): LogLevel {
   const raw = process.env.LOG_LEVEL?.trim().toUpperCase();
-  if (raw === undefined) {
-    // Default to INFO in production, DEBUG in development
+  if (raw === undefined || raw === '') {
+    // Unset, empty, or whitespace-only LOG_LEVEL: default to INFO in
+    // production, DEBUG in development. Guarding the empty string here is
+    // required because Number('') === 0 would otherwise pass the numeric
+    // range check below and silently resolve to LogLevel.ERROR.
     return process.env.NODE_ENV === 'production' ? LogLevel.INFO : LogLevel.DEBUG;
   }
 
