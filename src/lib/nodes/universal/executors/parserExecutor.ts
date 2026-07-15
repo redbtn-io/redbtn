@@ -10,6 +10,7 @@
  * Error-isolated: parser failures never crash the tool execution.
  */
 import type { NodeConfig, UniversalStep } from '../types';
+import { getToolResultErrorMessage } from './toolResultError';
 
 interface ParserConfig {
     inputField?: string;
@@ -26,35 +27,6 @@ export type ParserToolExecutor = (
     toolName: string,
     parameters: Record<string, any>,
 ) => Promise<any>;
-
-function getToolResultErrorMessage(result: any, toolName: string): string | null {
-    if (!result || typeof result !== 'object' || result.isError !== true) {
-        return null;
-    }
-
-    let detail = '';
-    if (Array.isArray(result.content)) {
-        const textBlock = result.content.find((block: any) => block?.type === 'text' && typeof block.text === 'string');
-        if (textBlock?.text) {
-            try {
-                const parsed = JSON.parse(textBlock.text);
-                detail = parsed?.error || parsed?.message || textBlock.text;
-            } catch {
-                detail = textBlock.text;
-            }
-        }
-    }
-
-    if (!detail) {
-        try {
-            detail = JSON.stringify(result);
-        } catch {
-            detail = String(result);
-        }
-    }
-
-    return `Parser tool "${toolName}" returned error: ${detail.substring(0, 1000)}`;
-}
 
 export class ParserExecutor {
     private steps: UniversalStep[];
@@ -1093,7 +1065,7 @@ export class ParserExecutor {
                     if (outputField) {
                         try {
                             const result = await this._executeTool(toolName, rendered);
-                            const toolError = getToolResultErrorMessage(result, toolName);
+                            const toolError = getToolResultErrorMessage(result, toolName, 'Parser');
                             if (toolError) {
                                 throw new Error(toolError);
                             }
@@ -1122,7 +1094,7 @@ export class ParserExecutor {
                         }
                     } else {
                         this._executeTool(toolName, rendered).then((result: any) => {
-                            const toolError = getToolResultErrorMessage(result, toolName);
+                            const toolError = getToolResultErrorMessage(result, toolName, 'Parser');
                             if (toolError) {
                                 throw new Error(toolError);
                             }

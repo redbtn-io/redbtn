@@ -46,6 +46,31 @@ describe('MCP tool idle watchdog integration', () => {
     ).resolves.toEqual({ result: { ok: true } });
   });
 
+  it.each([
+    ['a string JSON error', JSON.stringify({ error: 'denied' }), 'denied'],
+    ['a structured JSON error', JSON.stringify({ error: { message: 'denied', code: 'DENIED' } }), '"message":"denied"'],
+    ['a non-JSON text error', 'gateway denied the request', 'gateway denied the request'],
+    ['an envelope with no text detail', undefined, '"isError":true'],
+  ])('fails %s without formatter errors', async (_label, text, expectedDetail) => {
+    const mcpClient = {
+      callTool: vi.fn(async () => ({
+        content: text === undefined ? [] : [{ type: 'text', text }],
+        isError: true,
+      })),
+    };
+
+    await expect(
+      executeTool(
+        {
+          toolName: `test_mcp_error_${Date.now()}`,
+          parameters: {},
+          outputField: 'result',
+        },
+        { runId: 'run-mcp-error', mcpClient },
+      ),
+    ).rejects.toThrow(expectedDetail);
+  });
+
   it('aborts and rejects a silent MCP tool as ToolHangError after the idle window', async () => {
     let observedSignal: AbortSignal | null = null;
     const mcpClient = {
