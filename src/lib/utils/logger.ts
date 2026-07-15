@@ -28,17 +28,34 @@ const LOG_LEVEL_NAMES: Record<LogLevel, string> = {
  * Get current log level from environment
  */
 function getCurrentLogLevel(): LogLevel {
-  const level = process.env.LOG_LEVEL?.toUpperCase();
-  switch (level) {
+  const raw = process.env.LOG_LEVEL?.trim().toUpperCase();
+  if (raw === undefined) {
+    // Default to INFO in production, DEBUG in development
+    return process.env.NODE_ENV === 'production' ? LogLevel.INFO : LogLevel.DEBUG;
+  }
+
+  switch (raw) {
     case 'ERROR': return LogLevel.ERROR;
     case 'WARN': return LogLevel.WARN;
     case 'INFO': return LogLevel.INFO;
     case 'DEBUG': return LogLevel.DEBUG;
     case 'TRACE': return LogLevel.TRACE;
+    case '0': return LogLevel.ERROR;
+    case '1': return LogLevel.WARN;
+    case '2': return LogLevel.INFO;
+    case '3': return LogLevel.DEBUG;
+    case '4': return LogLevel.TRACE;
     default:
-      // Default to INFO in production, DEBUG in development
-      return process.env.NODE_ENV === 'production' ? LogLevel.INFO : LogLevel.DEBUG;
+      break;
   }
+
+  const numeric = Number(raw);
+  if (Number.isInteger(numeric) && numeric >= LogLevel.ERROR && numeric <= LogLevel.TRACE) {
+    return numeric as LogLevel;
+  }
+
+  // Default to INFO in production, DEBUG in development
+  return process.env.NODE_ENV === 'production' ? LogLevel.INFO : LogLevel.DEBUG;
 }
 
 /**
