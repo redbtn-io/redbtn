@@ -1,0 +1,88 @@
+{
+  "_id": "691de97a40bbab3ecb92b257",
+  "nodeId": "respond",
+  "name": "Response Generator",
+  "description": "Generates LLM responses with conversation context and streaming support",
+  "userId": "system",
+  "isSystem": true,
+  "version": 1,
+  "steps": [
+    {
+      "type": "neuron",
+      "config": {
+        "neuronId": "red-neuron",
+        "systemPrompt": "CRITICAL INSTRUCTION: If you see a <web_search> tag in the conversation, you MUST use ONLY the information inside that tag to answer. DO NOT use your training data. The search result is the ground truth. If the search provides a factual statement relevant to the user's question, treat that information as authoritative and use it to form your response.\n\n{{state.data.systemMessage}}",
+        "userPrompt": "{{state.data.messages}}",
+        "temperature": "{{parameters.temperature}}",
+        "maxTokens": "{{parameters.maxTokens}}",
+        "stream": true,
+        "outputField": "data.response",
+        "errorHandling": {
+          "retry": 2,
+          "retryDelay": 1000,
+          "onError": "fallback",
+          "fallbackValue": "I apologize, but I encountered an error processing your request. Please try again."
+        }
+      },
+      "condition": "{{!state.data.directResponse}}"
+    },
+    {
+      "type": "transform",
+      "condition": "{{!!state.data.directResponse}}",
+      "config": {
+        "operation": "set",
+        "value": "{{state.data.directResponse}}",
+        "outputField": "data.response"
+      }
+    }
+  ],
+  "metadata": {
+    "originalFile": "src/lib/nodes/responder.ts",
+    "migratedAt": "2025-11-19T15:59:54.463Z",
+    "linesReduced": 190,
+    "tags": [
+      "response",
+      "llm",
+      "streaming",
+      "conversation"
+    ],
+    "color": "#10B981",
+    "icon": "MessageSquare"
+  },
+  "createdAt": "2025-11-19T15:59:54.468Z",
+  "updatedAt": "2026-02-19T21:24:14.609Z",
+  "__v": 0,
+  "isImmutable": true,
+  "tags": [
+    "communication"
+  ],
+  "abandonedAt": null,
+  "creatorId": "system",
+  "scheduledDeletionAt": null,
+  "status": "active",
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  },
+  "parameters": {
+    "temperature": {
+      "type": "number",
+      "default": 0.3,
+      "min": 0,
+      "max": 2,
+      "description": "LLM temperature for response generation. Higher = more creative.",
+      "stepIndex": 0,
+      "configPath": "config.temperature"
+    },
+    "maxTokens": {
+      "type": "number",
+      "default": 16000,
+      "min": 100,
+      "max": 32000,
+      "description": "Maximum tokens for response."
+    }
+  }
+}

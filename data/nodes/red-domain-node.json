@@ -1,0 +1,110 @@
+{
+  "nodeId": "red-domain-node",
+  "name": "Red Domain Specialist",
+  "description": "Scaffold node shared by all 7 Red domain subgraphs. Reads the domain's snapshot from red:user-state, calls an LLM in specialist persona, writes the updated snapshot back, returns a response string. Per-domain behavior lives in the wrapping graph (which sets state.input.domain).",
+  "userId": "system",
+  "isSystem": true,
+  "isImmutable": true,
+  "isPublic": true,
+  "version": 1,
+  "status": "active",
+  "creatorId": "system",
+  "tags": [
+    "assistant",
+    "domain"
+  ],
+  "metadata": {
+    "tags": [
+      "assistant",
+      "domain"
+    ],
+    "color": "#E11D48",
+    "icon": "Compass"
+  },
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  },
+  "parameters": {
+    "temperature": {
+      "type": "number",
+      "default": 0.5,
+      "min": 0,
+      "max": 2,
+      "description": "LLM temperature for the domain specialist response."
+    },
+    "maxTokens": {
+      "type": "number",
+      "default": 2000,
+      "min": 100,
+      "max": 16000
+    }
+  },
+  "steps": [
+    {
+      "type": "transform",
+      "config": {
+        "operation": "get-global",
+        "namespace": "red:user-state",
+        "key": "rolling_summary",
+        "outputField": "data.userSummary"
+      },
+      "errorHandling": {
+        "onError": "fallback",
+        "fallbackValue": ""
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "get-global",
+        "namespace": "red:user-state",
+        "key": "domain_snapshots",
+        "outputField": "data.allSnapshots"
+      },
+      "errorHandling": {
+        "onError": "fallback",
+        "fallbackValue": {}
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{state.data.allSnapshots[state.input.domain]}}",
+        "outputField": "data.domainSnapshot"
+      },
+      "errorHandling": {
+        "onError": "fallback",
+        "fallbackValue": ""
+      }
+    },
+    {
+      "type": "neuron",
+      "config": {
+        "neuronId": "red-neuron",
+        "systemPrompt": "You are Red's {{state.input.domain}} specialist. The user has routed a request to you via the parent Red assistant. Respond with a short, actionable answer or one clarifying question — no preamble, no markdown, no lists. Speak in the voice of a trusted advisor in this domain.\n\nROLLING USER SUMMARY:\n{{state.data.userSummary}}\n\nYOUR PREVIOUS SNAPSHOT OF THIS DOMAIN (what you knew last turn):\n{{state.data.domainSnapshot}}\n\nUPSTREAM CONTEXT FROM THE ASSISTANT:\n{{state.input.context}}",
+        "userPrompt": "Request: {{state.input.request}}\nUrgency: {{state.input.urgency}}",
+        "temperature": "{{parameters.temperature}}",
+        "maxTokens": "{{parameters.maxTokens}}",
+        "stream": false,
+        "outputField": "data.response",
+        "errorHandling": {
+          "retry": 1,
+          "retryDelay": 1000,
+          "onError": "fallback",
+          "fallbackValue": "I couldn't reach the domain specialist right now. Try again in a moment."
+        }
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "{{state.data.response}}",
+        "outputField": "response"
+      }
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "nodeId": "red-context-builder-node",
+  "name": "Red Context Builder",
+  "description": "Loads user state from the red:user-state global namespace and assembles the systemPrompt used by the Red personal assistant stream on every (re)connect.",
+  "userId": "system",
+  "isSystem": true,
+  "isImmutable": true,
+  "isPublic": true,
+  "version": 1,
+  "status": "active",
+  "creatorId": "system",
+  "tags": [
+    "assistant",
+    "context",
+    "startup"
+  ],
+  "metadata": {
+    "tags": [
+      "assistant",
+      "context",
+      "startup"
+    ],
+    "color": "#E11D48",
+    "icon": "Brain"
+  },
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  },
+  "parameters": {},
+  "steps": [
+    {
+      "type": "transform",
+      "config": {
+        "operation": "get-global",
+        "namespace": "red:user-state",
+        "key": "rolling_summary",
+        "outputField": "data.userSummary"
+      },
+      "errorHandling": {
+        "onError": "fallback",
+        "fallbackValue": ""
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "get-global",
+        "namespace": "red:user-state",
+        "key": "open_loops",
+        "outputField": "data.openLoops"
+      },
+      "errorHandling": {
+        "onError": "fallback",
+        "fallbackValue": []
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "get-global",
+        "namespace": "red:user-state",
+        "key": "preferences",
+        "outputField": "data.preferences"
+      },
+      "errorHandling": {
+        "onError": "fallback",
+        "fallbackValue": {}
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "get-global",
+        "namespace": "red:user-state",
+        "key": "domain_snapshots",
+        "outputField": "data.domainSnapshots"
+      },
+      "errorHandling": {
+        "onError": "fallback",
+        "fallbackValue": {}
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": "You are Red, a proactive personal voice assistant. Keep replies concise, direct, and conversational — you are speaking, not writing. No bullet lists, no markdown, no long preambles.\n\nWhen the user asks about something that falls into one of your domain specialties, route it by calling the matching tool (personal, work, health, financial, home, research, creative). Wait for the tool result before replying. If the request is ambiguous, ask a short clarifying question instead of guessing which tool to call.\n\n--- CURRENT USER STATE ---\n\nRolling summary:\n{{state.data.userSummary}}\n\nOpen loops (things the user is waiting on or has parked):\n{{state.data.openLoops}}\n\nPer-domain snapshot (what each domain specialist last knew):\n{{state.data.domainSnapshots}}\n\nPreferences:\n{{state.data.preferences}}\n\n--- /STATE ---",
+        "outputField": "data.systemPrompt"
+      }
+    }
+  ]
+}

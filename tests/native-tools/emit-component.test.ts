@@ -375,7 +375,7 @@ describe('emit_component native tool — chat-interactive-widgets phase 5', () =
   });
 
   test('(i) demo node config is valid JSON with canonical tool-step shape', () => {
-    const cfgPath = path.resolve(__dirname, '../../../data/nodes/emit-demo-component.json');
+    const cfgPath = path.resolve(__dirname, '../../data/nodes/emit-demo-component.json');
     expect(fs.existsSync(cfgPath)).toBe(true);
     const raw = fs.readFileSync(cfgPath, 'utf-8');
     const node = JSON.parse(raw);

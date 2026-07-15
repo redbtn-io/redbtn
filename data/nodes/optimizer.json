@@ -1,0 +1,70 @@
+{
+  "_id": "691de97a40bbab3ecb92b244",
+  "nodeId": "optimizer",
+  "name": "Query Optimizer",
+  "description": "Optimizes user queries into effective search terms using LLM",
+  "userId": "system",
+  "isSystem": true,
+  "version": 1,
+  "steps": [
+    {
+      "type": "neuron",
+      "config": {
+        "neuronId": "red-neuron",
+        "systemPrompt": "Extract the key search terms from the user's prompt. Focus on:\n- Core concepts and keywords\n- Specific entities (names, places, products)\n- Time-relevant terms (if asking about \"latest\" or \"recent\")\n- Technical terms exactly as written\n\nReturn ONLY the optimized search query, nothing else.",
+        "userPrompt": "{{data.toolParam || data.query.message}}",
+        "outputField": "data.optimizedQuery",
+        "stream": false,
+        "temperature": "{{parameters.temperature}}",
+        "maxTokens": 100,
+        "errorHandling": {
+          "retry": 2,
+          "retryDelay": 1000,
+          "fallbackValue": "{{data.toolParam || data.query.message}}",
+          "onError": "fallback"
+        }
+      }
+    }
+  ],
+  "metadata": {
+    "originalFile": "src/lib/nodes/search/optimizer.ts",
+    "migratedAt": "2025-11-19T15:59:54.235Z",
+    "linesReduced": 59,
+    "tags": [
+      "search",
+      "optimization",
+      "query-processing"
+    ],
+    "color": "#F59E0B",
+    "icon": "Shuffle"
+  },
+  "createdAt": "2025-11-19T15:59:54.255Z",
+  "updatedAt": "2026-02-19T21:24:14.624Z",
+  "__v": 0,
+  "isImmutable": true,
+  "tags": [
+    "transformation"
+  ],
+  "abandonedAt": null,
+  "creatorId": "system",
+  "scheduledDeletionAt": null,
+  "status": "active",
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  },
+  "parameters": {
+    "temperature": {
+      "type": "number",
+      "default": 0.3,
+      "min": 0,
+      "max": 2,
+      "description": "LLM temperature for query optimization.",
+      "stepIndex": 0,
+      "configPath": "config.temperature"
+    }
+  }
+}

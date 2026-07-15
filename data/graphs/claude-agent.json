@@ -1,0 +1,132 @@
+{
+  "graphId": "claude-agent",
+  "userId": "system",
+  "isDefault": true,
+  "isSystem": true,
+  "name": "SSH Claude Agent",
+  "description": "Run Claude Code on a remote machine via SSH via the RedRun invoke API. Optionally emails the report via the send-email cloud function.",
+  "graphType": "workflow",
+  "tier": 4,
+  "version": "3.0.0",
+  "nodes": [
+    {
+      "id": "invoke-ssh-claude",
+      "config": {
+        "nodeId": "command",
+        "steps": [
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.requestBody",
+              "value": "{{JSON.stringify({host: state.data.input.host, port: state.data.input.port, user: state.data.input.user || 'alpha', sshKeyPath: state.data.input.sshKeyPath, prompt: state.data.input.prompt, model: state.data.input.model || 'sonnet', maxTurns: state.data.input.maxTurns || 50, timeout: state.data.input.timeout || 900000, workingDir: state.data.input.workingDir})}}"
+            }
+          },
+          {
+            "type": "tool",
+            "config": {
+              "toolName": "fetch_url",
+              "parameters": {
+                "url": "{{state.data.input.invokeUrl}}/api/invoke/ssh-claude",
+                "method": "POST",
+                "headers": {
+                  "Content-Type": "application/json",
+                  "x-api-key": "{{state.data.input.apiKey}}"
+                },
+                "body": "{{state.data.requestBody}}",
+                "timeout": 900000
+              },
+              "outputField": "data.fetchResult",
+              "errorHandling": {
+                "retry": 1,
+                "retryDelay": 5000,
+                "onError": "throw"
+              }
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "json",
+              "inputField": "data.fetchResult.body",
+              "outputField": "data.invokeResult"
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.response",
+              "value": "{{state.data.invokeResult.output || state.data.invokeResult.stdout || state.data.invokeResult.result || (typeof state.data.invokeResult === 'object' ? JSON.stringify(state.data.invokeResult) : String(state.data.invokeResult))}}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "send-email-report",
+      "config": {
+        "nodeId": "command",
+        "steps": [
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.emailRequestBody",
+              "value": "{{JSON.stringify({to: state.data.input.email, subject: '[redbtn] Claude Agent Report', text: state.data.response || 'No output'})}}"
+            }
+          },
+          {
+            "type": "tool",
+            "config": {
+              "toolName": "fetch_url",
+              "parameters": {
+                "url": "{{state.data.input.invokeUrl}}/api/invoke/send-email",
+                "method": "POST",
+                "headers": {
+                  "Content-Type": "application/json",
+                  "x-api-key": "{{state.data.input.apiKey}}"
+                },
+                "body": "{{state.data.emailRequestBody}}",
+                "timeout": 30000
+              },
+              "outputField": "data.emailResult",
+              "errorHandling": {
+                "onError": "continue"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "from": "__start__", "to": "invoke-ssh-claude" },
+    { "from": "invoke-ssh-claude", "to": "send-email-report" },
+    { "from": "send-email-report", "to": "__end__" }
+  ],
+  "neuronAssignments": {},
+  "config": {
+    "maxReplans": 0,
+    "maxSearchIterations": 0,
+    "timeout": 21600,
+    "enableFastpath": false
+  },
+  "isPublic": true,
+  "isImmutable": false,
+  "usageCount": 0,
+  "inputSchema": [
+    { "key": "host", "label": "SSH Host", "type": "text", "required": true, "placeholder": "e.g. server.example.com", "helpText": "Hostname or IP of the target machine" },
+    { "key": "port", "label": "SSH Port", "type": "number", "required": false, "default": 22, "placeholder": "22" },
+    { "key": "user", "label": "SSH User", "type": "text", "required": false, "default": "alpha", "placeholder": "alpha" },
+    { "key": "sshKeyPath", "label": "SSH Key Path", "type": "text", "required": true, "placeholder": "~/.ssh/id_ed25519", "helpText": "Path to the SSH private key on the worker. Required — there is deliberately no default, so a key path is never inherited from whoever happened to author this graph." },
+    { "key": "prompt", "label": "Agent Prompt", "type": "textarea", "required": true, "placeholder": "You are an agent that...", "helpText": "The full prompt/directive for the Claude agent" },
+    { "key": "model", "label": "Model", "type": "select", "required": false, "options": ["sonnet", "opus", "haiku"], "default": "sonnet" },
+    { "key": "maxTurns", "label": "Max Turns", "type": "number", "required": false, "default": 50, "placeholder": "50", "helpText": "Maximum tool-use turns for Claude" },
+    { "key": "timeout", "label": "Timeout (ms)", "type": "number", "required": false, "default": 900000, "placeholder": "900000", "helpText": "Max execution time in milliseconds" },
+    { "key": "workingDir", "label": "Working Directory", "type": "text", "required": false, "placeholder": "/path/to/project", "helpText": "Directory to cd into before running Claude" },
+    { "key": "email", "label": "Email Report To", "type": "text", "required": false, "placeholder": "user@example.com", "helpText": "Send the agent output to this email via the send-email cloud function (leave empty to skip)" },
+    { "key": "invokeUrl", "label": "Invoke URL", "type": "text", "required": true, "default": "https://run.redbtn.io", "placeholder": "https://run.redbtn.io", "helpText": "RedRun API endpoint URL" },
+    { "key": "apiKey", "label": "API Key", "type": "password", "required": true, "placeholder": "Your RedRun API key", "helpText": "x-api-key for authenticating with the invoke endpoint", "secret": true }
+  ]
+}

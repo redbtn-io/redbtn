@@ -1,0 +1,93 @@
+{
+  "nodeId": "red-domain-neuron-setup",
+  "name": "Red Domain Neuron Setup",
+  "description": "Resolves Red-[Domain] namespace context and prepares a domain-specific system prompt for neuron execution.",
+  "parameters": {
+    "domain": {
+      "type": "string",
+      "default": "personal",
+      "description": "Domain key (personal/work/health/financial/home/research/creative)."
+    },
+    "namespace": {
+      "type": "string",
+      "default": "Red-Personal",
+      "description": "Optional explicit namespace. If empty, derived from domain as Red-[Domain]."
+    }
+  },
+  "metadata": {
+    "tags": [
+      "assistant",
+      "domain",
+      "setup"
+    ],
+    "color": "#E11D48",
+    "icon": "Compass"
+  },
+  "tags": [
+    "assistant",
+    "domain",
+    "setup"
+  ],
+  "isPublic": false,
+  "steps": [
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "outputField": "data.resolvedNamespace",
+        "value": "{{(function(){ var d=((state.parameters&&state.parameters.domain)||'personal').toString().trim(); var explicit=(state.parameters&&state.parameters.namespace)||''; if(explicit) return explicit; return 'Red-' + d.charAt(0).toUpperCase() + d.slice(1); })()}}"
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "get-global",
+        "namespace": "{{state.data.resolvedNamespace}}",
+        "key": "context",
+        "outputField": "data.domainContext"
+      },
+      "errorHandling": {
+        "onError": "fallback",
+        "fallbackValue": ""
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "get-global",
+        "namespace": "{{state.data.resolvedNamespace}}",
+        "key": "toolInfo",
+        "outputField": "data.domainToolInfo"
+      },
+      "errorHandling": {
+        "onError": "fallback",
+        "fallbackValue": ""
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "outputField": "data.userMessage",
+        "value": "{{(function(){ var i=state.data.input||{}; return i.message||i.query||i.text||''; })()}}"
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "outputField": "data.systemPrompt",
+        "value": "{{(function(){ var domain=(state.parameters&&state.parameters.domain)||'personal'; var d=String(domain).toLowerCase(); var ns=state.data.resolvedNamespace||('Red-' + String(domain).charAt(0).toUpperCase() + String(domain).slice(1)); var ctx=state.data.domainContext||''; var ti=state.data.domainToolInfo||''; var p=\"You are Red's \"+domain+\" specialist. Give a concise, actionable answer or one clarifying question. No preamble, no markdown headers. Use attached tools when needed for grounded context, persistence, or external actions.\"; p+=\"\\n\\nDomain workflow: read state first, write durable updates, and store reusable knowledge in libraries.\"; if(d==='financial'){ p+=\"\\n\\nFinancial workflow: prefer Plaid for accounts/balances/transactions and Alpaca for portfolio/orders/market data before making financial claims.\"; } p+=\"\\n\\nDOMAIN NAMESPACE: \"+ns; if(ctx) p+=\"\\n\\nDOMAIN CONTEXT:\\n\"+ctx; if(ti) p+=\"\\n\\nDOMAIN TOOL INFO:\\n\"+ti; return p; })()}}"
+      }
+    },
+    {
+      "type": "transform",
+      "condition": "{{state.data.resolvedNamespace === 'Red-Work'}}",
+      "config": {
+        "operation": "set",
+        "outputField": "data.systemPrompt",
+        "value": "{{(function(){var p=state.data.systemPrompt||'';p+=\"\\n\\nWORKER DIRECTION: You can act as middle-management for three autonomous workers via the direct-worker-tool. The workers are: 'redbtn' (namespace worker), 'become' (namespace become-worker), and 'eliteEntries' (namespace ee-worker). The tool takes { worker, on, value }. The 'on' verb chooses the action: 'run' queues a one-shot directive into the worker's nextTurn (consumed on its very next turn, then cleared); 'strategic' sets nextStrategic (applied at the worker's NEXT planning transition, not immediately); 'enable' and 'disable' toggle the worker's automation on or off. BEFORE you direct a worker, call get_global_state on its namespace (worker / become-worker / ee-worker) and read workerState, lastTurnOutput, workingPhases, and currentPhaseIndex so you know what it is doing - never direct blind. Remember: nextTurn is one-shot (consumed and cleared the moment the worker next runs), while nextStrategic persists until the worker reaches its next planning transition.\";return p;})()}}"
+      }
+    }
+  ]
+}

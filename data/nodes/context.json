@@ -1,0 +1,129 @@
+{
+  "_id": "691e35fa6e38c35e17ce5f47",
+  "nodeId": "context",
+  "name": "Context Loader",
+  "description": "Loads conversation history, summary, and optional knowledge library context",
+  "userId": "system",
+  "isSystem": true,
+  "version": 2,
+  "steps": [
+    {
+      "type": "tool",
+      "config": {
+        "toolName": "get_context_history",
+        "parameters": {
+          "conversationId": "{{state.data.options.conversationId}}",
+          "maxTokens": "{{parameters.maxTokens}}",
+          "includeSummary": true,
+          "summaryType": "trailing",
+          "format": "llm"
+        },
+        "outputField": "data.contextMessages",
+        "retryOnError": true,
+        "maxRetries": 2
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "\"{{state.data.contextMessages.length}}\" > \"0\"",
+        "setField": "contextLoaded",
+        "trueValue": true,
+        "falseValue": false
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "concat",
+        "inputField": "data.contextMessages",
+        "concatWith": "data.messages",
+        "outputField": "data.messages",
+        "fallbackToConcat": true
+      }
+    },
+    {
+      "type": "conditional",
+      "config": {
+        "condition": "{{state.data.options.includeKnowledge}} == true",
+        "steps": {
+          "true": [
+            {
+              "type": "tool",
+              "config": {
+                "toolName": "search_all_libraries",
+                "parameters": {
+                  "userId": "{{state.data.options.userId}}",
+                  "query": "{{state.data.query.message}}",
+                  "limit": 3,
+                  "threshold": "{{parameters.knowledgeThreshold}}",
+                  "includeShared": true
+                },
+                "outputField": "data.knowledgeResults",
+                "errorHandling": {
+                  "retry": 1,
+                  "onError": "continue"
+                }
+              }
+            },
+            {
+              "type": "conditional",
+              "config": {
+                "condition": "{{state.data.knowledgeResults}} != undefined && \"{{state.data.knowledgeResults.isError}}\" != \"true\"",
+                "setField": "data.hasKnowledge",
+                "trueValue": true,
+                "falseValue": false
+              }
+            }
+          ],
+          "false": []
+        }
+      }
+    }
+  ],
+  "metadata": {
+    "tags": [
+      "context",
+      "memory",
+      "conversation",
+      "knowledge"
+    ],
+    "migratedFrom": "src/lib/nodes/context.ts",
+    "migratedAt": "2025-11-19T21:26:18.926Z",
+    "color": "#6366F1",
+    "icon": "Database"
+  },
+  "createdAt": "2025-11-19T21:26:18.926Z",
+  "updatedAt": "2025-01-20T00:00:00.000Z",
+  "isImmutable": true,
+  "tags": [
+    "infrastructure"
+  ],
+  "abandonedAt": null,
+  "creatorId": "system",
+  "scheduledDeletionAt": null,
+  "status": "active",
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  },
+  "parameters": {
+    "maxTokens": {
+      "type": "number",
+      "default": 30000,
+      "min": 1000,
+      "max": 100000,
+      "description": "Maximum tokens for conversation context."
+    },
+    "knowledgeThreshold": {
+      "type": "number",
+      "default": 0.65,
+      "min": 0,
+      "max": 1,
+      "description": "Similarity threshold for knowledge retrieval."
+    }
+  }
+}

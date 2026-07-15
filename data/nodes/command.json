@@ -1,0 +1,77 @@
+{
+  "_id": "6927e9a529826e178ace5f47",
+  "nodeId": "command",
+  "name": "Command Executor",
+  "description": "Executes system commands via the ssh_shell native tool",
+  "userId": "system",
+  "isSystem": true,
+  "version": 1,
+  "steps": [
+    {
+      "type": "tool",
+      "config": {
+        "toolName": "ssh_shell",
+        "inputMapping": "{{state.data?.currentStep?.command || state.data?.command}}",
+        "outputField": "data.commandResult",
+        "errorHandling": {
+          "retry": 1,
+          "retryDelay": 500,
+          "onError": "continue",
+          "fallbackValue": {
+            "error": "Command execution failed",
+            "success": false
+          }
+        }
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "append",
+        "inputField": "data.commandResult",
+        "outputField": "data.executionResults",
+        "template": {
+          "type": "command",
+          "result": "{{state.data.commandResult}}",
+          "timestamp": "{{new Date().toISOString()}}"
+        }
+      }
+    },
+    {
+      "type": "transform",
+      "config": {
+        "operation": "set",
+        "value": false,
+        "outputField": "data.executorAwaitingReturn"
+      }
+    }
+  ],
+  "metadata": {
+    "tags": [
+      "command",
+      "mcp",
+      "system",
+      "execution"
+    ],
+    "createdAt": "2025-11-27T06:03:17.698Z",
+    "icon": "Wrench",
+    "color": "#3B82F6"
+  },
+  "createdAt": "2025-11-27T06:03:17.698Z",
+  "updatedAt": "2025-11-27T06:03:17.698Z",
+  "isImmutable": true,
+  "tags": [
+    "tools"
+  ],
+  "abandonedAt": null,
+  "creatorId": "system",
+  "scheduledDeletionAt": null,
+  "status": "active",
+  "isPublic": true,
+  "ownerName": "System",
+  "stats": {
+    "usageCount": 0,
+    "forkCount": 0,
+    "lastUsedAt": null
+  }
+}
