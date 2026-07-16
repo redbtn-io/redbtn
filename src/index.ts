@@ -153,6 +153,24 @@ export type {
 } from "./lib/run";
 export { LEGACY_TRIGGER_MAP, toTriggerType, enrichInput } from "./lib/run";
 
+// Cross-process orphan DETECTION surface — consumed by @redbtn/worker's
+// requeue-on-boot recovery so it reuses the reaper's exact orphan definition.
+export {
+  findOrphanedRuns,
+  hasRecoveryClaim,
+  reapOrphanedRuns,
+  ORPHAN_REAPED_COLLECTIONS,
+} from "./lib/run";
+export type {
+  ReaperDb,
+  ReaperRedis,
+  ReaperDbProvider,
+  OrphanRunInfo,
+  FindOrphanedRunsResult,
+  ReapOrphanedRunsOptions,
+  ReapOrphanedRunsResult,
+} from "./lib/run";
+
 // Automation concurrency limiter (atomic, zombie-aware cap enforcement).
 export {
   AutomationConcurrencyLimiter,
@@ -506,7 +524,7 @@ export class Red {
   /**
    * Gracefully shuts down the Red instance, stopping heartbeat and cleaning up resources.
    */
-  public async shutdown(): Promise<void> {
+  public async shutdown(options?: { markInFlightInterrupted?: boolean }): Promise<void> {
     console.log(`[Red] Shutting down node: ${this.nodeId}...`);
 
     // Stop thinking if active
@@ -520,22 +538,34 @@ export class Red {
     // THIS process's own in-flight runs interrupted before exit (a graceful
     // redrun restart should not create orphans in the first place). Runs BEFORE
     // redis.quit() since it needs Redis. Fully guarded.
+    // `markInFlightInterrupted` (default true) is the #276 graceful marking:
+    // best-effort mark THIS process's own in-flight runs interrupted so a clean
+    // restart never creates orphans. A caller that has ALREADY drained on SIGTERM
+    // and wants runs that outlived the drain grace to be re-dispatched by the
+    // NEXT engine (requeue-on-boot) passes `false` — those runs are then LEFT
+    // `running` for detection on the next boot instead of being marked terminal
+    // here.
+    const markInFlightInterrupted = options?.markInFlightInterrupted ?? true;
     if (this.orphanReaper) {
       try {
         this.orphanReaper.stop();
-        const entries = runControlRegistry.runIds().map((runId) => {
-          const ctx = runControlRegistry.get(runId);
-          return {
-            runId,
-            publisher: ctx?.runPublisher as { interrupt(reason?: string): Promise<void> } | undefined,
-          };
-        });
-        if (entries.length > 0) {
-          const marked = await this.orphanReaper.markShutdownInFlight(
-            entries,
-            'engine-restart orphan — engine shutdown (SIGTERM) before run completion',
-          );
-          console.log(`[Red] Orphan reaper marked ${marked}/${entries.length} in-flight run(s) interrupted on shutdown`);
+        if (markInFlightInterrupted) {
+          const entries = runControlRegistry.runIds().map((runId) => {
+            const ctx = runControlRegistry.get(runId);
+            return {
+              runId,
+              publisher: ctx?.runPublisher as { interrupt(reason?: string): Promise<void> } | undefined,
+            };
+          });
+          if (entries.length > 0) {
+            const marked = await this.orphanReaper.markShutdownInFlight(
+              entries,
+              'engine-restart orphan — engine shutdown (SIGTERM) before run completion',
+            );
+            console.log(`[Red] Orphan reaper marked ${marked}/${entries.length} in-flight run(s) interrupted on shutdown`);
+          }
+        } else {
+          console.log('[Red] Shutdown drain elapsed — leaving in-flight run(s) running for requeue-on-boot recovery');
         }
       } catch (error) {
         console.warn('[Red] Orphan reaper shutdown marking failed (non-fatal):', error);

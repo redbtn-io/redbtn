@@ -475,15 +475,37 @@ function collectCandidates(docs: any[], into: Map<string, RunCandidate>): void {
   }
 }
 
+/** A `running` run that detection judged a dead orphan (no side effects taken). */
+export interface OrphanRunInfo {
+  runId: string;
+  /** conversationId (run-state authoritative, else durable doc) for key cleanup / re-lock. */
+  conversationId?: string;
+  agentId?: string;
+  /** Why it was judged an orphan (from `decideOrphan`). */
+  reason: string;
+}
+
+export interface FindOrphanedRunsResult {
+  scanned: number;
+  orphans: OrphanRunInfo[];
+  kept: number;
+}
+
 /**
- * One cross-process sweep. Gathers `running` runs older than the age gate from
- * the durable stores, then reaps only those with no fresh heartbeat AND no
- * owning process. The age gate (startedAt older than the stale threshold) keeps
- * a just-started run — whose Redis state / lock may not have landed yet — from
- * ever being a candidate; it is a floor, not a reap condition (a live long run
- * older than the gate is still spared by its fresh heartbeat).
+ * Cross-process orphan DETECTION with no side effects. Gathers `running` runs
+ * older than the age gate from the durable stores and returns those that are
+ * genuinely dead — no fresh heartbeat AND no owning process — per `decideOrphan`.
+ *
+ * This is the SINGLE definition of "which runs are orphans": `reapOrphanedRuns`
+ * (which kills them) and the worker's requeue-on-boot recovery (which
+ * re-dispatches them) both consume it, so the two can never disagree.
+ *
+ * The age gate (startedAt older than the stale threshold) keeps a just-started
+ * run — whose Redis state / lock may not have landed yet — from ever being a
+ * candidate; it is a floor, not a reap condition (a live long run older than the
+ * gate is still spared by its fresh heartbeat).
  */
-export async function reapOrphanedRuns(options: ReapOrphanedRunsOptions): Promise<ReapOrphanedRunsResult> {
+export async function findOrphanedRuns(options: ReapOrphanedRunsOptions): Promise<FindOrphanedRunsResult> {
   const now = options.now ?? new Date();
   const staleAfterMs = options.staleAfterMs ?? getOrphanStaleThresholdMs();
   const limit = options.limit ?? DEFAULT_CANDIDATE_LIMIT;
@@ -508,8 +530,7 @@ export async function reapOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
     }
   }
 
-  const details: Array<{ runId: string; reason: string }> = [];
-  let reaped = 0;
+  const orphans: OrphanRunInfo[] = [];
   let kept = 0;
 
   for (const candidate of candidates.values()) {
@@ -532,22 +553,65 @@ export async function reapOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
       kept++;
       continue;
     }
+    orphans.push({ runId: candidate.runId, conversationId, agentId: candidate.agentId, reason: decision.reason });
+  }
 
+  return { scanned: candidates.size, orphans, kept };
+}
+
+/**
+ * Is a booting engine currently recovering (re-dispatching) this run? While a
+ * recovery claim is held the reaper must NOT kill the run — a peer took
+ * responsibility for requeueing it, and the re-dispatched run re-establishes a
+ * fresh heartbeat. Fails SAFE: on a Redis error it reports `true` (claimed) so a
+ * lookup blip never causes us to kill a run that is being recovered.
+ */
+export async function hasRecoveryClaim(redis: ReaperRedis, runId: string): Promise<boolean> {
+  try {
+    return (await redis.exists(RunKeys.recoveryClaim(runId))) > 0;
+  } catch (err) {
+    console.warn(`[orphan-reaper] recovery-claim lookup failed for ${runId} (assuming claimed):`, err);
+    return true;
+  }
+}
+
+/**
+ * One cross-process sweep. Detects dead orphans via `findOrphanedRuns` and marks
+ * them terminal — EXCEPT any run currently claimed for requeue-on-boot recovery,
+ * which is left untouched for the recovering engine (see `hasRecoveryClaim`).
+ */
+export async function reapOrphanedRuns(options: ReapOrphanedRunsOptions): Promise<ReapOrphanedRunsResult> {
+  const now = options.now ?? new Date();
+  const collections = options.collections ?? ORPHAN_REAPED_COLLECTIONS;
+  const { redis, db } = options;
+
+  const found = await findOrphanedRuns(options);
+
+  const details: Array<{ runId: string; reason: string }> = [];
+  let reaped = 0;
+  let keptForRecovery = 0;
+
+  for (const orphan of found.orphans) {
+    if (await hasRecoveryClaim(redis, orphan.runId)) {
+      // A booting engine is re-dispatching this run — leave it alone.
+      keptForRecovery++;
+      continue;
+    }
     await markRunTerminal({
       redis,
       db,
-      runId: candidate.runId,
-      reason: `${decision.reason} @ ${now.toISOString()}`,
-      conversationId,
-      agentId: candidate.agentId,
+      runId: orphan.runId,
+      reason: `${orphan.reason} @ ${now.toISOString()}`,
+      conversationId: orphan.conversationId,
+      agentId: orphan.agentId,
       now,
       collections,
     });
     reaped++;
-    details.push({ runId: candidate.runId, reason: decision.reason });
+    details.push({ runId: orphan.runId, reason: orphan.reason });
   }
 
-  return { scanned: candidates.size, reaped, kept, details };
+  return { scanned: found.scanned, reaped, kept: found.kept + keptForRecovery, details };
 }
 
 // ---------------------------------------------------------------------------

@@ -604,6 +604,26 @@ export const RunKeys = {
   /** Active run for conversation: `run:conversation:{conversationId}` */
   conversationRun: (conversationId: string) => `run:conversation:${conversationId}`,
   /**
+   * Requeue-on-boot recovery record: `run:recovery:{runId}`.
+   *
+   * Written by the worker's run processor at execution start (the full enqueue
+   * payload) and deleted when the run reaches a terminal state. If the engine
+   * process dies mid-run the record survives, so a booting engine can
+   * re-dispatch the run instead of losing the work. Redis-only, TTL'd.
+   */
+  recovery: (runId: string) => `run:recovery:${runId}`,
+  /**
+   * Requeue-on-boot recovery claim: `run:recovery:claim:{runId}`.
+   *
+   * Atomic `SET NX` ticket a booting engine takes before re-dispatching an
+   * orphaned run, so concurrently-booting replicas requeue each orphan at most
+   * once. While the claim is held the cross-process orphan reaper LEAVES the run
+   * alone (it is being recovered, not killed) — see `orphan-reaper.ts` ->
+   * `hasRecoveryClaim`. Short-TTL'd; the recovered run's own fresh heartbeat
+   * protects it thereafter.
+   */
+  recoveryClaim: (runId: string) => `run:recovery:claim:${runId}`,
+  /**
    * External interrupt channel: `run:interrupt:{runId}`.
    *
    * Pub/sub-only — no state stored. When any actor publishes ANY message to
