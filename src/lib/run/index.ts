@@ -127,3 +127,24 @@ export {
   type RunProgressStalenessOptions,
   type RunProgressStalenessResult,
 } from './progress-contract';
+
+export {
+  AutomationConcurrencyLimiter,
+  AUTOMATION_CONCURRENCY_MODES,
+  DEFAULT_TRIGGER_ID,
+  ACQUIRE_LUA,
+  normalizeAutomationConcurrency,
+  resolveEffectiveConcurrency,
+  effectiveCap,
+  tryAcquireAutomationSlot,
+  heartbeatAutomationSlot,
+  releaseAutomationSlot,
+  type AutomationConcurrencyMode,
+  type AutomationConcurrencyConfig,
+  type AutomationTriggerConcurrency,
+  type RawAutomationConcurrency,
+  type ResolvedConcurrency,
+  type AutomationConcurrencySlot,
+  type AdmissionDecision,
+  type TryAcquireOptions,
+} from './automation-concurrency';
