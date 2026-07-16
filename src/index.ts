@@ -153,6 +153,24 @@ export type {
 } from "./lib/run";
 export { LEGACY_TRIGGER_MAP, toTriggerType, enrichInput } from "./lib/run";
 
+// Cross-process orphan DETECTION surface — consumed by @redbtn/worker's
+// requeue-on-boot recovery so it reuses the reaper's exact orphan definition.
+export {
+  findOrphanedRuns,
+  hasRecoveryClaim,
+  reapOrphanedRuns,
+  ORPHAN_REAPED_COLLECTIONS,
+} from "./lib/run";
+export type {
+  ReaperDb,
+  ReaperRedis,
+  ReaperDbProvider,
+  OrphanRunInfo,
+  FindOrphanedRunsResult,
+  ReapOrphanedRunsOptions,
+  ReapOrphanedRunsResult,
+} from "./lib/run";
+
 // Automation concurrency limiter (atomic, zombie-aware cap enforcement).
 export {
   AutomationConcurrencyLimiter,
