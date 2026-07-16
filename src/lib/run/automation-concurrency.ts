@@ -65,9 +65,14 @@ import { RunKeys, RunConfig } from './types';
  * - `allow`     — never block; run always admitted (still tracked).
  * - `skip`      — drop the trigger; do not start a run.
  * - `queue`     — caller enqueues the trigger to run when a slot frees.
- * - `interrupt` — cancel the in-flight run(s) and start the new one. Pre-existing
- *                 mode; the actual cancellation is the caller's job — the limiter
- *                 admits the run and returns the runIds to interrupt.
+ * - `interrupt` — make room by cancelling the OLDEST in-flight run(s) in the
+ *                 over-cap scope, then start the new one. Cap-aware (only evicts
+ *                 down to the cap) and per-scope: a per-trigger `interrupt` frees
+ *                 the trigger scope, a total `interrupt` the total scope. The
+ *                 limiter selects + evicts the targets atomically and returns
+ *                 their runIds; performing the actual cancellation is the caller's
+ *                 job. A blocking (`skip`/`queue`) cap on the OTHER scope still
+ *                 wins — interrupt never bypasses it.
  */
 export type AutomationConcurrencyMode = 'allow' | 'skip' | 'queue' | 'interrupt';
 
@@ -274,8 +279,11 @@ export interface AdmissionDecision {
   /** Which scope caused a block (undefined when admitted). */
   blockedBy?: 'total' | 'trigger';
   /**
-   * For `interrupt` mode: run ids that were already active and should be
-   * cancelled by the caller before/while the new run proceeds.
+   * For an admitted `interrupt` decision: the oldest in-flight run ids that were
+   * evicted (atomically, within the acquire script, respecting the scope caps) to
+   * make room for this run. They are already removed from slot tracking; the
+   * caller MUST cancel them. Present (possibly empty) whenever `decision` is
+   * `interrupt`.
    */
   interruptRunIds?: string[];
 }
@@ -285,16 +293,31 @@ export interface AdmissionDecision {
 // =============================================================================
 
 /**
- * Atomic acquire. Prunes zombies, checks both caps, conditionally registers.
+ * Atomic, scope-aware acquire. Prunes zombies, evaluates BOTH scopes under their
+ * own overflow policy, and — in one indivisible step — either registers the run
+ * (interrupting the oldest in-flight runs when a scope is `interrupt`) or blocks.
  *
  * KEYS[1] = total sorted set, KEYS[2] = per-trigger sorted set.
- * ARGV: [now, cutoff, totalMax, triggerMax, member(runId), keyTtl]
- *   - `totalMax` / `triggerMax`: numeric cap, or -1 for unlimited.
+ * ARGV: [now, cutoff, totalMax, triggerMax, member(runId), keyTtl,
+ *        totalInterrupt(0|1), triggerInterrupt(0|1)]
+ *   - `totalMax` / `triggerMax`: numeric cap, or -1 for unlimited (`allow`).
+ *   - `*Interrupt`: 1 when that scope's overflow mode is `interrupt` (make room by
+ *     cancelling the oldest runs) rather than a hard block (`skip`/`queue`).
  *   - `cutoff`: now - staleMs. Members with score <= cutoff are dead → pruned.
  *
- * Returns [allowed(0|1), totalCount, triggerCount, blockedTrigger(0|1)] where the
- * counts are the post-decision cardinalities. Idempotent for a member that is
- * already registered (re-acquire just refreshes its heartbeat).
+ * Returns [allowed(0|1), totalCount, triggerCount, blockedTrigger(0|1), interrupted]
+ * where the counts are the post-decision cardinalities and `interrupted` is the
+ * (possibly empty) list of runIds evicted to make room — the caller must cancel
+ * them. Idempotent for an already-registered member (re-acquire just refreshes
+ * its heartbeat).
+ *
+ * Policy: a scope at/over its cap under a blocking mode (`skip`/`queue`) is a hard
+ * ceiling — an `interrupt` on the OTHER scope cannot override it, and when any
+ * scope hard-blocks NOTHING is evicted (interrupt never fires just to then be
+ * blocked). Only when neither scope hard-blocks do the `interrupt` scopes evict
+ * their oldest members down to `cap-1`, so the new run lands exactly at the cap.
+ * Interrupt targets are selected and removed INSIDE this script, closing the
+ * read-then-act race that a pre-`eval` `listActiveSlots` would reopen.
  *
  * This is the SINGLE SOURCE OF TRUTH for admission; the FakeRedis in the test
  * suite mirrors this exact algorithm.
@@ -306,6 +329,8 @@ local totalMax = tonumber(ARGV[3])
 local triggerMax = tonumber(ARGV[4])
 local member = ARGV[5]
 local ttl = tonumber(ARGV[6])
+local totalInterrupt = tonumber(ARGV[7])
+local triggerInterrupt = tonumber(ARGV[8])
 
 -- 1) prune zombies (no heartbeat within the stale window) from both scopes
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', cutoff)
@@ -317,26 +342,64 @@ if redis.call('ZSCORE', KEYS[1], member) then
   redis.call('ZADD', KEYS[2], now, member)
   redis.call('EXPIRE', KEYS[1], ttl)
   redis.call('EXPIRE', KEYS[2], ttl)
-  return { 1, redis.call('ZCARD', KEYS[1]), redis.call('ZCARD', KEYS[2]), 0 }
+  return { 1, redis.call('ZCARD', KEYS[1]), redis.call('ZCARD', KEYS[2]), 0, {} }
 end
 
 local totalCount = redis.call('ZCARD', KEYS[1])
 local triggerCount = redis.call('ZCARD', KEYS[2])
 
-local totalOk = (totalMax < 0) or (totalCount < totalMax)
-local triggerOk = (triggerMax < 0) or (triggerCount < triggerMax)
+-- A scope hard-blocks when it is at/over its cap under a non-interrupt (skip/queue)
+-- mode. \`allow\` uses cap -1 and never blocks. An interrupt scope makes room below.
+local totalBlock = (totalMax >= 0) and (totalCount >= totalMax) and (totalInterrupt == 0)
+local triggerBlock = (triggerMax >= 0) and (triggerCount >= triggerMax) and (triggerInterrupt == 0)
 
-if totalOk and triggerOk then
-  redis.call('ZADD', KEYS[1], now, member)
-  redis.call('ZADD', KEYS[2], now, member)
-  redis.call('EXPIRE', KEYS[1], ttl)
-  redis.call('EXPIRE', KEYS[2], ttl)
-  return { 1, totalCount + 1, triggerCount + 1, 0 }
+if totalBlock or triggerBlock then
+  local blockedTrigger = 0
+  if triggerBlock then blockedTrigger = 1 end
+  return { 0, totalCount, triggerCount, blockedTrigger, {} }
 end
 
-local blockedTrigger = 0
-if not triggerOk then blockedTrigger = 1 end
-return { 0, totalCount, triggerCount, blockedTrigger }
+-- No hard block. Resolve interrupt scopes by evicting the oldest runs to make room
+-- (down to cap-1, so the new run lands exactly at the cap). Collect their runIds.
+local interrupted = {}
+local seen = {}
+
+local function evict(fromKey, count, maxCap)
+  local need = count - maxCap + 1
+  if need < 1 then return end
+  local victims = redis.call('ZRANGE', fromKey, 0, need - 1)
+  for i = 1, #victims do
+    local v = victims[i]
+    if v ~= member and not seen[v] then
+      redis.call('ZREM', KEYS[1], v)
+      redis.call('ZREM', KEYS[2], v)
+      seen[v] = true
+      interrupted[#interrupted + 1] = v
+    end
+  end
+end
+
+-- Trigger scope first: its members are in BOTH sets, so evicting here also frees
+-- total slots and keeps the two scopes consistent.
+if triggerMax >= 0 and triggerInterrupt == 1 and triggerCount >= triggerMax then
+  evict(KEYS[2], triggerCount, triggerMax)
+  totalCount = redis.call('ZCARD', KEYS[1])
+end
+
+-- Total scope next, against the (possibly reduced) count. A total victim from
+-- another trigger is removed from the total set here; its own trigger set is
+-- cleaned when the caller releases the cancelled run (stale-prune backstops it).
+if totalMax >= 0 and totalInterrupt == 1 and totalCount >= totalMax then
+  evict(KEYS[1], totalCount, totalMax)
+end
+
+-- Register the new run in both scopes.
+redis.call('ZADD', KEYS[1], now, member)
+redis.call('ZADD', KEYS[2], now, member)
+redis.call('EXPIRE', KEYS[1], ttl)
+redis.call('EXPIRE', KEYS[2], ttl)
+
+return { 1, redis.call('ZCARD', KEYS[1]), redis.call('ZCARD', KEYS[2]), 0, interrupted }
 `;
 
 // =============================================================================
@@ -384,35 +447,12 @@ export class AutomationConcurrencyLimiter {
     const triggerKey = RunKeys.automationConcurrencyTrigger(opts.automationId, triggerId);
     const keyTtl = RunConfig.AUTOMATION_CONCURRENCY_KEY_TTL_SECONDS;
 
-    // `interrupt`: admit unconditionally but report who to cancel. We still
-    // register the new run so it holds a slot and heartbeats/releases normally.
-    if (resolved.total.mode === 'interrupt') {
-      const preexisting = await this.listActiveSlots({
-        automationId: opts.automationId,
-        triggerId,
-        now,
-        staleMs,
-      });
-      const res = (await this.redis.eval(
-        ACQUIRE_LUA,
-        2,
-        totalKey,
-        triggerKey,
-        String(now),
-        String(cutoff),
-        String(UNLIMITED),
-        String(UNLIMITED),
-        opts.runId,
-        String(keyTtl),
-      )) as [number, number, number, number];
-      return {
-        allowed: true,
-        decision: 'interrupt',
-        totalActive: Number(res[1]),
-        triggerActive: Number(res[2]),
-        interruptRunIds: preexisting.filter((r) => r !== opts.runId),
-      };
-    }
+    // Each scope's overflow mode is passed to the script as an interrupt flag, so
+    // interrupt is handled ATOMICALLY (target selection + eviction + registration
+    // in one step) and respects both caps — no separate pre-`eval` read, and a
+    // per-trigger interrupt is no longer collapsed to `skip`.
+    const totalInterrupt = resolved.total.mode === 'interrupt' ? 1 : 0;
+    const triggerInterrupt = resolved.trigger.mode === 'interrupt' ? 1 : 0;
 
     const res = (await this.redis.eval(
       ACQUIRE_LUA,
@@ -425,20 +465,30 @@ export class AutomationConcurrencyLimiter {
       String(resolved.triggerCap),
       opts.runId,
       String(keyTtl),
-    )) as [number, number, number, number];
+      String(totalInterrupt),
+      String(triggerInterrupt),
+    )) as [number, number, number, number, unknown[]];
 
     const allowed = Number(res[0]) === 1;
     const totalActive = Number(res[1]);
     const triggerActive = Number(res[2]);
+    const interruptRunIds = (Array.isArray(res[4]) ? res[4] : [])
+      .map(String)
+      .filter((r) => r !== opts.runId);
 
     if (allowed) {
+      // An interrupt scope governs this admission whenever either scope's mode is
+      // `interrupt`; report the (possibly empty) list of runs the caller must cancel.
+      if (totalInterrupt === 1 || triggerInterrupt === 1) {
+        return { allowed: true, decision: 'interrupt', totalActive, triggerActive, interruptRunIds };
+      }
       return { allowed: true, decision: 'allow', totalActive, triggerActive };
     }
 
     const blockedBy: 'total' | 'trigger' = Number(res[3]) === 1 ? 'trigger' : 'total';
-    // The mode that governs overflow is the blocking scope's mode.
+    // The mode that governs overflow is the blocking scope's mode. A blocking scope
+    // is `skip` or `queue` (`allow` never blocks; `interrupt` makes room instead).
     const mode = blockedBy === 'trigger' ? resolved.trigger.mode : resolved.total.mode;
-    // `allow` can never block, so a blocked decision is skip or queue.
     const decision: 'skip' | 'queue' = mode === 'queue' ? 'queue' : 'skip';
 
     return { allowed: false, decision, totalActive, triggerActive, blockedBy };

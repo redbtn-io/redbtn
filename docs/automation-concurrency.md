@@ -33,7 +33,8 @@ the legacy bare-mode string **or** the numeric object form:
 ```
 
 - `mode`: `allow` (never blocks) · `skip` (drop at cap) · `queue` (caller
-  enqueues) · `interrupt` (cancel in-flight, then start).
+  enqueues) · `interrupt` (make room by cancelling the oldest in-flight run(s),
+  then start).
 - `max`: positive integer cap. Ignored for `allow`. Omitted with a blocking mode
   → the legacy cap of **1** (so `"skip"` still means cap-1).
 
@@ -41,6 +42,25 @@ A run is admitted only when **both** the total scope and the applicable
 per-trigger scope have room. A missing per-trigger override means that trigger is
 bounded solely by the total cap. Legacy strings normalise exactly to the old
 behaviour, so existing automations are unchanged until reconfigured.
+
+### Interrupt is per-scope, cap-aware, and atomic
+
+`interrupt` is evaluated **independently per scope**, inside the same acquire
+script — it is *not* a blanket "cancel everything and start":
+
+- Each scope's `interrupt` frees only **its own** scope: a per-trigger
+  `interrupt` interrupts that trigger's runs; a total `interrupt` interrupts
+  across the automation. (Previously a per-trigger `interrupt` at cap wrongly
+  reported `skip`, and a total `interrupt` ignored per-trigger caps.)
+- It evicts only the **oldest** runs needed to bring the scope down to `cap-1`,
+  so the new run lands exactly at the cap — `max` is respected (interrupt no
+  longer means "cancel all").
+- A blocking (`skip`/`queue`) cap on the **other** scope is a hard ceiling that
+  `interrupt` cannot bypass; when any scope hard-blocks, **nothing** is evicted.
+- Target selection **and** eviction happen inside `ACQUIRE_LUA`, so there is no
+  read-then-act window (zombies are pruned first, so a crashed run is never
+  reported as an interrupt target). The admission returns `interruptRunIds` — the
+  runs already removed from tracking that the caller must cancel.
 
 ## Atomicity (requirement 1)
 

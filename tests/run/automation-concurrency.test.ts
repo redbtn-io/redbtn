@@ -108,13 +108,15 @@ class FakeRedis {
     for (const [mem, score] of [...m]) if (score <= cutoff) m.delete(mem);
   }
 
-  private runAcquire(keys: string[], argv: string[]): [number, number, number, number] {
+  private runAcquire(keys: string[], argv: string[]): [number, number, number, number, string[]] {
     const now = Number(argv[0]);
     const cutoff = Number(argv[1]);
     const totalMax = Number(argv[2]);
     const triggerMax = Number(argv[3]);
     const member = argv[4];
     const ttl = Number(argv[5]);
+    const totalInterrupt = Number(argv[6]);
+    const triggerInterrupt = Number(argv[7]);
     const [k1, k2] = keys;
 
     this.prune(k1, cutoff);
@@ -127,22 +129,51 @@ class FakeRedis {
       m2.set(member, now);
       this.ttls.set(k1, ttl);
       this.ttls.set(k2, ttl);
-      return [1, m1.size, m2.size, 0];
+      return [1, m1.size, m2.size, 0, []];
     }
 
-    const totalCount = m1.size;
+    let totalCount = m1.size;
     const triggerCount = m2.size;
-    const totalOk = totalMax < 0 || totalCount < totalMax;
-    const triggerOk = triggerMax < 0 || triggerCount < triggerMax;
 
-    if (totalOk && triggerOk) {
-      m1.set(member, now);
-      m2.set(member, now);
-      this.ttls.set(k1, ttl);
-      this.ttls.set(k2, ttl);
-      return [1, totalCount + 1, triggerCount + 1, 0];
+    const totalBlock = totalMax >= 0 && totalCount >= totalMax && totalInterrupt === 0;
+    const triggerBlock = triggerMax >= 0 && triggerCount >= triggerMax && triggerInterrupt === 0;
+    if (totalBlock || triggerBlock) {
+      return [0, totalCount, triggerCount, triggerBlock ? 1 : 0, []];
     }
-    return [0, totalCount, triggerCount, triggerOk ? 0 : 1];
+
+    const interrupted: string[] = [];
+    const seen = new Set<string>();
+    const oldest = (key: string, n: number): string[] =>
+      [...this.z(key)]
+        .sort((a, b) => a[1] - b[1] || (a[0] < b[0] ? -1 : 1))
+        .map((e) => e[0])
+        .slice(0, n);
+    const evict = (fromKey: string, count: number, maxCap: number): void => {
+      const need = count - maxCap + 1;
+      if (need < 1) return;
+      for (const v of oldest(fromKey, need)) {
+        if (v !== member && !seen.has(v)) {
+          m1.delete(v);
+          m2.delete(v);
+          seen.add(v);
+          interrupted.push(v);
+        }
+      }
+    };
+
+    if (triggerMax >= 0 && triggerInterrupt === 1 && triggerCount >= triggerMax) {
+      evict(k2, triggerCount, triggerMax);
+      totalCount = m1.size;
+    }
+    if (totalMax >= 0 && totalInterrupt === 1 && totalCount >= totalMax) {
+      evict(k1, totalCount, totalMax);
+    }
+
+    m1.set(member, now);
+    m2.set(member, now);
+    this.ttls.set(k1, ttl);
+    this.ttls.set(k2, ttl);
+    return [1, m1.size, m2.size, 0, interrupted];
   }
 }
 
@@ -385,6 +416,123 @@ describe('allow + interrupt modes', () => {
     expect(b.allowed).toBe(true);
     expect(b.decision).toBe('interrupt');
     expect(b.interruptRunIds).toEqual(['r1']);
+  });
+});
+
+describe('interrupt mode — scope-aware, cap-aware, atomic', () => {
+  it('a per-trigger interrupt override interrupts its trigger instead of skipping (bug 1)', async () => {
+    const { limiter } = makeLimiter();
+    const cfg = {
+      automationId: AUTO,
+      triggerId: 'tA',
+      concurrency: { mode: 'allow' as const }, // total unlimited
+      triggerConcurrency: { mode: 'interrupt' as const, max: 1 },
+    };
+    const first = await limiter.tryAcquire({ ...cfg, runId: 'r1', now: 1000 });
+    expect(first.allowed).toBe(true);
+    expect(first.decision).toBe('interrupt');
+    expect(first.interruptRunIds).toEqual([]);
+
+    const second = await limiter.tryAcquire({ ...cfg, runId: 'r2', now: 1001 });
+    expect(second.allowed).toBe(true);
+    // The bug: this used to come back as 'skip'. It must interrupt r1 and admit r2.
+    expect(second.decision).toBe('interrupt');
+    expect(second.interruptRunIds).toEqual(['r1']);
+    // The trigger scope holds exactly the new run afterwards.
+    expect(await limiter.countActive({ automationId: AUTO, triggerId: 'tA', now: 1002 })).toBe(1);
+  });
+
+  it('a total interrupt does NOT bypass a per-trigger skip cap (bug 2)', async () => {
+    const { limiter } = makeLimiter();
+    const base = {
+      automationId: AUTO,
+      concurrency: { mode: 'interrupt' as const, max: 5 }, // total interrupt, cap 5
+    };
+    const tA = { ...base, triggerId: 'tA', triggerConcurrency: { mode: 'skip' as const, max: 1 } };
+
+    const first = await limiter.tryAcquire({ ...tA, runId: 'r1', now: 1000 });
+    expect(first.allowed).toBe(true);
+
+    // The per-trigger skip-1 cap wins even though the total mode is interrupt.
+    const second = await limiter.tryAcquire({ ...tA, runId: 'r2', now: 1001 });
+    expect(second.allowed).toBe(false);
+    expect(second.decision).toBe('skip');
+    expect(second.blockedBy).toBe('trigger');
+    // r1 must NOT have been interrupted.
+    expect(await limiter.listActiveSlots({ automationId: AUTO, triggerId: 'tA', now: 1002 })).toEqual([
+      'r1',
+    ]);
+
+    // A different trigger with no override is still bounded only by the total
+    // interrupt cap, so it is admitted (with an interrupt decision).
+    const other = await limiter.tryAcquire({ ...base, triggerId: 'tB', runId: 'r3', now: 1003 });
+    expect(other.allowed).toBe(true);
+    expect(other.decision).toBe('interrupt');
+  });
+
+  it('interrupt evicts only the oldest runs needed to satisfy the cap (cap-aware)', async () => {
+    const { limiter } = makeLimiter();
+    const cfg = { automationId: AUTO, concurrency: { mode: 'interrupt' as const, max: 2 } };
+    await limiter.tryAcquire({ ...cfg, runId: 'r1', now: 1000 });
+    await limiter.tryAcquire({ ...cfg, runId: 'r2', now: 1001 }); // total now at cap 2
+
+    const third = await limiter.tryAcquire({ ...cfg, runId: 'r3', now: 1002 });
+    expect(third.allowed).toBe(true);
+    expect(third.decision).toBe('interrupt');
+    // Old (uncapped) behaviour would interrupt every prior run; cap-2 evicts only r1.
+    expect(third.interruptRunIds).toEqual(['r1']);
+    expect(third.totalActive).toBe(2); // stays exactly at the cap
+    expect(await limiter.listActiveSlots({ automationId: AUTO, now: 1003 })).toEqual(['r2', 'r3']);
+  });
+
+  it('total interrupt makes room across triggers by evicting the oldest total run', async () => {
+    const { limiter } = makeLimiter();
+    const base = { automationId: AUTO, concurrency: { mode: 'interrupt' as const, max: 2 } };
+    await limiter.tryAcquire({ ...base, triggerId: 'tA', runId: 'rA1', now: 1000 });
+    await limiter.tryAcquire({ ...base, triggerId: 'tA', runId: 'rA2', now: 1001 });
+
+    // total at cap 2 (both under tA); a brand-new trigger tB fires.
+    const rb = await limiter.tryAcquire({ ...base, triggerId: 'tB', runId: 'rB1', now: 1002 });
+    expect(rb.allowed).toBe(true);
+    expect(rb.decision).toBe('interrupt');
+    expect(rb.interruptRunIds).toEqual(['rA1']); // oldest total run, from another trigger
+    expect(rb.totalActive).toBe(2);
+    // The interrupted run is out of the TOTAL scope immediately.
+    expect(await limiter.listActiveSlots({ automationId: AUTO, now: 1003 })).toEqual(['rA2', 'rB1']);
+  });
+
+  it('mixed interrupt scopes: the tighter per-trigger interrupt cap governs its trigger', async () => {
+    const { limiter } = makeLimiter();
+    const cfg = {
+      automationId: AUTO,
+      triggerId: 'tA',
+      concurrency: { mode: 'interrupt' as const, max: 5 }, // total interrupt, cap 5
+      triggerConcurrency: { mode: 'interrupt' as const, max: 1 }, // trigger interrupt, cap 1
+    };
+    await limiter.tryAcquire({ ...cfg, runId: 'r1', now: 1000 });
+    const r2 = await limiter.tryAcquire({ ...cfg, runId: 'r2', now: 1001 });
+    expect(r2.allowed).toBe(true);
+    expect(r2.decision).toBe('interrupt');
+    // The trigger cap of 1 forces r1's interrupt while the total (cap 5) has room.
+    expect(r2.interruptRunIds).toEqual(['r1']);
+    expect(r2.triggerActive).toBe(1);
+    expect(r2.totalActive).toBe(1);
+  });
+
+  it('interrupt reports only live runs as targets — a zombie is pruned, not "interrupted"', async () => {
+    const { limiter } = makeLimiter();
+    const cfg = { automationId: AUTO, concurrency: { mode: 'interrupt' as const, max: 1 } };
+    const T = 5_000_000;
+    await limiter.tryAcquire({ ...cfg, runId: 'zombie', now: T }); // holds the only slot
+
+    // Past the stale window with no heartbeat: the same atomic acquire prunes the
+    // zombie first, so the new run is admitted WITHOUT interrupting anything. This
+    // is the acquire being the single source of truth (no pre-eval read race).
+    const fresh = await limiter.tryAcquire({ ...cfg, runId: 'r2', now: T + STALE + 1 });
+    expect(fresh.allowed).toBe(true);
+    expect(fresh.decision).toBe('interrupt');
+    expect(fresh.interruptRunIds).toEqual([]); // zombie was pruned, not interrupted
+    expect(fresh.totalActive).toBe(1);
   });
 });
 
