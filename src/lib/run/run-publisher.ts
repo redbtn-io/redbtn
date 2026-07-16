@@ -54,6 +54,7 @@ import {
 import type { RedLog } from '@redbtn/redlog';
 import { ConversationPublisher, createConversationPublisher } from '../conversation';
 import { assertChatComponentSpec } from '../chat-components/spec-schema';
+import { heartbeatAutomationSlot, releaseAutomationSlot } from './automation-concurrency';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -151,6 +152,15 @@ export interface RunPublisherOptions {
   stateTtl?: number;
   /** RedLog instance for structured logging */
   log?: RedLog;
+  /**
+   * Automation concurrency slot this run occupies. Set by the trigger path
+   * (webhook receiver / cron scheduler) after it atomically claimed a slot via
+   * `tryAcquireAutomationSlot`. When present, RunPublisher refreshes the slot's
+   * heartbeat on every progress event and releases it on run terminal — so the
+   * slot ages out on crash and frees promptly on clean completion. Omit for
+   * non-automation runs (chat, subgraph).
+   */
+  concurrencySlot?: { automationId: string; triggerId?: string };
 }
 
 /**
@@ -180,6 +190,12 @@ export class RunPublisher {
   private readonly generationsCollection?: GenerationsCollection;
   private readonly stateTtl: number;
   private readonly redlog?: RedLog;
+  /** Automation concurrency slot descriptor (automationId + triggerId). */
+  private readonly concurrencySlot?: { automationId: string; triggerId?: string };
+  /** Guards releaseConcurrencySlot so terminal-path double-calls stay a no-op. */
+  private concurrencySlotReleased = false;
+  /** Last time the concurrency slot heartbeat was refreshed (throttle guard). */
+  private lastConcurrencyHeartbeatMs = 0;
   private state: RunState | null = null;
   private initialized = false;
   /** ConversationPublisher for forwarding events to the chat UI */
@@ -220,6 +236,50 @@ export class RunPublisher {
     this.generationsCollection = options.generationsCollection;
     this.stateTtl = options.stateTtl ?? RunConfig.STATE_TTL_SECONDS;
     this.redlog = options.log;
+    this.concurrencySlot = options.concurrencySlot;
+  }
+
+  /**
+   * Refresh the automation concurrency slot heartbeat. Best-effort — a
+   * concurrency-store hiccup must never fail the run. No-op when this run does
+   * not occupy a slot (chat / subgraph) or the slot was already released.
+   */
+  private async heartbeatConcurrencySlot(): Promise<void> {
+    if (!this.concurrencySlot || this.concurrencySlotReleased) return;
+    // Throttle: the stale window is 30 min, so refreshing every ~15s keeps the
+    // slot comfortably alive without hammering Redis on every streamed chunk.
+    const now = Date.now();
+    if (now - this.lastConcurrencyHeartbeatMs < RunConfig.AUTOMATION_RUN_HEARTBEAT_THROTTLE_MS) return;
+    this.lastConcurrencyHeartbeatMs = now;
+    try {
+      await heartbeatAutomationSlot(this.redis, {
+        automationId: this.concurrencySlot.automationId,
+        triggerId: this.concurrencySlot.triggerId,
+        runId: this.runId,
+      });
+    } catch (err) {
+      console.warn(`[RunPublisher] concurrency heartbeat failed for ${this.runId}:`, err);
+    }
+  }
+
+  /**
+   * Release the automation concurrency slot. Best-effort + idempotent — called
+   * from every terminal path (complete / fail / interrupt). The stale-window
+   * prune is the real backstop if this never lands (crash), but releasing on
+   * clean terminal frees the slot immediately.
+   */
+  private async releaseConcurrencySlot(): Promise<void> {
+    if (!this.concurrencySlot || this.concurrencySlotReleased) return;
+    this.concurrencySlotReleased = true;
+    try {
+      await releaseAutomationSlot(this.redis, {
+        automationId: this.concurrencySlot.automationId,
+        triggerId: this.concurrencySlot.triggerId,
+        runId: this.runId,
+      });
+    } catch (err) {
+      console.warn(`[RunPublisher] concurrency release failed for ${this.runId}:`, err);
+    }
   }
 
   get id(): string {
@@ -439,6 +499,9 @@ export class RunPublisher {
     // keeps Redis tidy and reclaims the space immediately.
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
+    // Free this run's automation concurrency slot immediately (best-effort;
+    // the stale-window prune is the backstop if the process dies first).
+    await this.releaseConcurrencySlot();
     // Presence: run done → clear the Working indicator.
     if (this.convPublisher) {
       await this.convPublisher.publishPresence(this.runId, 'idle', {
@@ -580,6 +643,9 @@ export class RunPublisher {
     }
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
+    // Free this run's automation concurrency slot immediately (best-effort;
+    // the stale-window prune is the backstop if the process dies first).
+    await this.releaseConcurrencySlot();
     // Presence: run errored → clear the Working indicator.
     if (this.convPublisher) {
       await this.convPublisher.publishPresence(this.runId, 'idle', {
@@ -664,6 +730,9 @@ export class RunPublisher {
     }
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
+    // Free this run's automation concurrency slot immediately (best-effort;
+    // the stale-window prune is the backstop if the process dies first).
+    await this.releaseConcurrencySlot();
     // Presence: run interrupted → clear the Working indicator.
     if (this.convPublisher) {
       await this.convPublisher.publishPresence(this.runId, 'idle', {
@@ -1364,6 +1433,10 @@ export class RunPublisher {
       if (this.state && heartbeat.redisUpdated) {
         this.state.lastProgressAt = heartbeat.lastProgressAt;
       }
+      // Keep this run's automation concurrency slot alive. A live run must never
+      // age out of its cap slot; only a crashed/zombie run (which stops emitting
+      // progress) does. No-op for non-automation runs.
+      await this.heartbeatConcurrencySlot();
     }
     // Fire-and-forget archive job — non-blocking, non-fatal
     this._enqueueArchive(event).catch(() => {});

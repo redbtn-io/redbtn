@@ -50,6 +50,59 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
 const ALLOWED_STATUSES = ['active', 'paused', 'disabled', 'error'] as const;
 type AllowedStatus = (typeof ALLOWED_STATUSES)[number];
 
+const CONCURRENCY_MODES = ['allow', 'skip', 'queue', 'interrupt'] as const;
+
+/**
+ * Concurrency schema fragment. Accepts EITHER the legacy bare-mode string OR the
+ * numeric object `{ mode, max }` (TOTAL scope, or a per-trigger override).
+ *   - mode: allow (unlimited) | skip (drop at cap) | queue (defer at cap) | interrupt
+ *   - max:  positive integer cap. Ignored for mode 'allow'. Omit with skip/queue
+ *           for the legacy cap of 1.
+ */
+const CONCURRENCY_SCHEMA = {
+  anyOf: [
+    { type: 'string', enum: [...CONCURRENCY_MODES] },
+    {
+      type: 'object',
+      properties: {
+        mode: { type: 'string', enum: [...CONCURRENCY_MODES] },
+        max: { type: 'integer', minimum: 1 },
+      },
+      additionalProperties: false,
+    },
+  ],
+  description:
+    'Concurrency cap. String mode (allow|skip|queue|interrupt) OR object { mode, max } where max is a positive integer. TOTAL scope on the automation; per-trigger override on triggers[].concurrency. Enforced atomically at trigger time.',
+} as const;
+
+/**
+ * Validate a raw concurrency value (string mode or { mode, max } object).
+ * Returns an error string or null. Mirrors normalizeAutomationConcurrency's
+ * accepted shapes without pulling the Redis-backed limiter into the tool.
+ */
+function validateConcurrency(value: unknown, label: string): string | null {
+  if (value == null) return null;
+  if (typeof value === 'string') {
+    return (CONCURRENCY_MODES as readonly string[]).includes(value)
+      ? null
+      : `${label} must be one of ${CONCURRENCY_MODES.join(', ')} (or a { mode, max } object)`;
+  }
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    if (obj.mode !== undefined && !(CONCURRENCY_MODES as readonly string[]).includes(obj.mode as string)) {
+      return `${label}.mode must be one of ${CONCURRENCY_MODES.join(', ')}`;
+    }
+    if (obj.max !== undefined) {
+      const n = obj.max;
+      if (typeof n !== 'number' || !Number.isFinite(n) || Math.floor(n) < 1) {
+        return `${label}.max must be a positive integer`;
+      }
+    }
+    return null;
+  }
+  return `${label} must be a mode string or a { mode, max } object`;
+}
+
 const updateAutomationTool: NativeToolDefinition = {
   description:
     "Surgically update an existing automation's configuration (name, description, tags, triggers, defaultInput, inputMapping, configOverrides, concurrency, scheduleMode, status). Owner-only. Pass `status: 'paused'` to pause or `status: 'active'` to resume — this is the single canonical knob for pause/resume.",
@@ -72,7 +125,7 @@ const updateAutomationTool: NativeToolDefinition = {
             id: { type: 'string' },
             type: { type: 'string', enum: ['webhook', 'schedule', 'manual', 'event'] },
             config: { type: 'object', additionalProperties: true },
-            concurrency: { type: 'string', enum: ['allow', 'skip', 'queue', 'interrupt'] },
+            concurrency: CONCURRENCY_SCHEMA,
           },
           required: ['type'],
         },
@@ -80,7 +133,7 @@ const updateAutomationTool: NativeToolDefinition = {
       defaultInput: { type: 'object', additionalProperties: true },
       inputMapping: { type: 'object', additionalProperties: true },
       configOverrides: { type: 'object', additionalProperties: true },
-      concurrency: { type: 'string', enum: ['allow', 'skip', 'queue', 'interrupt'] },
+      concurrency: CONCURRENCY_SCHEMA,
       scheduleMode: { type: 'string', enum: ['cron', 'interval'] },
       status: {
         type: 'string',
@@ -106,6 +159,32 @@ const updateAutomationTool: NativeToolDefinition = {
     const forbidden = ['userId', 'graphId', 'createdAt', 'updatedAt'];
     for (const key of forbidden) {
       if (key in patch) delete patch[key];
+    }
+
+    // Validate concurrency shape early (total + per-trigger override) for a
+    // clearer error than the webapp's generic 400.
+    if ('concurrency' in patch) {
+      const err = validateConcurrency(patch.concurrency, 'concurrency');
+      if (err) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: err, code: 'VALIDATION' }) }],
+          isError: true,
+        };
+      }
+    }
+    if (Array.isArray(patch.triggers)) {
+      for (let i = 0; i < patch.triggers.length; i++) {
+        const t = patch.triggers[i];
+        if (t && typeof t === 'object' && 'concurrency' in t) {
+          const err = validateConcurrency(t.concurrency, `triggers[${i}].concurrency`);
+          if (err) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({ error: err, code: 'VALIDATION' }) }],
+              isError: true,
+            };
+          }
+        }
+      }
     }
 
     // Canonical-status compatibility shim for the deprecation window.

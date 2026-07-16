@@ -659,6 +659,31 @@ export const RunKeys = {
    * lifetime (TTL matches run state TTL).
    */
   componentEventsInbox: (runId: string) => `run:component-events:${runId}`,
+  /**
+   * Automation concurrency — TOTAL scope: `automation:concurrency:{automationId}:total`.
+   *
+   * Sorted set of in-flight run ids for an automation across ALL of its
+   * triggers, scored by each run's lastProgressAt heartbeat (epoch ms). Zombie
+   * runs (no heartbeat within AUTOMATION_CONCURRENCY_STALE_MS) are pruned before
+   * every count, so a crashed engine never permanently holds a cap slot — this
+   * is also what stops dead runs from showing as phantom "Active Runs" forever.
+   *
+   * The `{automationId}` hash tag keeps the total + per-trigger keys in the same
+   * Redis Cluster slot so a single Lua script can mutate both atomically. On the
+   * standalone (non-cluster) engine Redis the tag is inert but harmless.
+   */
+  automationConcurrencyTotal: (automationId: string) =>
+    `automation:concurrency:{${automationId}}:total`,
+  /**
+   * Automation concurrency — PER-TRIGGER scope:
+   * `automation:concurrency:{automationId}:trigger:{triggerId}`.
+   *
+   * Sorted set of in-flight run ids for one (automationId, triggerId) pair,
+   * scored by lastProgressAt (epoch ms). Shares the `{automationId}` hash tag
+   * with the total key (see above) so both can be updated in one atomic script.
+   */
+  automationConcurrencyTrigger: (automationId: string, triggerId: string) =>
+    `automation:concurrency:{${automationId}}:trigger:${triggerId}`,
 } as const;
 
 // =============================================================================
@@ -692,6 +717,22 @@ export const RunConfig = {
   LOCK_TTL_SECONDS: 60 * 5,
   /** Lock renewal interval (every 30 seconds while running) */
   LOCK_RENEWAL_INTERVAL_MS: 30000,
+  /**
+   * Stale window for automation concurrency slots (30 minutes).
+   *
+   * A run holding a concurrency slot must refresh its heartbeat within this
+   * window or it is treated as dead and its slot is reclaimed. Kept equal to
+   * RUN_PROGRESS_STALE_MS so the concurrency view and the liveness view agree
+   * on what "alive" means — a run that is actively making progress keeps its
+   * slot indefinitely; only a crashed / zombie run ages out.
+   */
+  AUTOMATION_CONCURRENCY_STALE_MS: 30 * 60 * 1000,
+  /**
+   * TTL (seconds) refreshed on the concurrency sorted-set keys on every acquire
+   * and heartbeat. A backstop so the keys disappear on their own once every
+   * member has aged out; comfortably larger than the stale window.
+   */
+  AUTOMATION_CONCURRENCY_KEY_TTL_SECONDS: 60 * 60,
 } as const;
 
 // =============================================================================

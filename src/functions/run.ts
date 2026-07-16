@@ -135,6 +135,14 @@ export interface RunOptions {
    */
   automationRunId?: string;
   /**
+   * Automation concurrency slot this run occupies. Set by the trigger path
+   * (webhook receiver / cron scheduler) AFTER it atomically claimed a slot via
+   * `tryAcquireAutomationSlot`. Threaded to RunPublisher so the slot heartbeats
+   * while the run makes progress and is released on terminal. Absent for
+   * non-automation runs.
+   */
+  concurrencySlot?: { automationId: string; triggerId?: string };
+  /**
    * Pre-allocated id for the assistant message this run will produce on the
    * conversation. Threaded through to RunPublisher.init so dispatch responses
    * and downstream SSE events share the same messageId.
@@ -1417,6 +1425,7 @@ export async function run(
     automationRunsCollection,
     generationId: runId,
     generationsCollection,
+    concurrencySlot: options.concurrencySlot,
   });
 
   // W-3: extract triggerType from the already-enriched input so that publisher.init()

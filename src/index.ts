@@ -151,6 +151,29 @@ export type {
 } from "./lib/run";
 export { LEGACY_TRIGGER_MAP, toTriggerType, enrichInput } from "./lib/run";
 
+// Automation concurrency limiter (atomic, zombie-aware cap enforcement).
+export {
+  AutomationConcurrencyLimiter,
+  AUTOMATION_CONCURRENCY_MODES,
+  DEFAULT_TRIGGER_ID,
+  normalizeAutomationConcurrency,
+  resolveEffectiveConcurrency,
+  effectiveCap,
+  tryAcquireAutomationSlot,
+  heartbeatAutomationSlot,
+  releaseAutomationSlot,
+} from "./lib/run";
+export type {
+  AutomationConcurrencyMode,
+  AutomationConcurrencyConfig,
+  AutomationTriggerConcurrency,
+  RawAutomationConcurrency,
+  ResolvedConcurrency,
+  AutomationConcurrencySlot,
+  AdmissionDecision,
+  TryAcquireOptions,
+} from "./lib/run";
+
 // Export TTS / Voice utilities
 export { TtsChunker, findBreakPoint, synthesize, isTtsAvailable, AudioStreamPipeline } from './lib/tts';
 export { transcribe, isSttAvailable, VoiceClient } from './lib/tts';
