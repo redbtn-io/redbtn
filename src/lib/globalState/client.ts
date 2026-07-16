@@ -121,7 +121,19 @@ export class GlobalStateClient {
 let defaultClient: GlobalStateClient | null = null;
 
 export function getGlobalStateClient(options?: Record<string, any>): GlobalStateClient {
-  if (!defaultClient || options) defaultClient = new GlobalStateClient(options);
+  // TENANT ISOLATION: an identity-bearing client (userId / authToken /
+  // internalKey) must NEVER be stashed in the process-wide `defaultClient`
+  // singleton. A worker process serves concurrent runs for different users;
+  // if caller A's client is cached here, the next NO-OPTIONS caller
+  // (templateRenderer's `{{globalState.*}}` lookups, `getGlobalValue` /
+  // `setGlobalValue`) reuses A's identity AND A's non-user-keyed value cache
+  // → cross-tenant read/write of persistent global state.
+  //
+  // So: when explicit options are supplied, always return a fresh,
+  // caller-owned client (captured locally by the caller before any await).
+  // Only the ambient, identity-less client is memoised.
+  if (options) return new GlobalStateClient(options);
+  if (!defaultClient) defaultClient = new GlobalStateClient();
   return defaultClient;
 }
 

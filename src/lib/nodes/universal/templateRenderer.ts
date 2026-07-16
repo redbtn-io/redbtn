@@ -32,8 +32,23 @@
 
 import { getGlobalStateClient } from '../../globalState';
 
-function getTemplateGlobalStateClient() {
-    return getGlobalStateClient();
+/**
+ * Build a GlobalStateClient scoped to the current run's user.
+ *
+ * TENANT ISOLATION: resolving `{{globalState.ns.key}}` must run under the
+ * user who owns THIS run — never a process-wide singleton that another
+ * concurrent run may have left behind. We derive the identity from `state`
+ * (the same fields transformExecutor uses) and pass explicit options, which
+ * `getGlobalStateClient` now honours by returning a fresh, per-call client
+ * instead of the shared ambient one. Passing options is required: without an
+ * identity the lookup would silently fall through to the internal-key path
+ * and lose per-user scoping.
+ */
+function getTemplateGlobalStateClient(state?: any) {
+    return getGlobalStateClient({
+        userId: state?.data?.userId ?? state?.userId,
+        workflowId: state?.data?.graphId ?? state?.graphId,
+    });
 }
 
 /**
@@ -326,8 +341,9 @@ export async function renderTemplateAsync(template: string, state: any): Promise
     if (globalStateMatches.length === 0) {
         return result;
     }
-    // Fetch all values in parallel
-    const client = getTemplateGlobalStateClient();
+    // Fetch all values in parallel — scoped to this run's user (see
+    // getTemplateGlobalStateClient).
+    const client = getTemplateGlobalStateClient(state);
     const replacements = await Promise.all(globalStateMatches.map(async (match) => {
         const fullMatch = match[0];
         const path = match[1];
@@ -382,14 +398,17 @@ export async function renderParametersAsync(parameters: Record<string, any>, sta
  * This optimizes performance by batching requests.
  *
  * @param template - Template string to analyze
+ * @param state - Run state, used to scope the prefetch to this run's user
+ *                (see getTemplateGlobalStateClient). Optional for backwards
+ *                compatibility; omit only when no user context exists.
  */
-export async function prefetchGlobalStateForTemplate(template: string): Promise<void> {
+export async function prefetchGlobalStateForTemplate(template: string, state?: any): Promise<void> {
     const matches = template.matchAll(/\{\{globalState\.(\w+)\.\w+(?:\.\w+)*\}\}/g);
     const namespaces = new Set<string>();
     for (const match of matches) {
         namespaces.add(match[1]);
     }
     if (namespaces.size === 0) return;
-    const client = getTemplateGlobalStateClient();
+    const client = getTemplateGlobalStateClient(state);
     await Promise.all(Array.from(namespaces).map(ns => client.prefetch(ns)));
 }

@@ -219,10 +219,22 @@ const invokeGraphTool: NativeToolDefinition = {
         ? Math.min(MAX_TIMEOUT_MS, Math.max(1000, Math.floor(Number(args.timeoutMs))))
         : DEFAULT_TIMEOUT_MS;
 
-    // ── 2. Resolve caller userId from graph state ────────────────────────────
+    // ── 2. Resolve caller userId from trusted run context ────────────────
+    // Resolve the run-level publisher ONCE, up front, so the trusted identity
+    // is available to the access check below AND reused when building the
+    // Red-shaped duck object in step 5 (avoids a use-before-declaration).
+    const publisher = context?.publisher as AnyObject | null;
+    // We intentionally use the run-level publisher identity (non-mutable across
+    // graph state updates) and fall back to `state.options.userId` only as a
+    // compatibility path for non-run callers.
+    const publisherUserId = publisher?.user;
     const callerUserId =
-      (context?.state?.userId as string | undefined) ||
-      (context?.state?.data?.userId as string | undefined) ||
+      (typeof publisherUserId === 'string' && publisherUserId.length > 0
+        ? publisherUserId
+        : (context?.state?.options?.userId as string | undefined) ||
+            (context?.state?.data?.options?.userId as string | undefined) ||
+            (context?.state?.userId as string | undefined) ||
+            (context?.state?.data?.userId as string | undefined)) ||
       null;
 
     if (!callerUserId) {
@@ -318,7 +330,7 @@ const invokeGraphTool: NativeToolDefinition = {
     }
 
     // ── 5. Build a Red-shaped duck object from the parent's state ────────────
-    const publisher = context?.publisher as AnyObject | null;
+    // `publisher` was resolved once in step 2 — reuse it here.
     const redShape = buildRedShape(context?.state || {}, publisher);
     if (!redShape) {
       return {
