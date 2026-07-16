@@ -50,6 +50,31 @@
  * left to the in-process watchdog; only a run with NO owning process is reaped
  * on the fast RUN_ORPHAN_STALE_MS threshold.
  *
+ * # Correctness: ownership-safe cleanup (never clobber a fresh acquirer)
+ *
+ * Deciding to reap and actually cleaning the run's Redis records are two steps,
+ * and a replacement run can win the SAME conversation in the window between
+ * them: it acquires the conversation lock (the orphan's had expired) and
+ * repoints `run:conversation:{id}` at itself. A naive delete of the pointer /
+ * lock at reap time would then wipe the LIVE run's records — freeing its mutex
+ * so a third run could execute the conversation concurrently. So the shared,
+ * conversation-scoped keys are cleaned ownership-safely:
+ *
+ *   - `run:conversation:{id}` stores the OWNING runId, so it is removed with an
+ *     atomic compare-and-delete (Lua): delete ONLY while it still names the run
+ *     being reaped. A fresh acquirer has already overwritten it with its own
+ *     runId, so the CAS no-ops and its pointer survives.
+ *   - `run:lock:{id}` stores a per-acquisition TOKEN, not a runId, so the reaper
+ *     cannot prove ownership of it. It is NEVER blind-deleted: a reaped orphan
+ *     provably holds no live lock (it is only reaped once its lock is absent, or
+ *     its run-state — with a longer TTL than the lock — is already gone), so any
+ *     lock present at cleanup time belongs to the fresh acquirer. The rightful
+ *     owner releases its lock via RunLock (token CAS) or it TTL-expires.
+ *
+ * The runId-keyed scratch keys (`run:{id}`, `run:shared:{id}`,
+ * `run:autostate:{id}`) are exclusively the orphan's — a fresh run has a
+ * different runId — so they are cleaned unconditionally without risk.
+ *
  * @module lib/run/orphan-reaper
  */
 import type { Redis } from 'ioredis';
@@ -84,7 +109,7 @@ export interface ReaperDb {
 export type ReaperDbProvider = () => Promise<ReaperDb | null>;
 
 /** Redis surface the reaper needs. A subset of ioredis, easy to fake in tests. */
-export type ReaperRedis = Pick<Redis, 'get' | 'set' | 'del' | 'exists' | 'scan'>;
+export type ReaperRedis = Pick<Redis, 'get' | 'set' | 'del' | 'exists' | 'scan' | 'eval'>;
 
 // ---------------------------------------------------------------------------
 // Durable run-status stores swept by the reaper.
@@ -239,6 +264,53 @@ export async function hasOwningLock(redis: ReaperRedis, lockKey: string): Promis
 }
 
 // ---------------------------------------------------------------------------
+// Ownership-safe conversation-pointer cleanup
+// ---------------------------------------------------------------------------
+
+/**
+ * Compare-and-delete the conversation-run pointer: DEL `run:conversation:{id}`
+ * only while it still holds `runId`. Mirrors RunLock's token-checked release so
+ * the two-step "decide to reap → clean up" can never wipe a fresh acquirer's
+ * pointer (it has already overwritten the key with its own runId, so the GET
+ * mismatches and the DEL is skipped).
+ */
+const RELEASE_CONVERSATION_POINTER_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
+
+/**
+ * Atomically clear the conversation-run pointer iff it still names `runId`.
+ * Returns true when this run's pointer was the one removed. Fails SAFE: on a
+ * Redis error it reports false (nothing removed) rather than falling back to a
+ * blind delete that could clobber a live run.
+ */
+export async function releaseConversationPointerIfOwner(
+  redis: ReaperRedis,
+  conversationId: string,
+  runId: string,
+): Promise<boolean> {
+  try {
+    const res = await redis.eval(
+      RELEASE_CONVERSATION_POINTER_SCRIPT,
+      1,
+      RunKeys.conversationRun(conversationId),
+      runId,
+    );
+    return res === 1;
+  } catch (err) {
+    console.warn(
+      `[orphan-reaper] conversation-pointer CAS-delete failed for ${conversationId} (run ${runId}):`,
+      err,
+    );
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Terminal marking
 // ---------------------------------------------------------------------------
 
@@ -333,14 +405,26 @@ export async function markRunTerminal(options: MarkRunTerminalOptions): Promise<
       options.conversationId ??
       (typeof existing?.conversationId === 'string' ? existing.conversationId : undefined);
 
-    const keysToDelete = [RunKeys.shared(runId), RunKeys.autoState(runId)];
+    // runId-keyed scratch state is exclusively THIS run's (a fresh run has a
+    // different runId), so it is always safe to delete unconditionally.
+    const ownKeys = [...new Set([RunKeys.shared(runId), RunKeys.autoState(runId)])];
+    if (ownKeys.length > 0) await redis.del(...ownKeys);
+
+    // Conversation-scoped keys may have been taken over by a DIFFERENT, live run
+    // in the window between the reaper's liveness check and here (a fresh
+    // acquirer wins the lock the orphan no longer holds and repoints the
+    // conversation at itself). Clean them ownership-safely:
+    //   * conversationRun pointer stores the OWNING runId → compare-and-delete,
+    //     so a fresh acquirer's pointer (now naming a different run) is spared.
+    //   * the execution lock stores a per-acquisition TOKEN, not a runId, so we
+    //     cannot prove ownership here. A reaped orphan provably holds no live
+    //     lock (only reaped once its lock is absent / its run-state is gone), so
+    //     any lock present now belongs to the fresh acquirer — NEVER blind-delete
+    //     it. Its rightful owner releases it via RunLock (token CAS) or it
+    //     TTL-expires (LOCK_TTL_SECONDS).
     if (conversationId) {
-      keysToDelete.push(RunKeys.conversationRun(conversationId));
-      keysToDelete.push(RunKeys.lock(conversationId));
-      if (options.agentId) keysToDelete.push(RunKeys.lock(conversationId, options.agentId));
+      await releaseConversationPointerIfOwner(redis, conversationId, runId);
     }
-    const unique = [...new Set(keysToDelete)];
-    if (unique.length > 0) await redis.del(...unique);
     redisCleaned = true;
   } catch (err) {
     console.warn(`[orphan-reaper] Failed to clean Redis run records for ${runId}:`, err);

@@ -5,6 +5,7 @@ import {
   hasOwningLock,
   buildTerminalSet,
   markRunTerminal,
+  releaseConversationPointerIfOwner,
   reapOrphanedRuns,
   markInFlightRunsInterrupted,
   getOrphanStaleThresholdMs,
@@ -52,6 +53,15 @@ function makeRedis(seed: Record<string, unknown> = {}): FakeRedis {
       const re = globToRegExp(pattern);
       const matched = [...store.keys()].filter((k) => re.test(k));
       return ['0', matched] as [string, string[]];
+    }),
+    // Minimal Lua interpreter for the reaper's compare-and-delete pointer script:
+    // `if get(KEYS[1]) == ARGV[1] then del(KEYS[1]) else 0`.
+    eval: vi.fn(async (_script: string, _numKeys: number, key: string, arg: string) => {
+      if (store.get(key) === arg) {
+        store.delete(key);
+        return 1;
+      }
+      return 0;
     }),
   } as unknown as FakeRedis;
 }
@@ -265,7 +275,7 @@ describe('buildTerminalSet', () => {
 // ---------------------------------------------------------------------------
 
 describe('markRunTerminal', () => {
-  it('flips durable stores with a status guard and cleans Redis run + lock keys', async () => {
+  it('flips durable stores with a status guard and cleans Redis run keys (CAS pointer, lock preserved)', async () => {
     const state = createInitialRunState({
       runId: 'run-x',
       userId: 'u',
@@ -298,16 +308,20 @@ describe('markRunTerminal', () => {
       runId: 'run-x',
       status: { $in: ['pending', 'queued', 'running'] },
     });
-    // Redis: run-state rewritten terminal, ancillary + lock keys deleted
+    // Redis: run-state rewritten terminal, runId-keyed scratch deleted.
     const terminal = JSON.parse(redis.store.get(RunKeys.state('run-x'))!);
     expect(terminal.status).toBe('interrupted');
     expect(redis.store.has(RunKeys.shared('run-x'))).toBe(false);
     expect(redis.store.has(RunKeys.autoState('run-x'))).toBe(false);
+    // conversationRun pointer still names this run → compare-and-deleted.
     expect(redis.store.has(RunKeys.conversationRun('conv-x'))).toBe(false);
-    expect(redis.store.has(RunKeys.lock('conv-x'))).toBe(false);
+    // The execution lock carries a per-acquisition token, not a runId, so the
+    // reaper NEVER blind-deletes it (ownership-safe — see the TOCTOU regression
+    // test below). It is left to its token-owner / TTL.
+    expect(redis.store.get(RunKeys.lock('conv-x'))).toBe('token');
   });
 
-  it('reads conversationId from run-state when not supplied', async () => {
+  it('reads conversationId from run-state when not supplied (CAS-clears the pointer)', async () => {
     const state = createInitialRunState({
       runId: 'run-y',
       userId: 'u',
@@ -318,12 +332,65 @@ describe('markRunTerminal', () => {
     });
     const redis = makeRedis({
       [RunKeys.state('run-y')]: state,
-      [RunKeys.lock('conv-y')]: 'token',
+      [RunKeys.conversationRun('conv-y')]: 'run-y',
     });
     const db = makeDb({ runEvents: [{ runId: 'run-y', status: 'running' }] });
 
+    // No conversationId passed — it must be derived from the run-state to build
+    // the pointer key, then compare-and-deleted because it still names run-y.
     await markRunTerminal({ redis, db, runId: 'run-y', reason: 'orphan', now: NOW });
-    expect(redis.store.has(RunKeys.lock('conv-y'))).toBe(false);
+    expect(redis.store.has(RunKeys.conversationRun('conv-y'))).toBe(false);
+  });
+
+  it('leaves a conversation pointer that a fresh run already re-owns (CAS mismatch)', async () => {
+    const state = createInitialRunState({
+      runId: 'orphan-z',
+      userId: 'u',
+      graphId: 'g',
+      graphName: 'G',
+      input: {},
+      conversationId: 'conv-z',
+    });
+    const redis = makeRedis({
+      [RunKeys.state('orphan-z')]: state,
+      // The pointer has ALREADY been taken over by a fresh run (fresh-z).
+      [RunKeys.conversationRun('conv-z')]: 'fresh-z',
+      [RunKeys.lock('conv-z')]: 'fresh-token',
+    });
+    const db = makeDb({ runEvents: [{ runId: 'orphan-z', status: 'running' }] });
+
+    await markRunTerminal({ redis, db, runId: 'orphan-z', reason: 'orphan', now: NOW });
+
+    // Reaping the orphan must NOT touch the fresh run's pointer or lock.
+    expect(redis.store.get(RunKeys.conversationRun('conv-z'))).toBe('fresh-z');
+    expect(redis.store.get(RunKeys.lock('conv-z'))).toBe('fresh-token');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// releaseConversationPointerIfOwner (atomic compare-and-delete)
+// ---------------------------------------------------------------------------
+
+describe('releaseConversationPointerIfOwner', () => {
+  it('deletes the pointer only while it still names the run', async () => {
+    const redis = makeRedis({ [RunKeys.conversationRun('c')]: 'run-a' });
+    expect(await releaseConversationPointerIfOwner(redis, 'c', 'run-a')).toBe(true);
+    expect(redis.store.has(RunKeys.conversationRun('c'))).toBe(false);
+  });
+
+  it('no-ops (does not delete) when a different run owns the pointer', async () => {
+    const redis = makeRedis({ [RunKeys.conversationRun('c')]: 'run-b' });
+    expect(await releaseConversationPointerIfOwner(redis, 'c', 'run-a')).toBe(false);
+    expect(redis.store.get(RunKeys.conversationRun('c'))).toBe('run-b');
+  });
+
+  it('fails SAFE (reports false, deletes nothing) when Redis eval errors', async () => {
+    const redis = makeRedis({ [RunKeys.conversationRun('c')]: 'run-a' });
+    (redis.eval as any) = vi.fn(async () => {
+      throw new Error('redis down');
+    });
+    expect(await releaseConversationPointerIfOwner(redis, 'c', 'run-a')).toBe(false);
+    expect(redis.store.get(RunKeys.conversationRun('c'))).toBe('run-a');
   });
 });
 
@@ -428,6 +495,72 @@ describe('reapOrphanedRuns', () => {
     // both collections still flipped by markRunTerminal
     expect(db.state.runEvents.docs[0].status).toBe('interrupted');
     expect(db.state.automationruns.docs[0].status).toBe('interrupted');
+  });
+
+  // ------------------------------------------------------------------------
+  // TOCTOU regression: a fresh run wins the SAME conversation in the window
+  // between the reaper deciding to reap and the reaper cleaning up. The stale
+  // reaper pass must NOT wipe the live run's lock/pointer (which would free the
+  // conversation mutex and let a third run execute concurrently). Reproduces the
+  // PR #276 review block; fails against the pre-fix blind-delete cleanup.
+  // ------------------------------------------------------------------------
+  it('does not clobber a fresh acquirer that wins the conversation between the check and the cleanup', async () => {
+    const conv = 'conv-race';
+    const orphanId = 'orphan-old';
+    const freshId = 'fresh-new';
+    const freshToken = '1752-fresh-token';
+
+    // Orphan: durable running with an old startedAt (passes the age gate), a
+    // Redis run-state whose heartbeat is stale, NO lock (its lock expired), and
+    // a lingering conversation pointer still naming itself (the engine crashed
+    // before clearing it) — a genuine, reapable engine-restart orphan.
+    const orphanState = createInitialRunState({
+      runId: orphanId,
+      userId: 'u',
+      graphId: 'g',
+      graphName: 'G',
+      input: {},
+      conversationId: conv,
+    });
+    orphanState.lastProgressAt = iso(-STALE_MS - 10_000);
+    const redis = makeRedis({
+      [RunKeys.state(orphanId)]: orphanState,
+      [RunKeys.conversationRun(conv)]: orphanId,
+      // NO lock key → the orphan holds no live lock and is reapable.
+    });
+    const db = makeDb({
+      runEvents: [{ runId: orphanId, status: 'running', startedAt: date(-3_600_000), conversationId: conv }],
+    });
+
+    // Interleave the race deterministically: right AFTER the reaper decides to
+    // reap (liveness read via get + hasOwningLock) and rewrites the orphan's
+    // terminal run-state (the first redis.set in markRunTerminal), a fresh run
+    // has ALREADY acquired the same conversation — it holds a live lock and has
+    // repointed the conversation at itself. The reaper's shared-key cleanup runs
+    // immediately after this set, so this models "fresh acquirer wins between the
+    // check and the delete." Implementation-agnostic (hooks a call both the
+    // buggy blind-delete and the fixed CAS cleanup make).
+    const realSet = redis.set as any;
+    let acquired = false;
+    (redis.set as any) = vi.fn(async (...args: any[]) => {
+      const out = await realSet(...args);
+      if (!acquired) {
+        acquired = true;
+        redis.store.set(RunKeys.lock(conv), freshToken); // fresh run's live lock
+        redis.store.set(RunKeys.conversationRun(conv), freshId); // fresh run repoints
+      }
+      return out;
+    });
+
+    const res = await reapOrphanedRuns({ redis, db, now: NOW, staleAfterMs: STALE_MS });
+
+    // The orphan's own durable record is still correctly reaped...
+    expect(res.reaped).toBe(1);
+    expect(db.state.runEvents.docs[0].status).toBe('interrupted');
+    // ...but the FRESH acquirer's live lock and pointer MUST survive the stale
+    // reaper pass. Pre-fix (blind del of pointer + lock) both were wiped here.
+    expect(redis.store.get(RunKeys.lock(conv))).toBe(freshToken);
+    expect(redis.store.get(RunKeys.conversationRun(conv))).toBe(freshId);
   });
 });
 
