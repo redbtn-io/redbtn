@@ -219,10 +219,18 @@ const invokeGraphTool: NativeToolDefinition = {
         ? Math.min(MAX_TIMEOUT_MS, Math.max(1000, Math.floor(Number(args.timeoutMs))))
         : DEFAULT_TIMEOUT_MS;
 
-    // ── 2. Resolve caller userId from graph state ────────────────────────────
+    // ── 2. Resolve caller userId from trusted run context ────────────────
+    // We intentionally use the run-level publisher identity (non-mutable across
+    // graph state updates) and fall back to `state.options.userId` only as a
+    // compatibility path for non-run callers.
+    const publisherUserId = (publisher as AnyObject | null)?.user;
     const callerUserId =
-      (context?.state?.userId as string | undefined) ||
-      (context?.state?.data?.userId as string | undefined) ||
+      (typeof publisherUserId === 'string' && publisherUserId.length > 0
+        ? publisherUserId
+        : (context?.state?.options?.userId as string | undefined) ||
+            (context?.state?.data?.options?.userId as string | undefined) ||
+            (context?.state?.userId as string | undefined) ||
+            (context?.state?.data?.userId as string | undefined)) ||
       null;
 
     if (!callerUserId) {
