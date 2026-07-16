@@ -25,6 +25,7 @@
  */
 
 import type { TriggeredRun, EnrichedInput, EnrichmentResult, Trigger } from './trigger-types';
+import type { RawAutomationConcurrency } from './automation-concurrency';
 
 // =============================================================================
 // Types for lazy-loaded DB dependencies
@@ -38,7 +39,12 @@ interface AutomationDoc {
   inputMapping?: Record<string, unknown>;
   configOverrides?: Record<string, unknown>;
   secretNames?: string[];
-  concurrency?: 'allow' | 'skip' | 'queue';
+  /**
+   * Concurrency config. Accepts the legacy bare-mode string ('allow' | 'skip' |
+   * 'queue' | 'interrupt') OR the numeric object form `{ mode, max }`. Normalise
+   * with `normalizeAutomationConcurrency` before use.
+   */
+  concurrency?: RawAutomationConcurrency;
   scheduleMode?: 'cron' | 'interval';
 }
 
