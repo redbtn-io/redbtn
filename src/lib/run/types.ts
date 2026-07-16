@@ -718,6 +718,27 @@ export const RunConfig = {
   /** Lock renewal interval (every 30 seconds while running) */
   LOCK_RENEWAL_INTERVAL_MS: 30000,
   /**
+   * FAST cross-process orphan threshold (2.5 minutes).
+   *
+   * DISTINCT from RUN_PROGRESS_STALE_MS (30 min). That window is for a
+   * live-but-idle run whose OWNING PROCESS is still alive (the in-process
+   * progress-idle watchdog handles those). This one is for an ORPHANED run:
+   * a run left `status:'running'` after its engine process died (crash /
+   * container recycle) with NO live process to reap it. Such a run has no
+   * fresh heartbeat AND no owning process (no run-state in Redis, or an
+   * expired conversation lock), so it is dead and reaped fast rather than
+   * lingering for 30 min (or forever). Overridable via env RUN_ORPHAN_STALE_MS.
+   */
+  RUN_ORPHAN_STALE_MS: 150 * 1000,
+  /**
+   * Interval (ms) between cross-process orphan sweeps (60 seconds). Runs in
+   * EVERY engine process independent of any single run's in-process watchdog,
+   * so an engine that dies without cleanup has its orphans reaped by a peer or
+   * successor within ~one interval + RUN_ORPHAN_STALE_MS. Overridable via env
+   * RUN_ORPHAN_SWEEP_INTERVAL_MS.
+   */
+  RUN_ORPHAN_SWEEP_INTERVAL_MS: 60 * 1000,
+  /**
    * Stale window for automation concurrency slots (30 minutes).
    *
    * A run holding a concurrency slot must refresh its heartbeat within this
