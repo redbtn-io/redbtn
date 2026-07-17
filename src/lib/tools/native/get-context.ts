@@ -11,6 +11,7 @@
 
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 import { MemoryManager } from '../../memory/memory';
+import { resolveCallerUserId, checkConversationAccess } from './_conversation-access';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -99,6 +100,32 @@ const getContext: NativeToolDefinition = {
     const startTime = Date.now();
 
     console.log(`[get_context] Building context for ${conversationId}, format=${format}`);
+
+    // ── Access check ──────────────────────────────────────────────────
+    // This tool reads directly from MemoryManager/user_conversations,
+    // bypassing the webapp API's ownership check that get_messages relies
+    // on. Without this, any caller supplying a guessed/known
+    // conversationId could read another user's conversation history and
+    // summaries.
+    const callerUserId = resolveCallerUserId(context);
+    if (!callerUserId) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'No userId available in graph state — cannot perform access check',
+          },
+        ],
+        isError: true,
+      };
+    }
+    const access = await checkConversationAccess(conversationId, callerUserId);
+    if (!access.ok) {
+      return {
+        content: [{ type: 'text', text: access.error || 'Forbidden' }],
+        isError: true,
+      };
+    }
 
     try {
       const mm = getMemoryManager();
