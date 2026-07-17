@@ -76,6 +76,36 @@ export {
 } from './run-lock';
 
 export {
+  OrphanReaper,
+  ORPHAN_REAPED_COLLECTIONS,
+  decideOrphan,
+  findOrphanedRuns,
+  hasRecoveryClaim,
+  reapOrphanedRuns,
+  markRunTerminal,
+  markInFlightRunsInterrupted,
+  readRunLiveness,
+  hasOwningLock,
+  buildTerminalSet,
+  getOrphanStaleThresholdMs,
+  getOrphanSweepIntervalMs,
+  type OrphanReaperDeps,
+  type OrphanDecision,
+  type OrphanRunInfo,
+  type FindOrphanedRunsResult,
+  type RunLivenessSnapshot,
+  type ReaperDb,
+  type ReaperRedis,
+  type ReaperDbProvider,
+  type InFlightRunEntry,
+  type ReapOrphanedRunsOptions,
+  type ReapOrphanedRunsResult,
+  type MarkRunTerminalOptions,
+  type MarkRunTerminalResult,
+  type OrphanReapedCollection,
+} from './orphan-reaper';
+
+export {
   type TriggerType,
   type TriggerSource,
   type TriggerMetadata,
