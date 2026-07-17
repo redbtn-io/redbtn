@@ -13,6 +13,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { enforceToolCapability, normalizeProfile } from '../../src/lib/permissions/enforce';
+import { isGuardedExecTool } from '../../src/lib/permissions/exec-guard';
 import { CapabilityDeniedError, type CapabilityProfile } from '../../src/lib/permissions/types';
 
 const ENV = 'env_ABC';
@@ -46,6 +47,18 @@ describe('exec/computer — FAIL-CLOSED when unprofiled', () => {
   it('DENIES ssh_shell / ssh_copy / read_file / desktop_exec with no profile', () => {
     for (const t of ['ssh_shell', 'ssh_copy', 'read_file', 'desktop_exec']) {
       expect(() => enforceToolCapability(null, t, { environmentId: ENV, command: 'x', path: '/x' }))
+        .toThrow(CapabilityDeniedError);
+    }
+  });
+  // Regression (capability-jail bypass): the environment fs-pack + async-exec
+  // tools MUTATE the remote filesystem (write_file/edit_file) or run arbitrary
+  // SSH commands (glob/grep_files/ssh_run_async) — strictly higher risk than the
+  // already-gated read-only read_file — yet were unmapped, so an UNPROFILED run
+  // (fail-closed) and a jailed run could both reach them ungated. They must be
+  // fail-closed exactly like ssh_shell/read_file.
+  it('DENIES fs-pack + async-exec env tools with no profile (fail-closed)', () => {
+    for (const t of ['write_file', 'edit_file', 'glob', 'grep_files', 'ssh_run_async', 'ssh_tail', 'ssh_kill', 'ssh_jobs']) {
+      expect(() => enforceToolCapability(null, t, { environmentId: ENV, command: 'x', path: '/x', jobId: 'j', pattern: '*' }))
         .toThrow(CapabilityDeniedError);
     }
   });
@@ -98,6 +111,22 @@ describe('exec — scoped grant', () => {
     expect(() => enforceToolCapability(execScoped, 'read_file', { environmentId: ENV, path: '/x' }))
       .not.toThrow();
   });
+  // The bypass this fix closes: a run jailed to ENV must NOT be able to WRITE a
+  // file or run an async command on a DIFFERENT env — and CAN on the granted one.
+  it('jails write_file / edit_file / ssh_run_async to the granted env only', () => {
+    for (const t of ['write_file', 'edit_file', 'glob', 'grep_files', 'ssh_run_async']) {
+      expect(() => enforceToolCapability(execScoped, t, { environmentId: OTHER, path: '/x', content: 'y', oldString: 'a', newString: 'b', command: 'rm -rf /', pattern: '*' }))
+        .toThrow(CapabilityDeniedError);
+      expect(() => enforceToolCapability(execScoped, t, { environmentId: ENV, path: '/x', content: 'y', oldString: 'a', newString: 'b', command: 'ls', pattern: '*' }))
+        .not.toThrow();
+    }
+  });
+  it('DENIES fs-pack write/exec under a data-only jail', () => {
+    for (const t of ['write_file', 'edit_file', 'ssh_run_async']) {
+      expect(() => enforceToolCapability(dataOnlyJail, t, { environmentId: ENV, path: '/x', content: 'y', command: 'ls' }))
+        .toThrow(CapabilityDeniedError);
+    }
+  });
 });
 
 describe('exec — unscoped (inline ssh_shell / no environmentId) requires wildcard', () => {
@@ -122,6 +151,18 @@ describe('computer — scoped grant', () => {
   it('a computer grant does NOT satisfy exec', () => {
     expect(() => enforceToolCapability(computerScoped, 'run_command', { environmentId: ENV, command: 'ls' }))
       .toThrow(CapabilityDeniedError);
+  });
+});
+
+describe('runtime exec-guard also covers the fs-pack + async-exec tools', () => {
+  // The kill switch / rate limit / fail-closed audit in exec-guard.ts key off the
+  // SAME tool-map (isGuardedExecTool → getDataToolRule + isFailClosedResource). If
+  // these tools are dropped from the map they silently lose that layer too, so
+  // assert coverage here — this test fails if the fix is reverted.
+  it('treats every environment write/exec tool as a guarded exec tool', () => {
+    for (const t of ['write_file', 'edit_file', 'glob', 'grep_files', 'ssh_run_async', 'ssh_tail', 'ssh_kill', 'ssh_jobs']) {
+      expect(isGuardedExecTool(t), `${t} must be a guarded exec tool`).toBe(true);
+    }
   });
 });
 
