@@ -208,10 +208,16 @@ const getRecentRuns: NativeToolDefinition = {
     // Resolve caller userId from graph state. Mirrors the convention used
     // by neuronExecutor / graphExecutor — `state.userId` first, fall back
     // to `state.data.userId` for callers that nest under data.
+    const publisherUserId =
+      typeof (context?.publisher as AnyObject | undefined)?.user === 'string'
+        ? ((context?.publisher as AnyObject).user as string).trim()
+        : '';
+    const stateUserId =
+      typeof context?.state?.userId === 'string' ? context.state.userId.trim() : '';
+    const stateDataUserId =
+      typeof context?.state?.data?.userId === 'string' ? context.state.data.userId.trim() : '';
     const callerUserId =
-      (context?.state?.userId as string | undefined) ||
-      (context?.state?.data?.userId as string | undefined) ||
-      null;
+      publisherUserId || stateUserId || stateDataUserId || null;
 
     if (!callerUserId) {
       return {
