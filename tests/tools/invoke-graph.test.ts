@@ -92,10 +92,11 @@ vi.mock('../../src/functions/run', () => ({
 }));
 
 // ── Helpers ───────────────────────────────────────────────────────────────
-function makeMockPublisher() {
+function makeMockPublisher(userId = 'user-1') {
   return {
     redis: { /* not actually used by invoke_graph internals — just must exist */ },
     redlog: undefined,
+    user: userId,
     toolProgress: vi.fn().mockResolvedValue(undefined),
   };
 }
@@ -201,7 +202,13 @@ describe('invoke_graph — validation', () => {
   test('missing userId in state returns isError', async () => {
     const r = await invokeGraphTool.handler(
       { graphId: 'g1', input: {} },
-      makeMockContext({ state: { neuronRegistry: {}, memory: {}, _graphRegistry: {} } }),
+      makeMockContext({
+        publisher: {
+          ...makeMockPublisher(),
+          user: undefined,
+        } as NativeToolContext['publisher'],
+        state: { neuronRegistry: {}, memory: {}, _graphRegistry: {} },
+      }),
     );
     expect(r.isError).toBe(true);
     expect(JSON.parse(r.content[0].text).error).toMatch(/userId/);
@@ -272,6 +279,35 @@ describe('invoke_graph — recursion limit', () => {
 });
 
 describe('invoke_graph — access check', () => {
+  test('state.userId spoofing does not grant access with trusted caller identity', async () => {
+    setGraphFixture({
+      graphId: 'g-private',
+      userId: 'user-1',
+      isPublic: false,
+      isSystem: false,
+      participants: [],
+    });
+
+    const r = await invokeGraphTool.handler(
+      { graphId: 'g-private', input: {} },
+      makeMockContext({
+        publisher: makeMockPublisher('attacker'),
+        state: {
+          userId: 'user-1',
+          data: { userId: 'user-1' },
+          neuronRegistry: {},
+          memory: {},
+          _graphRegistry: {},
+          mcpClient: { callTool: async () => ({}) },
+        },
+      }),
+    );
+    expect(r.isError).toBe(true);
+    const body = JSON.parse(r.content[0].text);
+    expect(body.error).toBe('access_denied');
+    expect(body.graphId).toBe('g-private');
+  });
+
   test('caller is owner → access granted', async () => {
     setGraphFixture({
       graphId: 'g1',

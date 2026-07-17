@@ -604,6 +604,26 @@ export const RunKeys = {
   /** Active run for conversation: `run:conversation:{conversationId}` */
   conversationRun: (conversationId: string) => `run:conversation:${conversationId}`,
   /**
+   * Requeue-on-boot recovery record: `run:recovery:{runId}`.
+   *
+   * Written by the worker's run processor at execution start (the full enqueue
+   * payload) and deleted when the run reaches a terminal state. If the engine
+   * process dies mid-run the record survives, so a booting engine can
+   * re-dispatch the run instead of losing the work. Redis-only, TTL'd.
+   */
+  recovery: (runId: string) => `run:recovery:${runId}`,
+  /**
+   * Requeue-on-boot recovery claim: `run:recovery:claim:{runId}`.
+   *
+   * Atomic `SET NX` ticket a booting engine takes before re-dispatching an
+   * orphaned run, so concurrently-booting replicas requeue each orphan at most
+   * once. While the claim is held the cross-process orphan reaper LEAVES the run
+   * alone (it is being recovered, not killed) — see `orphan-reaper.ts` ->
+   * `hasRecoveryClaim`. Short-TTL'd; the recovered run's own fresh heartbeat
+   * protects it thereafter.
+   */
+  recoveryClaim: (runId: string) => `run:recovery:claim:${runId}`,
+  /**
    * External interrupt channel: `run:interrupt:{runId}`.
    *
    * Pub/sub-only — no state stored. When any actor publishes ANY message to
@@ -717,6 +737,27 @@ export const RunConfig = {
   LOCK_TTL_SECONDS: 60 * 5,
   /** Lock renewal interval (every 30 seconds while running) */
   LOCK_RENEWAL_INTERVAL_MS: 30000,
+  /**
+   * FAST cross-process orphan threshold (2.5 minutes).
+   *
+   * DISTINCT from RUN_PROGRESS_STALE_MS (30 min). That window is for a
+   * live-but-idle run whose OWNING PROCESS is still alive (the in-process
+   * progress-idle watchdog handles those). This one is for an ORPHANED run:
+   * a run left `status:'running'` after its engine process died (crash /
+   * container recycle) with NO live process to reap it. Such a run has no
+   * fresh heartbeat AND no owning process (no run-state in Redis, or an
+   * expired conversation lock), so it is dead and reaped fast rather than
+   * lingering for 30 min (or forever). Overridable via env RUN_ORPHAN_STALE_MS.
+   */
+  RUN_ORPHAN_STALE_MS: 150 * 1000,
+  /**
+   * Interval (ms) between cross-process orphan sweeps (60 seconds). Runs in
+   * EVERY engine process independent of any single run's in-process watchdog,
+   * so an engine that dies without cleanup has its orphans reaped by a peer or
+   * successor within ~one interval + RUN_ORPHAN_STALE_MS. Overridable via env
+   * RUN_ORPHAN_SWEEP_INTERVAL_MS.
+   */
+  RUN_ORPHAN_SWEEP_INTERVAL_MS: 60 * 1000,
   /**
    * Stale window for automation concurrency slots (30 minutes).
    *

@@ -206,6 +206,32 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   read_file: { resource: 'exec', action: 'execute', extract: envId },
   ssh_copy: { resource: 'exec', action: 'execute', extract: envId },
   desktop_exec: { resource: 'exec', action: 'execute', extract: envId },
+  // The environment fs-pack + async-exec tools reach the SAME authority as the
+  // ones above — SFTP write/edit MUTATE the remote filesystem, and glob /
+  // grep_files / ssh_run_async run arbitrary SSH commands on the environment —
+  // so they MUST share the `exec:execute` gate. Omitting them was a real hole:
+  // `read_file` (read-only) was gated while the strictly-more-dangerous
+  // `write_file` / `edit_file` / `ssh_run_async` bypassed BOTH the capability
+  // jail (enforce.ts short-circuits allow for unmapped tools) AND the exec
+  // runtime guard (kill switch / rate limit / audit key off this same map).
+  // The async-job control/read tools (ssh_kill/ssh_tail/ssh_jobs) address a
+  // job on a specific environmentId and belong to the same exec authority.
+  // `list_dir` is the SIXTH fs-pack tool (native-registry.ts §fs pack): the
+  // read-only SFTP sibling of `read_file` — a single-level `readdir` or a
+  // recursive BFS tree-walk of ANY environmentId. It is EXACTLY the same
+  // cross-env read authority as `read_file`, so it must share the gate too;
+  // leaving it unmapped retained the identical capability-jail bypass (a
+  // jailed/unprofiled run could enumerate the directory tree of any env, and
+  // it evaded the kill-switch/rate-limit/audit runtime guard).
+  write_file: { resource: 'exec', action: 'execute', extract: envId },
+  edit_file: { resource: 'exec', action: 'execute', extract: envId },
+  glob: { resource: 'exec', action: 'execute', extract: envId },
+  grep_files: { resource: 'exec', action: 'execute', extract: envId },
+  list_dir: { resource: 'exec', action: 'execute', extract: envId },
+  ssh_run_async: { resource: 'exec', action: 'execute', extract: envId },
+  ssh_tail: { resource: 'exec', action: 'execute', extract: envId },
+  ssh_kill: { resource: 'exec', action: 'execute', extract: envId },
+  ssh_jobs: { resource: 'exec', action: 'execute', extract: envId },
 
   // ── Computer-use: screen + mouse/keyboard (desktop connectors) ────────────
   // FAIL-CLOSED. Grant `computer:control` scoped to the desktop's environmentId.

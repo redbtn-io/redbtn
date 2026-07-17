@@ -18,6 +18,8 @@ import { GraphRegistry } from "./lib/graphs/GraphRegistry";
 import { NeuronRegistry } from "./lib/neurons/NeuronRegistry";
 import { createLogger } from "./lib/utils/logger";
 import { RedLog } from "@redbtn/redlog";
+import { OrphanReaper, type ReaperDb } from "./lib/run/orphan-reaper";
+import { runControlRegistry } from "./lib/run/RunControlRegistry";
 
 // Export database utilities for external use
 export {
@@ -150,6 +152,24 @@ export type {
   AttachmentRef,
 } from "./lib/run";
 export { LEGACY_TRIGGER_MAP, toTriggerType, enrichInput } from "./lib/run";
+
+// Cross-process orphan DETECTION surface — consumed by @redbtn/worker's
+// requeue-on-boot recovery so it reuses the reaper's exact orphan definition.
+export {
+  findOrphanedRuns,
+  hasRecoveryClaim,
+  reapOrphanedRuns,
+  ORPHAN_REAPED_COLLECTIONS,
+} from "./lib/run";
+export type {
+  ReaperDb,
+  ReaperRedis,
+  ReaperDbProvider,
+  OrphanRunInfo,
+  FindOrphanedRunsResult,
+  ReapOrphanedRunsOptions,
+  ReapOrphanedRunsResult,
+} from "./lib/run";
 
 // Automation concurrency limiter (atomic, zombie-aware cap enforcement).
 export {
@@ -284,6 +304,24 @@ export interface InvokeOptions {
 // --- The Red Library Class ---
 
 /**
+ * Resolve the Mongo db handle the orphan reaper marks runs terminal against.
+ * Uses the engine's bundled mongoose connection (the worker connects it before
+ * `Red.load()`), mirroring how `functions/run.ts` obtains its heartbeat-mirror
+ * collections. Returns null when Mongo is not connected — the reaper then
+ * skips the sweep rather than throwing.
+ */
+async function getReaperDb(): Promise<ReaperDb | null> {
+  try {
+    const mongoose = await import('mongoose');
+    const db = mongoose.default.connection?.db;
+    return (db ?? null) as unknown as ReaperDb | null;
+  } catch (err) {
+    console.warn('[Red] Orphan reaper could not resolve Mongo db:', err);
+    return null;
+  }
+}
+
+/**
  * The primary class for the Red AI engine. It encapsulates the agent's
  * core logic, state management, and interaction models.
  */
@@ -294,6 +332,8 @@ export class Red {
   private baseState: object = {};
   private nodeId?: string;
   private heartbeatInterval?: NodeJS.Timeout;
+  /** Cross-process orphan reaper (startup reconciliation + periodic sweep). */
+  private orphanReaper?: OrphanReaper;
 
   // Properties to hold the configured model instances
   /**
@@ -421,6 +461,23 @@ export class Red {
 
     // Start heartbeat to register node as active
     this.heartbeatInterval = background.startHeartbeat(this.nodeId, this.redis);
+
+    // Cross-process orphan reaper. Runs in EVERY engine process (independent of
+    // the scheduler, which is disabled on worker-only replicas), so a run left
+    // `status:'running'` by a crashed/recycled engine self-heals: reconciled
+    // once on boot, then swept periodically. Fully guarded — a reaper failure
+    // must never break engine startup.
+    try {
+      this.orphanReaper = new OrphanReaper({
+        redis: this.redis,
+        getDb: getReaperDb,
+        nodeId: this.nodeId,
+      });
+      await this.orphanReaper.startupReconcile();
+      this.orphanReaper.start();
+    } catch (error) {
+      console.warn('[Red] Orphan reaper failed to start (non-fatal):', error);
+    }
   }
 
   /**
@@ -467,7 +524,7 @@ export class Red {
   /**
    * Gracefully shuts down the Red instance, stopping heartbeat and cleaning up resources.
    */
-  public async shutdown(): Promise<void> {
+  public async shutdown(options?: { markInFlightInterrupted?: boolean }): Promise<void> {
     console.log(`[Red] Shutting down node: ${this.nodeId}...`);
 
     // Stop thinking if active
@@ -476,6 +533,45 @@ export class Red {
     // Stop heartbeat
     await background.stopHeartbeat(this.nodeId, this.redis, this.heartbeatInterval);
     this.heartbeatInterval = undefined;
+
+    // SIGTERM graceful marking: stop the periodic sweep and best-effort mark
+    // THIS process's own in-flight runs interrupted before exit (a graceful
+    // redrun restart should not create orphans in the first place). Runs BEFORE
+    // redis.quit() since it needs Redis. Fully guarded.
+    // `markInFlightInterrupted` (default true) is the #276 graceful marking:
+    // best-effort mark THIS process's own in-flight runs interrupted so a clean
+    // restart never creates orphans. A caller that has ALREADY drained on SIGTERM
+    // and wants runs that outlived the drain grace to be re-dispatched by the
+    // NEXT engine (requeue-on-boot) passes `false` — those runs are then LEFT
+    // `running` for detection on the next boot instead of being marked terminal
+    // here.
+    const markInFlightInterrupted = options?.markInFlightInterrupted ?? true;
+    if (this.orphanReaper) {
+      try {
+        this.orphanReaper.stop();
+        if (markInFlightInterrupted) {
+          const entries = runControlRegistry.runIds().map((runId) => {
+            const ctx = runControlRegistry.get(runId);
+            return {
+              runId,
+              publisher: ctx?.runPublisher as { interrupt(reason?: string): Promise<void> } | undefined,
+            };
+          });
+          if (entries.length > 0) {
+            const marked = await this.orphanReaper.markShutdownInFlight(
+              entries,
+              'engine-restart orphan — engine shutdown (SIGTERM) before run completion',
+            );
+            console.log(`[Red] Orphan reaper marked ${marked}/${entries.length} in-flight run(s) interrupted on shutdown`);
+          }
+        } else {
+          console.log('[Red] Shutdown drain elapsed — leaving in-flight run(s) running for requeue-on-boot recovery');
+        }
+      } catch (error) {
+        console.warn('[Red] Orphan reaper shutdown marking failed (non-fatal):', error);
+      }
+      this.orphanReaper = undefined;
+    }
 
     // Disconnect from MCP servers
     try {

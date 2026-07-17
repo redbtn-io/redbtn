@@ -31,6 +31,13 @@ import {
   writeAutoState,
   deleteAutoState,
 } from './run-auto-state';
+// Ownership-safe conversation-pointer cleanup. run:conversation:{id} stores the
+// OWNING runId; a superseding run can repoint it at itself the moment this run's
+// lock lapses, so every DEL of the pointer is a compare-and-delete against the
+// owning runId (delete only while it still names us). Blind-deleting could wipe a
+// fresh acquirer's live pointer — the exact TOCTOU class fixed in the orphan
+// reaper (PR #276); this applies the same guard to the normal lifecycle paths.
+import { releaseConversationPointerIfOwner } from './orphan-reaper';
 import {
   touchRunProgress,
   type AutomationRunsCollection,
@@ -492,7 +499,9 @@ export class RunPublisher {
     this.state!.completedAt = Date.now();
     await this.saveState();
     if (this.state!.conversationId) {
-      await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
+      // Compare-and-delete: only clear the pointer while it still names THIS run,
+      // so a run that already superseded us in this conversation keeps its pointer.
+      await releaseConversationPointerIfOwner(this.redis, this.state!.conversationId, this.runId);
     }
     // Drop the shared-state hash now that no parallel branches will
     // run again. TTL would clean it up eventually, but explicit del
@@ -639,7 +648,8 @@ export class RunPublisher {
     this.state!.completedAt = Date.now();
     await this.saveState();
     if (this.state!.conversationId) {
-      await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
+      // Compare-and-delete: spare a superseding run's pointer (see complete()).
+      await releaseConversationPointerIfOwner(this.redis, this.state!.conversationId, this.runId);
     }
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
@@ -726,7 +736,10 @@ export class RunPublisher {
     if (reason) this.state!.error = `interrupted: ${reason}`;
     await this.saveState();
     if (this.state!.conversationId) {
-      await this.redis.del(RunKeys.conversationRun(this.state!.conversationId));
+      // Compare-and-delete: spare a superseding run's pointer (see complete()).
+      // Critical on the interrupt path — interrupts are how one run supersedes
+      // another, so a fresh acquirer racing this cleanup is the common case.
+      await releaseConversationPointerIfOwner(this.redis, this.state!.conversationId, this.runId);
     }
     await deleteSharedState(this.redis, this.runId);
     await deleteAutoState(this.redis, this.runId);
@@ -1683,7 +1696,9 @@ export async function publishRunError(
     await redis.set(RunKeys.state(runId), JSON.stringify(errorState), 'EX', ttl);
     const convId = options?.conversationId ?? existing?.conversationId;
     if (convId) {
-      await redis.del(RunKeys.conversationRun(convId));
+      // Compare-and-delete: only clear the pointer while it still names this run,
+      // so a run that already took over the conversation keeps its live pointer.
+      await releaseConversationPointerIfOwner(redis, convId, runId);
     }
   } catch {
     // non-fatal — the pub/sub terminal event is what unblocks consumers
@@ -1916,12 +1931,15 @@ export async function getActiveRunForConversation(redis: Redis, conversationId: 
   if (!runId) return null;
   const stateJson = await redis.get(RunKeys.state(runId));
   if (!stateJson) {
-    await redis.del(RunKeys.conversationRun(conversationId));
+    // Stale pointer names a run with no state — clear it, but only while it still
+    // names THAT run: a fresh acquirer may have repointed between the reads above,
+    // and its live pointer must survive (compare-and-delete against `runId`).
+    await releaseConversationPointerIfOwner(redis, conversationId, runId);
     return null;
   }
   const state = JSON.parse(stateJson) as RunState;
   if (state.status === 'completed' || state.status === 'error') {
-    await redis.del(RunKeys.conversationRun(conversationId));
+    await releaseConversationPointerIfOwner(redis, conversationId, runId);
     return null;
   }
   return runId;
