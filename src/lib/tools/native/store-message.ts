@@ -10,6 +10,7 @@
 
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 import { MemoryManager, ConversationMessage } from '../../memory/memory';
+import { resolveCallerUserId, checkConversationAccess } from './_conversation-access';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -90,6 +91,43 @@ const storeMessage: NativeToolDefinition = {
       `[store_message] conversationId:${conversationId}, role:${role}, ` +
       `messageId:${messageId || '(auto)'}, content length:${content?.length}`
     );
+
+    // ── Access check ──────────────────────────────────────────────────
+    // This tool writes directly to MemoryManager/user_conversations,
+    // bypassing the webapp API's ownership check that get_messages relies
+    // on. Without this, any caller supplying a guessed/known
+    // conversationId could inject messages into another user's
+    // conversation. `viewer` participants are excluded — they can read
+    // but not post (mirrors add-participant.ts semantics).
+    const callerUserId = resolveCallerUserId(context);
+    if (!callerUserId) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: 'No userId available in graph state — cannot perform access check',
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const access = await checkConversationAccess(conversationId, callerUserId, {
+      allowRoles: ['owner', 'member'],
+    });
+    if (!access.ok) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ success: false, error: access.error }),
+          },
+        ],
+        isError: true,
+      };
+    }
 
     try {
       const mm = getMemoryManager();
