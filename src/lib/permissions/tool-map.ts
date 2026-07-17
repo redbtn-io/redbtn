@@ -216,10 +216,18 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   // runtime guard (kill switch / rate limit / audit key off this same map).
   // The async-job control/read tools (ssh_kill/ssh_tail/ssh_jobs) address a
   // job on a specific environmentId and belong to the same exec authority.
+  // `list_dir` is the SIXTH fs-pack tool (native-registry.ts §fs pack): the
+  // read-only SFTP sibling of `read_file` — a single-level `readdir` or a
+  // recursive BFS tree-walk of ANY environmentId. It is EXACTLY the same
+  // cross-env read authority as `read_file`, so it must share the gate too;
+  // leaving it unmapped retained the identical capability-jail bypass (a
+  // jailed/unprofiled run could enumerate the directory tree of any env, and
+  // it evaded the kill-switch/rate-limit/audit runtime guard).
   write_file: { resource: 'exec', action: 'execute', extract: envId },
   edit_file: { resource: 'exec', action: 'execute', extract: envId },
   glob: { resource: 'exec', action: 'execute', extract: envId },
   grep_files: { resource: 'exec', action: 'execute', extract: envId },
+  list_dir: { resource: 'exec', action: 'execute', extract: envId },
   ssh_run_async: { resource: 'exec', action: 'execute', extract: envId },
   ssh_tail: { resource: 'exec', action: 'execute', extract: envId },
   ssh_kill: { resource: 'exec', action: 'execute', extract: envId },
