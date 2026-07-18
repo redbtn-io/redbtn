@@ -36,10 +36,18 @@ function makeCtx(opts: { runId?: string | null; publisher?: unknown } = {}): Nat
     publisher: (opts.publisher ?? null) as unknown as Record<string, unknown> | null,
     state: {},
     runId,
+    abortSignal: null,
     nodeId: null,
     toolId: null,
-    abortSignal: null,
   };
+}
+
+function makeCtxWithAbortSignal(
+  abortSignal: AbortSignal,
+  opts: { runId?: string | null; publisher?: unknown } = {},
+): NativeToolContext {
+  const ctx = makeCtx(opts);
+  return { ...ctx, abortSignal };
 }
 
 beforeEach(() => {
@@ -73,6 +81,37 @@ describe('read_component_events — webapp path (WEBAPP_URL set)', () => {
       'http://test.local/api/v1/runs/run-1/component-event',
       expect.objectContaining({ method: 'GET' }),
     );
+  });
+
+  test('forwards caller abort signal to the component-event fetch request', async () => {
+    process.env.WEBAPP_URL = 'http://test.local';
+    const controller = new AbortController();
+    const events = [
+      { componentId: 'cmp_a', payload: { x: 1 }, timestamp: '2026-05-27T00:00:01Z' },
+    ];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(init?.signal).toBe(controller.signal);
+      return new Response(JSON.stringify({ events }), { status: 200 });
+    });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(fetchMock as unknown as typeof fetch);
+
+    const result = await readComponentEventsTool.handler({}, makeCtxWithAbortSignal(controller.signal));
+    expect(result.isError).not.toBe(true);
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.events).toEqual(events);
+  });
+
+  test('returns ABORTED error quickly when tool context is already cancelled', async () => {
+    process.env.WEBAPP_URL = 'http://test.local';
+    const controller = new AbortController();
+    controller.abort('test-cancel');
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ events: [] }), { status: 200 }));
+    vi.spyOn(globalThis, 'fetch').mockImplementation(fetchMock as unknown as typeof fetch);
+
+    const result = await readComponentEventsTool.handler({}, makeCtxWithAbortSignal(controller.signal));
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ code: 'ABORTED' });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   test('peek:true appends ?peek=1 and forwards events without clearing', async () => {
@@ -131,6 +170,19 @@ describe('read_component_events — fallback path (no WEBAPP_URL)', () => {
       makeCtx({ publisher: { redis } }),
     );
     expect(JSON.parse(again.content[0].text).events).toEqual([]);
+  });
+
+  test('returns ABORTED error quickly when tool context is already cancelled in fallback mode', async () => {
+    const redis = makeRedis([]);
+    const controller = new AbortController();
+    controller.abort('test-cancel');
+    const result = await readComponentEventsTool.handler(
+      {},
+      makeCtxWithAbortSignal(controller.signal, { publisher: { redis } }),
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ code: 'ABORTED' });
+    expect(redis.lrange).not.toHaveBeenCalled();
   });
 
   test('honours peek:true in the fallback path (does not delete the list)', async () => {
