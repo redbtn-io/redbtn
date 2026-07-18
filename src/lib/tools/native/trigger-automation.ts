@@ -85,6 +85,10 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
   return headers;
 }
 
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'AbortError';
+}
+
 const triggerAutomationTool: NativeToolDefinition = {
   description:
     "Manually trigger an automation by id. Returns the new runId and initial status. Set wait:true to block until the run reaches a terminal status (completed / failed / cancelled) — useful when an agent needs the result before proceeding. Stream-mode automations always return their session immediately.",
@@ -291,15 +295,45 @@ const triggerAutomationTool: NativeToolDefinition = {
     let pollInterval = initialPollIntervalMs;
     let lastSeenStatus = initialStatus;
     let lastSeenRun: AnyObject | null = null;
+    const abortedResponse = {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            error: 'Aborted',
+            runId,
+            automationId,
+            status: 'cancelled',
+          }),
+        },
+      ],
+      isError: true,
+    };
+
+    if (context.abortSignal?.aborted) {
+      return abortedResponse;
+    }
 
     while (Date.now() - startedAt < timeoutMs) {
       // Sleep before the first poll so the worker has a beat to start.
+      if (context.abortSignal?.aborted) {
+        return abortedResponse;
+      }
       await new Promise((r) => setTimeout(r, pollInterval));
+      if (context.abortSignal?.aborted) {
+        return abortedResponse;
+      }
 
       let runResponse: Response;
       try {
-        runResponse = await fetch(runUrl, { headers: buildHeaders(context) });
+        runResponse = await fetch(runUrl, {
+          headers: buildHeaders(context),
+          signal: context.abortSignal ?? undefined,
+        });
       } catch (err: unknown) {
+        if (isAbortError(err) || context.abortSignal?.aborted) {
+          return abortedResponse;
+        }
         // Transient network errors during polling — back off and retry.
         pollInterval = Math.min(MAX_POLL_INTERVAL_MS, pollInterval * 2);
         const remaining = timeoutMs - (Date.now() - startedAt);
