@@ -326,16 +326,45 @@ export class RunControlRegistry {
    * registry doesn't accumulate stale callbacks. Returns a no-op
    * unregister if the run isn't registered (caller doesn't need to
    * special-case missing-context).
+   *
+   * If the run's controller is ALREADY aborted at registration time (the
+   * tool lost the race — e.g. a slow SSH handshake completing after the
+   * interrupt already fired `cancel()`), the callback would otherwise sit
+   * in the Set forever: `cancel()` only walks it once, at the moment of
+   * cancellation, so a hook added afterwards would never run and the tool
+   * would keep executing on a "cancelled" run with no cleanup. Detect that
+   * and invoke the callback immediately instead of registering it.
    */
   registerOnCancel(runId: string | undefined, cb: () => void | Promise<void>): () => void {
     if (!runId) return () => {};
     const ctx = this.contexts.get(runId);
     if (!ctx) return () => {};
+    if (ctx.controller.signal.aborted) {
+      this.invokeCancelCallback(runId, cb);
+      return () => {};
+    }
     ctx.onCancelCallbacks.add(cb);
     return () => {
       const c = this.contexts.get(runId);
       c?.onCancelCallbacks.delete(cb);
     };
+  }
+
+  /**
+   * Fire a single onCancel callback with the same fire-and-forget error
+   * handling `cancel()` uses for the whole set: synchronous throws and
+   * async rejections are both swallowed (logged, not propagated) so one
+   * misbehaving tool cleanup hook can never block or crash cancellation.
+   */
+  private invokeCancelCallback(runId: string, cb: () => void | Promise<void>): void {
+    try {
+      const r = cb();
+      if (r && typeof (r as Promise<void>).catch === 'function') {
+        (r as Promise<void>).catch(err => console.warn(`[RunControlRegistry] onCancel callback threw for run ${runId}:`, err));
+      }
+    } catch (err) {
+      console.warn(`[RunControlRegistry] onCancel callback threw for run ${runId}:`, err);
+    }
   }
 
   /**
@@ -426,14 +455,7 @@ export class RunControlRegistry {
     //    running on a different host. Fire-and-forget; we don't await.
     const callbacks = Array.from(ctx.onCancelCallbacks);
     for (const cb of callbacks) {
-      try {
-        const r = cb();
-        if (r && typeof (r as Promise<void>).catch === 'function') {
-          (r as Promise<void>).catch(err => console.warn(`[RunControlRegistry] onCancel callback threw for run ${runId}:`, err));
-        }
-      } catch (err) {
-        console.warn(`[RunControlRegistry] onCancel callback threw for run ${runId}:`, err);
-      }
+      this.invokeCancelCallback(runId, cb);
     }
 
     // 3. Cancel every in-flight neuron call. Snapshot the set first so
