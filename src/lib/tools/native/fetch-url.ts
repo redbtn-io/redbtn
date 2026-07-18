@@ -106,14 +106,15 @@ const fetchUrlTool: NativeToolDefinition = {
       const BACKOFF = [2_000, 5_000];
       let response: Response | null = null;
 
-      // Pre-aborted check
-      if (runAbortSignal?.aborted) {
-        const err: Error & { name: string } = new Error('fetch_url aborted before send');
-        err.name = 'AbortError';
-        throw err;
-      }
-
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        // Abort could land between retry attempts; check per-iteration, not just once
+        // before entering the loop, so a cancellation during backoff is observed.
+        if (runAbortSignal?.aborted) {
+          const err: Error & { name: string } = new Error('fetch_url aborted before send');
+          err.name = 'AbortError';
+          throw err;
+        }
+
         const controller = new AbortController();
         const timer = setTimeout(() => {
           timeoutFired = true;
@@ -125,6 +126,9 @@ const fetchUrlTool: NativeToolDefinition = {
           : null;
         if (runAbortSignal && runAbortListener) {
           runAbortSignal.addEventListener('abort', runAbortListener, { once: true });
+          if (runAbortSignal.aborted) {
+            runAbortListener();
+          }
         }
 
         try {

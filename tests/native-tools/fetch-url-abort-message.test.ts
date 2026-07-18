@@ -135,4 +135,61 @@ describe('fetch_url — abort message distinguishes external signal from timeout
     expect(parsed.error).toMatch(/aborted/);
     expect(parsed.error).not.toMatch(/timed out/);
   });
+
+  test('stops retrying when the run is aborted during retry backoff', async () => {
+    vi.useFakeTimers();
+
+    let firstAttemptStartedResolve: (() => void) | undefined;
+    let releaseFirstAttemptResolve: (() => void) | undefined;
+    let callCount = 0;
+
+    const firstAttemptStartedPromise = new Promise<void>((resolve) => {
+      firstAttemptStartedResolve = resolve;
+    });
+    const releaseFirstAttemptPromise = new Promise<void>((resolve) => {
+      releaseFirstAttemptResolve = resolve;
+    });
+
+    try {
+      // First attempt returns a 5xx to force a retry path; abort happens
+      // during that retry cooldown so the second attempt should never be made.
+      globalThis.fetch = vi.fn(async (_url: any, _init: any) => {
+        callCount += 1;
+        if (callCount === 1) {
+          firstAttemptStartedResolve?.();
+          await releaseFirstAttemptPromise;
+          return new Response('retry', { status: 503, statusText: 'Service Unavailable' });
+        }
+
+        return new Response('ok', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }) as any;
+
+      const controller = new AbortController();
+      const ctx = buildContext(controller.signal);
+      const handlerPromise = fetchUrlTool.handler(
+        { url: 'http://test.invalid/retry', timeout: 60_000 },
+        ctx,
+      );
+
+      await firstAttemptStartedPromise;
+      releaseFirstAttemptResolve?.();
+      await Promise.resolve();
+
+      controller.abort('tests:abort-during-retry');
+      await vi.advanceTimersByTimeAsync(2_050);
+
+      const result = await handlerPromise;
+
+      expect(callCount).toBe(1);
+      expect((result as any).isError).toBe(true);
+      const text = (result as any).content?.[0]?.text || '';
+      const parsed = JSON.parse(text);
+      expect(parsed.error).toMatch(/aborted by caller/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
