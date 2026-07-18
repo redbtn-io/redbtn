@@ -1395,11 +1395,16 @@ export class RunPublisher {
     const sub = new StreamSubscriber({ redis: this.redis, channel, eventsKey });
     const generator = sub.subscribe({
       catchUp: true,
-      terminalEvents: ['run_complete', 'run_error'],
+      terminalEvents: ['run_complete', 'run_error', 'run_interrupted'],
       idleTimeoutMs: 30000,
       isAlive: async () => {
         const state = await this.getState();
-        return state !== null && state.status !== 'completed' && state.status !== 'error';
+        return (
+          state !== null &&
+          state.status !== 'completed' &&
+          state.status !== 'error' &&
+          state.status !== 'interrupted'
+        );
       },
     }) as AsyncGenerator<RunEvent, void, unknown>;
     const ready = Promise.resolve();
