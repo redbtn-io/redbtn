@@ -268,6 +268,10 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
     const nodeStartTime = Date.now();
 
     // Validate configuration
+    if (nodeConfig.steps !== undefined && !Array.isArray(nodeConfig.steps)) {
+        throw new Error('[UniversalNode] Invalid config: "steps" must be an array');
+    }
+
     if (!nodeConfig.steps && (!nodeConfig.type || !nodeConfig.config)) {
         throw new Error('[UniversalNode] Invalid config: must provide either "steps" array or "type" + "config"');
     }
@@ -628,6 +632,10 @@ function deepMergeObjects(target: any, source: any, depth = 0, seen = new WeakSe
  * @throws Error if configuration is invalid
  */
 export function validateUniversalNodeConfig(nodeConfig: NodeConfig): void {
+    if (nodeConfig.steps !== undefined && !Array.isArray(nodeConfig.steps)) {
+        throw new Error('Invalid universal node config: "steps" must be an array');
+    }
+
     // Check for configuration format
     if (!nodeConfig.steps && (!nodeConfig.type || !nodeConfig.config)) {
         throw new Error('Invalid universal node config: must provide either "steps" array or "type" + "config"');
