@@ -182,6 +182,82 @@ describe('RunControlRegistry — cancel()', () => {
   });
 });
 
+describe('RunControlRegistry — registerOnCancel() / onCancelCallbacks', () => {
+  let registry: RunControlRegistry;
+
+  beforeEach(() => {
+    registry = new RunControlRegistry();
+  });
+
+  it('cancel() invokes a callback registered before cancellation', () => {
+    registry.register('run-1', 'worker-a');
+    let fired = false;
+    registry.registerOnCancel('run-1', () => { fired = true; });
+    registry.cancel('run-1', 'because');
+    expect(fired).toBe(true);
+  });
+
+  it('the returned unregister function removes the callback before it fires', () => {
+    registry.register('run-1', 'worker-a');
+    let fired = false;
+    const unregister = registry.registerOnCancel('run-1', () => { fired = true; });
+    unregister();
+    registry.cancel('run-1');
+    expect(fired).toBe(false);
+  });
+
+  it('registerOnCancel() with undefined runId returns a safe no-op unregister', () => {
+    const unregister = registry.registerOnCancel(undefined, () => { throw new Error('never'); });
+    expect(() => unregister()).not.toThrow();
+  });
+
+  it('registerOnCancel() for an unknown run returns a safe no-op unregister', () => {
+    const unregister = registry.registerOnCancel('does-not-exist', () => { throw new Error('never'); });
+    expect(() => unregister()).not.toThrow();
+  });
+
+  it('a throwing callback does not stop later callbacks or crash cancel()', () => {
+    registry.register('run-1', 'worker-a');
+    let secondFired = false;
+    registry.registerOnCancel('run-1', () => { throw new Error('boom'); });
+    registry.registerOnCancel('run-1', () => { secondFired = true; });
+    const result = registry.cancel('run-1');
+    expect(result.ack).toBe(true);
+    expect(secondFired).toBe(true);
+  });
+
+  it('a rejecting async callback does not surface as an unhandled rejection', async () => {
+    registry.register('run-1', 'worker-a');
+    registry.registerOnCancel('run-1', async () => { throw new Error('async boom'); });
+    expect(() => registry.cancel('run-1')).not.toThrow();
+    // Give the rejected promise's .catch() a turn to run before the test exits.
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  it(
+    'REGRESSION: registerOnCancel() called AFTER the run is already cancelled fires ' +
+      'immediately instead of being silently dropped',
+    () => {
+      // Reproduces the ssh_shell race: cancel() can land while a tool is
+      // still mid-setup (e.g. an SSH connect handshake) and only calls
+      // registerOnCancel() once that finishes. Before the fix, cancel()
+      // had already walked (and emptied) its one-shot callback pass, so a
+      // hook registered afterwards sat in the Set forever and never ran —
+      // the remote process was never killed.
+      registry.register('run-1', 'worker-a');
+      registry.cancel('run-1', 'interrupted-before-tool-was-ready');
+
+      let fired = false;
+      const unregister = registry.registerOnCancel('run-1', () => { fired = true; });
+
+      expect(fired).toBe(true);
+      // Nothing to unregister — the callback fired immediately rather than
+      // being added to the (already-spent) callback set.
+      expect(() => unregister()).not.toThrow();
+    },
+  );
+});
+
 describe('NeuronCall — direct cancellation primitives', () => {
   it('starts un-aborted', () => {
     const call = new NeuronCall('n');
