@@ -62,6 +62,26 @@ function getRunSignal(state: any): AbortSignal | undefined {
     return state?._abortController?.signal;
 }
 
+function isMalformedNativeToolResult(result: unknown): string | null {
+    if (result === null || result === undefined) {
+        return 'missing';
+    }
+
+    if (typeof result !== 'object') {
+        return `non-object (${typeof result})`;
+    }
+
+    if ((result as { isError?: unknown }).isError === true) {
+        return null;
+    }
+
+    if (!Array.isArray((result as { content?: unknown }).content)) {
+        return 'missing array `content` field';
+    }
+
+    return null;
+}
+
 /** Resolved credentials shape passed to tools via meta/context */
 interface ResolvedToolCredentials {
     type: string;
@@ -563,8 +583,8 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
             // Retry logic — mirrors the MCP path
             const maxNativeRetries = config.retryOnError ? (config.maxRetries ?? 3) : 0;
             let lastNativeError: Error | undefined;
-            for (let attempt = 0; attempt <= maxNativeRetries; attempt++) {
-                try {
+                for (let attempt = 0; attempt <= maxNativeRetries; attempt++) {
+                    try {
                     if (attempt > 0) {
                         console.log(`[ToolExecutor] Native tool retry ${attempt}/${maxNativeRetries}: ${config.toolName}`);
                         if (runPublisher) {
@@ -582,6 +602,12 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                         nativeContext,
                         resolveNativeToolIdleTimeoutMs(config),
                     );
+                    const malformedNativeResult = isMalformedNativeToolResult(nativeResult);
+                    if (malformedNativeResult) {
+                        throw new Error(
+                            `Native tool "${config.toolName}" returned malformed result (${malformedNativeResult})`,
+                        );
+                    }
                     const nativeError = getToolResultErrorMessage(nativeResult, config.toolName, 'Native');
                     if (nativeError) {
                         throw new Error(nativeError);
