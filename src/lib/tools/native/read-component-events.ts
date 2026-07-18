@@ -86,6 +86,7 @@ const readComponentEventsTool: NativeToolDefinition = {
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
     const args = (rawArgs ?? {}) as ReadArgs;
     const peek = args.peek === true;
+    const abortSignal = context?.abortSignal ?? null;
     const runId = (typeof args.runId === 'string' && args.runId.trim().length > 0)
       ? args.runId.trim()
       : (context?.runId ?? null);
@@ -104,11 +105,21 @@ const readComponentEventsTool: NativeToolDefinition = {
 
     const baseUrl = getBaseUrl();
     if (baseUrl) {
+      if (abortSignal?.aborted) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: 'read_component_events: operation already aborted', code: 'ABORTED' }) }],
+          isError: true,
+        };
+      }
       // Preferred path: round-trip through the webapp endpoint so auth +
       // ownership enforcement lives in one place.
       try {
         const url = `${baseUrl}/api/v1/runs/${encodeURIComponent(runId)}/component-event${peek ? '?peek=1' : ''}`;
-        const res = await fetch(url, { method: 'GET', headers: buildHeaders(context) });
+        const res = await fetch(url, {
+          method: 'GET',
+          headers: buildHeaders(context),
+          signal: abortSignal ?? undefined,
+        });
         if (!res.ok) {
           const body = await res.text().catch(() => '');
           return {
@@ -148,6 +159,12 @@ const readComponentEventsTool: NativeToolDefinition = {
             text: JSON.stringify({ error: 'no redis client available (set WEBAPP_URL or run under a publisher context)', code: 'CONFIG' }),
           },
         ],
+        isError: true,
+      };
+    }
+    if (abortSignal?.aborted) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'read_component_events: operation already aborted', code: 'ABORTED' }) }],
         isError: true,
       };
     }
