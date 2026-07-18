@@ -334,4 +334,75 @@ describe('run progress watchdog', () => {
     expect(readState(values, 'run-default-timeout').status).toBe('error');
     expect(values.has(RunKeys.lock('conv-default-timeout'))).toBe(false);
   });
+
+  it('unsubscribes the interrupt listener after terminal interrupt so late interrupts are ignored', async () => {
+    const { run, RunInterruptedError } = await import('../../src/functions/run');
+    const { runControlRegistry } = await import('../../src/lib/run/RunControlRegistry');
+
+    const { redis, values } = makeRedis();
+    const runId = 'run-interrupt-cleanup';
+    const conversationId = 'conv-interrupt-cleanup';
+    const compiledGraph = {
+      config: {
+        name: 'Cleanup Graph',
+        progressIdleTimeoutMs: 10_000,
+        nodes: [{ id: 'respond' }],
+      },
+      graph: {
+        streamEvents: vi.fn((initialState: any) => {
+          const signal = initialState._abortController?.signal;
+          let callCount = 0;
+          return {
+            [Symbol.asyncIterator]() {
+              return {
+                next: () => {
+                  callCount += 1;
+                  if (callCount === 1) {
+                    return Promise.resolve({
+                      done: false,
+                      value: {
+                        event: 'on_llm_stream',
+                        metadata: { langgraph_node: 'respond' },
+                        data: { chunk: { content: 'x' } },
+                      },
+                    });
+                  }
+                  return new Promise((resolve, reject) => {
+                    const onAbort = () => {
+                      signal?.removeEventListener('abort', onAbort);
+                      reject(new RunInterruptedError('tests:timeout'));
+                    };
+                    signal?.addEventListener('abort', onAbort, { once: true });
+                    setTimeout(() => {
+                      signal?.removeEventListener('abort', onAbort);
+                      resolve({ done: true, value: undefined });
+                    }, 5_000);
+                  });
+                },
+              };
+            },
+          };
+        }),
+      },
+    };
+
+    const result = await run(makeRed(compiledGraph, redis) as any, { message: 'go' }, {
+      userId: 'user-1',
+      graphId: 'graph-cleanup',
+      runId,
+      conversationId,
+      stream: true,
+    });
+    const completion = 'completion' in result ? result.completion : Promise.reject(new Error('not streaming'));
+
+    await Promise.resolve();
+    runControlRegistry.cancel(runId, 'tests:timeout');
+    const completed = await completion;
+
+    expect(completed.status).toBe('interrupted');
+    expect(completed.interruptedReason).toBe('tests:timeout');
+    expect(values.has(RunKeys.lock(conversationId))).toBe(false);
+    expect(runControlRegistry.runIds()).not.toContain(runId);
+    expect(runControlRegistry.get(runId)).toBeUndefined();
+  });
 });
