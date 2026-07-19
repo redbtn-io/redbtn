@@ -353,7 +353,6 @@ const sendWebhookTool: NativeToolDefinition = {
       };
     }
     clearTimeout(timer);
-    if (runAbortSignal && onRunAbort) runAbortSignal.removeEventListener('abort', onRunAbort);
 
     // Read response body. HEAD has no body so skip the read.
     let rawText = '';
@@ -365,9 +364,17 @@ const sendWebhookTool: NativeToolDefinition = {
           MAX_RESPONSE_BYTES,
         ));
       } catch {
+        if (runAbortSignal?.aborted) {
+          if (runAbortSignal && onRunAbort) runAbortSignal.removeEventListener('abort', onRunAbort);
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: 'send_webhook aborted by caller' }) }],
+            isError: true,
+          };
+        }
         rawText = '';
       }
     }
+    if (runAbortSignal && onRunAbort) runAbortSignal.removeEventListener('abort', onRunAbort);
 
     const parsed = tryParseJson(rawText);
 
