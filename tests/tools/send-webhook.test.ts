@@ -310,6 +310,40 @@ describe('send_webhook — happy path', () => {
     expect(streamCancelled).toBe(true);
     expect(response.text).not.toHaveBeenCalled();
   });
+
+  test('stops pulling after a later chunk crosses the response cap', async () => {
+    let pullCount = 0;
+    let streamCancelled = false;
+    const bodyStream = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          pullCount += 1;
+          if (pullCount <= 2) {
+            controller.enqueue(new TextEncoder().encode('x'.repeat(60_000)));
+          } else {
+            // A third pull would show that the reader continued after the cap.
+            controller.close();
+          }
+        },
+        cancel() {
+          streamCancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const response = new Response(bodyStream, { status: 200 });
+    globalThis.fetch = vi.fn(async () => response) as unknown as typeof globalThis.fetch;
+
+    const r = await sendWebhookTool.handler(
+      { url: 'https://h.example/x', method: 'GET' },
+      makeMockContext(),
+    );
+    const body = JSON.parse(r.content[0].text);
+    expect(body.truncated).toBe(true);
+    expect(body.response).toBe('x'.repeat(100_000));
+    expect(pullCount).toBe(2);
+    expect(streamCancelled).toBe(true);
+  });
 });
 
 describe('send_webhook — upstream error', () => {
