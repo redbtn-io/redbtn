@@ -77,6 +77,64 @@ function tryParseJson(s: string): unknown | null {
   }
 }
 
+/**
+ * Read at most maxBytes from a response body, cancelling the stream as soon
+ * as the cap is exceeded so an oversized webhook cannot be buffered in full.
+ */
+async function readResponseTextCapped(
+  response: Response,
+  maxBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
+  if (!response.body) return { text: '', truncated: false };
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  let truncated = false;
+
+  try {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+
+      const remaining = maxBytes - received;
+      if (value.byteLength > remaining) {
+        if (remaining > 0) {
+          chunks.push(value.slice(0, remaining));
+          received += remaining;
+        }
+        truncated = true;
+        try {
+          await reader.cancel();
+        } catch {
+          // Ignore cancellation failures; the capped bytes are still usable.
+        }
+        break;
+      }
+
+      chunks.push(value);
+      received += value.byteLength;
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Ignore release failures from unusual fetch implementations.
+    }
+  }
+
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return { text: new TextDecoder().decode(bytes), truncated };
+}
+
 const sendWebhookTool: NativeToolDefinition = {
   description:
     'Send an outbound HTTP request to a webhook URL. Defaults to POST with ' +
@@ -299,24 +357,26 @@ const sendWebhookTool: NativeToolDefinition = {
 
     // Read response body. HEAD has no body so skip the read.
     let rawText = '';
+    let truncated = false;
     if (method !== 'HEAD') {
       try {
-        rawText = await response.text();
+        ({ text: rawText, truncated } = await readResponseTextCapped(
+          response,
+          MAX_RESPONSE_BYTES,
+        ));
       } catch {
         rawText = '';
       }
     }
 
-    const truncated = rawText.length > MAX_RESPONSE_BYTES;
-    const bodyText = truncated ? rawText.slice(0, MAX_RESPONSE_BYTES) : rawText;
-    const parsed = tryParseJson(bodyText);
+    const parsed = tryParseJson(rawText);
 
     const responsePayload: AnyObject = {
       status: response.status,
       statusText: response.statusText,
       url,
       method,
-      response: parsed !== null ? parsed : bodyText,
+      response: parsed !== null ? parsed : rawText,
     };
     if (truncated) responsePayload.truncated = true;
 
