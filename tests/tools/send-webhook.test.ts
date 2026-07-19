@@ -344,6 +344,53 @@ describe('send_webhook — happy path', () => {
     expect(pullCount).toBe(2);
     expect(streamCancelled).toBe(true);
   });
+
+  test('aborts a response body read after headers arrive', async () => {
+    const runAbortController = new AbortController();
+    let bodyReadStarted!: () => void;
+    const bodyReadStartedPromise = new Promise<void>((resolve) => {
+      bodyReadStarted = resolve;
+    });
+
+    globalThis.fetch = vi.fn(async (_input, init) => {
+      let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+      const bodyStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              if (fallbackTimer) clearTimeout(fallbackTimer);
+              controller.error(new DOMException('aborted', 'AbortError'));
+            },
+            { once: true },
+          );
+        },
+        pull(controller) {
+          bodyReadStarted();
+          return new Promise<void>((resolve) => {
+            // Without the post-headers abort bridge, this fallback completes
+            // the read and exposes the regression as a successful response.
+            fallbackTimer = setTimeout(() => {
+              controller.close();
+              resolve();
+            }, 50);
+          });
+        },
+      });
+      return new Response(bodyStream, { status: 200 });
+    }) as unknown as typeof globalThis.fetch;
+
+    const resultPromise = sendWebhookTool.handler(
+      { url: 'https://h.example/slow', method: 'GET' },
+      makeMockContext({ abortSignal: runAbortController.signal }),
+    );
+    await bodyReadStartedPromise;
+    runAbortController.abort();
+
+    const r = await resultPromise;
+    expect(r.isError).toBe(true);
+    expect(JSON.parse(r.content[0].text).error).toBe('send_webhook aborted by caller');
+  });
 });
 
 describe('send_webhook — upstream error', () => {
