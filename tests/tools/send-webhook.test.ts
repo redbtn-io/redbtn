@@ -277,6 +277,39 @@ describe('send_webhook — happy path', () => {
     expect(typeof body.response).toBe('string');
     expect((body.response as string).length).toBe(100_000);
   });
+
+  test('caps response buffering at 100KB and cancels an oversized stream', async () => {
+    let streamCancelled = false;
+    const bodyStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('x'.repeat(150_000)));
+      },
+      cancel() {
+        streamCancelled = true;
+      },
+    });
+    const response = {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers(),
+      body: bodyStream,
+      text: vi.fn(async () => {
+        throw new Error('send_webhook must read the capped stream directly');
+      }),
+    } as unknown as Response;
+    globalThis.fetch = vi.fn(async () => response) as unknown as typeof globalThis.fetch;
+
+    const r = await sendWebhookTool.handler(
+      { url: 'https://h.example/x', method: 'GET' },
+      makeMockContext(),
+    );
+    const body = JSON.parse(r.content[0].text);
+    expect(body.truncated).toBe(true);
+    expect(body.response).toBe('x'.repeat(100_000));
+    expect(streamCancelled).toBe(true);
+    expect(response.text).not.toHaveBeenCalled();
+  });
 });
 
 describe('send_webhook — upstream error', () => {
