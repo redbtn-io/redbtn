@@ -29,6 +29,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { redactSensitive } from '../../utils/redact-sensitive';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -130,7 +131,7 @@ const getRunTool: NativeToolDefinition = {
 
       return {
         content: [
-          { type: 'text', text: JSON.stringify({ run }) },
+          { type: 'text', text: JSON.stringify({ run: redactSensitive(run) }) },
         ],
       };
     } catch (err: unknown) {

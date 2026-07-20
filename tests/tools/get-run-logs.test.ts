@@ -144,6 +144,23 @@ describe('get_run_logs — happy path', () => {
     expect(body.level).toBe('warn');
   });
 
+  test('redacts secret-bearing metadata from historical log responses', async () => {
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      runId: 'r-secret',
+      logs: [{
+        level: 'info',
+        message: 'Tool started',
+        metadata: { input: { authorization: 'Bearer should-not-return', sshKey: 'private-material' } },
+      }],
+    }), { status: 200 })) as unknown as typeof globalThis.fetch;
+
+    const result = await getRunLogsTool.handler({ runId: 'r-secret' }, makeMockContext());
+    const text = result.content[0].text;
+    expect(text).not.toContain('should-not-return');
+    expect(text).not.toContain('private-material');
+    expect(text).toContain('[REDACTED]');
+  });
+
   test('limit caps the response and sets hasMore:true', async () => {
     globalThis.fetch = vi.fn(async () =>
       new Response(
