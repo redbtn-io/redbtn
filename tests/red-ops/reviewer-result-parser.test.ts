@@ -5,8 +5,9 @@
  *
  * `ops/red-ops/red-ops-reviewer.node.json` is the config deployed to the LIVE
  * `red-ops-reviewer` MCP node — the INDEPENDENT last gate before prod. It reviews
- * a PR, runs CI, squash-merges, promotes beta->main, verifies the deploy, and
- * flags @george on failure.
+ * a PR, runs CI, squash-merges feature PRs into beta, promotes beta->main with
+ * an ancestry-preserving merge commit, verifies the deploy, and flags @george
+ * on failure.
  *
  * The node is entirely `{{...}}` templates, so its logic lives in strings and
  * cannot be type-checked. These tests drive the ACTUAL committed step
@@ -284,12 +285,19 @@ describe('red-ops-reviewer — promotion never deletes the base branch (prompt g
     expect(p).toContain('NEVER pass --delete-branch when the head ref is a PERMANENT branch');
     expect(p).toMatch(/beta, main, master, prod/);
     expect(p).toContain('Promotion must NEVER delete the base branch it just merged from');
-    // The permanent-head merge uses the no-delete form of the command.
-    expect(p).toContain('--squash --match-head-commit <headRefOid>');
+    // A base=main promotion uses an ancestry-preserving merge commit and no delete.
+    expect(p).toContain('--merge --match-head-commit <headRefOid>');
+    expect(p).not.toContain('--squash');
     // The promote sub-step is explicitly called out as head=beta, merged WITHOUT delete.
     expect(p).toContain('promote beta->main (its head IS beta, so merge it WITHOUT --delete-branch)');
     // headRefName is captured so the agent can tell whether the head is permanent.
     expect(p).toContain('--json headRefName,headRefOid,baseRefName');
+  });
+
+  it('keeps disposable feature PRs into beta on squash merge', () => {
+    const p = promptFor({ prUrl: PR, repo: REPO, base: 'beta', reviewOnly: false });
+    expect(p).toContain('--squash --match-head-commit <headRefOid>');
+    expect(p).not.toContain('--merge --match-head-commit <headRefOid>');
   });
 
   it('REVIEW-ONLY prompt never merges or deletes anything', () => {
