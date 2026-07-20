@@ -107,6 +107,21 @@ describe('get_run — happy path', () => {
     expect(capturedUrl).toContain(encodeURIComponent('has spaces & ?'));
   });
 
+  test('redacts secrets and credentials from returned run state', async () => {
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({
+      runId: 'run_secret',
+      input: { _secrets: { DEPLOY_TOKEN: 'do-not-return' } },
+      output: { resolvedSshKey: 'private-material', command: 'curl -H "Authorization: Bearer abc.def.ghi"' },
+    }), { status: 200 })) as unknown as typeof globalThis.fetch;
+
+    const result = await getRunTool.handler({ runId: 'run_secret' }, makeMockContext());
+    const text = result.content[0].text;
+    expect(text).not.toContain('do-not-return');
+    expect(text).not.toContain('private-material');
+    expect(text).not.toContain('abc.def.ghi');
+    expect(text).toContain('[REDACTED]');
+  });
+
   test('forwards bearer + user-id headers from state', async () => {
     let capturedHeaders: Record<string, string> = {};
     globalThis.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
