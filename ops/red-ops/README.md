@@ -86,7 +86,8 @@ open cards would have silently swallowed that direction on every quiet tick.
 ## The reviewer node (`red-ops-reviewer`)
 
 The INDEPENDENT last gate before prod: given a PR it re-runs CI, reviews the diff,
-squash-merges to base, promotes `beta`→`main`, verifies the deploy, and flags
+squash-merges feature PRs into `beta`, uses ancestry-preserving merge commits for
+promotions from `beta`→`main`, verifies the deploy, and flags
 `@george` on any failure. Like the triage node it is entirely `{{...}}` templates,
 so `tests/red-ops/reviewer-result-parser.test.ts` drives the ACTUAL step
 expressions in `red-ops-reviewer.node.json` through the engine's own `resolveValue`
@@ -101,6 +102,13 @@ sets `needsGeorge`. The live MCP node embeds this same JS as template strings; t
 JSON is the source of truth and the two are kept in sync (deploy with the same
 `PUT /api/v1/nodes/red-ops-reviewer` used for the triage node, or `node_patch`).
 
+**Merge strategy.** AUTO-MERGE resolves the PR base before constructing the step 5
+command. A permanent promotion whose base is `main` uses
+`gh pr merge --merge --match-head-commit`, preserving the ancestry shared by
+`beta` and `main`. Disposable feature-branch PRs whose base is `beta` continue to
+use `gh pr merge --squash`; this keeps normal feature integration compact while
+making repeated beta→main promotions converge instead of permanently diverging.
+
 **Promotion must never delete the base branch (2026-07-15).** The AUTO-MERGE step
 used to run `gh pr merge <pr> --squash --delete-branch` unconditionally. A promote
 `beta`→`main` PR's HEAD ref **is** `beta`, so `--delete-branch` deleted `refs/heads/beta`
@@ -108,9 +116,9 @@ outright — twice on 2026-07-15 (PR #455, #457), which broke the "workers branc
 beta" convention and RedRun's beta-track autoDeploy. Two guards now prevent this:
 
 1. **Prompt rule (prevention).** Step 5 forbids `--delete-branch` on any *permanent*
-   branch (`beta`/`main`/`master`/`prod`); a permanent head is merged with the plain
-   `gh pr merge --squash --match-head-commit` form. Only disposable feature branches
-   are cleaned up.
+   branch (`beta`/`main`/`master`/`prod`); a permanent promotion head is merged with
+   the plain `gh pr merge --merge --match-head-commit` form. Only disposable feature
+   branches are cleaned up.
 2. **Branch-protection guard (self-heal).** After the merge guard confirms a merge, a
    deterministic `data.betaGuardCommand` / `data.betaGuard` / `data.result` triple
    checks whether the merged PR's permanent head branch still exists and, if it was
