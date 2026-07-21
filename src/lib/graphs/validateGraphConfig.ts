@@ -22,6 +22,7 @@
  */
 import { END } from '@langchain/langgraph';
 import type { GraphConfig, GraphEdgeConfig, GraphNodeConfig } from '../types/graph';
+import { normalizeProfile } from '../permissions/enforce';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -238,6 +239,18 @@ export async function validateGraphConfig(
 
   if (!config.graphId || typeof config.graphId !== 'string' || !config.graphId.trim()) {
     err({ code: 'MISSING_GRAPH_ID', message: 'Graph is missing required field: graphId' });
+  }
+
+  if ('capabilities' in config) {
+    const normalized = normalizeProfile((config as { capabilities?: unknown }).capabilities);
+    if (normalized === null) {
+      err({
+        code: 'CAPABILITIES_MALFORMED',
+        message:
+          `Graph has malformed 'capabilities'. Expected shape: { name?, description?, capabilities: ` +
+          `[{ resource: 'state'|'knowledge'|'exec'|'computer'|'environment', actions: [...], selector }] }`,
+      });
+    }
   }
 
   if (!Array.isArray(config.nodes) || config.nodes.length === 0) {
