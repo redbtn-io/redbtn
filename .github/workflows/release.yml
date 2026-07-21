@@ -25,7 +25,6 @@ jobs:
     timeout-minutes: 20
     env:
       NPM_REGISTRY: https://registry.redbtn.io
-      NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/redbtn-npmrc
       ALLOW_NEW_PACKAGE: ${{ inputs.allow_new_package || 'false' }}
     steps:
       - name: Checkout main
@@ -42,13 +41,15 @@ jobs:
         run: |
           set -eu
           test -n "$REDBTN_NPM_TOKEN" || { echo 'REDBTN_NPM_TOKEN is not configured' >&2; exit 1; }
+          npmrc="$RUNNER_TEMP/redbtn-npmrc"
           umask 077
           {
             printf '@redbtn:registry=%s\n' "$NPM_REGISTRY"
             printf '//registry.redbtn.io/:_auth=%s\n' "$REDBTN_NPM_TOKEN"
             printf 'always-auth=true\n'
-          } > "$NPM_CONFIG_USERCONFIG"
-          npm whoami --registry "$NPM_REGISTRY"
+          } > "$npmrc"
+          echo "NPM_CONFIG_USERCONFIG=$npmrc" >> "$GITHUB_ENV"
+          NPM_CONFIG_USERCONFIG="$npmrc" npm whoami --registry "$NPM_REGISTRY"
 
       - name: Install dependencies
         run: npm ci
