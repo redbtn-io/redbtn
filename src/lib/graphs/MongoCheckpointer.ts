@@ -92,6 +92,29 @@ function assertSerializationOk(label: string, source: any, bytes: Uint8Array): v
   );
 }
 
+// Hard ceiling for a single serialized checkpoint / write value. Mongo rejects
+// documents over 16MB, and the bson serializer's internal buffer (17,825,792
+// bytes) throws ERR_OUT_OF_RANGE before that — which surfaced as an unhandled
+// rejection that killed the whole worker process mid-run (2026-07-20, tpf-ai
+// deep reports carrying ~6MB of TTS audio base64 in state). 14MB leaves room
+// for the base64 inflation and the rest of the document around the payload.
+const MAX_CHECKPOINT_BYTES = (() => {
+  const raw = Number(process.env.CHECKPOINT_MAX_BYTES);
+  return Number.isFinite(raw) && raw > 0 ? raw : 14 * 1024 * 1024;
+})();
+
+function oversized(label: string, threadId: string | undefined, bytes: number): boolean {
+  if (bytes <= MAX_CHECKPOINT_BYTES) return false;
+  console.error(
+    `[MongoCheckpointer] ${label} skipped for thread ${threadId ?? 'unknown'}: ` +
+    `serialized size ${bytes} exceeds ${MAX_CHECKPOINT_BYTES} bytes. ` +
+    `The run continues WITHOUT this checkpoint (crash-resume falls back to the ` +
+    `previous one). Shrink graph state — large blobs (audio/doc payloads) ` +
+    `should be cleared from state once consumed.`
+  );
+  return true;
+}
+
 // ============================================================================
 // MongoDB schema helpers (raw mongoose access, no model recompilation)
 // ============================================================================
@@ -276,15 +299,22 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
       const checkpointStr = Buffer.from(checkpointBytes).toString('base64');
       const metadataStr = Buffer.from(metadataBytes).toString('base64');
       const parentCheckpointId = config.configurable?.checkpoint_id ?? null;
-      await CheckpointModel.findOneAndUpdate(
-        { conversationId, threadId, checkpointNs, checkpointId: checkpoint.id },
-        { $set: { conversationId, threadId, checkpointNs, checkpointId: checkpoint.id, parentCheckpointId, checkpoint: checkpointStr, metadata: metadataStr, createdAt: new Date() } },
-        { upsert: true, new: true }
-      );
+      if (!oversized('put(checkpoint)', threadId, checkpointStr.length + metadataStr.length)) {
+        await CheckpointModel.findOneAndUpdate(
+          { conversationId, threadId, checkpointNs, checkpointId: checkpoint.id },
+          { $set: { conversationId, threadId, checkpointNs, checkpointId: checkpoint.id, parentCheckpointId, checkpoint: checkpointStr, metadata: metadataStr, createdAt: new Date() } },
+          { upsert: true, new: true }
+        );
+      }
       return { configurable: { conversation_id: conversationId, thread_id: threadId, checkpoint_ns: checkpointNs, checkpoint_id: checkpoint.id } };
     } catch (error) {
-      console.error('[MongoCheckpointer] put error:', error);
-      throw error;
+      // NEVER rethrow: checkpoint persistence is best-effort. A thrown error
+      // here escapes LangGraph's pregel loop as an unhandled rejection and
+      // kills the worker process, orphaning every in-flight run (the
+      // 2026-07-20 tpf-ai incident). Losing one checkpoint only degrades
+      // crash-resume granularity — the run itself must keep going.
+      console.error('[MongoCheckpointer] put error (non-fatal, checkpoint skipped):', error);
+      return { configurable: { conversation_id: conversationId, thread_id: threadId, checkpoint_ns: checkpointNs, checkpoint_id: checkpoint.id } };
     }
   }
 
@@ -298,20 +328,28 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
       const WritesModel = getWritesModel();
       await Promise.all(
         writes.map(async ([channel, value]: [string, any], idx: number) => {
-          const [, valueBytes] = await this.serde.dumpsTyped(value);
-          assertSerializationOk(`putWrites(${channel})`, value, valueBytes);
-          const valueStr = Buffer.from(valueBytes).toString('base64');
-          const resolvedIdx = WRITES_IDX_MAP[channel] ?? idx;
-          await WritesModel.findOneAndUpdate(
-            { conversationId, threadId, checkpointNs, checkpointId, taskId, idx: resolvedIdx },
-            { $setOnInsert: { conversationId, threadId, checkpointNs, checkpointId, taskId, idx: resolvedIdx, channel, value: valueStr, createdAt: new Date() } },
-            { upsert: true }
-          );
+          try {
+            const [, valueBytes] = await this.serde.dumpsTyped(value);
+            assertSerializationOk(`putWrites(${channel})`, value, valueBytes);
+            const valueStr = Buffer.from(valueBytes).toString('base64');
+            if (oversized(`putWrites(${channel})`, threadId, valueStr.length)) return;
+            const resolvedIdx = WRITES_IDX_MAP[channel] ?? idx;
+            await WritesModel.findOneAndUpdate(
+              { conversationId, threadId, checkpointNs, checkpointId, taskId, idx: resolvedIdx },
+              { $setOnInsert: { conversationId, threadId, checkpointNs, checkpointId, taskId, idx: resolvedIdx, channel, value: valueStr, createdAt: new Date() } },
+              { upsert: true }
+            );
+          } catch (error) {
+            // A single pending write is independently best-effort. Containing
+            // it here also lets sibling writes in the same checkpoint proceed.
+            console.error(`[MongoCheckpointer] putWrites(${channel}) error (non-fatal, write skipped):`, error);
+          }
         })
       );
     } catch (error) {
-      console.error('[MongoCheckpointer] putWrites error:', error);
-      throw error;
+      // Same rationale as put(): a failed pending-write record must never
+      // crash the worker. See the put() catch block.
+      console.error('[MongoCheckpointer] putWrites error (non-fatal, write skipped):', error);
     }
   }
 
