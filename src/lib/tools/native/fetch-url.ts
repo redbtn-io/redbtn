@@ -88,6 +88,7 @@ const fetchUrlTool: NativeToolDefinition = {
       // never leak to a third party. A header the caller set explicitly is
       // never overwritten (case-insensitive check), so an explicit
       // Authorization header always wins.
+      let attachedInternalAuth = false;
       if (isInternalHost(url)) {
         const hasHeader = (name: string): boolean => {
           const lower = name.toLowerCase();
@@ -98,9 +99,18 @@ const fetchUrlTool: NativeToolDefinition = {
           const value = authHeaders[key];
           if (value && !hasHeader(key)) {
             fetchHeaders[key] = value;
+            attachedInternalAuth = true;
           }
         }
       }
+      // Do not let credentials attached for the original internal URL cross a
+      // redirect boundary. A redirect target is not re-checked by this tool's
+      // one-shot allowlist decision, and fetch implementations may preserve
+      // X-User-Id/X-Internal-Key on cross-origin hops. Callers can explicitly
+      // fetch the Location target as a new request, which re-runs the allowlist.
+      const effectiveRedirect = attachedInternalAuth
+        ? 'manual'
+        : (followRedirects ? 'follow' : 'manual');
 
       const MAX_RETRIES = 2;
       const BACKOFF = [2_000, 5_000];
@@ -137,7 +147,7 @@ const fetchUrlTool: NativeToolDefinition = {
             headers: fetchHeaders,
             body: method !== 'GET' && method !== 'HEAD' ? (body || undefined) : undefined,
             signal: controller.signal,
-            redirect: followRedirects ? 'follow' : 'manual',
+            redirect: effectiveRedirect,
           });
           clearTimeout(timer);
           if (runAbortSignal && runAbortListener) {

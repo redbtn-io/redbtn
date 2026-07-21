@@ -30,6 +30,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { redactSensitive } from '../../utils/redact-sensitive';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -214,7 +215,7 @@ const getRunLogsTool: NativeToolDefinition = {
         : allLogs;
 
     const hasMore = filtered.length > limit;
-    const logs = hasMore ? filtered.slice(0, limit) : filtered;
+    const logs = redactSensitive(hasMore ? filtered.slice(0, limit) : filtered);
 
     return {
       content: [

@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      allow_new_package:
+        description: Allow publishing when this package has no registry entry
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NPM_REGISTRY: https://registry.redbtn.io
+      ALLOW_NEW_PACKAGE: ${{ inputs.allow_new_package || 'false' }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Authenticate to Verdaccio
+        env:
+          REDBTN_NPM_TOKEN: ${{ secrets.REDBTN_NPM_TOKEN }}
+        run: |
+          set -eu
+          test -n "$REDBTN_NPM_TOKEN" || { echo 'REDBTN_NPM_TOKEN is not configured' >&2; exit 1; }
+          npmrc="$RUNNER_TEMP/redbtn-npmrc"
+          umask 077
+          {
+            printf '@redbtn:registry=%s\n' "$NPM_REGISTRY"
+            printf '//registry.redbtn.io/:_auth=%s\n' "$REDBTN_NPM_TOKEN"
+            printf 'always-auth=true\n'
+          } > "$npmrc"
+          echo "NPM_CONFIG_USERCONFIG=$npmrc" >> "$GITHUB_ENV"
+          NPM_CONFIG_USERCONFIG="$npmrc" npm whoami --registry "$NPM_REGISTRY"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Publish or skip and reconcile dist-tags
+        run: ./scripts/release.sh

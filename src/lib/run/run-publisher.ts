@@ -62,6 +62,7 @@ import type { RedLog } from '@redbtn/redlog';
 import { ConversationPublisher, createConversationPublisher } from '../conversation';
 import { assertChatComponentSpec } from '../chat-components/spec-schema';
 import { heartbeatAutomationSlot, releaseAutomationSlot } from './automation-concurrency';
+import { redactSensitive } from '../utils/redact-sensitive';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -324,7 +325,7 @@ export class RunPublisher {
           conversationId: this.state?.conversationId,
           generationId: this.runId,
         },
-        metadata: meta,
+        metadata: redactSensitive(meta),
       });
     } catch (error) {
       if (DEBUG) console.error('[RunPublisher] redlog error:', error);

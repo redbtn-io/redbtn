@@ -75,7 +75,7 @@ export abstract class McpServerSSE {
             code: -32603,
             message: `Internal error: ${error}`
           },
-          id: req.body.id || null
+          id: req.body?.id ?? null
         });
       }
     });
@@ -175,6 +175,17 @@ export abstract class McpServerSSE {
    * Handle incoming JSON-RPC request
    */
   private async handleRequest(request: any): Promise<any> {
+    if (!request || typeof request !== 'object' || Array.isArray(request)) {
+      return {
+        jsonrpc: '2.0',
+        error: {
+          code: -32600,
+          message: 'Invalid Request'
+        },
+        id: null
+      };
+    }
+
     const { jsonrpc, id, method, params } = request;
 
     // Validate JSON-RPC 2.0
@@ -185,7 +196,7 @@ export abstract class McpServerSSE {
           code: -32600,
           message: 'Invalid Request: jsonrpc must be "2.0"'
         },
-        id: id || null
+        id: id ?? null
       };
     }
 
