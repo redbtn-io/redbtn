@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import { execFileSync } from 'child_process';
+import path from 'path';
 import type { NativeToolContext } from '../../src/lib/tools/native-registry';
 import { sanitizeToolInputForTelemetry } from '../../src/lib/tools/tool-telemetry';
 
@@ -142,6 +144,18 @@ describe('send_email George-only delivery', () => {
 
   test('redacts message content from run telemetry input', () => {
     expect(sanitizeToolInputForTelemetry('send_email', {
+      to: GEORGE_EMAIL_RECIPIENT, subject: 'private subject', body: 'private body',
+    })).toEqual({ recipient: GEORGE_EMAIL_RECIPIENT, content: 'redacted' });
+  });
+
+  test('keeps the recipient in the built CommonJS telemetry module', () => {
+    const projectRoot = path.resolve(__dirname, '../..');
+    execFileSync('npm', ['run', 'build'], { cwd: projectRoot, stdio: 'pipe' });
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const builtTelemetry = require(path.join(projectRoot, 'dist/lib/tools/tool-telemetry.js')) as {
+      sanitizeToolInputForTelemetry: typeof sanitizeToolInputForTelemetry;
+    };
+    expect(builtTelemetry.sanitizeToolInputForTelemetry('send_email', {
       to: GEORGE_EMAIL_RECIPIENT, subject: 'private subject', body: 'private body',
     })).toEqual({ recipient: GEORGE_EMAIL_RECIPIENT, content: 'redacted' });
   });

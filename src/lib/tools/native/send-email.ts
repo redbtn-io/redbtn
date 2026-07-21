@@ -7,12 +7,12 @@
  */
 import nodemailer from 'nodemailer';
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
+import { AGENT_EMAIL_SENDER, GEORGE_EMAIL_RECIPIENT } from '../agent-email-policy';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
-export const AGENT_EMAIL_SENDER = 'agent@redbtn.io';
-export const GEORGE_EMAIL_RECIPIENT = 'george@redbtn.io';
+export { AGENT_EMAIL_SENDER, GEORGE_EMAIL_RECIPIENT } from '../agent-email-policy';
 
 interface MailMessage {
   from: string;
