@@ -307,6 +307,43 @@ describe('red-ops-reviewer — promotion never deletes the base branch (prompt g
   });
 });
 
+// Regression for the 2026-07-21 finding: five bot-authored promote (beta->main)
+// PRs sat open MERGEABLE/CLEAN for 2-3 days because the old prompt only told the
+// model to "open/verify" the promote PR, with no explicit review/merge/verify
+// commands and no verdict-contract requirement — so the model treated it as
+// optional and stopped after the ORIGINAL PR's merge. The promote sub-step now
+// gets the same command-level, non-skippable treatment as the main merge.
+describe('red-ops-reviewer — promote PR is mandatory, not a soft suggestion', () => {
+  const REPO = 'redbtn-io/redauth';
+
+  it('AUTO-MERGE prompt gives an explicit discover/create/review/merge/verify sequence for the promote PR', () => {
+    const p = promptFor({ prUrl: PR, repo: REPO, base: 'beta', reviewOnly: false });
+    expect(p).toContain('this is REQUIRED, not optional, and gets the SAME rigor as steps 4-5 above, never a shortcut');
+    // Discover + create use the real repo, not a placeholder.
+    expect(p).toContain(`gh pr list --repo ${REPO} --base main --head beta --state open`);
+    expect(p).toContain(`gh pr create --repo ${REPO} --base main --head beta`);
+    // The promote PR gets its OWN formal review — it is not covered by the
+    // original PR's step-4 approval.
+    expect(p).toContain('FORMALLY REVIEW it exactly like step 4');
+    expect(p).toContain('gh pr review <promotePrUrl> --approve');
+    // The merge command is explicit, ancestry-preserving (--merge, matching the
+    // base:main promotion rule above — not --squash), and still forbids
+    // --delete-branch on the beta head.
+    expect(p).toContain('gh pr merge <promotePrUrl> --merge --match-head-commit <promoteHeadOid>');
+    // A CLEAN/MERGEABLE-but-unmerged promote PR is explicitly not a valid end state.
+    expect(p).toContain('a CLEAN/MERGEABLE promote PR you have not personally driven to MERGED is NOT done');
+    expect(p).toContain('never end the run leaving an actionable promote PR silently open');
+  });
+
+  it('verdict contract forbids ending a beta-base run on a bare "merged" verdict', () => {
+    const p = promptFor({ prUrl: PR, repo: REPO, base: 'beta', reviewOnly: false });
+    expect(p).toContain(
+      'When base is beta, verdict must be promoted, merged-verify-pending, or blocked — never plain merged',
+    );
+    expect(p).toContain('promoted may be true only once you confirmed the promote PR itself shows MERGED');
+  });
+});
+
 describe('red-ops-reviewer — branch-protection guard command', () => {
   const REPO = 'redbtn-io/redrun';
 

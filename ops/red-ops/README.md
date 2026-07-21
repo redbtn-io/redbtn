@@ -126,6 +126,29 @@ beta" convention and RedRun's beta-track autoDeploy. Two guards now prevent this
    and sets `needsGeorge` with `betaGuardStatus=RECREATED`. `tests/red-ops/reviewer-result-parser.test.ts`
    covers both guards.
 
+**Promotion must not be a soft suggestion (2026-07-21).** Five bot-authored promote
+(`beta`→`main`) PRs sat open MERGEABLE/CLEAN for 2-3 days apiece (`red-track#14`,
+`redbtn-cli#15`, `reddoc#49`, `redauth#40`, `redlog#31`) because step 5's old prompt
+only said "also open/verify promote beta->main ... then verify RedRun deploy" — no
+explicit `gh pr create`/`gh pr review`/`gh pr merge` commands for the promote PR
+itself (unlike the original PR, which gets exact commands), and no verdict-contract
+requirement forcing the model back to confirm it. All six PRs had empty
+`reviewDecision` and empty `statusCheckRollup` — the reviewer bot never even
+formally reviewed its own promote PRs, let alone merged them. This is a model-
+instruction-following gap, not a GitHub-side gate: `allow_auto_merge` is `false` on
+every affected repo (all private, free-plan — `GET .../branches/main/protection`
+returns 403, so there are no required status checks for native auto-merge to key
+off anyway). Step 5 now spells out the promote PR as a mandatory (a)-(g) sequence —
+discover, create if missing, formally review (its own `reviewDecision`, separate
+from the original PR's), capture its SHA, merge ancestry-preserving (`--merge`, per
+the merge-strategy rule above — not `--squash`) with the same no-`--delete-branch`
+rule, verify `state:MERGED`, and treat a still-open promote PR as BLOCKED
+(`promoted:false`, `needsGeorge:true`) rather than a silent stop. The verdict
+contract now forbids ending a `base:beta` run on a bare `merged` verdict — it must
+be `promoted`, `merged-verify-pending`, or `blocked`. Covered by
+`tests/red-ops/reviewer-result-parser.test.ts` ("promote PR is mandatory, not a
+soft suggestion").
+
 ## Deploying / rolling back
 
 Deploy the node (`nodeId` at the top level, config fields flattened alongside it):
