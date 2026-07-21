@@ -50,5 +50,8 @@ jobs:
           } > "$NPM_CONFIG_USERCONFIG"
           npm whoami --registry "$NPM_REGISTRY"
 
+      - name: Install dependencies
+        run: npm ci
+
       - name: Publish or skip and reconcile dist-tags
         run: ./scripts/release.sh

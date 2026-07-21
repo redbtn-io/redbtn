@@ -78,7 +78,7 @@ trap 'rm -f "$query_error"' EXIT
 if versions_json="$(npm view "$package_name" versions --json --registry "$registry" 2>"$query_error")"; then
   registry_has_package=true
 else
-  if rg -q 'E404|404 Not Found|is not in this registry' "$query_error"; then
+  if grep -qE 'E404|404 Not Found|is not in this registry' "$query_error"; then
     registry_has_package=false
     versions_json='[]'
   else
