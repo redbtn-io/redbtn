@@ -328,16 +328,22 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
       const WritesModel = getWritesModel();
       await Promise.all(
         writes.map(async ([channel, value]: [string, any], idx: number) => {
-          const [, valueBytes] = await this.serde.dumpsTyped(value);
-          assertSerializationOk(`putWrites(${channel})`, value, valueBytes);
-          const valueStr = Buffer.from(valueBytes).toString('base64');
-          if (oversized(`putWrites(${channel})`, threadId, valueStr.length)) return;
-          const resolvedIdx = WRITES_IDX_MAP[channel] ?? idx;
-          await WritesModel.findOneAndUpdate(
-            { conversationId, threadId, checkpointNs, checkpointId, taskId, idx: resolvedIdx },
-            { $setOnInsert: { conversationId, threadId, checkpointNs, checkpointId, taskId, idx: resolvedIdx, channel, value: valueStr, createdAt: new Date() } },
-            { upsert: true }
-          );
+          try {
+            const [, valueBytes] = await this.serde.dumpsTyped(value);
+            assertSerializationOk(`putWrites(${channel})`, value, valueBytes);
+            const valueStr = Buffer.from(valueBytes).toString('base64');
+            if (oversized(`putWrites(${channel})`, threadId, valueStr.length)) return;
+            const resolvedIdx = WRITES_IDX_MAP[channel] ?? idx;
+            await WritesModel.findOneAndUpdate(
+              { conversationId, threadId, checkpointNs, checkpointId, taskId, idx: resolvedIdx },
+              { $setOnInsert: { conversationId, threadId, checkpointNs, checkpointId, taskId, idx: resolvedIdx, channel, value: valueStr, createdAt: new Date() } },
+              { upsert: true }
+            );
+          } catch (error) {
+            // A single pending write is independently best-effort. Containing
+            // it here also lets sibling writes in the same checkpoint proceed.
+            console.error(`[MongoCheckpointer] putWrites(${channel}) error (non-fatal, write skipped):`, error);
+          }
         })
       );
     } catch (error) {
