@@ -14,6 +14,7 @@ import { runControlRegistry } from '../../../run/RunControlRegistry';
 import { getRunPublisher, getMcpClient, getConnectionManager, getGraphRegistry, getMeteringClient } from '../../../run/contextLookup';
 import { ToolHangError, withToolIdleWatchdog, type ToolIdleWatchdogHandle } from '../../../tools/tool-idle-watchdog';
 import { getNativeRegistry } from '../../../tools/native-registry';
+import { sanitizeToolInputForTelemetry } from '../../../tools/tool-telemetry';
 import type { ToolStepConfig } from '../types';
 
 function getNativeRegistryLazy(): any {
@@ -125,7 +126,7 @@ export async function executeTool(config: ToolStepConfig, state: any): Promise<P
     console.log('[ToolExecutor] ====== STARTING TOOL EXECUTION ======');
     console.log('[ToolExecutor] ToolName:', config.toolName);
     console.log('[ToolExecutor] OutputField:', config.outputField);
-    console.log('[ToolExecutor] Parameters:', JSON.stringify(config.parameters));
+    console.log('[ToolExecutor] Parameters:', JSON.stringify(sanitizeToolInputForTelemetry(config.toolName, config.parameters)));
     // Normalize legacy config format
     const normalizedConfig = normalizeToolStepConfig(config);
     // If error handling configured (new way), use it
@@ -454,7 +455,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
             console.log(`[ToolExecutor] Routing to native tool: ${config.toolName}`);
             if (runPublisher) {
                 await runPublisher.toolStart(toolId, config.toolName, 'native', {
-                    input: renderedParams,
+                    input: sanitizeToolInputForTelemetry(config.toolName, renderedParams),
                     ...(subgraphTag ? { subgraph: subgraphTag } : {}),
                 });
             }

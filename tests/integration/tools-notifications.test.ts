@@ -94,6 +94,19 @@ function setEmailEnv() {
   process.env.EMAIL_USER = 'agent@redbtn.io';
   process.env.EMAIL_PASS = 'app-password';
   process.env.EMAIL_FROM = 'agent@redbtn.io';
+  process.env.REDRUN_API_URL = 'https://run.test';
+  process.env.REDRUN_AGENT_EMAIL_AUDIT_KEY = 'audit-key';
+}
+
+function auditResponse(url: string, init?: RequestInit): Response | null {
+  if (url === 'https://run.test/api/agent-email/audits') {
+    return new Response(JSON.stringify({ auditId: 'audit-integration-1', status: 'attempted' }), { status: 201 });
+  }
+  if (url === 'https://run.test/api/agent-email/audits/audit-integration-1') {
+    const body = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ auditId: 'audit-integration-1', status: body.status }), { status: 200 });
+  }
+  return null;
 }
 
 describe('notifications pack integration — registration + chained execution', () => {
@@ -139,7 +152,7 @@ describe('notifications pack integration — registration + chained execution', 
       webhookCalls.length = 0;
       sendMailImpl = async () => ({
         messageId: '<integration-1@smtp.test>',
-        accepted: ['ops@redbtn.io'],
+        accepted: ['george@redbtn.io'],
         rejected: [],
       });
     });
@@ -156,6 +169,8 @@ describe('notifications pack integration — registration + chained execution', 
       globalThis.fetch = vi.fn(
         async (input: RequestInfo | URL, init?: RequestInit) => {
           const url = typeof input === 'string' ? input : (input as URL).toString();
+          const audit = auditResponse(url, init);
+          if (audit) return audit;
           webhookCalls.push({
             url,
             method: init?.method ?? 'GET',
@@ -172,7 +187,7 @@ describe('notifications pack integration — registration + chained execution', 
       const emailResult = await registry.callTool(
         'send_email',
         {
-          to: 'ops@redbtn.io',
+          to: 'george@redbtn.io',
           subject: '[ALERT] Build failed on main',
           body:
             '# Build failed\n\n' +
@@ -185,10 +200,7 @@ describe('notifications pack integration — registration + chained execution', 
       );
       expect(emailResult.isError).toBeFalsy();
       const emailBody = JSON.parse(emailResult.content[0].text);
-      expect(emailBody.ok).toBe(true);
-      expect(emailBody.messageId).toBe('<integration-1@smtp.test>');
-      expect(emailBody.from).toBe('agent@redbtn.io');
-      expect(emailBody.to).toEqual(['ops@redbtn.io']);
+      expect(emailBody).toEqual({ ok: true, status: 'accepted', auditId: 'audit-integration-1', messageId: '<integration-1@smtp.test>' });
       // Markdown rendered to HTML + plain-text by default.
       expect(typeof lastSendMailCall!.html).toBe('string');
       expect((lastSendMailCall!.html as string)).toContain('<h1>Build failed</h1>');
@@ -241,17 +253,18 @@ describe('notifications pack integration — registration + chained execution', 
         throw new Error('SMTP timeout');
       };
 
-      globalThis.fetch = vi.fn(async () =>
-        new Response('ok', { status: 200 }),
-      ) as unknown as typeof globalThis.fetch;
+      globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const audit = auditResponse(String(input), init);
+        return audit ?? new Response('ok', { status: 200 });
+      }) as unknown as typeof globalThis.fetch;
 
       const emailResult = await registry.callTool(
         'send_email',
-        { to: 'r@x.com', subject: 's', body: 'b' },
+        { to: 'george@redbtn.io', subject: 's', body: 'b' },
         ctx,
       );
       expect(emailResult.isError).toBe(true);
-      expect(JSON.parse(emailResult.content[0].text).error).toMatch(/SMTP/);
+      expect(JSON.parse(emailResult.content[0].text).code).toBe('SMTP_DELIVERY_FAILED');
 
       // The agent observes the email failure and decides to still ping the
       // webhook — both tools are independent.
@@ -299,7 +312,7 @@ describe('notifications pack integration — registration + chained execution', 
 
       const r = await registry.callTool(
         'send_email',
-        { to: 'r@x.com', body: 'b' /* missing subject */ },
+        { to: 'george@redbtn.io', body: 'b' /* missing subject */ },
         ctx,
       );
       expect(r.isError).toBe(true);

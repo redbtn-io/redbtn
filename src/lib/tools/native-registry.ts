@@ -248,7 +248,6 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   'parse_document',
 
   // ── Messaging ──
-  'send_email',
   'send_webhook',
   'download_file',
 
@@ -1444,9 +1443,8 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   // ─── Notifications pack (TOOL-HANDOFF.md §4.13) ───────────────────────────
   // Two tools that complement the existing `push_message` (in-app conversation
   // push). These extend notification reach beyond the app:
-  //   - send_email     → outbound SMTP via the same Gmail relay used by the
-  //                      magic-link auth flow. Markdown-by-default body with
-  //                      HTML + plain-text delivery; attachments supported.
+  //   - send_email     → a George-only audited SMTP delivery capability.
+  //                      It is intentionally not exposed as a remote MCP tool.
   //   - send_webhook   → outbound HTTP to an arbitrary URL (Slack, Discord,
   //                      Zapier, custom backends). Defaults to POST + JSON;
   //                      returns { status, response } with parsed JSON body

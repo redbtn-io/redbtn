@@ -345,10 +345,10 @@ Routes under `/api/v1/streams`. Engine module `redbtn/src/lib/streams/`.
 | Tool | Inputs | Output |
 |---|---|---|
 | `push_message` (existing) | (existing) | (existing) |
-| `send_email` | `to`, `subject`, `body`, `bodyType?: 'text' \| 'html' \| 'markdown' (default 'markdown')`, `attachments?` | `{ ok: true, messageId }` |
+| `send_email` | `to: 'george@redbtn.io'`, `subject`, `body`, `bodyType?: 'text' \| 'html' \| 'markdown' (default 'markdown')` | `{ ok: true, status: 'accepted', auditId, messageId }` |
 | `send_webhook` | `url`, `method? (default 'POST')`, `headers?`, `body?` | `{ status, response }` |
 
-**Email backend:** wire to the same SMTP/Gmail relay used by the `send-email` agent. SMTP creds in `~/code/@redbtn/.env.docker` (`EMAIL_USER`, `EMAIL_PASS`). From-address default: `agent@redbtn.io` (alias of `george@redbtn.io`).
+**Email backend:** use the configured SMTP relay with environment-only credentials. This capability is fixed to `agent@redbtn.io` → `george@redbtn.io`; it has no attachment, sender override, CC/BCC, or reply-to path. See `docs/agent-email-delivery.md` for controlled verification.
 
 ### 4.14 Files
 
