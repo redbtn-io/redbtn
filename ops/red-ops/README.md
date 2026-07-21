@@ -144,3 +144,52 @@ fails its own validation with `CONDITIONAL_MISSING_TARGETS`. That is a pre-exist
 (it reproduces on a graph freshly written by `update_graph`), and it means the patch tool cannot
 be used to undo this. `update_graph` with the full `edges` array from
 `red-coordinator.graph.before.json` works and is the tested rollback path.
+
+## Config-wipe outage, all reviewer runs (2026-07-19)
+
+Every `red-reviewer-auto` run between roughly 00:07:50Z and 01:16Z failed instantly
+(~1-2s) with `Step 1 (transform) failed: Cannot read properties of undefined (reading
+'operation')` — the board's review gate was down fleet-wide for over an hour, with
+worker-dispatched PRs (e.g. redlog#24, redToken#36) piling up unreviewed.
+
+**Root cause.** The live `red-ops-reviewer` node's `fullConfig` lost its `config`
+object on every step but one — `GET /api/v1/nodes/<id>` (and the `get_node` MCP tool)
+intentionally return a **schema-only** view of `steps`/`fullConfig` (`{stepIndex, type,
+configurable}`, no `config` value; see the GOTCHA in `[[project_red_ops_convergence_build]]`
+memory). Something wrote that schema-only shape back as the node's live `steps`,
+which strips every step's actual `operation`/`value`/`toolName` and leaves the engine
+executing steps with no config at all. There was no local or remote DB backup to
+restore from (`~/backups/mongo` on alphaServer and `~/backups/alphaserver/mongo` on
+redServer were both empty — the `backup-dbs.timer` referenced in AGENTS.md is not
+actually scheduled on either box; that's a separate, still-open gap).
+
+**Fix.** Redeployed the committed 20-step `red-ops-reviewer.node.json` verbatim via
+`node_patch` (`op:set path:/steps` with the full step array, which recompiles
+`fullConfig`) — this file is the tested source of truth per `tests/red-ops/reviewer-result-parser.test.ts`
+(21/21 passing before deploy). Verified live via `GET /api/v1/nodes/red-ops-reviewer`
+that every `fullConfig[i].config` is present, then smoke-tested with a real
+`reviewOnly:true` run against redlog#24 — it ran the full pipeline (ssh_shell, gh
+inspect, checkout, build/typecheck, test suite, review) with no step errors.
+
+**Known gap — CLI-limit-handling steps not restored.** The live node had **26** steps
+before the corruption; the committed JSON only has **20**. The extra 6 belonged to
+the session-limit auto-routing feature described in the `project_red_ops_session_limit_handling`
+memory (2026-07-16), which was applied directly to the live Mongo node and never
+back-ported into this file. Since the corruption wiped their config too and there was
+no backup to recover the exact live JS from, redeploying the committed 20-step version
+was the safe, testable path — but it means CLI-limit auto-detection/routing is
+currently **not present** on the reviewer node (still present on worker/coordinator).
+Re-apply that feature deliberately in a follow-up and commit it here so this can't
+happen again.
+
+**Guard added.** `verify-deployed.js` fetches a live node via the same REST endpoint
+and fails if any step's `config` is empty, or if the live step count drifts from the
+committed `.node.json`:
+
+```bash
+REDBTN_PAT=$REDBTN_PAT node ops/red-ops/verify-deployed.js red-ops-triage red-ops-reviewer
+```
+
+Run this after any live edit to a red-ops node (`node_patch`, direct Mongo, or the
+`PUT`/`POST` deploy commands above) — it would have caught this outage in one call
+instead of via 1060+ silently-failing runs.
