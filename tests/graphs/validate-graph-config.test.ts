@@ -306,6 +306,24 @@ describe('validateGraphConfig — conditional edges', () => {
       expect(findError(r, 'CONDITION_BAD_SYNTAX'), `expected ${expr} to be flagged`).toBeDefined();
     }
   });
+
+  test('non-string condition → CONDITION_BAD_TYPE', async () => {
+    const r = await validateGraphConfig(
+      baseConfig({
+        edges: [
+          { from: '__start__', to: 'n1' },
+          {
+            from: 'n1',
+            condition: true,
+            fallback: 'n2',
+            to: 'n2',
+          },
+          { from: 'n2', to: '__end__' },
+        ],
+      } as unknown as GraphConfig),
+    );
+    expect(findError(r, 'CONDITION_BAD_TYPE')).toBeDefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
