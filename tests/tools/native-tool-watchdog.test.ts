@@ -81,6 +81,34 @@ describe('native tool idle watchdog integration', () => {
     );
   });
 
+  it('fails when a native tool returns a malformed non-error result', async () => {
+    const toolName = `test_native_malformed_${Date.now()}`;
+    const runPublisher = makeRunPublisher();
+    registerNativeTool(toolName, async () => ({ content: 'not-an-array' } as any));
+
+    await expect(
+      executeTool(
+        {
+          toolName,
+          parameters: {},
+          outputField: 'result',
+          errorHandling: {
+            onError: 'fallback',
+            fallbackValue: { fallback: true },
+          },
+        },
+        { runId: 'run-native-malformed', runPublisher },
+      ),
+    ).resolves.toEqual({ fallback: true });
+
+    expect(runPublisher.toolComplete).not.toHaveBeenCalled();
+    expect(runPublisher.toolError).toHaveBeenCalledTimes(1);
+    expect(runPublisher.toolError).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.stringContaining('malformed result'),
+    );
+  });
+
   it('retries native isError envelopes and only completes after a successful retry', async () => {
     const toolName = `test_native_error_retry_${Date.now()}`;
     const runPublisher = makeRunPublisher();
