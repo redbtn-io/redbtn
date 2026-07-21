@@ -25,6 +25,7 @@ import { HumanMessage } from '@langchain/core/messages';
 import { resolveToolStrategy, type ToolStrategy } from '../../../neurons/capability-matrix';
 import { resolveTools, toBindToolsPayload, type ResolvedTool } from '../../../tools/tool-resolver';
 import { coerceArgsToSchema } from '../../../tools/coerce-args';
+import { sanitizeToolInputForTelemetry } from '../../../tools/tool-telemetry';
 
 /**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
@@ -1438,7 +1439,9 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
       if (runPublisher) {
         const subgraphTag = resolveSubgraphTag(state);
         await runPublisher.toolStart(toolId, toolName, resolved?.source ?? 'native', {
-          input: dispatchArgs,
+          // Tool arguments are normally useful telemetry, but email subject/body
+          // are message content and must never be persisted in run events.
+          input: sanitizeToolInputForTelemetry(toolName, dispatchArgs),
           triggeredBy: 'neuron',
           neuronStepId,
           ...(subgraphTag ? { subgraph: subgraphTag } : {}),

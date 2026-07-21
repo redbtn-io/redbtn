@@ -13,7 +13,7 @@ import { describe, it, expect } from 'vitest';
 import { runNativeToolUseLoop } from '../../src/lib/nodes/universal/executors/neuronExecutor';
 import type { ResolvedTool } from '../../src/lib/tools/tool-resolver';
 
-function makeHarness(toolCallArgs: Record<string, unknown>) {
+function makeHarness(toolCallArgs: Record<string, unknown>, toolName = 'test_tool') {
   const callOrder: string[] = [];
   const chunks: string[] = [];
   const toolStartInputs: Array<Record<string, unknown>> = [];
@@ -38,7 +38,7 @@ function makeHarness(toolCallArgs: Record<string, unknown>) {
 
   const resolvedTools: ResolvedTool[] = [
     {
-      name: 'test_tool',
+      name: toolName,
       description: 'A fake tool for tests',
       inputSchema: {
         type: 'object',
@@ -60,7 +60,7 @@ function makeHarness(toolCallArgs: Record<string, unknown>) {
       if (callCount === 1) {
         return {
           content: '',
-          tool_calls: [{ id: 'call_1', name: 'test_tool', args: toolCallArgs }],
+          tool_calls: [{ id: 'call_1', name: toolName, args: toolCallArgs }],
         };
       }
       return { content: 'All done.', tool_calls: [] };
@@ -122,5 +122,22 @@ describe('message_user tool-call prop', () => {
     expect(harness.getCapturedInvokeArgs()).toEqual({ foo: 'bar' });
     expect(harness.chunks).toEqual([]);
     expect(harness.callOrder).not.toContain('chunk');
+  });
+
+  it('redacts send_email message content from emitted tool_start telemetry', async () => {
+    const harness = makeHarness({
+      to: 'george@redbtn.io',
+      subject: 'private subject',
+      body: 'private body',
+    }, 'send_email');
+
+    await harness.run();
+
+    expect(harness.toolStartInputs).toEqual([{
+      recipient: 'george@redbtn.io',
+      content: 'redacted',
+    }]);
+    expect(JSON.stringify(harness.toolStartInputs)).not.toContain('private subject');
+    expect(JSON.stringify(harness.toolStartInputs)).not.toContain('private body');
   });
 });
