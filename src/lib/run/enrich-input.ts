@@ -387,7 +387,10 @@ async function collectGraphReferencedSecretNames(
 // Step 3: Resolve secrets
 // =============================================================================
 
-async function resolveSecrets(
+// Exported for unit tests that assert the caller userId is forwarded into the
+// redsecrets resolve() input (see extractSecretNamesFromConfig above for the
+// same testability-export pattern). Not part of the stable public surface.
+export async function resolveSecrets(
   input: Record<string, unknown>,
   userId: string,
   automationDoc: AutomationDoc | null,
@@ -430,12 +433,21 @@ async function resolveSecrets(
 
     const scopeId = automationDoc?.automationId ?? userId;
     const scope = automationDoc ? 'automation' : 'user';
+    // Owner of the secrets we're allowed to resolve. For automation-scoped runs
+    // that's the automation's creator (automationDoc.userId), NOT the run's
+    // triggering user — otherwise a triggerer could resolve someone else's
+    // automation secrets. For user-scoped runs it's the run's own user.
+    // Passing userId lets the hardened redsecrets fallback (>=0.2.0) match only
+    // documents owned by that user; the installed 0.1.0 ignores the field, so
+    // this is forward-compatible and safe to land ahead of the package fix.
+    const ownerUserId = automationDoc?.userId ?? userId;
 
     const batch = await secretsRepo.resolve(db, {
       names: secretNames,
       appName: 'redbtn',
       scope,
       scopeId,
+      userId: ownerUserId,
     }, 'secrets');
 
     Object.assign(resolvedSecrets, batch);
