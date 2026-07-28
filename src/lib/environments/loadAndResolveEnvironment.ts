@@ -306,6 +306,9 @@ async function defaultSecretsResolver(): Promise<(name: string, userId: string) 
         appName: 'redbtn',
         scope: 'user',
         scopeId: userId,
+        // Forward the (owner's) userId so the hardened redsecrets fallback only
+        // matches that user's documents. Ignored by the installed 0.1.0.
+        userId,
       },
       'secrets',
     );
