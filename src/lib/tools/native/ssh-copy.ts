@@ -27,14 +27,21 @@
  */
 
 import { Client, SFTPWrapper } from 'ssh2';
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import mongoose from 'mongoose';
 import { environmentManager } from '../../environments/EnvironmentManager';
 import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
 import { getCapabilityProfile } from '../../run/contextLookup';
 import { enforceToolCapability } from '../../permissions/enforce';
+import { readAllowlistedSshKey } from './ssh-key-path';
+
+// Test seam — mirrors ssh_shell's factory so the inline SSH path can be
+// exercised with a mock client (no real network) in unit tests.
+type SshClientFactory = () => Client;
+let sshClientFactory: SshClientFactory = () => new Client();
+
+export function __setSshCopyClientFactoryForTests(factory: SshClientFactory | null): void {
+  sshClientFactory = factory ?? (() => new Client());
+}
 
 // Use GridFSBucket and ObjectId from mongoose's bundled mongodb to avoid BSON version mismatch
 const { GridFSBucket } = mongoose.mongo;
@@ -315,11 +322,11 @@ const sshCopy: NativeToolDefinition = {
       },
       sshKeyPath: {
         type: 'string',
-        description: 'Path to SSH private key file. Supports ~ expansion.',
+        description: 'Path to an SSH private key file on the worker machine. Supports ~ expansion. Reads are confined to the operator-allowlisted directories in the SSH_KEY_PATH_ALLOWED_DIRS env var (and are refused entirely when it is unset) — it cannot read arbitrary worker paths. Prefer passing the key content inline via `sshKey` from `_secrets`.',
       },
       sshKey: {
         type: 'string',
-        description: 'SSH private key content (PEM string).',
+        description: 'SSH private key content (PEM string). Preferred: use this with a key stored in `_secrets` instead of sshKeyPath.',
       },
       password: {
         type: 'string',
@@ -488,7 +495,7 @@ const sshCopy: NativeToolDefinition = {
     // 2. SSH connect + SFTP transfer
     // -----------------------------------------------------------------------
     return new Promise((resolve) => {
-      const conn = new Client();
+      const conn = sshClientFactory();
       let settled = false;
 
       const settle = (error: Error | null, result?: AnyObject) => {
@@ -525,12 +532,11 @@ const sshCopy: NativeToolDefinition = {
       if (sshKey) {
         connConfig.privateKey = Buffer.from(sshKey, 'utf8');
       } else if (sshKeyPath) {
-        const expandedPath = sshKeyPath.replace(/^~/, os.homedir());
         try {
-          connConfig.privateKey = fs.readFileSync(expandedPath);
+          connConfig.privateKey = readAllowlistedSshKey(sshKeyPath);
         } catch (readErr: unknown) {
           const msg = readErr instanceof Error ? readErr.message : String(readErr);
-          return settle(new Error(`Cannot read SSH key at '${expandedPath}': ${msg}`));
+          return settle(new Error(msg));
         }
       } else if (password) {
         connConfig.password = password;
