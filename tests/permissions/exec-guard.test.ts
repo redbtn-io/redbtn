@@ -3,7 +3,7 @@
  * fail-closed-on-audit. Mocks ioredis + fetch.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { runExecGuard, ExecBlockedError, isGuardedExecTool, __setRedisForTest } from '../../src/lib/permissions/exec-guard';
+import { runExecGuard, ExecBlockedError, isGuardedExecTool, auditAttempt, __setRedisForTest } from '../../src/lib/permissions/exec-guard';
 
 // Injected fake redis (no real connection).
 const redisState = {
@@ -109,5 +109,68 @@ describe('exec-guard — SHADOW mode (Goal 3: log-only migration)', () => {
   it('STILL DENIES on an explicit kill switch (not relaxed by shadow)', async () => {
     redisState.get.mockImplementation(async (k: string) => (k === 'exec:kill:global' ? '1' : null));
     await expect(runExecGuard(ctx, 'run_command', okArgs)).rejects.toMatchObject({ code: 'kill_switch' });
+  });
+});
+
+// ── Engine (worker) run context: durable-audit authenticates as a SERVICE
+// PRINCIPAL ──────────────────────────────────────────────────────────────────
+// A worker/engine run carries NO user Bearer token; it authenticates to the
+// webapp audit sink as a service principal (X-Internal-Key + X-User-Id), exactly
+// like the native state tools. This is the path EVERY Red Ops run takes (shared
+// principal 69a0b790a0ae8660290a78da). If it did not authenticate, auditAttempt
+// would return false and — at shadow-off — Gate 7 (fail-closed audit) would DENY
+// all Red Ops exec fleet-wide. These tests pin that the engine context DOES
+// authenticate, and pin the exact conditions under which it (deliberately) cannot.
+// See docs/redops-exec-guard-readiness.md §3.
+describe('exec-guard — engine run context audits as a service principal', () => {
+  const RED_OPS_PRINCIPAL = '69a0b790a0ae8660290a78da';
+  // Representative worker/engine context: a userId + run identity, NO Bearer token.
+  const engineCtx: any = { state: { userId: RED_OPS_PRINCIPAL, runId: 'run_x', graphId: 'tHXXSTFtOuM9' } };
+
+  afterEach(() => { delete process.env.INTERNAL_SERVICE_KEY; });
+
+  it('auditAttempt returns true and sends X-Internal-Key + X-User-Id (no Bearer)', async () => {
+    process.env.INTERNAL_SERVICE_KEY = 'svc-key';
+    const calls: Array<{ url: string; init: any }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init });
+      return { ok: true } as Response;
+    }));
+
+    const ok = await auditAttempt(engineCtx, 'run_command', 'exec', 'execute', '*', 'allowed');
+
+    expect(ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain('/api/v1/permissions/exec-attempts');
+    const headers = calls[0].init.headers as Record<string, string>;
+    expect(headers['X-Internal-Key']).toBe('svc-key');
+    expect(headers['X-User-Id']).toBe(RED_OPS_PRINCIPAL);
+    expect(headers['Authorization']).toBeUndefined(); // worker runs carry NO Bearer
+    const body = JSON.parse(calls[0].init.body as string);
+    expect(body.graphId).toBe('tHXXSTFtOuM9'); // run identity threaded from state
+    expect(body.outcome).toBe('allowed');
+  });
+
+  it('auditAttempt returns false and never POSTs when neither a Bearer nor an internal key is present (fail-closed trigger)', async () => {
+    delete process.env.INTERNAL_SERVICE_KEY; // no service credential…
+    // …and engineCtx carries no authToken → canAuth is false → cannot durably persist.
+    const ok = await auditAttempt(engineCtx, 'run_command', 'exec', 'execute', '*', 'allowed');
+    expect(ok).toBe(false);
+    expect(fetch).not.toHaveBeenCalled(); // never POST an unauthenticated audit
+  });
+
+  it('runExecGuard ALLOWS a Red Ops engine run end-to-end (Gate 7 audit succeeds via service principal)', async () => {
+    process.env.INTERNAL_SERVICE_KEY = 'svc-key';
+    redisState.incr.mockImplementation(async () => 1); // under the rate cap
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true }) as Response));
+    await expect(runExecGuard(engineCtx, 'run_command', { command: 'ls' })).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it('runExecGuard DENIES a Red Ops engine run (audit_unavailable) when the service credential is missing, shadow OFF', async () => {
+    delete process.env.INTERNAL_SERVICE_KEY;
+    delete process.env.PERMISSIONS_SHADOW;
+    redisState.incr.mockImplementation(async () => 1); // under the rate cap — isolate the audit gate
+    await expect(runExecGuard(engineCtx, 'run_command', { command: 'ls' })).rejects.toMatchObject({ code: 'audit_unavailable' });
   });
 });
