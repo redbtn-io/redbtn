@@ -30,11 +30,10 @@
  */
 
 import { Client, ConnectConfig } from 'ssh2';
-import * as fs from 'fs';
-import * as os from 'os';
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 import { environmentManager } from '../../environments/EnvironmentManager';
 import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
+import { readAllowlistedSshKey } from './ssh-key-path';
 
 // No limits — Claude sessions can produce large outputs and we need
 // the full stream-json including the final result event
@@ -116,11 +115,11 @@ const sshShell: NativeToolDefinition = {
       },
       sshKeyPath: {
         type: 'string',
-        description: 'Path to SSH private key file on the worker machine. Supports ~ expansion.',
+        description: 'Path to an SSH private key file on the worker machine. Supports ~ expansion. Reads are confined to the operator-allowlisted directories in the SSH_KEY_PATH_ALLOWED_DIRS env var (and are refused entirely when it is unset) — it cannot read arbitrary worker paths. Prefer passing the key content inline via `sshKey` from `_secrets`.',
       },
       sshKey: {
         type: 'string',
-        description: 'SSH private key content (PEM string). Use this instead of sshKeyPath when the key is stored in secrets.',
+        description: 'SSH private key content (PEM string). Preferred: use this with a key stored in `_secrets` instead of sshKeyPath.',
       },
       password: {
         type: 'string',
@@ -249,6 +248,11 @@ const sshShell: NativeToolDefinition = {
       let settled = false;
       let remotePid: number | null = null;
       let unregisterCancel: (() => void) | null = null;
+      // Declared here (not down in the ready handler) so `settle` can safely
+      // reference it even when it fires before a connection is established —
+      // e.g. an sshKeyPath rejected by the allowlist guard. A later `let`
+      // would leave it in the temporal dead zone on that early-error path.
+      let statusInterval: NodeJS.Timeout | null = null;
       const startTime = Date.now();
 
       const settle = (error: Error | null) => {
@@ -353,13 +357,12 @@ const sshShell: NativeToolDefinition = {
         connConfig.privateKey = Buffer.from(sshKey, 'utf8');
         console.log(`[ssh_shell] Using key auth: inline key (${sshKey.length} chars)`);
       } else if (sshKeyPath) {
-        const expandedPath = sshKeyPath.replace(/^~/, os.homedir());
         try {
-          connConfig.privateKey = fs.readFileSync(expandedPath);
-          console.log(`[ssh_shell] Using key auth: ${expandedPath}`);
+          connConfig.privateKey = readAllowlistedSshKey(sshKeyPath);
+          console.log(`[ssh_shell] Using key auth: allowlisted sshKeyPath`);
         } catch (readErr: unknown) {
           const msg = readErr instanceof Error ? readErr.message : String(readErr);
-          return settle(new Error(`Cannot read SSH key at '${expandedPath}': ${msg}`));
+          return settle(new Error(msg));
         }
       } else if (password) {
         connConfig.password = password;
@@ -369,7 +372,7 @@ const sshShell: NativeToolDefinition = {
       }
 
       // Periodic status publisher — keeps client informed during long SSH runs
-      let statusInterval: NodeJS.Timeout | null = null;
+      // (statusInterval is declared above so the early-error path can clear it).
 
       conn.on('ready', () => {
         console.log(`[ssh_shell] SSH connection established to ${user}@${host}:${port}`);
