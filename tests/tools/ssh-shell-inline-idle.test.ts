@@ -195,7 +195,14 @@ describe('ssh_shell inline output-idle watchdog', () => {
       { abortSignal: abortController.signal } as any,
     );
 
-    await flushAsync();
+    // The mock defers twice on the check phase (connect -> 'ready', then exec ->
+    // callback), so a single flushAsync() can lose the race to the timer phase
+    // under CI load. Poll with a bounded number of flushes instead: this settles
+    // in one or two iterations normally and still fails the assertion below if
+    // the channel genuinely never opens.
+    for (let i = 0; i < 50 && primaryChannel === null; i += 1) {
+      await flushAsync();
+    }
     expect(primaryChannel).not.toBeNull();
 
     abortController.abort();
