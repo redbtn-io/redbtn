@@ -200,24 +200,35 @@ export interface GraphConfig {
   /** Graph-level configuration options */
   config?: GraphGlobalConfig;
   /**
-   * Data-permissions capability profile (the data-permissions layer).
+   * Capability profile for this graph (the permissions layer).
    *
-   * When present, runs of this graph are JAILED: native State + Knowledge tools
-   * are enforced fail-closed against the declared grants. A graph with NO
-   * `capabilities` field is UNPROFILED → unrestricted (today's behavior, fully
-   * backward-compatible). See `lib/permissions/` for the model + enforcement.
+   * Attaching a profile changes behavior in TWO opposite directions, and both
+   * matter when authoring one:
+   *
+   *   - DATA resources (`state` / `knowledge`) are fail-OPEN. A graph with NO
+   *     `capabilities` field is UNPROFILED → unrestricted (today's behavior,
+   *     fully backward-compatible). Attaching ANY profile flips them to
+   *     enforced, so a profile that grants only `exec` also REVOKES the data
+   *     access the graph previously had implicitly.
+   *   - HIGH-RISK resources (`exec` / `computer` / `environment`) are
+   *     fail-CLOSED: denied unless a profile explicitly grants them. An
+   *     unprofiled graph therefore cannot run `ssh_shell` / `run_command` at
+   *     all (only `PERMISSIONS_SHADOW=true` downgrades that denial to a log).
    *
    * Shape: `{ name, description?, capabilities: [{ resource, actions[], selector }] }`.
-   * Typed as a loose record here to avoid a hard dependency from the graph
-   * types onto the permissions module; the engine normalizes it via
-   * `resolveCapabilityProfile()` at run start.
+   * The unions below MIRROR `lib/permissions/types.ts` (`CapabilityResource` /
+   * `CapabilityAction`) structurally rather than importing them, to keep the
+   * graph types free of a hard dependency on the permissions module; the engine
+   * normalizes this value via `resolveCapabilityProfile()` at run start.
+   * `lib/permissions/redops-profile.ts` carries a compile-time guard that fails
+   * the build if the two definitions drift apart.
    */
   capabilities?: {
     name?: string;
     description?: string;
     capabilities: Array<{
-      resource: 'state' | 'knowledge';
-      actions: Array<'read' | 'write' | 'create' | 'delete'>;
+      resource: 'state' | 'knowledge' | 'exec' | 'computer' | 'environment';
+      actions: Array<'read' | 'write' | 'create' | 'delete' | 'execute' | 'control'>;
       selector: string;
     }>;
   };
