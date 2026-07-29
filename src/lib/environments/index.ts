@@ -31,6 +31,7 @@ export {
   EnvironmentNotFoundError,
   EnvironmentAccessDeniedError,
   EnvironmentSecretMissingError,
+  EnvironmentSharedSecretMissingError,
   type LoadEnvironmentDeps,
 } from './loadAndResolveEnvironment';
 
