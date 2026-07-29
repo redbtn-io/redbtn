@@ -13,3 +13,9 @@ export { selectorMatches, decide, buildDenialReason } from './matcher';
 export { isDataTool, getDataToolRule, DATA_TOOL_RULES } from './tool-map';
 export { enforceToolCapability, normalizeProfile } from './enforce';
 export { resolveCapabilityProfile, GRAPH_CAPABILITIES_FIELD } from './resolve';
+export {
+  RED_OPS_CAPABILITY_PROFILE,
+  RED_OPS_GRAPH_IDS,
+  type GraphCapabilityProfile,
+  type GraphCapabilityEntry,
+} from './redops-profile';
