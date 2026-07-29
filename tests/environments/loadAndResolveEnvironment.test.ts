@@ -12,7 +12,12 @@
  *   - Happy path: doc exists, owner accesses, secret resolves
  *   - Missing doc → EnvironmentNotFoundError
  *   - Owner mismatch + not public → EnvironmentAccessDeniedError
- *   - Owner mismatch + public → resolves with owner's secret scope
+ *   - Owner mismatch + public → resolves in the CALLER's secret scope, and the
+ *     owner's scope is never consulted (P0: `isPublic` shares the environment,
+ *     not the owner's private key)
+ *   - Owner mismatch + public + caller has no such secret →
+ *     EnvironmentSharedSecretMissingError, with no owner-scope fallback
+ *   - desktop-agent / cli → short-circuit, no secret lookup at all
  *   - Empty secretRef → EnvironmentSecretMissingError
  *   - Secret resolves to empty/null → EnvironmentSecretMissingError
  *   - Defaults applied to partial doc
@@ -25,6 +30,7 @@ import {
   EnvironmentNotFoundError,
   EnvironmentAccessDeniedError,
   EnvironmentSecretMissingError,
+  EnvironmentSharedSecretMissingError,
 } from '../../src/lib/environments/loadAndResolveEnvironment';
 
 // ---------------------------------------------------------------------------
@@ -73,13 +79,28 @@ describe('loadAndResolveEnvironment — happy paths', () => {
     expect(env.secretRef).toBe('TEST_KEY');
     expect(sshKey).toMatch(/BEGIN RSA PRIVATE KEY/);
     expect(findEnvironment).toHaveBeenCalledWith('env_abc');
-    // Resolution scoped to OWNER's userId, not the caller's (matters for public envs)
+    // Caller IS the owner here, so the caller scope and the owner scope coincide.
     expect(secretsResolver).toHaveBeenCalledWith('TEST_KEY', 'user_owner');
   });
 
-  it('non-owner can use a public environment (with owner-scoped secret)', async () => {
+  it('owner of a PUBLIC env still resolves in their own scope', async () => {
     const findEnvironment = vi.fn().mockResolvedValue(buildRawDoc({ isPublic: true }));
-    const secretsResolver = vi.fn().mockResolvedValue('public-key-bytes');
+    const secretsResolver = vi.fn().mockResolvedValue('owner-key-bytes');
+
+    const { env, sshKey } = await loadAndResolveEnvironment('env_abc', 'user_owner', {
+      findEnvironment,
+      secretsResolver,
+    });
+
+    expect(env.isPublic).toBe(true);
+    expect(sshKey).toBe('owner-key-bytes');
+    expect(secretsResolver).toHaveBeenCalledWith('TEST_KEY', 'user_owner');
+    expect(secretsResolver).toHaveBeenCalledTimes(1);
+  });
+
+  it("non-owner of a public env resolves in the CALLER's scope, never the owner's", async () => {
+    const findEnvironment = vi.fn().mockResolvedValue(buildRawDoc({ isPublic: true }));
+    const secretsResolver = vi.fn().mockResolvedValue('callers-own-key-bytes');
 
     const { env, sshKey } = await loadAndResolveEnvironment('env_abc', 'user_other', {
       findEnvironment,
@@ -87,9 +108,35 @@ describe('loadAndResolveEnvironment — happy paths', () => {
     });
 
     expect(env.isPublic).toBe(true);
-    expect(sshKey).toBe('public-key-bytes');
-    // Secret resolved using the OWNER's userId, not the caller's userId
-    expect(secretsResolver).toHaveBeenCalledWith('TEST_KEY', 'user_owner');
+    // The caller gets THEIR key, not the owner's.
+    expect(sshKey).toBe('callers-own-key-bytes');
+
+    // P0 regression guard — assert on the resolver's call arguments, not just
+    // the returned value, so an accidental owner-scope fallback fails loudly.
+    expect(secretsResolver).toHaveBeenCalledWith('TEST_KEY', 'user_other');
+    expect(secretsResolver).toHaveBeenCalledTimes(1);
+    for (const [, scopeUserId] of secretsResolver.mock.calls) {
+      expect(scopeUserId).not.toBe('user_owner');
+    }
+  });
+
+  it('desktop-agent and cli envs short-circuit with no secret lookup', async () => {
+    for (const kind of ['desktop-agent', 'cli'] as const) {
+      const findEnvironment = vi.fn().mockResolvedValue(
+        buildRawDoc({ kind, isPublic: true, host: undefined, user: undefined, secretRef: undefined }),
+      );
+      const secretsResolver = vi.fn();
+
+      // Non-owner caller, to prove the short-circuit precedes any scope decision.
+      const { env, sshKey } = await loadAndResolveEnvironment('env_abc', 'user_other', {
+        findEnvironment,
+        secretsResolver,
+      });
+
+      expect(env.kind).toBe(kind);
+      expect(sshKey).toBe('');
+      expect(secretsResolver).not.toHaveBeenCalled();
+    }
   });
 
   it('applies Phase A defaults when fields are missing on the raw doc', async () => {
@@ -175,6 +222,52 @@ describe('loadAndResolveEnvironment — errors', () => {
     await expect(
       loadAndResolveEnvironment('env_abc', 'user_owner', { findEnvironment, secretsResolver }),
     ).rejects.toThrow(EnvironmentSecretMissingError);
+  });
+
+  it('throws EnvironmentSharedSecretMissingError when a NON-owner lacks the secret', async () => {
+    const findEnvironment = vi.fn().mockResolvedValue(buildRawDoc({ isPublic: true }));
+    const secretsResolver = vi.fn().mockResolvedValue(null);
+
+    await expect(
+      loadAndResolveEnvironment('env_abc', 'user_other', { findEnvironment, secretsResolver }),
+    ).rejects.toThrow(EnvironmentSharedSecretMissingError);
+
+    // Exactly one lookup, in the caller's scope — no owner-scope retry.
+    expect(secretsResolver).toHaveBeenCalledTimes(1);
+    expect(secretsResolver).toHaveBeenCalledWith('TEST_KEY', 'user_other');
+    expect(secretsResolver).not.toHaveBeenCalledWith('TEST_KEY', 'user_owner');
+  });
+
+  it('shared-secret error names the missing secret and yields no key material', async () => {
+    const findEnvironment = vi.fn().mockResolvedValue(buildRawDoc({ isPublic: true }));
+    const secretsResolver = vi.fn().mockResolvedValue('');
+
+    try {
+      await loadAndResolveEnvironment('env_abc', 'user_other', { findEnvironment, secretsResolver });
+      expect.fail('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(EnvironmentSharedSecretMissingError);
+      expect((err as { code: string }).code).toBe('ENV_SHARED_SECRET_MISSING');
+      expect((err as Error).message).toContain('TEST_KEY');
+      expect((err as Error).message).toMatch(/your own scope/i);
+      // The owner's key is not leaked through the error surface either.
+      expect(JSON.stringify(err)).not.toContain('BEGIN');
+      expect((err as { secretRef: string }).secretRef).toBe('TEST_KEY');
+      expect((err as { userId: string }).userId).toBe('user_other');
+    }
+  });
+
+  it('owner-path secret miss keeps the original ENV_SECRET_MISSING code', async () => {
+    const findEnvironment = vi.fn().mockResolvedValue(buildRawDoc({ isPublic: true }));
+    const secretsResolver = vi.fn().mockResolvedValue(null);
+
+    try {
+      await loadAndResolveEnvironment('env_abc', 'user_owner', { findEnvironment, secretsResolver });
+      expect.fail('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(EnvironmentSecretMissingError);
+      expect((err as { code: string }).code).toBe('ENV_SECRET_MISSING');
+    }
   });
 
   it('rejects empty environmentId arg', async () => {

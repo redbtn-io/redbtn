@@ -263,7 +263,10 @@ interface IEnvironment {
   archiveOutputLogs: boolean;         // default true — tail every exec to environmentLogs
   
   // Audit
-  isPublic: boolean;                  // default false — only owner can use
+  isPublic: boolean;                  // default false — only owner can use.
+                                      // true = any user may USE the env, but the
+                                      // SSH key still resolves in THEIR own secret
+                                      // scope (see §3.6) — never the owner's.
   createdAt: Date;
   updatedAt: Date;
   lastUsedAt?: Date;
@@ -286,7 +289,11 @@ GET    /api/v1/environments/:id/logs         tail of recent commands (if archive
 
 When opening a session:
 1. Read `Environment.secretRef` (string, e.g. `"ALPHA_SERVER_KEY"`)
-2. Resolve via `@redbtn/redsecrets` repository (same machinery `enrich-input.ts` uses)
+2. Resolve via `@redbtn/redsecrets` repository (same machinery `enrich-input.ts` uses),
+   **in the CALLER's user scope** — never the owner's. `isPublic` shares the
+   environment (host/port/user), not the owner's private key: a non-owner must
+   hold their own secret of that name or the resolve fails with
+   `ENV_SHARED_SECRET_MISSING`. There is deliberately no owner-scope fallback.
 3. Pass the resolved value as `ssh2.ConnectConfig.privateKey: Buffer.from(value, 'utf8')`
 4. NEVER cache the resolved secret — fetch fresh per session-open
 

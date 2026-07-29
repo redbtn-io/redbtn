@@ -240,6 +240,7 @@ export {
   EnvironmentNotFoundError,
   EnvironmentAccessDeniedError,
   EnvironmentSecretMissingError,
+  EnvironmentSharedSecretMissingError,
 } from './lib/environments';
 export type {
   // Manager / session config

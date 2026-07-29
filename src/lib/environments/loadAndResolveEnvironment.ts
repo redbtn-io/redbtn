@@ -21,7 +21,12 @@
  *   2. Verifies the caller `userId` has access — owner OR `isPublic === true`.
  *      Throws `EnvironmentAccessDeniedError` if not.
  *   3. Resolves `env.secretRef` via `@redbtn/redsecrets` (user scope, app
- *      `redbtn`). Throws `EnvironmentSecretMissingError` if the secret is
+ *      `redbtn`) **in the CALLER's scope**. For the owner that is their own
+ *      scope, unchanged. For a non-owner reaching the env via `isPublic`, the
+ *      lookup happens in the caller's own secret scope and NEVER falls back to
+ *      the owner's — `isPublic` shares the connection details, not the key.
+ *      Throws `EnvironmentSecretMissingError` (owner) or
+ *      `EnvironmentSharedSecretMissingError` (non-owner) when the secret is
  *      not present or empty.
  *   4. Returns `{ env, sshKey }` ready to feed into
  *      `environmentManager.acquire(env, sshKey, userId)`.
@@ -66,7 +71,8 @@ export class EnvironmentNotFoundError extends Error {
 
 /**
  * Thrown when the caller `userId` does not have access to the environment.
- * Owner-only by default; `isPublic: true` opens read/use to any user. Future
+ * Owner-only by default; `isPublic: true` opens read/use to any user (with
+ * their OWN credentials — see `EnvironmentSharedSecretMissingError`). Future
  * Phase B+ may add explicit participants[]; until then we keep the policy
  * tight.
  */
@@ -94,6 +100,35 @@ export class EnvironmentSecretMissingError extends Error {
   ) {
     super(`Secret '${secretRef}' for environment ${environmentId} is missing or empty`);
     this.name = 'EnvironmentSecretMissingError';
+  }
+}
+
+/**
+ * Thrown when a NON-OWNER reaches a public environment but has no secret of
+ * the environment's `secretRef` name in their own scope.
+ *
+ * `isPublic` is a visibility flag, not consent to hand out the owner's private
+ * key: a shared environment shares the connection details (host/port/user), and
+ * each caller authenticates with their own credential. There is deliberately NO
+ * fallback to the owner's scope — that fallback was the P0 defect this error
+ * exists to make impossible.
+ *
+ * The message names the secret the caller must create in
+ * /settings/secrets so the run is self-service to fix.
+ */
+export class EnvironmentSharedSecretMissingError extends Error {
+  readonly code = 'ENV_SHARED_SECRET_MISSING';
+  constructor(
+    public readonly environmentId: string,
+    public readonly secretRef: string,
+    public readonly userId: string,
+  ) {
+    super(
+      `Environment ${environmentId} is shared with you, but its credentials are not: ` +
+        `create a secret named '${secretRef}' in your own scope (/settings/secrets) to use it. ` +
+        `The environment owner's key is never shared.`,
+    );
+    this.name = 'EnvironmentSharedSecretMissingError';
   }
 }
 
@@ -152,6 +187,9 @@ function applyDefaults(raw: Record<string, unknown>): IEnvironment {
  * Owner OR public access. Future versions may add explicit participants[];
  * for now we keep the same policy as ENVIRONMENT-HANDOFF.md §3.5: only the
  * owner can use a non-public environment.
+ *
+ * NOTE: this gates *reachability* only. Whose secret scope the SSH key is read
+ * from is a separate decision — see the caller-scope resolution below.
  */
 function hasAccess(env: IEnvironment, userId: string): boolean {
   if (env.userId === userId) return true;
@@ -191,7 +229,9 @@ export interface LoadEnvironmentDeps {
  *
  * @throws EnvironmentNotFoundError — env doesn't exist
  * @throws EnvironmentAccessDeniedError — userId lacks access
- * @throws EnvironmentSecretMissingError — secretRef resolves to nothing
+ * @throws EnvironmentSecretMissingError — owner's own secretRef resolves to nothing
+ * @throws EnvironmentSharedSecretMissingError — non-owner of a public env has no
+ *   secret of that name in their own scope (never falls back to the owner's)
  */
 export async function loadAndResolveEnvironment(
   environmentId: string,
@@ -247,10 +287,18 @@ export async function loadAndResolveEnvironment(
     throw new EnvironmentSecretMissingError(environmentId, '<missing>');
   }
   const secretsResolver = deps.secretsResolver ?? (await defaultSecretsResolver());
-  // Resolve in the OWNER's scope, not the caller's scope. Public envs are
-  // intentionally usable by other users but they share the owner's key.
-  const sshKey = await secretsResolver(env.secretRef, env.userId);
+
+  // Resolve in the CALLER's scope. For the owner that IS their own scope, so
+  // owner behaviour is unchanged. For a non-owner who reached this env via
+  // `isPublic`, the key comes from the caller's own secret store and there is
+  // deliberately NO fallback to the owner's scope: `isPublic` shares the
+  // environment (host/port/user), never the owner's private key.
+  const isOwner = env.userId === userId;
+  const sshKey = await secretsResolver(env.secretRef, userId);
   if (!sshKey) {
+    if (!isOwner) {
+      throw new EnvironmentSharedSecretMissingError(environmentId, env.secretRef, userId);
+    }
     throw new EnvironmentSecretMissingError(environmentId, env.secretRef);
   }
 

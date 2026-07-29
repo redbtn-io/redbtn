@@ -142,25 +142,24 @@ describe('NeuronRegistry resolveSecret — forwards userId', () => {
 // Call site 3 — loadAndResolveEnvironment.ts defaultSecretsResolver()
 // ===========================================================================
 describe('loadAndResolveEnvironment defaultSecretsResolver — forwards userId', () => {
-  it("resolves in the env OWNER's scope with userId=owner", async () => {
-    const rawDoc = {
-      environmentId: 'env_1',
-      userId: 'user_owner',
-      name: 'Box',
-      host: 'example.com',
-      port: 2222,
-      user: 'deploy',
-      secretRef: 'SSH_KEY',
-      isPublic: true,
-      createdAt: new Date('2026-01-01'),
-      updatedAt: new Date('2026-01-01'),
-    };
+  const publicEnvDoc = {
+    environmentId: 'env_1',
+    userId: 'user_owner',
+    name: 'Box',
+    host: 'example.com',
+    port: 2222,
+    user: 'deploy',
+    secretRef: 'SSH_KEY',
+    isPublic: true,
+    createdAt: new Date('2026-01-01'),
+    updatedAt: new Date('2026-01-01'),
+  };
 
+  it("resolves in the OWNER's scope when the owner is the caller", async () => {
     // No secretsResolver injected → the production defaultSecretsResolver()
-    // path runs, which is the resolve() call we are asserting on. A DIFFERENT
-    // caller uses the public env; resolution must still be owner-scoped.
-    const { sshKey } = await loadAndResolveEnvironment('env_1', 'user_caller', {
-      findEnvironment: async () => rawDoc,
+    // path runs, which is the resolve() call we are asserting on.
+    const { sshKey } = await loadAndResolveEnvironment('env_1', 'user_owner', {
+      findEnvironment: async () => publicEnvDoc,
     });
 
     expect(sshKey).toBe('MOCK_SSH_KEY');
@@ -173,6 +172,31 @@ describe('loadAndResolveEnvironment defaultSecretsResolver — forwards userId',
         userId: 'user_owner',
       }),
     );
-    expect(lastResolveInput().userId).not.toBe('user_caller');
+  });
+
+  it("resolves in the CALLER's scope when a non-owner uses a public env (P0: never the owner's)", async () => {
+    // A DIFFERENT caller reaches the env via isPublic. `isPublic` shares the
+    // environment, not the owner's private key — resolution must be
+    // caller-scoped so the owner's SSH_KEY is unreachable from this run.
+    const { sshKey } = await loadAndResolveEnvironment('env_1', 'user_caller', {
+      findEnvironment: async () => publicEnvDoc,
+    });
+
+    expect(sshKey).toBe('MOCK_SSH_KEY');
+    expect(lastResolveInput()).toEqual(
+      expect.objectContaining({
+        names: ['SSH_KEY'],
+        appName: 'redbtn',
+        scope: 'user',
+        scopeId: 'user_caller',
+        userId: 'user_caller',
+      }),
+    );
+    // Regression guard: the owner's scope is never consulted, on any call.
+    for (const call of resolveMock.mock.calls) {
+      const input = call[1] as unknown as Record<string, unknown>;
+      expect(input.scopeId).not.toBe('user_owner');
+      expect(input.userId).not.toBe('user_owner');
+    }
   });
 });
