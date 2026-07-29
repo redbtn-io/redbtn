@@ -1,0 +1,33 @@
+{
+  "name": "red-ops-fleet-exec",
+  "description": "Red Ops fleet dispatch (Coordinator / Worker / Reviewer). Grants unscoped exec so the executor node's three inline ssh_shell steps run without depending on PERMISSIONS_SHADOW; the '*' selector is required because those calls pass no environmentId (tool-map.ts:107-111) and an unscoped exec call rejects any non-wildcard selector (enforce.ts step 3). State and knowledge are granted wildcard to preserve the unprofiled data behavior these graphs have today, since attaching any profile switches those resources from fail-open to enforced.",
+  "capabilities": [
+    {
+      "resource": "exec",
+      "actions": [
+        "execute"
+      ],
+      "selector": "*"
+    },
+    {
+      "resource": "state",
+      "actions": [
+        "read",
+        "write",
+        "create",
+        "delete"
+      ],
+      "selector": "*"
+    },
+    {
+      "resource": "knowledge",
+      "actions": [
+        "read",
+        "write",
+        "create",
+        "delete"
+      ],
+      "selector": "*"
+    }
+  ]
+}

@@ -82,6 +82,18 @@ open cards would have silently swallowed that direction on every quiet tick.
 | `red-ops-reviewer.node.json` | The `red-ops-reviewer` node, exactly as deployed. |
 | `red-coordinator.graph.after.json` | Graph `tHXXSTFtOuM9` as it is now. |
 | `red-coordinator.graph.before.json` | Graph as it was — the rollback target. |
+| `red-ops-capability-profile.json` | The capability profile to attach to all three Red Ops graphs. |
+| `CAPABILITY-PROFILE-RUNBOOK.md` | How to apply, read back, invalidate and verify that profile. |
+
+## The capability profile
+
+`exec` is fail-closed: the three Red Ops graphs (`tHXXSTFtOuM9`, `eCrxF8-glwgW`, `red-reviewer`)
+declare no capability profile, so every `ssh_shell` call they make is denied and survives only
+because `PERMISSIONS_SHADOW=true` downgrades the denial to a log. Turning shadow mode off stops all
+Red Ops SSH fleet-wide. `red-ops-capability-profile.json` is the fix; see
+`CAPABILITY-PROFILE-RUNBOOK.md` for the procedure and `src/lib/permissions/redops-profile.ts` for
+the typed source the JSON is generated from (the two are asserted equal by
+`tests/permissions/redops-exec-profile.test.ts`).
 
 ## The reviewer node (`red-ops-reviewer`)
 
