@@ -103,7 +103,13 @@ export class GraphRegistry {
     }
     const doc = await Graph.findOne({
       graphId,
-      $or: [{ userId }, ...SYSTEM_OWNER_BRANCHES],
+      // isPublic: a public graph is loadable by ANY user — this is what
+      // makes ecosystem agents (cli-agent et al.) attachable to
+      // conversations by accounts that don't own them. Without this
+      // branch the load threw GraphNotFoundError and loadGraph silently
+      // fell back to red-assistant, which looked like the wrong agent
+      // answering rather than an access failure.
+      $or: [{ userId }, { isPublic: true }, ...SYSTEM_OWNER_BRANCHES],
     });
     if (!doc) throw new GraphNotFoundError(`Graph '${graphId}' not found for user ${userId}`);
     const rawConfig = doc.toObject();
@@ -140,6 +146,12 @@ export class GraphRegistry {
           `Graph '${graphConfig.graphId}' requires tier ${graphConfig.tier} or higher (user has tier ${userTier})`
         );
       }
+      return;
+    }
+    // Public non-system graphs: executable by anyone, same contract as the
+    // list/invoke surfaces advertise. Tier gating stays a system-graph
+    // concept — a user publishing a graph public IS the access decision.
+    if ((graphConfig as { isPublic?: boolean }).isPublic === true) {
       return;
     }
     throw new GraphAccessDeniedError(`Graph '${graphConfig.graphId}' is private and owned by another user`);
