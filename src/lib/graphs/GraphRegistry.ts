@@ -19,7 +19,7 @@ import { Graph } from '../models/Graph';
 import { compileGraphFromConfig, GraphCompilationError } from './compiler';
 import { GraphConfig, CompiledGraph } from '../types/graph';
 import type { RedConfig } from '../../index';
-import { SYSTEM_USER_ID, LEGACY_SYSTEM_USER_ID } from '../system-resource';
+import { SYSTEM_USER_ID } from '../system-resource';
 
 /**
  * Mongo `$or` branches that match a system-owned graph. System graphs were
@@ -32,7 +32,6 @@ import { SYSTEM_USER_ID, LEGACY_SYSTEM_USER_ID } from '../system-resource';
 const SYSTEM_OWNER_BRANCHES: Array<Record<string, unknown>> = [
   { isSystem: true },
   { userId: SYSTEM_USER_ID },
-  { userId: LEGACY_SYSTEM_USER_ID },
 ];
 const GRAPH_REGISTRY_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -131,14 +130,11 @@ export class GraphRegistry {
 
   private async validateAccess(graphConfig: GraphConfig, userId: string): Promise<void> {
     if (graphConfig.userId === userId) return;
-    // Recognise system graphs in all migrated forms: canonical SYSTEM_USER_ID,
-    // the isSystem flag, or the legacy 'system' string. Pre-fix this only
-    // matched the legacy string, so canonical-ID system graphs (red-assistant
-    // et al.) were treated as another user's private graph → access denied.
+    // System graphs: the isSystem flag or canonical SYSTEM_USER_ID owner
+    // (the legacy 'system' sentinel was fully migrated away 2026-08-05).
     const isSystem =
       (graphConfig as any).isSystem === true ||
-      graphConfig.userId === SYSTEM_USER_ID ||
-      graphConfig.userId === LEGACY_SYSTEM_USER_ID;
+      graphConfig.userId === SYSTEM_USER_ID;
     if (isSystem) {
       const userTier = await this.getUserTier(userId);
       if (userTier > graphConfig.tier) {
