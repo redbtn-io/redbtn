@@ -25,6 +25,14 @@ export interface ConversationMessage {
   id?: string; // Optional message ID (e.g., msg_1234567890_abc123def)
   role: 'system' | 'user' | 'assistant';
   content: string;
+  /**
+   * Who wrote it. Human turns carry the participant's userId; agent turns
+   * carry `agent:<agentId>`. Without this every consumer sees an anonymous
+   * "user" and a multi-human conversation reads as one person talking to
+   * itself — which is exactly how the chat assistant ended up greeting two
+   * different people as "User".
+   */
+  senderId?: string;
   timestamp: number;
   thinking?: string; // Optional thinking/reasoning text
   toolExecutions?: StoredToolExecution[]; // Tool executions for this message
@@ -306,6 +314,7 @@ export class MemoryManager {
         id: (m.id ?? m.messageId) as string | undefined,
         role: m.role,
         content: m.content ?? '',
+        senderId: typeof m.senderId === 'string' ? m.senderId : undefined,
         timestamp: m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp) || Date.now(),
         thinking: typeof m.thinking === 'string' ? m.thinking : undefined,
         toolExecutions: Array.isArray(m.toolExecutions) ? m.toolExecutions : [],
