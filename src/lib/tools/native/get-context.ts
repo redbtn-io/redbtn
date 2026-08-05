@@ -146,6 +146,44 @@ const getContext: NativeToolDefinition = {
       // Fetch recent messages within token limit
       const recentMessages = await mm.getContextForConversation(conversationId);
 
+      // Who is in this conversation? Human turns carry a userId and agent
+      // turns `agent:<id>`; without resolving those to names every format
+      // below flattens a group into an anonymous "user" (the bug where the
+      // assistant greeted two different people as "User").
+      const senderNames = new Map<string, string>();
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const mongoose = require('mongoose');
+        const db = mongoose.connection?.readyState === 1 ? mongoose.connection.db : null;
+        if (db) {
+          const query = mongoose.Types.ObjectId.isValid(conversationId)
+            ? { _id: new mongoose.Types.ObjectId(conversationId) }
+            : { conversationId };
+          const conv = await db.collection('user_conversations').findOne(query, {
+            projection: { participants: 1, agents: 1 },
+          });
+          for (const p of conv?.participants ?? []) {
+            const label = p?.displayName || p?.email;
+            if (p?.userId && label) senderNames.set(String(p.userId), String(label));
+          }
+          for (const a of conv?.agents ?? []) {
+            if (a?.id && a?.name) senderNames.set(`agent:${a.id}`, String(a.name));
+          }
+        }
+      } catch (err) {
+        console.warn('[get_context] sender-name lookup failed:', (err as Error).message);
+      }
+      const labelFor = (msg: { senderId?: string; role: string }): string | undefined => {
+        if (!msg.senderId) return undefined;
+        return senderNames.get(msg.senderId);
+      };
+      // Only disambiguate when there is actually something to disambiguate:
+      // a 1:1 chat stays clean, a group gets names.
+      const distinctHumanSenders = new Set(
+        recentMessages.filter((m) => m.role === 'user' && m.senderId).map((m) => m.senderId as string),
+      );
+      const multiParty = distinctHumanSenders.size > 1;
+
       // Estimate total tokens (rough: 1 token ~ 4 chars)
       let totalTokens = 0;
       for (const msg of recentMessages) {
@@ -183,7 +221,10 @@ const getContext: NativeToolDefinition = {
                   conversationId,
                   trailingSummary,
                   executiveSummary,
-                  messages: recentMessages,
+                  messages: recentMessages.map((m) => ({
+                    ...m,
+                    senderName: labelFor(m),
+                  })),
                   totalTokens,
                 },
                 null,
@@ -202,7 +243,8 @@ const getContext: NativeToolDefinition = {
         }
         text += `## Recent Messages (${recentMessages.length} messages, ~${totalTokens} tokens)\n\n`;
         for (const msg of recentMessages) {
-          text += `**${msg.role.toUpperCase()}** (${new Date(msg.timestamp).toISOString()}):\n${msg.content}\n\n`;
+          const who = labelFor(msg) || msg.role.toUpperCase();
+          text += `**${who}** (${new Date(msg.timestamp).toISOString()}):\n${msg.content}\n\n`;
         }
         return { content: [{ type: 'text', text }] };
       } else {
@@ -219,7 +261,15 @@ const getContext: NativeToolDefinition = {
           });
         }
         for (const msg of recentMessages) {
-          llmMessages.push({ role: msg.role, content: msg.content });
+          const who = labelFor(msg);
+          const content = multiParty && msg.role === 'user' && who
+            ? `${who}: ${msg.content}`
+            : msg.content;
+          llmMessages.push({
+            role: msg.role,
+            content,
+            ...(who ? { name: who } : {}),
+          });
         }
 
         return {
