@@ -24,7 +24,7 @@ import { createLogger } from '../utils/logger';
 import { NeuronConfig } from '../types/neuron';
 import { runControlRegistry, NeuronCall } from '../run/RunControlRegistry';
 import type { RedConfig } from '../../index';
-import { SYSTEM_USER_ID, LEGACY_SYSTEM_USER_ID } from '../system-resource';
+import { SYSTEM_USER_ID } from '../system-resource';
 
 type PartialRedConfig = Pick<RedConfig, 'databaseUrl'> & Partial<Omit<RedConfig, 'databaseUrl'>>;
 
@@ -32,22 +32,20 @@ type PartialRedConfig = Pick<RedConfig, 'databaseUrl'> & Partial<Omit<RedConfig,
  * Mongo `$or` branches that match a system-owned neuron. System neurons were
  * migrated from `userId: 'system'` to canonical `SYSTEM_USER_ID` + an
  * `isSystem: true` flag (all 14 system neurons; zero still use the legacy
- * string). The registry must match all three forms or system neurons
- * (red-neuron, red-worker, etc.) become invisible and graph runs fail with
- * "Neuron '…' not found". Mirrors GraphRegistry's SYSTEM_OWNER_BRANCHES.
+ * The registry matches the isSystem flag or the canonical owner id (the
+ * legacy 'system' sentinel was fully migrated away 2026-08-05). Mirrors
+ * GraphRegistry's SYSTEM_OWNER_BRANCHES.
  */
 const SYSTEM_OWNER_BRANCHES: Array<Record<string, unknown>> = [
   { isSystem: true },
   { userId: SYSTEM_USER_ID },
-  { userId: LEGACY_SYSTEM_USER_ID },
 ];
 
 /** True if a neuron doc is system-owned in any migrated form. */
 function isSystemNeuron(doc: { userId?: string; isSystem?: boolean }): boolean {
   return (
     doc.isSystem === true ||
-    doc.userId === SYSTEM_USER_ID ||
-    doc.userId === LEGACY_SYSTEM_USER_ID
+    doc.userId === SYSTEM_USER_ID
   );
 }
 

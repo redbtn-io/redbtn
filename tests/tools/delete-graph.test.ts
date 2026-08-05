@@ -88,11 +88,11 @@ describe('delete_graph — system asset protection', () => {
     expect(calls[0].method).toBe('GET');
   });
 
-  test('REFUSES delete when userId === "system" even without isSystem flag', async () => {
+  test('REFUSES delete when userId is the canonical system id even without isSystem flag', async () => {
     let deleteCalled = false;
     globalThis.fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       if ((init?.method || 'GET') === 'GET') {
-        return new Response(JSON.stringify({ graph: { graphId: 'sys', userId: 'system' } }), { status: 200 });
+        return new Response(JSON.stringify({ graph: { graphId: 'sys', userId: '000000000000000000000001' } }), { status: 200 });
       }
       deleteCalled = true;
       return new Response('{}', { status: 200 });

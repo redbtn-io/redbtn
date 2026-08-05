@@ -2,12 +2,11 @@
  * System resource identification and gating
  *
  * The platform uses a canonical system-user ID for ownership tracking.
- * During the migration from legacy 'system' string IDs, we check both
- * the canonical ID and the legacy string for backward compatibility.
+ * (The legacy 'system' string sentinel was fully migrated away on
+ * 2026-08-05 — canonical is the only representation.)
  */
 
 export const SYSTEM_USER_ID = '000000000000000000000001';
-export const LEGACY_SYSTEM_USER_ID = 'system';
 
 /**
  * Check if a resource is owned by the system
@@ -26,8 +25,5 @@ export function isSystemResource(
   
   // Check canonical and legacy system user IDs
   const ownerId = resource[ownerField];
-  return (
-    String(ownerId) === SYSTEM_USER_ID ||
-    String(ownerId) === LEGACY_SYSTEM_USER_ID
-  );
+  return String(ownerId) === SYSTEM_USER_ID;
 }
