@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     timeout-minutes: 30
 
     # The conversation-attribution tests assert on documents that actually land
