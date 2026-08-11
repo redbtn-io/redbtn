@@ -275,8 +275,14 @@ export type ToolRef =
       name: string;
       /** Override the tool description shown to the LLM */
       description?: string;
-      /** Force a specific resolution path (skips prefix sniffing) */
-      source?: 'native' | 'mcp' | 'graph';
+      /**
+       * Force a specific resolution path (skips prefix sniffing).
+       * `'hosted'` marks a PROVIDER-executed tool (e.g. `web_search`) — the
+       * provider runs it and returns grounded output inline; redbtn never
+       * executes it. Referenced by normalised capability name, resolved to
+       * the provider wire format via the hosted capability matrix.
+       */
+      source?: 'native' | 'mcp' | 'graph' | 'hosted';
     };
 
 /**

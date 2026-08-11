@@ -165,3 +165,72 @@ describe('isLoopingStrategy', () => {
     expect(isLoopingStrategy('none')).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Provider-hosted tools (2026-08-11, Become board card 6a7aa658)
+// ---------------------------------------------------------------------------
+
+import {
+  resolveHostedToolSpec,
+  isHostedCapability,
+  HOSTED_CAPABILITIES,
+} from '../../src/lib/neurons/capability-matrix';
+
+describe('resolveHostedToolSpec — (provider, model, capability) → wire spec', () => {
+  it('google gemini-2.x maps web_search to { googleSearch: {} }', () => {
+    expect(resolveHostedToolSpec('google', 'gemini-2.5-flash', 'web_search'))
+      .toEqual({ googleSearch: {} });
+  });
+
+  it('google gemini-2.x supports code_execution and url_context', () => {
+    expect(resolveHostedToolSpec('google', 'gemini-2.0-pro', 'code_execution'))
+      .toEqual({ codeExecution: {} });
+    expect(resolveHostedToolSpec('google', 'gemini-2.0-pro', 'url_context'))
+      .toEqual({ urlContext: {} });
+  });
+
+  it('google gemini-1.5 uses the legacy googleSearchRetrieval form', () => {
+    expect(resolveHostedToolSpec('google', 'gemini-1.5-pro', 'web_search'))
+      .toEqual({ googleSearchRetrieval: {} });
+  });
+
+  it('gemini-1.5 has no code_execution → null', () => {
+    expect(resolveHostedToolSpec('google', 'gemini-1.5-pro', 'code_execution')).toBeNull();
+  });
+
+  it('openai maps web_search to the responses-API preview tool', () => {
+    expect(resolveHostedToolSpec('openai', 'gpt-4o', 'web_search'))
+      .toEqual({ type: 'web_search_preview' });
+  });
+
+  it('anthropic maps web_search to the server tool spec', () => {
+    expect(resolveHostedToolSpec('anthropic', 'claude-sonnet-4', 'web_search'))
+      .toEqual({ type: 'web_search_20250305', name: 'web_search', max_uses: 5 });
+  });
+
+  it('anthropic code_execution is deliberately unsupported (beta header) → null', () => {
+    expect(resolveHostedToolSpec('anthropic', 'claude-sonnet-4', 'code_execution')).toBeNull();
+  });
+
+  it('ollama / custom have no hosted tools → null', () => {
+    expect(resolveHostedToolSpec('ollama', 'llama3.1', 'web_search')).toBeNull();
+    expect(resolveHostedToolSpec('custom', 'anything', 'web_search')).toBeNull();
+  });
+
+  it('matching is case-insensitive like the strategy matrix', () => {
+    expect(resolveHostedToolSpec('google', 'Gemini-2.5-Flash', 'web_search'))
+      .toEqual({ googleSearch: {} });
+  });
+});
+
+describe('isHostedCapability', () => {
+  it('accepts every declared capability', () => {
+    for (const cap of HOSTED_CAPABILITIES) {
+      expect(isHostedCapability(cap)).toBe(true);
+    }
+  });
+  it('rejects vendor names and unknowns', () => {
+    expect(isHostedCapability('googleSearch')).toBe(false);
+    expect(isHostedCapability('file_search')).toBe(false);
+  });
+});
