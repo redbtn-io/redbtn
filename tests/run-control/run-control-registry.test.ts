@@ -197,6 +197,22 @@ describe('RunControlRegistry — registerOnCancel() / onCancelCallbacks', () => 
     expect(fired).toBe(true);
   });
 
+  it('cancel() fires onCancel callbacks BEFORE aborting the controller', () => {
+    // Order is load-bearing: aborting the controller first runs a tool's own
+    // abortSignal listener synchronously, which settles the tool (and tears
+    // down its SSH connection) — the settled-guard in its cancel callback
+    // then skips the remote kill entirely. This inversion left interrupted
+    // runs' remote processes alive (2026-08-10 Become Agent incident).
+    const ctx = registry.register('run-1', 'worker-a');
+    let abortedWhenCallbackRan: boolean | null = null;
+    registry.registerOnCancel('run-1', () => {
+      abortedWhenCallbackRan = ctx.controller.signal.aborted;
+    });
+    registry.cancel('run-1', 'ordering-test');
+    expect(abortedWhenCallbackRan).toBe(false);
+    expect(ctx.controller.signal.aborted).toBe(true);
+  });
+
   it('the returned unregister function removes the callback before it fires', () => {
     registry.register('run-1', 'worker-a');
     let fired = false;
