@@ -82,6 +82,17 @@ describe('validateGraphConfig — top level', () => {
     const r = await validateGraphConfig(baseConfig({ graphId: '   ' }));
     expect(findError(r, 'MISSING_GRAPH_ID')).toBeDefined();
   });
+
+  test('malformed capabilities object → CAPABILITIES_MALFORMED', async () => {
+    const r = await validateGraphConfig(
+      baseConfig({
+        capabilities: { name: 'bad', capabilities: 'oops' } as unknown as GraphConfig['capabilities'],
+      }),
+    );
+    const issue = findError(r, 'CAPABILITIES_MALFORMED');
+    expect(issue).toBeDefined();
+    expect(r.valid).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
