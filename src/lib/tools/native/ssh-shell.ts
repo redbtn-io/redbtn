@@ -249,14 +249,36 @@ const sshShell: NativeToolDefinition = {
       let settled = false;
       let remotePid: number | null = null;
       let unregisterCancel: (() => void) | null = null;
-      // Kill-then-settle machinery. `beginKill` is assigned once exec()
-      // starts (it closes over the live stream + captured pid); before that
-      // there is no remote process, so aborting just settles. `killing`
-      // makes the sequence idempotent AND suppresses the natural
+      // Kill-then-settle machinery. `beginKill` is assigned once the exec
+      // callback runs (it closes over the live stream + captured pid).
+      // `killing` makes the sequence idempotent AND suppresses the natural
       // stream-close settle so the caller sees the kill reason, not a
       // spurious success with a null exit code.
       let beginKill: ((reason: string) => void) | null = null;
       let killing = false;
+      let pendingKillReason: string | null = null;
+      // Entry point for every kill trigger (run interrupt, caller abort,
+      // timeout). There is a real window where the REMOTE command has
+      // already spawned but ssh2's exec callback — which assigns
+      // `beginKill` — has not run yet on this side (observed under CI
+      // load). Settling in that window orphans the remote process, so park
+      // the reason and let the exec callback fire the kill the moment it
+      // lands; a bounded fallback settles if the callback never arrives
+      // (connection died — nothing identifiable to kill).
+      const requestKill = (reason: string) => {
+        if (settled || killing) return;
+        if (beginKill) {
+          beginKill(reason);
+          return;
+        }
+        if (pendingKillReason) return;
+        pendingKillReason = reason;
+        setTimeout(() => {
+          if (!settled && !killing && !beginKill) {
+            settle(new Error(reason));
+          }
+        }, 3000);
+      };
       // Declared here (not down in the ready handler) so `settle` can safely
       // reference it even when it fires before a connection is established —
       // e.g. an sshKeyPath rejected by the allowlist guard. A later `let`
@@ -342,20 +364,16 @@ const sshShell: NativeToolDefinition = {
 
       if (timeout > 0) {
         timeoutTimer = setTimeout(() => {
-          const msg = `SSH command timed out after ${Math.round(timeout / 1000)}s`;
           // Kill the remote process group before dropping the connection —
           // a bare settle() here used to leave the remote command running
           // to completion after every timeout.
-          if (beginKill) beginKill(msg);
-          else settle(new Error(msg));
+          requestKill(`SSH command timed out after ${Math.round(timeout / 1000)}s`);
         }, timeout);
       }
 
       if (context?.abortSignal) {
         context.abortSignal.addEventListener('abort', () => {
-          const msg = 'SSH command aborted by caller';
-          if (beginKill) beginKill(msg);
-          else settle(new Error(msg));
+          requestKill('SSH command aborted by caller');
         }, { once: true });
       }
 
@@ -443,8 +461,7 @@ const sshShell: NativeToolDefinition = {
           beginKill = (reason: string) => {
             if (settled || killing) return;
             killing = true;
-            const pid = remotePid;
-            console.log(`[ssh_shell] Kill sequence starting — pid=${pid ?? 'unknown'} run=${runId ?? 'none'}: ${reason}`);
+            console.log(`[ssh_shell] Kill sequence starting — pid=${remotePid ?? 'unknown'} run=${runId ?? 'none'}: ${reason}`);
             // 1. Channel signal. Modern OpenSSH (>=7.9) delivers this to the
             //    remote process group immediately; verified effective against
             //    the fleet's sshd. Free to try everywhere.
@@ -460,7 +477,7 @@ const sshShell: NativeToolDefinition = {
             //    command die too. The connection MUST stay open until this
             //    exec closes; the 2.5s cap bounds the wait when the
             //    connection is already dead (e.g. keepalive timeout).
-            if (pid && pid > 1) {
+            const sideChannelKill = (pid: number) => {
               const cap = setTimeout(finish, 2500);
               try {
                 conn.exec(`kill -TERM -- -${pid} 2>/dev/null; sleep 0.5; kill -KILL -- -${pid} 2>/dev/null; true`, { pty: false }, (kerr, kstream) => {
@@ -486,10 +503,18 @@ const sshShell: NativeToolDefinition = {
                 clearTimeout(cap);
                 finish();
               }
+            };
+            if (remotePid && remotePid > 1) {
+              sideChannelKill(remotePid);
             } else {
-              // No pid captured — the channel signal above is the best we
-              // can do. Settle on the next tick.
-              setTimeout(finish, 100);
+              // No pid captured yet — when the kill lands moments after exec
+              // starts, the PID marker may still be in flight on stderr.
+              // Give it a brief window, then fall back to the channel signal
+              // alone.
+              setTimeout(() => {
+                if (remotePid && remotePid > 1) sideChannelKill(remotePid);
+                else finish();
+              }, 250);
             }
           };
 
@@ -500,8 +525,17 @@ const sshShell: NativeToolDefinition = {
           // — that ordering is what makes the kill reachable at all.
           if (runId) {
             unregisterCancel = runControlRegistry.registerOnCancel(runId, () => {
-              beginKill?.('SSH command cancelled by run interrupt');
+              requestKill('SSH command cancelled by run interrupt');
             });
+          }
+
+          // A kill requested during the exec-request window (remote command
+          // already spawned server-side, this callback not yet run) fires
+          // now that the stream exists.
+          if (pendingKillReason) {
+            const reason = pendingKillReason;
+            pendingKillReason = null;
+            beginKill(reason);
           }
 
           stream.on('data', (data: Buffer) => {
