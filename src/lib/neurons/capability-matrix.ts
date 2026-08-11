@@ -169,3 +169,109 @@ export function resolveToolStrategy(
 export function isLoopingStrategy(strategy: ToolStrategy): boolean {
   return strategy === 'native' || strategy === 'prompt-injection';
 }
+
+// =============================================================================
+// Provider-hosted tools
+// =============================================================================
+//
+// A second category of tool, distinct from everything the tool-resolver
+// handles: the PROVIDER executes these itself (Google's googleSearch,
+// OpenAI's web_search, Anthropic's web_search…). They have no name /
+// description / schema / executor on our side — you switch them on and
+// grounded output comes back inline, with no tool-call callback.
+//
+// Steps reference them by NORMALISED capability name (`hosted:web_search`),
+// never by vendor wire format, so a graph runs unchanged across providers.
+// This matrix maps `(provider, model, capability) → raw wire spec`; the specs
+// bypass `toBindToolsPayload` and are concatenated verbatim onto the
+// `bindTools()` array. Adding a provider or model family is a matrix entry,
+// not a code change.
+
+/** Normalised, vendor-neutral capability names steps may reference. */
+export type HostedCapability = 'web_search' | 'code_execution' | 'url_context';
+
+export const HOSTED_CAPABILITIES: readonly HostedCapability[] = [
+  'web_search',
+  'code_execution',
+  'url_context',
+];
+
+export function isHostedCapability(value: string): value is HostedCapability {
+  return (HOSTED_CAPABILITIES as readonly string[]).includes(value);
+}
+
+/** Raw provider wire spec — passed verbatim to `model.bindTools()`. */
+export type HostedToolSpec = Record<string, unknown>;
+
+interface HostedMatrixEntry {
+  /** Glob patterns (case-insensitive, optional trailing `*`) */
+  patterns: string[];
+  specs: Partial<Record<HostedCapability, HostedToolSpec>>;
+}
+
+const HOSTED_MATRIX: Record<NeuronProvider, HostedMatrixEntry[]> = {
+  google: [
+    {
+      patterns: ['gemini-2*', 'gemini-3*'],
+      specs: {
+        web_search: { googleSearch: {} },
+        code_execution: { codeExecution: {} },
+        url_context: { urlContext: {} },
+      },
+    },
+    {
+      // Gemini 1.5 predates the unified `googleSearch` tool.
+      patterns: ['gemini-1.5*'],
+      specs: {
+        web_search: { googleSearchRetrieval: {} },
+      },
+    },
+  ],
+  openai: [
+    {
+      patterns: ['gpt-4*', 'gpt-5*', 'o1*', 'o3*', 'chatgpt-*'],
+      specs: {
+        web_search: { type: 'web_search_preview' },
+        code_execution: { type: 'code_interpreter', container: { type: 'auto' } },
+      },
+    },
+  ],
+  anthropic: [
+    {
+      patterns: ['claude-*'],
+      specs: {
+        // Server-side web search tool (Anthropic executes it; results come
+        // back inline as grounded text). code_execution needs a beta header
+        // LangChain does not set — deliberately absent until wired.
+        web_search: { type: 'web_search_20250305', name: 'web_search', max_uses: 5 },
+      },
+    },
+  ],
+  // No hosted tools exist for self-hosted / OpenAI-compatible endpoints.
+  ollama: [],
+  custom: [],
+};
+
+/**
+ * Resolve the provider wire spec for a hosted capability, or `null` when the
+ * (provider, model) pair does not support it. `null` is a DECLARED outcome —
+ * the executor either degrades to the client-executed equivalent (redbtn's
+ * native `web_search`) or fails the step with a clear config error; it never
+ * silently drops the capability.
+ */
+export function resolveHostedToolSpec(
+  provider: NeuronProvider,
+  model: string,
+  capability: HostedCapability,
+): HostedToolSpec | null {
+  const entries = HOSTED_MATRIX[provider];
+  if (!entries) return null;
+  for (const entry of entries) {
+    for (const pattern of entry.patterns) {
+      if (matchesGlob(model, pattern)) {
+        return entry.specs[capability] ?? null;
+      }
+    }
+  }
+  return null;
+}

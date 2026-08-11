@@ -187,3 +187,47 @@ describe('toBindToolsPayload', () => {
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Hosted-ref partition (2026-08-11, Become board card 6a7aa658)
+// ---------------------------------------------------------------------------
+
+import { partitionToolRefs } from '../../src/lib/tools/tool-resolver';
+
+describe('partitionToolRefs — hosted vs client refs', () => {
+  it('splits hosted: strings out of a mixed list', () => {
+    const { clientRefs, hostedCapabilities } = partitionToolRefs([
+      'web_search',
+      'hosted:web_search',
+      'mcp:server.tool',
+      'hosted:code_execution',
+    ]);
+    expect(clientRefs).toEqual(['web_search', 'mcp:server.tool']);
+    expect(hostedCapabilities).toEqual(['web_search', 'code_execution']);
+  });
+
+  it('honours object form with explicit source: hosted', () => {
+    const { clientRefs, hostedCapabilities } = partitionToolRefs([
+      { name: 'web_search', source: 'hosted' },
+      { name: 'scrape_url' },
+    ]);
+    expect(clientRefs).toEqual([{ name: 'scrape_url' }]);
+    expect(hostedCapabilities).toEqual(['web_search']);
+  });
+
+  it('sniffs the hosted: prefix inside object names', () => {
+    const { hostedCapabilities } = partitionToolRefs([{ name: 'hosted:url_context' }]);
+    expect(hostedCapabilities).toEqual(['url_context']);
+  });
+
+  it('dedupes repeated hosted capabilities', () => {
+    const { hostedCapabilities } = partitionToolRefs(['hosted:web_search', 'hosted:web_search']);
+    expect(hostedCapabilities).toEqual(['web_search']);
+  });
+
+  it('all-client lists pass through untouched', () => {
+    const { clientRefs, hostedCapabilities } = partitionToolRefs(['a', 'graph:g']);
+    expect(clientRefs).toEqual(['a', 'graph:g']);
+    expect(hostedCapabilities).toEqual([]);
+  });
+});

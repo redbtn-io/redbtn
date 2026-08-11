@@ -72,7 +72,7 @@ interface NormalisedToolRef {
   /** Optional description override */
   descriptionOverride?: string;
   /** Forced source path */
-  source: 'native' | 'mcp' | 'graph';
+  source: 'native' | 'mcp' | 'graph' | 'hosted';
 }
 
 /** Normalise a ToolRef into a struct with explicit source. */
@@ -83,6 +83,9 @@ function normalise(ref: ToolRef): NormalisedToolRef {
     }
     if (ref.startsWith('graph:')) {
       return { name: ref.slice(6), source: 'graph' };
+    }
+    if (ref.startsWith('hosted:')) {
+      return { name: ref.slice(7), source: 'hosted' };
     }
     return { name: ref, source: 'native' };
   }
@@ -96,6 +99,9 @@ function normalise(ref: ToolRef): NormalisedToolRef {
   }
   if (ref.name.startsWith('graph:')) {
     return { name: ref.name.slice(6), descriptionOverride: ref.description, source: 'graph' };
+  }
+  if (ref.name.startsWith('hosted:')) {
+    return { name: ref.name.slice(7), descriptionOverride: ref.description, source: 'hosted' };
   }
   return { name: ref.name, descriptionOverride: ref.description, source: 'native' };
 }
@@ -359,9 +365,46 @@ export async function resolveTools(
       case 'graph':
         out.push(await resolveGraph(norm.name, norm.descriptionOverride, state));
         break;
+      case 'hosted':
+        // Provider-executed — has no name/description/schema/executor on our
+        // side and must NOT be flattened into a function declaration. Callers
+        // partition these out first (partitionToolRefs); skipping here keeps
+        // a stray hosted ref from crashing resolution.
+        break;
     }
   }
   return out;
+}
+
+/**
+ * Split tool refs into the two execution categories:
+ *
+ *   - `clientRefs`          — redbtn executes these (native / MCP / graph).
+ *                             They resolve through {@link resolveTools} and
+ *                             run the tool-use loop exactly as before.
+ *   - `hostedCapabilities`  — the PROVIDER executes these. Normalised
+ *                             capability names (`web_search`, …) to be mapped
+ *                             to wire specs via the hosted capability matrix
+ *                             and appended raw to the `bindTools()` array.
+ *
+ * The two coexist: a neuron can have hosted search AND its own MCP tools in
+ * one call.
+ */
+export function partitionToolRefs(refs: ToolRef[]): {
+  clientRefs: ToolRef[];
+  hostedCapabilities: string[];
+} {
+  const clientRefs: ToolRef[] = [];
+  const hostedCapabilities: string[] = [];
+  for (const ref of refs) {
+    const norm = normalise(ref);
+    if (norm.source === 'hosted') {
+      if (!hostedCapabilities.includes(norm.name)) hostedCapabilities.push(norm.name);
+    } else {
+      clientRefs.push(ref);
+    }
+  }
+  return { clientRefs, hostedCapabilities };
 }
 
 /**
