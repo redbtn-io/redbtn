@@ -112,7 +112,10 @@ describe('ssh_shell — environmentId mode', () => {
     expect(parsed.environmentId).toBe('env_pool');
     // The mock's onExec wraps command in `cd ... && echo hello` because the
     // env has workingDir=/tmp by default — verify we see something derived.
-    expect(parsed.stdout).toMatch(/ran: cd .+ echo hello/);
+    // The command now rides inside the PID-capture wrapper (`set -m; echo
+    // __RDBTN_PID__=$$ ...; exec bash -c '...'`) so timeout/abort can kill
+    // the remote process group.
+    expect(parsed.stdout).toMatch(/ran: set -m; echo __RDBTN_PID__.*cd .+ echo hello/);
     // Confirm the resolution helper was called with the right inputs.
     expect(loadAndResolveEnvironment).toHaveBeenCalledWith('env_pool', 'user_a');
     // Exactly one client constructed for this single call.

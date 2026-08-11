@@ -257,6 +257,12 @@ const sshShell: NativeToolDefinition = {
       let beginKill: ((reason: string) => void) | null = null;
       let killing = false;
       let pendingKillReason: string | null = null;
+      // Set once the in-band side-channel kill exec has confirmably RUN on
+      // the remote host. When we settle with an error and this is still
+      // false while a remote pid is known, the process may be orphaned with
+      // no live channel to stop it — settle() then fires a last-resort kill
+      // over a FRESH connection (the keepalive-timeout zombie class).
+      let remoteKillConfirmed = false;
       // Entry point for every kill trigger (run interrupt, caller abort,
       // timeout). There is a real window where the REMOTE command has
       // already spawned but ssh2's exec callback — which assigns
@@ -286,9 +292,51 @@ const sshShell: NativeToolDefinition = {
       let statusInterval: NodeJS.Timeout | null = null;
       const startTime = Date.now();
 
+      // Best-effort kill over a FRESH connection. Used when the primary
+      // connection died (keepalive timeout, transport drop) or the in-band
+      // kill could not be confirmed — without this, the remote command runs
+      // to completion unsupervised (the 2026-08-10 camxw4 zombie class).
+      // Entirely detached: never blocks or re-triggers settle().
+      const fireLastResortKill = (pid: number) => {
+        console.log(`[ssh_shell] Fresh-connection kill for pid ${pid} on ${host}:${port}`);
+        try {
+          const kconn = sshClientFactory();
+          const guard = setTimeout(() => { try { kconn.end(); } catch (_) { /* ignore */ } }, 10000);
+          kconn.on('ready', () => {
+            kconn.exec(`kill -KILL -- -${pid} 2>/dev/null; true`, { pty: false }, (kerr, kstream) => {
+              if (kerr) {
+                clearTimeout(guard);
+                try { kconn.end(); } catch (_) { /* ignore */ }
+                return;
+              }
+              kstream.on('close', () => {
+                console.log(`[ssh_shell] Fresh-connection kill for pid ${pid} completed`);
+                clearTimeout(guard);
+                try { kconn.end(); } catch (_) { /* ignore */ }
+              });
+              kstream.resume();
+              kstream.stderr.resume();
+            });
+          });
+          kconn.on('error', (e: Error) => {
+            clearTimeout(guard);
+            console.warn(`[ssh_shell] Fresh-connection kill failed: ${e.message}`);
+          });
+          kconn.connect(connConfig);
+        } catch (e: unknown) {
+          console.warn('[ssh_shell] Fresh-connection kill threw:', e instanceof Error ? e.message : String(e));
+        }
+      };
+
       const settle = (error: Error | null) => {
         if (settled) return;
         settled = true;
+
+        // Error settle with a live-looking remote process and no confirmed
+        // kill → last-resort fresh-connection kill (fire-and-forget).
+        if (error && remotePid && remotePid > 1 && !remoteKillConfirmed) {
+          fireLastResortKill(remotePid);
+        }
 
         if (timeoutTimer) {
           clearTimeout(timeoutTimer);
@@ -488,6 +536,7 @@ const sshShell: NativeToolDefinition = {
                   }
                   kstream.on('close', () => {
                     console.log(`[ssh_shell] Remote pid ${pid} kill exec completed`);
+                    remoteKillConfirmed = true;
                     clearTimeout(cap);
                     finish();
                   });
