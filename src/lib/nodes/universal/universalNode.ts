@@ -675,6 +675,19 @@ export function validateUniversalNodeConfig(nodeConfig: NodeConfig): void {
         // Type-specific validation
         const config = step.config as any;
 
+        // errorHandling.onError — an unrecognized value silently degrades to
+        // 'throw' at runtime (errorHandler's switch default), making any
+        // configured fallbackValue dead config. Reject it at validation time.
+        const validOnError = ['throw', 'fallback', 'skip'];
+        for (const eh of [(step as any).errorHandling, config?.errorHandling]) {
+            if (eh?.onError !== undefined && !validOnError.includes(eh.onError)) {
+                throw new Error(
+                    `Step ${stepNumber}: invalid errorHandling.onError "${eh.onError}". ` +
+                    `Must be one of: ${validOnError.join(', ')}`
+                );
+            }
+        }
+
         switch (step.type) {
             case 'neuron':
                 if (!config.userPrompt) {

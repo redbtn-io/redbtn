@@ -311,6 +311,34 @@ function extractThinkingFromContent(content: string): { thinking: string; cleane
   return { thinking: thinking.trim(), cleanedContent };
 }
 
+/**
+ * Detect a node failure that reached graph END without being consumed.
+ *
+ * When a step fails, universalNode records `data.error` and routes toward
+ * `error_handler` — but graphs without that node (or with a static join edge
+ * that outruns the routing hint) discard it, and the run used to complete
+ * "successfully" with empty output (2026-08-10: Become run camxw4 completed
+ * empty after its ssh_shell step died on a keepalive timeout).
+ *
+ * The failure is UNCONSUMED when the error is set AND the run produced no
+ * user-visible output — no streamed/aggregated content AND no `data.response`
+ * (the canonical field tool-responder graphs set after delivering a reply).
+ * A graph that recovered and answered keeps its `completed` status; the error
+ * still travels in the output data for observability.
+ */
+function unconsumedNodeError(
+  data: Record<string, unknown> | undefined,
+  content: string,
+): string | null {
+  const err = data?.error;
+  if (typeof err !== 'string' || err.length === 0) return null;
+  if (content && content.trim().length > 0) return null;
+  const response = data?.response;
+  if (typeof response === 'string' && response.trim().length > 0) return null;
+  if (response && typeof response === 'object') return null;
+  return err;
+}
+
 // =============================================================================
 // Resume helper — load checkpointed state from a prior run
 // =============================================================================
@@ -762,6 +790,12 @@ async function executeNonStreaming(
         ? rawResponse
         : rawResponse?.content || '';
     const { thinking, cleanedContent } = extractThinkingFromContent(responseContent);
+    // A node failure that reached END with no output is a FAILED run, not a
+    // completed one — report it as such instead of a silent empty success.
+    const nodeError = unconsumedNodeError(result.data, cleanedContent);
+    if (nodeError) {
+      throw new Error(`Node failure reached graph end with no output: ${nodeError}`);
+    }
     // Pass the FULL final graph state as the second arg so the run_complete
     // event's `output` carries every state-root field (not just the
     // content/thinking/data quadrant). Canonical aliases are still layered
@@ -1034,6 +1068,12 @@ async function executeStreaming(
     const finalThinking = thinkingBuffer || cachedState?.output?.thinking || '';
     // Use graph output data if available, fall back to initial state data
     const finalData = graphOutputData || initialState.data || {};
+    // A node failure that reached END with no output is a FAILED run, not a
+    // completed one — report it as such instead of a silent empty success.
+    const nodeError = unconsumedNodeError(finalData, finalContent);
+    if (nodeError) {
+      throw new Error(`Node failure reached graph end with no output: ${nodeError}`);
+    }
     // Pass the full captured graph state (when available) so the run_complete
     // event's `output` carries every state-root field — not just the legacy
     // content/thinking/data quadrant. Falls back to just the convenience

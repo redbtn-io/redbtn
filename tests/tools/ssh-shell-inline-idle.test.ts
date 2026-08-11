@@ -224,3 +224,82 @@ describe('ssh_shell inline output-idle watchdog', () => {
     expect(clients[0].execCalls.some((cmd) => cmd.includes('kill -TERM -- -4245'))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Last-resort fresh-connection kill (2026-08-11)
+//
+// When the primary connection dies mid-command (keepalive timeout class),
+// there is no channel left to kill through — the tool must open a FRESH
+// connection and kill the captured process group, or the remote command runs
+// to completion unsupervised (the Become run camxw4 zombie).
+// ---------------------------------------------------------------------------
+
+describe('ssh_shell — last-resort fresh-connection kill', () => {
+  let clients: MockSshClient[];
+
+  beforeEach(() => {
+    clients = [];
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    __setSshClientFactoryForTests(null);
+    vi.restoreAllMocks();
+  });
+
+  it('kills via a fresh connection when the transport dies mid-command', async () => {
+    let primaryChannel: MockSshChannel | null = null;
+    __setSshClientFactoryForTests(() => {
+      const client = new MockSshClient();
+      client.behaviour.onExec = (command, channel) => {
+        if (command.startsWith('kill ')) {
+          channel.finish(0);
+          return;
+        }
+        primaryChannel = channel;
+        channel.pushStderr('__RDBTN_PID__=5150\n');
+      };
+      clients.push(client);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return client as any;
+    });
+
+    const resultPromise = sshShellTool.handler(
+      {
+        host: 'localhost',
+        user: 'alpha',
+        command: 'sleep 100',
+        timeout: 60_000,
+      },
+      {} as any,
+    );
+
+    for (let i = 0; i < 50 && primaryChannel === null; i += 1) {
+      await flushAsync();
+    }
+    expect(primaryChannel).not.toBeNull();
+
+    // Transport death — conn errors without the command ever completing.
+    clients[0].simulateDrop('Keepalive timeout');
+
+    const result = await resultPromise;
+    expect(result.isError).toBe(true);
+
+    // The detached fresh-connection kill spins up a SECOND client and kills
+    // the captured process group.
+    for (
+      let i = 0;
+      i < 50 &&
+      !clients.some((c, idx) => idx > 0 && c.execCalls.some((cmd) => cmd.includes('kill -KILL -- -5150')));
+      i += 1
+    ) {
+      await flushAsync();
+    }
+    expect(clients.length).toBeGreaterThanOrEqual(2);
+    expect(
+      clients.some((c, idx) => idx > 0 && c.execCalls.some((cmd) => cmd.includes('kill -KILL -- -5150'))),
+    ).toBe(true);
+  });
+});
