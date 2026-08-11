@@ -755,3 +755,93 @@ describe('EnvironmentSession — archiveOutputLogs record shape', () => {
     expect(captured!.expiresAt.getTime()).toBeGreaterThan(captured!.startedAt.getTime());
   });
 });
+
+// ---------------------------------------------------------------------------
+// Remote process-group kill on abort / timeout (2026-08-11)
+//
+// Closing the ssh channel does NOT stop the remote command — the session must
+// force-kill the captured process group via a side-channel exec on the same
+// pooled connection, or the remote work keeps running unsupervised (the
+// Become zombie-claude class, ported here from ssh-shell.ts).
+// ---------------------------------------------------------------------------
+
+describe('EnvironmentSession — remote process-group kill on abort/timeout', () => {
+  it('abort kills the remote pgroup via a side-channel exec on the pooled connection', async () => {
+    let client!: MockSshClient;
+    const env = buildEnv({});
+    const session = new EnvironmentSession({
+      env,
+      sshKey: 'k',
+      userId: env.userId,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      clientFactory: (() => {
+        client = new MockSshClient();
+        client.behaviour.onExec = (command, channel) => {
+          if (command.includes('kill -TERM')) {
+            channel.finish(0);
+            return;
+          }
+          // Main command: emit the PID marker, then hang (never finish).
+          channel.pushStderr('__RDBTN_PID__=4242\n');
+        };
+        return client as any;
+      }) as any,
+    });
+    await session.open();
+
+    const ac = new AbortController();
+    const p = session.exec('sleep 100', { abortSignal: ac.signal });
+    // Let the exec dispatch and the marker arrive.
+    for (let i = 0; i < 20 && !client.execCalls.some((c) => c.includes('sleep 100')); i += 1) {
+      await flushAsync();
+    }
+    ac.abort();
+    await expect(p).rejects.toThrow('exec aborted');
+
+    // The detached kill exec lands on the SAME client (pooled connection).
+    for (
+      let i = 0;
+      i < 50 && !client.execCalls.some((c) => c.includes('kill -TERM -- -4242'));
+      i += 1
+    ) {
+      await flushAsync();
+    }
+    expect(client.execCalls.some((c) => c.includes('kill -TERM -- -4242'))).toBe(true);
+    await session.close();
+  });
+
+  it('timeout kills the remote pgroup', async () => {
+    let client!: MockSshClient;
+    const env = buildEnv({});
+    const session = new EnvironmentSession({
+      env,
+      sshKey: 'k',
+      userId: env.userId,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      clientFactory: (() => {
+        client = new MockSshClient();
+        client.behaviour.onExec = (command, channel) => {
+          if (command.includes('kill -TERM')) {
+            channel.finish(0);
+            return;
+          }
+          channel.pushStderr('__RDBTN_PID__=7777\n');
+        };
+        return client as any;
+      }) as any,
+    });
+    await session.open();
+
+    await expect(session.exec('sleep 100', { timeout: 60 })).rejects.toThrow(/timed out|timeout/i);
+
+    for (
+      let i = 0;
+      i < 50 && !client.execCalls.some((c) => c.includes('kill -TERM -- -7777'));
+      i += 1
+    ) {
+      await flushAsync();
+    }
+    expect(client.execCalls.some((c) => c.includes('kill -TERM -- -7777'))).toBe(true);
+    await session.close();
+  });
+});

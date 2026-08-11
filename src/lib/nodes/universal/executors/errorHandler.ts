@@ -74,6 +74,17 @@ export async function executeWithErrorHandling<T>(
             return undefined as unknown as T;
         case 'throw':
         default:
+            if (onError !== 'throw') {
+                // An unrecognized onError (e.g. 'continue') silently degrades to
+                // 'throw', turning any configured fallbackValue into dead config
+                // — exactly how the Become cli-analyst swallowed its ssh_shell
+                // failures. Config validation rejects new offenders; this warn
+                // surfaces existing bad documents.
+                console.warn(
+                    `[ErrorHandler] Invalid onError value "${String(onError)}" — ` +
+                    `valid: throw | fallback | skip. Treating as 'throw'.`
+                );
+            }
             console.error(`[ErrorHandler] Throwing error: ${lastError?.message}`);
             throw lastError;
     }

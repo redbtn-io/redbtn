@@ -99,6 +99,20 @@ const KEEPALIVE_COUNT_MAX = 5;
 /** Exec polling timeout for the close event before settling with whatever we have. */
 const EXEC_DRAIN_GRACE_MS = 100;
 
+/**
+ * PID-capture marker for exec commands — mirrors ssh-shell.ts. The wrapper
+ * echoes its own pid (which, under a non-PTY sshd session, is also the
+ * process-group id) to stderr before exec'ing the user command, so
+ * timeout/abort can kill the ENTIRE remote process group instead of just
+ * closing the channel (which leaves the remote process running).
+ */
+const ENV_PID_MARKER = '__RDBTN_PID__=';
+
+/** Bash-safe single-quote escape (same idiom as ssh-shell.ts shQuote). */
+function shQuoteEnv(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 function isDefinitiveTimeoutOrIdleError(err: unknown): boolean {
   if (err instanceof EnvironmentTimeoutError) return true;
   if (!err || typeof err !== 'object') return false;
@@ -479,6 +493,11 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
       fullCommand = `${envExports} && ${fullCommand}`;
     }
 
+    // Wrap for pid capture so timeout/abort can force-kill the remote
+    // process group. `set -m` + `exec` keeps the captured $$ valid as the
+    // group leader (see ssh-shell.ts for the full rationale).
+    fullCommand = `set -m; echo ${ENV_PID_MARKER}$$ 1>&2; exec bash -c ${shQuoteEnv(fullCommand)}`;
+
     const startTime = Date.now();
     let stdout = '';
     let stderr = '';
@@ -491,6 +510,39 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
       let timeoutTimer: NodeJS.Timeout | null = null;
       let abortListener: (() => void) | null = null;
       let stream: ReturnType<typeof streamAccessor> | null = null;
+      let remotePid: number | null = null;
+
+      // Kill the remote process group via a side-channel exec on the SAME
+      // (pooled, persistent) connection. Unlike the one-shot ssh_shell path,
+      // the session connection outlives settle(), so the kill can run
+      // detached — no need to hold the caller's promise open for it.
+      const killRemoteGroup = (why: string, isRetry = false) => {
+        const pid = remotePid;
+        if (!pid || pid <= 1) {
+          // Marker may still be in flight when the kill lands moments after
+          // exec starts — retry once after a short window.
+          if (!isRetry) {
+            setTimeout(() => killRemoteGroup(why, true), 300);
+          }
+          return;
+        }
+        if (!this.client) return;
+        console.log(`[EnvironmentSession] ${this.environmentId}: killing remote pgroup ${pid} (${why})`);
+        try {
+          this.client.exec(`kill -TERM -- -${pid} 2>/dev/null; sleep 0.5; kill -KILL -- -${pid} 2>/dev/null; true`, (kerr, kstream) => {
+            if (kerr) {
+              console.warn(`[EnvironmentSession] ${this.environmentId}: kill side-channel failed: ${kerr.message}`);
+              return;
+            }
+            kstream.on('close', () => console.log(`[EnvironmentSession] ${this.environmentId}: pgroup ${pid} kill exec completed`));
+            kstream.on('error', () => { /* logged via close-less path; ignore */ });
+            kstream.resume();
+            kstream.stderr.resume();
+          });
+        } catch (e: unknown) {
+          console.warn(`[EnvironmentSession] ${this.environmentId}: kill side-channel threw:`, e instanceof Error ? e.message : String(e));
+        }
+      };
 
       const clearLocal = () => {
         if (timeoutTimer) {
@@ -531,12 +583,16 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
         }
         stream = channelStream;
 
-        // Hard timeout — kill the stream after opts.timeout.
+        // Hard timeout — kill the remote process group, then the stream.
+        // Closing the channel alone does NOT stop the remote command; the
+        // group kill (via killRemoteGroup on the persistent connection) is
+        // what actually ends the work.
         if (opts.timeout && opts.timeout > 0) {
           timeoutTimer = setTimeout(() => {
             try {
               channelStream.signal('KILL');
             } catch { /* best-effort */ }
+            killRemoteGroup('timeout');
             try {
               channelStream.close();
             } catch { /* best-effort */ }
@@ -548,11 +604,13 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
         if (opts.abortSignal) {
           if (opts.abortSignal.aborted) {
             try { channelStream.signal('KILL'); } catch { /* ignore */ }
+            killRemoteGroup('abort');
             try { channelStream.close(); } catch { /* ignore */ }
             return settle(new Error('exec aborted'), null);
           }
           abortListener = () => {
             try { channelStream.signal('KILL'); } catch { /* ignore */ }
+            killRemoteGroup('abort');
             try { channelStream.close(); } catch { /* ignore */ }
             settle(new Error('exec aborted'), null);
           };
@@ -569,7 +627,17 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
         });
 
         channelStream.stderr.on('data', (data: Buffer) => {
-          const chunk = data.toString('utf8');
+          let chunk = data.toString('utf8');
+          // Capture + strip the PID marker emitted by the exec wrapper so
+          // callers never see it in stderr output.
+          if (remotePid === null && chunk.includes(ENV_PID_MARKER)) {
+            const m = chunk.match(/__RDBTN_PID__=(\d+)\r?\n?/);
+            if (m) {
+              remotePid = parseInt(m[1], 10);
+              chunk = chunk.replace(/__RDBTN_PID__=\d+\r?\n?/, '');
+            }
+          }
+          if (!chunk) return; // marker-only chunk
           stderr += chunk;
           if (stderr.length > EXEC_MAX_OUTPUT_BYTES) {
             stderr = stderr.slice(stderr.length - EXEC_MAX_OUTPUT_BYTES);
