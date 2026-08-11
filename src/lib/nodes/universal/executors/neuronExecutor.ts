@@ -22,8 +22,15 @@ import { getNativeRegistry } from '../../../tools/native-registry';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
 import { getRunPublisher, getNeuronRegistry, getMcpClient, getGraphRegistry, getMeteringClient } from '../../../run/contextLookup';
 import { HumanMessage } from '@langchain/core/messages';
-import { resolveToolStrategy, type ToolStrategy } from '../../../neurons/capability-matrix';
-import { resolveTools, toBindToolsPayload, type ResolvedTool } from '../../../tools/tool-resolver';
+import {
+  resolveToolStrategy,
+  resolveHostedToolSpec,
+  isHostedCapability,
+  HOSTED_CAPABILITIES,
+  type ToolStrategy,
+  type HostedToolSpec,
+} from '../../../neurons/capability-matrix';
+import { resolveTools, toBindToolsPayload, partitionToolRefs, type ResolvedTool } from '../../../tools/tool-resolver';
 import { coerceArgsToSchema } from '../../../tools/coerce-args';
 
 /**
@@ -337,8 +344,62 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // -------------------------------------------------------------------------
     const attachedTools = Array.isArray(config.tools) ? config.tools : [];
     if (attachedTools.length > 0) {
-      // Mutually exclusive: structured-output + tools is a config error
-      if (config.structuredOutput && config.toolStrategy !== 'structured-output') {
+      // Split into the two execution categories. `hosted:*` refs are
+      // PROVIDER-executed (Google googleSearch, OpenAI web_search, …): no
+      // name/schema/executor on our side, no callback ever arrives, so they
+      // must bypass the resolver AND the tool-use loop.
+      const { clientRefs, hostedCapabilities } = partitionToolRefs(attachedTools);
+
+      // Resolve strategy + hosted wire specs from the model's neuron config
+      let neuronCfg: any;
+      try {
+        neuronCfg = await neuronRegistry.getConfig(neuronId, userId);
+      } catch (cfgErr) {
+        console.warn('[NeuronExecutor] Could not load neuron config for capability matrix; falling back to "none":', cfgErr);
+        neuronCfg = null;
+      }
+
+      // Map each hosted capability to its provider wire spec. Unsupported
+      // capability → DECLARED behaviour, never a silent drop: web_search
+      // degrades to redbtn's client-executed native tool (same graph runs on
+      // any provider, only quality varies); anything else fails the step
+      // with a config error naming the gap.
+      const hostedSpecs: HostedToolSpec[] = [];
+      for (const cap of hostedCapabilities) {
+        if (!isHostedCapability(cap)) {
+          throw new Error(
+            `Neuron step config error: unknown hosted tool capability "hosted:${cap}". ` +
+            `Known capabilities: ${HOSTED_CAPABILITIES.map((c) => `hosted:${c}`).join(', ')}`
+          );
+        }
+        const spec = neuronCfg
+          ? resolveHostedToolSpec(neuronCfg.provider, neuronCfg.model, cap)
+          : null;
+        if (spec) {
+          hostedSpecs.push(spec);
+        } else if (cap === 'web_search') {
+          console.warn(
+            `[NeuronExecutor] hosted:web_search not supported by ` +
+            `${neuronCfg?.provider ?? 'unknown'}/${neuronCfg?.model ?? 'unknown'} — ` +
+            `degrading to the client-executed native web_search tool.`
+          );
+          clientRefs.push('web_search');
+        } else {
+          throw new Error(
+            `Neuron step config error: hosted:${cap} is not supported by ` +
+            `${neuronCfg?.provider ?? 'unknown'}/${neuronCfg?.model ?? 'unknown'} and has no ` +
+            `client-executed fallback. Remove the ref or switch the neuron to a provider that supports it.`
+          );
+        }
+      }
+
+      // Mutually exclusive: structured-output + CLIENT tools is a config
+      // error (the tool-use loop needs free-form tool calls back, which
+      // conflicts with a forced schema). Hosted tools are exempt — they
+      // return grounded text with no callback, so hosted-only +
+      // structuredOutput is allowed (subject to a provider-support check at
+      // the withStructuredOutput site below).
+      if (clientRefs.length > 0 && config.structuredOutput && config.toolStrategy !== 'structured-output') {
         // 'structured-output' strategy is allowed (it just ignores tools), but
         // any other combo with structuredOutput defined is invalid.
         if (!config.toolStrategy || config.toolStrategy === 'auto'
@@ -350,62 +411,85 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
         }
       }
 
-      // Resolve strategy from the model's neuron config
-      let neuronCfg: any;
-      try {
-        neuronCfg = await neuronRegistry.getConfig(neuronId, userId);
-      } catch (cfgErr) {
-        console.warn('[NeuronExecutor] Could not load neuron config for capability matrix; falling back to "none":', cfgErr);
-        neuronCfg = null;
-      }
-      const strategy: ToolStrategy = neuronCfg
-        ? resolveToolStrategy(neuronCfg.provider, neuronCfg.model, config.toolStrategy)
-        : (config.toolStrategy && config.toolStrategy !== 'auto' ? config.toolStrategy as ToolStrategy : 'none');
-
-      console.log('[NeuronExecutor] Tool strategy resolved:', {
-        neuronId,
-        provider: neuronCfg?.provider,
-        model: neuronCfg?.model,
-        override: config.toolStrategy,
-        resolved: strategy,
-        toolCount: attachedTools.length,
-      });
-
-      if (strategy === 'native') {
-        // Resolve all tools through native/MCP/graph registries
-        const resolved = await resolveTools(attachedTools, state);
-        const finalContent = await runNativeToolUseLoop({
-          config,
-          state,
-          model,
-          baseMessages: await buildBaseMessagesForToolLoop(config, state),
-          resolvedTools: resolved,
+      // Hosted-only: bind the provider-executed tools and fall through to
+      // the NORMAL single-call path (plain / structuredOutput / streaming).
+      // No tool-use loop — no callback ever arrives for a hosted tool, so a
+      // loop would either mis-count iterations or wait forever.
+      if (hostedSpecs.length > 0 && clientRefs.length === 0) {
+        if (typeof model.bindTools !== 'function') {
+          throw new Error(`Model for neuron '${neuronId}' does not support bindTools() (required for hosted tools)`);
+        }
+        console.log('[NeuronExecutor] Binding provider-hosted tools (no tool-use loop):', {
           neuronId,
-          userId,
-          callRunId,
-          abortSignal,
-          neuronRegistry,
+          provider: neuronCfg?.provider,
+          model: neuronCfg?.model,
+          capabilities: hostedCapabilities,
         });
-        return { [config.outputField]: finalContent };
+        model = model.bindTools(hostedSpecs);
+        if (config.structuredOutput && typeof model.withStructuredOutput !== 'function') {
+          throw new Error(
+            'Neuron step config error: hosted tools + structuredOutput is not supported for this ' +
+            'provider/model combination yet — drop structuredOutput and parse JSON from the text ' +
+            'output in a follow-up transform instead.'
+          );
+        }
+        // fall through to the existing plain-LLM / structuredOutput path
       }
+      if (clientRefs.length > 0) {
+        const strategy: ToolStrategy = neuronCfg
+          ? resolveToolStrategy(neuronCfg.provider, neuronCfg.model, config.toolStrategy)
+          : (config.toolStrategy && config.toolStrategy !== 'auto' ? config.toolStrategy as ToolStrategy : 'none');
 
-      if (strategy === 'prompt-injection') {
-        throw new Error(
-          'Neuron step config error: prompt-injection tool strategy is not yet implemented. ' +
-          'Use a tool-capable model (e.g. llama3.1+, qwen2.5+, mistral-nemo, gpt-4*, claude-*, gemini-1.5+) ' +
-          'or set `toolStrategy: "none"` to ignore attached tools for now.'
-        );
-      }
+        console.log('[NeuronExecutor] Tool strategy resolved:', {
+          neuronId,
+          provider: neuronCfg?.provider,
+          model: neuronCfg?.model,
+          override: config.toolStrategy,
+          resolved: strategy,
+          toolCount: clientRefs.length,
+          hostedCount: hostedSpecs.length,
+        });
 
-      if (strategy === 'structured-output') {
-        // User explicitly opted into structured output despite attaching
-        // tools — fall through to the existing structuredOutput path. Tools
-        // are silently ignored (the LLM won't be told about them).
-        console.warn('[NeuronExecutor] toolStrategy: "structured-output" — attached tools are ignored.');
-        // fall through to existing logic below
-      } else if (strategy === 'none') {
-        console.warn('[NeuronExecutor] toolStrategy: "none" — attached tools are ignored. Falling through to plain LLM call.');
-        // fall through to existing logic below
+        if (strategy === 'native') {
+          // Resolve client tools through native/MCP/graph registries. Hosted
+          // specs ride along raw on the bindTools payload — the loop itself
+          // never sees a callback for them (providers execute them
+          // server-side), so they cannot count toward maxToolIterations.
+          const resolved = await resolveTools(clientRefs, state);
+          const finalContent = await runNativeToolUseLoop({
+            config,
+            state,
+            model,
+            baseMessages: await buildBaseMessagesForToolLoop(config, state),
+            resolvedTools: resolved,
+            hostedSpecs,
+            neuronId,
+            userId,
+            callRunId,
+            abortSignal,
+            neuronRegistry,
+          });
+          return { [config.outputField]: finalContent };
+        }
+
+        if (strategy === 'prompt-injection') {
+          throw new Error(
+            'Neuron step config error: prompt-injection tool strategy is not yet implemented. ' +
+            'Use a tool-capable model (e.g. llama3.1+, qwen2.5+, mistral-nemo, gpt-4*, claude-*, gemini-1.5+) ' +
+            'or set `toolStrategy: "none"` to ignore attached tools for now.'
+          );
+        }
+
+        if (strategy === 'structured-output') {
+          // User explicitly opted into structured output despite attaching
+          // tools — fall through to the existing structuredOutput path. Tools
+          // are silently ignored (the LLM won't be told about them).
+          console.warn('[NeuronExecutor] toolStrategy: "structured-output" — attached tools are ignored.');
+          // fall through to existing logic below
+        } else if (strategy === 'none') {
+          console.warn('[NeuronExecutor] toolStrategy: "none" — attached tools are ignored. Falling through to plain LLM call.');
+          // fall through to existing logic below
+        }
       }
     }
 
@@ -1095,6 +1179,12 @@ export interface NativeToolUseLoopArgs {
   baseMessages: any[];
   /** Resolved tools (already passed through tool-resolver.resolveTools) */
   resolvedTools: ResolvedTool[];
+  /**
+   * Provider-hosted tool wire specs (from the hosted capability matrix).
+   * Concatenated RAW onto the bindTools payload — the provider executes
+   * these itself, so they never produce tool_calls and never enter the loop.
+   */
+  hostedSpecs?: HostedToolSpec[];
   neuronId: string;
   userId: string;
   callRunId: string | undefined;
@@ -1242,7 +1332,12 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
     if (typeof model.bindTools !== 'function') {
       throw new Error(`Model for neuron '${neuronId}' does not support bindTools()`);
     }
-    boundModel = model.bindTools(toBindToolsPayload(resolvedTools));
+    // Client tools flatten to function declarations; hosted specs (provider-
+    // executed — googleSearch, web_search_preview, …) ride along verbatim.
+    boundModel = model.bindTools([
+      ...toBindToolsPayload(resolvedTools),
+      ...(args.hostedSpecs ?? []),
+    ]);
   } catch (bindErr: any) {
     throw new Error(
       `Failed to bind tools to model for neuron '${neuronId}': ${bindErr instanceof Error ? bindErr.message : String(bindErr)}`
