@@ -34,6 +34,7 @@ import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '.
 import { environmentManager } from '../../environments/EnvironmentManager';
 import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
 import { readAllowlistedSshKey } from './ssh-key-path';
+import { runControlRegistry } from '../../run/RunControlRegistry';
 
 // No limits — Claude sessions can produce large outputs and we need
 // the full stream-json including the final result event
@@ -248,6 +249,36 @@ const sshShell: NativeToolDefinition = {
       let settled = false;
       let remotePid: number | null = null;
       let unregisterCancel: (() => void) | null = null;
+      // Kill-then-settle machinery. `beginKill` is assigned once the exec
+      // callback runs (it closes over the live stream + captured pid).
+      // `killing` makes the sequence idempotent AND suppresses the natural
+      // stream-close settle so the caller sees the kill reason, not a
+      // spurious success with a null exit code.
+      let beginKill: ((reason: string) => void) | null = null;
+      let killing = false;
+      let pendingKillReason: string | null = null;
+      // Entry point for every kill trigger (run interrupt, caller abort,
+      // timeout). There is a real window where the REMOTE command has
+      // already spawned but ssh2's exec callback — which assigns
+      // `beginKill` — has not run yet on this side (observed under CI
+      // load). Settling in that window orphans the remote process, so park
+      // the reason and let the exec callback fire the kill the moment it
+      // lands; a bounded fallback settles if the callback never arrives
+      // (connection died — nothing identifiable to kill).
+      const requestKill = (reason: string) => {
+        if (settled || killing) return;
+        if (beginKill) {
+          beginKill(reason);
+          return;
+        }
+        if (pendingKillReason) return;
+        pendingKillReason = reason;
+        setTimeout(() => {
+          if (!settled && !killing && !beginKill) {
+            settle(new Error(reason));
+          }
+        }, 3000);
+      };
       // Declared here (not down in the ready handler) so `settle` can safely
       // reference it even when it fires before a connection is established —
       // e.g. an sshKeyPath rejected by the allowlist guard. A later `let`
@@ -333,13 +364,16 @@ const sshShell: NativeToolDefinition = {
 
       if (timeout > 0) {
         timeoutTimer = setTimeout(() => {
-          settle(new Error(`SSH command timed out after ${Math.round(timeout / 1000)}s`));
+          // Kill the remote process group before dropping the connection —
+          // a bare settle() here used to leave the remote command running
+          // to completion after every timeout.
+          requestKill(`SSH command timed out after ${Math.round(timeout / 1000)}s`);
         }, timeout);
       }
 
       if (context?.abortSignal) {
         context.abortSignal.addEventListener('abort', () => {
-          settle(new Error('SSH command aborted by caller'));
+          requestKill('SSH command aborted by caller');
         }, { once: true });
       }
 
@@ -419,47 +453,89 @@ const sshShell: NativeToolDefinition = {
             return settle(err);
           }
 
-          // Register cancel callback that kills the remote process group.
-          // Runs when runControlRegistry.cancel(runId) fires (interrupt
-          // arrives from /api/v1/runs/:runId/interrupt). Cooperative
-          // signal first; force-kill via a side-channel exec on the same
-          // SSH connection 1s later.
-          if (runId) {
-            // Lazy-import to avoid a hard module dep at the top — this
-            // module ships in environments without the registry too
-            // (e.g. unit tests of the inline path).
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const { runControlRegistry } = require('../../run/RunControlRegistry');
-            unregisterCancel = runControlRegistry.registerOnCancel(runId, () => {
-              if (settled) return;
-              const pid = remotePid;
-              console.log(`[ssh_shell] Cancel callback firing — pid=${pid ?? 'unknown'} run=${runId}`);
-              // 1. Cooperative: signal the channel. Many sshd configs
-              //    ignore signal requests, but it's free to try.
-              try { stream.signal('KILL'); } catch (_) { /* ignore */ }
-              // 2. Force-kill via a side-channel exec on the SAME
-              //    connection. Kills the process group so any children
-              //    spawned by the user command die too. Only attempt if
-              //    we captured the PID; otherwise rely on conn.end()
-              //    in settle() to drop the channel.
-              if (pid && pid > 1) {
-                try {
-                  conn.exec(`kill -TERM -- -${pid} 2>/dev/null; sleep 1; kill -KILL -- -${pid} 2>/dev/null; true`, { pty: false }, (kerr, kstream) => {
-                    if (kerr) {
-                      console.warn(`[ssh_shell] kill side-channel exec failed: ${kerr.message}`);
-                      return;
-                    }
-                    kstream.on('close', () => console.log(`[ssh_shell] Remote pid ${pid} kill exited`));
-                    kstream.resume();
-                    kstream.stderr.resume();
+          // Kill-then-settle: terminate the REMOTE process group, then — and
+          // only then — settle (settle() calls conn.end(), and tearing the
+          // connection down early is exactly the race that used to strand
+          // the kill and leave remote `claude` processes running for hours;
+          // see 2026-08-10 Become Agent incident).
+          beginKill = (reason: string) => {
+            if (settled || killing) return;
+            killing = true;
+            console.log(`[ssh_shell] Kill sequence starting — pid=${remotePid ?? 'unknown'} run=${runId ?? 'none'}: ${reason}`);
+            // 1. Channel signal. Modern OpenSSH (>=7.9) delivers this to the
+            //    remote process group immediately; verified effective against
+            //    the fleet's sshd. Free to try everywhere.
+            try { stream.signal('KILL'); } catch (_) { /* ignore */ }
+            let finished = false;
+            const finish = () => {
+              if (finished) return;
+              finished = true;
+              settle(new Error(reason));
+            };
+            // 2. Force-kill via a side-channel exec on the SAME connection.
+            //    Kills the process group so any children spawned by the user
+            //    command die too. The connection MUST stay open until this
+            //    exec closes; the 2.5s cap bounds the wait when the
+            //    connection is already dead (e.g. keepalive timeout).
+            const sideChannelKill = (pid: number) => {
+              const cap = setTimeout(finish, 2500);
+              try {
+                conn.exec(`kill -TERM -- -${pid} 2>/dev/null; sleep 0.5; kill -KILL -- -${pid} 2>/dev/null; true`, { pty: false }, (kerr, kstream) => {
+                  if (kerr) {
+                    console.warn(`[ssh_shell] kill side-channel exec failed: ${kerr.message}`);
+                    clearTimeout(cap);
+                    return finish();
+                  }
+                  kstream.on('close', () => {
+                    console.log(`[ssh_shell] Remote pid ${pid} kill exec completed`);
+                    clearTimeout(cap);
+                    finish();
                   });
-                } catch (e: unknown) {
-                  console.warn('[ssh_shell] kill side-channel threw:', e instanceof Error ? e.message : String(e));
-                }
+                  kstream.on('error', () => {
+                    clearTimeout(cap);
+                    finish();
+                  });
+                  kstream.resume();
+                  kstream.stderr.resume();
+                });
+              } catch (e: unknown) {
+                console.warn('[ssh_shell] kill side-channel threw:', e instanceof Error ? e.message : String(e));
+                clearTimeout(cap);
+                finish();
               }
-              // 3. Settle locally with abort error.
-              setTimeout(() => settle(new Error('SSH command cancelled by run interrupt')), 50);
+            };
+            if (remotePid && remotePid > 1) {
+              sideChannelKill(remotePid);
+            } else {
+              // No pid captured yet — when the kill lands moments after exec
+              // starts, the PID marker may still be in flight on stderr.
+              // Give it a brief window, then fall back to the channel signal
+              // alone.
+              setTimeout(() => {
+                if (remotePid && remotePid > 1) sideChannelKill(remotePid);
+                else finish();
+              }, 250);
+            }
+          };
+
+          // Register with the run-control registry so an external interrupt
+          // (run:interrupt:{runId} → runControlRegistry.cancel) triggers the
+          // kill. The registry fires these callbacks BEFORE aborting the run
+          // controller, so this runs ahead of the abortSignal listener above
+          // — that ordering is what makes the kill reachable at all.
+          if (runId) {
+            unregisterCancel = runControlRegistry.registerOnCancel(runId, () => {
+              requestKill('SSH command cancelled by run interrupt');
             });
+          }
+
+          // A kill requested during the exec-request window (remote command
+          // already spawned server-side, this callback not yet run) fires
+          // now that the stream exists.
+          if (pendingKillReason) {
+            const reason = pendingKillReason;
+            pendingKillReason = null;
+            beginKill(reason);
           }
 
           stream.on('data', (data: Buffer) => {
@@ -546,6 +622,10 @@ const sshShell: NativeToolDefinition = {
             if (signal) {
               console.log(`[ssh_shell] Process killed by signal: ${signal}`);
             }
+            // During a kill sequence the close is a CONSEQUENCE of the kill
+            // (signal/KILL landed) — let finish() settle with the kill
+            // reason instead of reporting a spurious null-exit success.
+            if (killing) return;
             settle(null);
           });
 

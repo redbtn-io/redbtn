@@ -170,7 +170,7 @@ describe('ssh_shell inline output-idle watchdog', () => {
     expect(body.stderr).toContain('err-4');
   });
 
-  it('clears the inline idle timer and closes the connection on caller abort', async () => {
+  it('kills the remote process group, then closes the connection on caller abort', async () => {
     const abortController = new AbortController();
     let primaryChannel: MockSshChannel | null = null;
 
@@ -216,7 +216,11 @@ describe('ssh_shell inline output-idle watchdog', () => {
 
     await new Promise((resolve) => setTimeout(resolve, 90));
 
-    expect(primaryChannel?.signalled).toBeNull();
-    expect(clients[0].execCalls.some((cmd) => cmd.includes('kill -TERM -- -4245'))).toBe(false);
+    // Kill-then-settle contract (2026-08-10 Become incident): a caller abort
+    // must terminate the REMOTE process group — channel signal plus a
+    // side-channel group kill against the captured pid — not just settle and
+    // drop the connection (which left remote processes running for hours).
+    expect(primaryChannel?.signalled).toBe('KILL');
+    expect(clients[0].execCalls.some((cmd) => cmd.includes('kill -TERM -- -4245'))).toBe(true);
   });
 });

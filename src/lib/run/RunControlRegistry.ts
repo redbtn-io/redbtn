@@ -35,7 +35,10 @@
  *
  * # Cancellation semantics
  *
- * `cancel()` performs three actions in order:
+ * `cancel()` performs these actions in order:
+ *   - Fires tool-supplied onCancel callbacks FIRST, while the controller is
+ *     still un-aborted — so tools like ssh_shell can kill remote work before
+ *     their own abortSignal listeners settle and drop the connection.
  *   - Marks the controller signal as aborted (graph code's between-step and
  *     mid-stream abort checks fire).
  *   - Calls `.cancel()` on every registered NeuronCall so any in-flight LLM
@@ -434,29 +437,35 @@ export class RunControlRegistry {
       return { ack: false, runId, reason };
     }
 
-    // 1. Run-level abort first — this is what universalNode / executors check.
+    // 1. Fire tool-supplied cancel callbacks BEFORE aborting the controller.
+    //    Tools (ssh_shell, etc) need a chance to start killing remote
+    //    work — the AbortController flip won't propagate to processes
+    //    running on a different host. Order is load-bearing: aborting the
+    //    controller first runs the tool's own abortSignal listener
+    //    SYNCHRONOUSLY (AbortController dispatches inline), which settles the
+    //    tool and tears down its connection — and the settled-guard in the
+    //    cancel callback then skips the remote kill entirely. That exact
+    //    inversion left interrupted Become runs' remote `claude` processes
+    //    alive on 2026-08-10. Fire-and-forget; we don't await.
+    const callbacks = Array.from(ctx.onCancelCallbacks);
+    for (const cb of callbacks) {
+      this.invokeCancelCallback(runId, cb);
+    }
+
+    // 2. Run-level abort — this is what universalNode / executors check.
     try {
       ctx.controller.abort({ reason } as any);
     } catch {
       try { ctx.controller.abort(); } catch { /* ignore */ }
     }
 
-    // 1b. Tombstone the runId. A detached straggler (e.g. the thinking-indicator
+    // 2b. Tombstone the runId. A detached straggler (e.g. the thinking-indicator
     //     parallel loop) may still be iterating after `run()`'s finally calls
     //     `unregister()` and removes the live context above. Once that happens
     //     `getRunSignal()` returns undefined and `checkAbort()` can no longer
     //     see this aborted signal — so it consults the tombstone instead.
     this.cancelledTombstones.set(runId, Date.now());
     this.pruneTombstones();
-
-    // 2. Fire tool-supplied cancel callbacks BEFORE walking neuron calls.
-    //    Tools (ssh_shell, etc) need a chance to start killing remote
-    //    work — the AbortController flip won't propagate to processes
-    //    running on a different host. Fire-and-forget; we don't await.
-    const callbacks = Array.from(ctx.onCancelCallbacks);
-    for (const cb of callbacks) {
-      this.invokeCancelCallback(runId, cb);
-    }
 
     // 3. Cancel every in-flight neuron call. Snapshot the set first so
     //    iteration is safe even if a callsite removes itself synchronously.
