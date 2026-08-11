@@ -4,10 +4,10 @@
   "isDefault": true,
   "isSystem": true,
   "name": "SSH Claude Agent",
-  "description": "Run Claude Code on a remote machine via SSH via the RedRun invoke API. Optionally emails the report via the send-email cloud function.",
+  "description": "Run Claude Code on a remote machine via SSH via the RedRun invoke API. Optionally emails the report via the send-email cloud function. The SSH private key is read from your own secret named SSH_KEY (store the key content, not a filesystem path, under Settings → Secrets); the engine resolves it per-run in the caller's scope, so nothing is ever inherited from the worker's disk.",
   "graphType": "workflow",
   "tier": 4,
-  "version": "3.0.0",
+  "version": "4.0.0",
   "nodes": [
     {
       "id": "invoke-ssh-claude",
@@ -19,7 +19,7 @@
             "config": {
               "operation": "set",
               "outputField": "data.requestBody",
-              "value": "{{JSON.stringify({host: state.data.input.host, port: state.data.input.port, user: state.data.input.user || 'alpha', sshKeyPath: state.data.input.sshKeyPath, prompt: state.data.input.prompt, model: state.data.input.model || 'sonnet', maxTurns: state.data.input.maxTurns || 50, timeout: state.data.input.timeout || 900000, workingDir: state.data.input.workingDir})}}"
+              "value": "{{JSON.stringify({host: state.data.input.host, port: state.data.input.port, user: state.data.input.user || 'alpha', sshKey: state.data.input._secrets && state.data.input._secrets.SSH_KEY, prompt: state.data.input.prompt, model: state.data.input.model || 'sonnet', maxTurns: state.data.input.maxTurns || 50, timeout: state.data.input.timeout || 900000, workingDir: state.data.input.workingDir})}}"
             }
           },
           {
@@ -119,7 +119,6 @@
     { "key": "host", "label": "SSH Host", "type": "text", "required": true, "placeholder": "e.g. server.example.com", "helpText": "Hostname or IP of the target machine" },
     { "key": "port", "label": "SSH Port", "type": "number", "required": false, "default": 22, "placeholder": "22" },
     { "key": "user", "label": "SSH User", "type": "text", "required": false, "default": "alpha", "placeholder": "alpha" },
-    { "key": "sshKeyPath", "label": "SSH Key Path", "type": "text", "required": true, "placeholder": "~/.ssh/id_ed25519", "helpText": "Path to the SSH private key on the worker. Required — there is deliberately no default, so a key path is never inherited from whoever happened to author this graph." },
     { "key": "prompt", "label": "Agent Prompt", "type": "textarea", "required": true, "placeholder": "You are an agent that...", "helpText": "The full prompt/directive for the Claude agent" },
     { "key": "model", "label": "Model", "type": "select", "required": false, "options": ["sonnet", "opus", "haiku"], "default": "sonnet" },
     { "key": "maxTurns", "label": "Max Turns", "type": "number", "required": false, "default": 50, "placeholder": "50", "helpText": "Maximum tool-use turns for Claude" },
