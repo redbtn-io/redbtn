@@ -151,7 +151,7 @@ export type {
   EnrichInputOptions,
   AttachmentRef,
 } from "./lib/run";
-export { LEGACY_TRIGGER_MAP, toTriggerType, enrichInput } from "./lib/run";
+export { LEGACY_TRIGGER_MAP, toTriggerType, enrichInput, SecretsDelegationError } from "./lib/run";
 
 // Cross-process orphan DETECTION surface — consumed by @redbtn/worker's
 // requeue-on-boot recovery so it reuses the reaper's exact orphan definition.
