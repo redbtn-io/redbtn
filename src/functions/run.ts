@@ -727,6 +727,16 @@ CRITICAL RULES:
     // Top-level userId mirror — same rationale as runId. Some neuron paths
     // need the user for tier-gated model access.
     userId: options.userId,
+    // Run-as-caller delegation: the CALLER's identity, set iff this run
+    // executes with executionIdentity:'caller'. Tools that resolve per-user
+    // resources (ssh_shell environments, environment secretRefs) key on this
+    // when present so a delegated run reaches the CALLER's machines and
+    // credentials — never the owner's. Deliberately a SEPARATE field from
+    // `userId`: neuron tier-gating and redToken metering must stay on the
+    // owner (RUN-AS-CALLER-DELEGATION-SPEC.md).
+    ...(options.connectionIdentityUserId
+      ? { callerUserId: options.connectionIdentityUserId }
+      : {}),
     // LEGACY — kept for any callers that still read `state._abortController`
     // directly. The authoritative signal source for new code is the
     // RunControlRegistry (per-process, survives checkpoints). This local
@@ -746,6 +756,10 @@ CRITICAL RULES:
       conversationId: options.conversationId,
       messages: message ? [{ role: 'user', content: message }] : [],
       userId: options.userId,
+      // Mirror of the top-level callerUserId (same rationale as userId/runId).
+      ...(options.connectionIdentityUserId
+        ? { callerUserId: options.connectionIdentityUserId }
+        : {}),
       accountTier: userSettings.accountTier,
       defaultNeuronId: userSettings.defaultNeuronId,
       defaultWorkerNeuronId: userSettings.defaultWorkerNeuronId,

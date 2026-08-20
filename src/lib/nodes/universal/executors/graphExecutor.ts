@@ -181,6 +181,12 @@ export async function executeGraph(
     const subInput: Record<string, any> = {
         runId: state.runId,
         userId: state.userId,
+        // Run-as-caller delegation survives subgraph invocation: without this
+        // a delegated parent would spawn an OWNER-identity subgraph, and any
+        // ssh_shell inside it would silently resolve the owner's environments.
+        ...(state.callerUserId || state.data?.callerUserId
+            ? { callerUserId: state.callerUserId || state.data?.callerUserId }
+            : {}),
         // Track depth to prevent recursion
         _subgraphDepth: currentDepth + 1,
         data: {},
@@ -199,6 +205,7 @@ export async function executeGraph(
 
     // Always propagate essential execution context
     subInput.data.userId = userId;
+    if (subInput.callerUserId) subInput.data.callerUserId = subInput.callerUserId;
     subInput.data.accountTier = state.data?.accountTier;
     subInput.data.defaultNeuronId = state.data?.defaultNeuronId;
     subInput.data.defaultWorkerNeuronId = state.data?.defaultWorkerNeuronId;
