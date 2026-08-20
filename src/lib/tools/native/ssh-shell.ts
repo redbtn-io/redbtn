@@ -751,11 +751,17 @@ interface ExecuteViaEnvironmentArgs {
 async function executeViaEnvironment(args: ExecuteViaEnvironmentArgs): Promise<NativeMcpResult> {
   const { environmentId, command, workingDir, timeout, env, context, publisher, runId, nodeId } = args;
   const startTime = Date.now();
-  // userId source — graph state root (set by buildInitialState in run.ts) is
-  // the canonical place. Defensive fallback to context.state.data.userId
-  // for any caller that didn't go through the standard graph init path.
+  // Identity source — the DELEGATED caller identity (state.callerUserId, set
+  // by buildInitialState iff the run executes as executionIdentity:'caller')
+  // takes precedence: a delegated run must resolve environments and SSH
+  // credentials against the CALLER, never the automation owner. Falls back to
+  // the run owner (state.userId) for normal runs, with a defensive
+  // state.data.* fallback for callers that didn't go through the standard
+  // graph init path.
   const userId =
-    (context?.state as AnyObject | undefined)?.userId
+    (context?.state as AnyObject | undefined)?.callerUserId
+    || (context?.state as AnyObject | undefined)?.data?.callerUserId
+    || (context?.state as AnyObject | undefined)?.userId
     || (context?.state as AnyObject | undefined)?.data?.userId
     || '';
 

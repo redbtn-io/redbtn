@@ -29,7 +29,7 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import mongoose from 'mongoose';
 
-import { resolveSecrets } from '../../src/lib/run/enrich-input';
+import { resolveSecrets, SecretsDelegationError } from '../../src/lib/run/enrich-input';
 import { NeuronRegistry } from '../../src/lib/neurons/NeuronRegistry';
 import { loadAndResolveEnvironment } from '../../src/lib/environments/loadAndResolveEnvironment';
 
@@ -110,6 +110,104 @@ describe('enrich-input resolveSecrets — forwards userId', () => {
   it('does not call resolve() when there are no secret names to resolve', async () => {
     await resolveSecrets({}, 'user_alice', null, 'run_3', []);
     expect(resolveMock).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// Call site 1b — enrich-input.ts resolveSecrets() under run-as-caller
+// delegation (executionIdentity:'caller' → secretsIdentityUserId set)
+// ===========================================================================
+describe('enrich-input resolveSecrets — run-as-caller delegation', () => {
+  const automationDoc = {
+    automationId: 'auto_42',
+    userId: 'user_owner',
+    secretNames: ['SSH_KEY'],
+  } as unknown as Parameters<typeof resolveSecrets>[2];
+
+  it("delegated run resolves against the CALLER's user scope — the automation bucket and owner are unreachable", async () => {
+    await resolveSecrets({}, 'user_owner', automationDoc, 'run_d1', [], 'user_caller');
+
+    expect(lastResolveInput()).toEqual(
+      expect.objectContaining({
+        names: ['SSH_KEY'],
+        appName: 'redbtn',
+        // NOT scope=automation/scopeId=auto_42: a delegated run must never
+        // read the automation's (owner-populated) secret bucket.
+        scope: 'user',
+        scopeId: 'user_caller',
+        userId: 'user_caller',
+      }),
+    );
+    for (const call of resolveMock.mock.calls) {
+      const input = call[1] as unknown as Record<string, unknown>;
+      expect(input.userId).not.toBe('user_owner');
+      expect(input.scopeId).not.toBe('auto_42');
+    }
+  });
+
+  it('fails closed (SecretsDelegationError) when the caller holds no secret of a referenced name', async () => {
+    // Caller's scope resolves nothing — the owner's SSH_KEY must NOT be a fallback.
+    resolveMock.mockResolvedValueOnce({});
+
+    let thrown: unknown;
+    try {
+      await resolveSecrets({}, 'user_owner', automationDoc, 'run_d2', [], 'user_caller');
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(SecretsDelegationError);
+    expect(thrown).toMatchObject({
+      code: 'SECRETS_DELEGATION_MISSING',
+      missingNames: ['SSH_KEY'],
+      callerUserId: 'user_caller',
+    });
+  });
+
+  it('fails closed when only SOME referenced secrets resolve for the caller', async () => {
+    resolveMock.mockResolvedValueOnce({ SSH_KEY: 'caller-key' });
+
+    const doc = {
+      automationId: 'auto_43',
+      userId: 'user_owner',
+      secretNames: ['SSH_KEY', 'API_TOKEN'],
+    } as unknown as Parameters<typeof resolveSecrets>[2];
+
+    await expect(
+      resolveSecrets({}, 'user_owner', doc, 'run_d3', [], 'user_caller'),
+    ).rejects.toMatchObject({
+      name: 'SecretsDelegationError',
+      missingNames: ['API_TOKEN'],
+    });
+  });
+
+  it('succeeds when the caller holds every referenced secret', async () => {
+    const { resolvedSecrets } = await resolveSecrets(
+      {}, 'user_owner', automationDoc, 'run_d4', [], 'user_caller',
+    );
+    expect(resolvedSecrets).toEqual({ SSH_KEY: 'MOCK_SSH_KEY' });
+  });
+
+  it('delegated run with no referenced secrets is a no-op (no resolve call, no throw)', async () => {
+    await resolveSecrets({}, 'user_owner', null, 'run_d5', [], 'user_caller');
+    expect(resolveMock).not.toHaveBeenCalled();
+  });
+
+  it('a resolve() failure on a delegated run rethrows instead of degrading to owner-path behavior', async () => {
+    resolveMock.mockRejectedValueOnce(new Error('mongo down'));
+    await expect(
+      resolveSecrets({}, 'user_owner', automationDoc, 'run_d6', [], 'user_caller'),
+    ).rejects.toThrow('mongo down');
+  });
+
+  it('owner path is byte-for-byte unchanged when no delegated identity is supplied', async () => {
+    await resolveSecrets({}, 'user_triggerer', automationDoc, 'run_d7', []);
+    expect(lastResolveInput()).toEqual(
+      expect.objectContaining({
+        scope: 'automation',
+        scopeId: 'auto_42',
+        userId: 'user_owner',
+      }),
+    );
   });
 });
 

@@ -78,7 +78,9 @@ function validationError(message: string, code = 'VALIDATION'): NativeMcpResult 
 
 function resolveUserId(context: NativeToolContext): string {
   const state = (context?.state ?? {}) as AnyObject;
-  return String(state.userId || state?.data?.userId || '');
+  // Delegated caller identity first (run-as-caller): SSH session ownership
+  // must follow the identity whose environment/credentials opened it.
+  return String(state.callerUserId || state?.data?.callerUserId || state.userId || state?.data?.userId || '');
 }
 
 const sshKill: NativeToolDefinition = {
