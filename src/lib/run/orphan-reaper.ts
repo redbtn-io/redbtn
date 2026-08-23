@@ -375,6 +375,27 @@ export function buildTerminalSet(
   };
 }
 
+/**
+ * Atomically commit the reaper's terminal verdict, unless the publisher has
+ * already committed one. The terminal state returned by this script is the
+ * verdict subsequently mirrored into Mongo. This closes the read/write race
+ * where a publisher could write `completed` after the reaper's GET but before
+ * its SET, only for stale cleanup to replace it with `interrupted`.
+ */
+const CLAIM_TERMINAL_STATE_SCRIPT = `
+  local current = redis.call("get", KEYS[1])
+  if current then
+    local ok, state = pcall(cjson.decode, current)
+    if ok and type(state) == "table" and
+      (state.status == "completed" or state.status == "error" or state.status == "interrupted") then
+      redis.call("expire", KEYS[1], tonumber(ARGV[2]))
+      return current
+    end
+  end
+  redis.call("set", KEYS[1], ARGV[1], "EX", tonumber(ARGV[2]))
+  return ARGV[1]
+`;
+
 export interface MarkRunTerminalOptions {
   redis: ReaperRedis;
   db: ReaperDb;
@@ -403,14 +424,13 @@ export interface MarkRunTerminalResult {
  */
 export async function markRunTerminal(options: MarkRunTerminalOptions): Promise<MarkRunTerminalResult> {
   const now = options.now ?? new Date();
-  const requestedStatus = options.status ?? 'interrupted';
+  const requestedStatus = asTerminalRunStatus(options.status) ?? 'interrupted';
   const collections = options.collections ?? ORPHAN_REAPED_COLLECTIONS;
   const { redis, db, runId, reason } = options;
 
-  // Re-read the cached state immediately before any write. A run may have
-  // completed after the sweep selected its stale durable row; the cached
-  // terminal verdict is authoritative and must never be overwritten by the
-  // stale orphan decision.
+  // Re-read the cached state after selection so the proposed terminal record
+  // retains the run metadata. The Lua claim below performs the authoritative
+  // terminal check atomically with its write.
   const stateKey = RunKeys.state(runId);
   let existing: Record<string, any> | null = null;
   try {
@@ -419,11 +439,38 @@ export async function markRunTerminal(options: MarkRunTerminalOptions): Promise<
   } catch {
     existing = null;
   }
-  const cachedTerminalStatus = asTerminalRunStatus(existing?.status);
-  const status = cachedTerminalStatus ?? requestedStatus;
-  const terminalAt = cachedTerminalStatus
-    ? (asDate(existing?.completedAt) ?? now)
-    : now;
+
+  const proposedState = {
+    ...(existing ?? {}),
+    runId,
+    status: requestedStatus,
+    ...(requestedStatus === 'completed' ? {} : { error: existing?.error ?? reason }),
+    completedAt: now.getTime(),
+  };
+
+  let terminalState: Record<string, any> = proposedState;
+  try {
+    const selected = await redis.eval(
+      CLAIM_TERMINAL_STATE_SCRIPT,
+      1,
+      stateKey,
+      JSON.stringify(proposedState),
+      String(RunConfig.STATE_TTL_SECONDS),
+    );
+    if (typeof selected === 'string') {
+      const parsed = JSON.parse(selected) as Record<string, any>;
+      if (asTerminalRunStatus(parsed.status)) terminalState = parsed;
+    }
+  } catch (err) {
+    // Do not fall back to a non-atomic SET or a durable terminal write. A later
+    // sweep can retry without risking a publisher's in-flight terminal verdict.
+    console.warn(`[orphan-reaper] Failed to atomically claim terminal state for ${runId}:`, err);
+    return { runId, durableModified: 0, redisCleaned: false };
+  }
+
+  const status = asTerminalRunStatus(terminalState.status) ?? requestedStatus;
+  const terminalAt = asDate(terminalState.completedAt) ?? now;
+  const terminalReason = typeof terminalState.error === 'string' ? terminalState.error : reason;
 
   // 1. Durable stores — flip non-terminal → terminal.
   let durableModified = 0;
@@ -431,7 +478,7 @@ export async function markRunTerminal(options: MarkRunTerminalOptions): Promise<
     try {
       const res = await db.collection(name).updateMany(
         { runId, status: { $in: NON_TERMINAL_STATUSES } },
-        { $set: buildTerminalSet(name, status, reason, terminalAt) },
+        { $set: buildTerminalSet(name, status, terminalReason, terminalAt) },
       );
       durableModified += res.modifiedCount ?? 0;
     } catch (err) {
@@ -443,20 +490,9 @@ export async function markRunTerminal(options: MarkRunTerminalOptions): Promise<
   //    orphan stops counting as active and its conversation lock is released.
   let redisCleaned = false;
   try {
-    const terminalState = {
-      ...(existing ?? {}),
-      runId,
-      status,
-      ...(status === 'completed' ? {} : { error: existing?.error ?? reason }),
-      completedAt: terminalAt.getTime(),
-    };
-    // Keep a short-lived terminal state so any late subscriber latches onto a
-    // terminal event instead of hanging; it expires with the normal TTL.
-    await redis.set(stateKey, JSON.stringify(terminalState), 'EX', RunConfig.STATE_TTL_SECONDS);
-
     const conversationId =
       options.conversationId ??
-      (typeof existing?.conversationId === 'string' ? existing.conversationId : undefined);
+      (typeof terminalState.conversationId === 'string' ? terminalState.conversationId : undefined);
 
     // runId-keyed scratch state is exclusively THIS run's (a fresh run has a
     // different runId), so it is always safe to delete unconditionally.
@@ -664,6 +700,7 @@ export async function reapOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
   let reaped = 0;
   let reconciled = 0;
   let keptForRecovery = 0;
+  let keptForRetry = 0;
 
   // A terminal Redis state is proof that the publisher reached its terminal
   // path. Reconcile any lagging durable `running` rows while that state still
@@ -689,7 +726,7 @@ export async function reapOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
       keptForRecovery++;
       continue;
     }
-    await markRunTerminal({
+    const marked = await markRunTerminal({
       redis,
       db,
       runId: orphan.runId,
@@ -699,6 +736,12 @@ export async function reapOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
       now,
       collections,
     });
+    if (!marked.redisCleaned && marked.durableModified === 0) {
+      // The atomic Redis claim failed before any terminal write. Report this as
+      // kept so the next sweep retries it instead of claiming a false success.
+      keptForRetry++;
+      continue;
+    }
     reaped++;
     details.push({ runId: orphan.runId, reason: orphan.reason });
   }
@@ -707,7 +750,7 @@ export async function reapOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
     scanned: found.scanned,
     reaped,
     reconciled,
-    kept: found.kept + keptForRecovery,
+    kept: found.kept + keptForRecovery + keptForRetry,
     details,
   };
 }
