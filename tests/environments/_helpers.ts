@@ -29,11 +29,14 @@ import { EnvironmentManager } from '../../src/lib/environments/EnvironmentManage
 // ---------------------------------------------------------------------------
 
 export class MockSshChannel extends EventEmitter {
-  readonly stderr = new EventEmitter();
+  readonly stderr = Object.assign(new EventEmitter(), {
+    resume() { return this; },
+  });
   signalled: string | null = null;
   closed = false;
 
   signal(sig: string): void { this.signalled = sig; }
+  resume(): this { return this; }
   close(): void { this.closed = true; }
   // eslint-disable-next-line @typescript-eslint/no-empty-function
   end(): void {}

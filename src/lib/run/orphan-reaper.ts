@@ -125,6 +125,22 @@ export type OrphanReapedCollection = (typeof ORPHAN_REAPED_COLLECTIONS)[number];
 
 /** Non-terminal statuses eligible for reaping (guards every terminal write). */
 const NON_TERMINAL_STATUSES = ['pending', 'queued', 'running'] as const;
+type TerminalRunStatus = Extract<RunStatus, 'completed' | 'error' | 'interrupted'>;
+
+function asTerminalRunStatus(value: unknown): TerminalRunStatus | undefined {
+  return value === 'completed' || value === 'error' || value === 'interrupted'
+    ? value
+    : undefined;
+}
+
+function asDate(value: unknown): Date | undefined {
+  const date = value instanceof Date
+    ? value
+    : typeof value === 'number' || typeof value === 'string'
+      ? new Date(value)
+      : undefined;
+  return date && !Number.isNaN(date.getTime()) ? date : undefined;
+}
 
 const DEFAULT_CANDIDATE_LIMIT = 1000;
 
@@ -166,6 +182,10 @@ export interface RunLivenessSnapshot {
   conversationId?: string;
   /** Whether the heartbeat is older than the stale threshold (or missing). */
   isStale: boolean;
+  /** Terminal verdict already committed to the Redis run state, if present. */
+  terminalStatus?: TerminalRunStatus;
+  /** Cached terminal timestamp, used when reconciling lagging durable stores. */
+  completedAt?: Date;
 }
 
 export interface OrphanDecision {
@@ -183,6 +203,9 @@ export interface OrphanDecision {
  *                   (proof the owning process is alive and renewing it).
  */
 export function decideOrphan(snapshot: RunLivenessSnapshot, lockPresent: boolean): OrphanDecision {
+  if (snapshot.terminalStatus) {
+    return { reap: false, reason: `already terminal in Redis — ${snapshot.terminalStatus}` };
+  }
   if (!snapshot.stateFound) {
     // No run-state in Redis: the owning process wrote nothing for at least the
     // 1-hour state TTL — it is gone. (A live run, even one idle far longer than
@@ -227,11 +250,25 @@ export async function readRunLiveness(
   if (!raw) return { stateFound: false, isStale: true };
 
   try {
-    const state = JSON.parse(raw) as { lastProgressAt?: unknown; conversationId?: unknown };
+    const state = JSON.parse(raw) as {
+      lastProgressAt?: unknown;
+      conversationId?: unknown;
+      status?: unknown;
+      completedAt?: unknown;
+    };
     const lastProgressAt = typeof state.lastProgressAt === 'string' ? state.lastProgressAt : undefined;
     const conversationId = typeof state.conversationId === 'string' ? state.conversationId : undefined;
+    const terminalStatus = asTerminalRunStatus(state.status);
+    const completedAt = terminalStatus ? asDate(state.completedAt) : undefined;
     const staleness = classifyRunProgressStaleness({ lastProgressAt }, opts);
-    return { stateFound: true, lastProgressAt, conversationId, isStale: staleness.isStale };
+    return {
+      stateFound: true,
+      lastProgressAt,
+      conversationId,
+      isStale: staleness.isStale,
+      terminalStatus,
+      completedAt,
+    };
   } catch {
     // Corrupt state blob — cannot prove liveness → treat as stale.
     return { stateFound: true, isStale: true };
@@ -325,10 +362,17 @@ export function buildTerminalSet(
   reason: string,
   completedAt: Date,
 ): Record<string, unknown> {
+  const durableStatus = collection === 'automationruns' && status === 'error'
+    ? 'failed'
+    : status;
   if (collection === 'runEvents') {
-    return { status, completedAt, updatedAt: completedAt };
+    return { status: durableStatus, completedAt, updatedAt: completedAt };
   }
-  return { status, completedAt, error: reason };
+  return {
+    status: durableStatus,
+    completedAt,
+    ...(status === 'completed' ? {} : { error: reason }),
+  };
 }
 
 export interface MarkRunTerminalOptions {
@@ -359,9 +403,27 @@ export interface MarkRunTerminalResult {
  */
 export async function markRunTerminal(options: MarkRunTerminalOptions): Promise<MarkRunTerminalResult> {
   const now = options.now ?? new Date();
-  const status = options.status ?? 'interrupted';
+  const requestedStatus = options.status ?? 'interrupted';
   const collections = options.collections ?? ORPHAN_REAPED_COLLECTIONS;
   const { redis, db, runId, reason } = options;
+
+  // Re-read the cached state immediately before any write. A run may have
+  // completed after the sweep selected its stale durable row; the cached
+  // terminal verdict is authoritative and must never be overwritten by the
+  // stale orphan decision.
+  const stateKey = RunKeys.state(runId);
+  let existing: Record<string, any> | null = null;
+  try {
+    const rawState = await redis.get(stateKey);
+    existing = rawState ? JSON.parse(rawState) : null;
+  } catch {
+    existing = null;
+  }
+  const cachedTerminalStatus = asTerminalRunStatus(existing?.status);
+  const status = cachedTerminalStatus ?? requestedStatus;
+  const terminalAt = cachedTerminalStatus
+    ? (asDate(existing?.completedAt) ?? now)
+    : now;
 
   // 1. Durable stores — flip non-terminal → terminal.
   let durableModified = 0;
@@ -369,7 +431,7 @@ export async function markRunTerminal(options: MarkRunTerminalOptions): Promise<
     try {
       const res = await db.collection(name).updateMany(
         { runId, status: { $in: NON_TERMINAL_STATUSES } },
-        { $set: buildTerminalSet(name, status, reason, now) },
+        { $set: buildTerminalSet(name, status, reason, terminalAt) },
       );
       durableModified += res.modifiedCount ?? 0;
     } catch (err) {
@@ -381,21 +443,12 @@ export async function markRunTerminal(options: MarkRunTerminalOptions): Promise<
   //    orphan stops counting as active and its conversation lock is released.
   let redisCleaned = false;
   try {
-    const stateKey = RunKeys.state(runId);
-    let existing: Record<string, any> | null = null;
-    try {
-      const rawState = await redis.get(stateKey);
-      existing = rawState ? JSON.parse(rawState) : null;
-    } catch {
-      existing = null;
-    }
-
     const terminalState = {
       ...(existing ?? {}),
       runId,
       status,
-      error: reason,
-      completedAt: now.getTime(),
+      ...(status === 'completed' ? {} : { error: existing?.error ?? reason }),
+      completedAt: terminalAt.getTime(),
     };
     // Keep a short-lived terminal state so any late subscriber latches onto a
     // terminal event instead of hanging; it expires with the normal TTL.
@@ -457,6 +510,7 @@ export interface ReapOrphanedRunsOptions {
 export interface ReapOrphanedRunsResult {
   scanned: number;
   reaped: number;
+  reconciled: number;
   kept: number;
   details: Array<{ runId: string; reason: string }>;
 }
@@ -485,9 +539,16 @@ export interface OrphanRunInfo {
   reason: string;
 }
 
+/** A Redis-terminal run whose durable `running` row needs reconciliation. */
+export interface TerminalRunInfo extends RunCandidate {
+  status: TerminalRunStatus;
+  completedAt?: Date;
+}
+
 export interface FindOrphanedRunsResult {
   scanned: number;
   orphans: OrphanRunInfo[];
+  terminalRuns: TerminalRunInfo[];
   kept: number;
 }
 
@@ -531,6 +592,7 @@ export async function findOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
   }
 
   const orphans: OrphanRunInfo[] = [];
+  const terminalRuns: TerminalRunInfo[] = [];
   let kept = 0;
 
   for (const candidate of candidates.values()) {
@@ -539,6 +601,17 @@ export async function findOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
     // lock key); fall back to the durable doc's value.
     const conversationId = snapshot.conversationId ?? candidate.conversationId;
     const lockKey = conversationId ?? candidate.runId;
+
+    if (snapshot.terminalStatus) {
+      terminalRuns.push({
+        runId: candidate.runId,
+        conversationId,
+        agentId: candidate.agentId,
+        status: snapshot.terminalStatus,
+        completedAt: snapshot.completedAt,
+      });
+      continue;
+    }
 
     let lockPresent = false;
     // Only the stale-but-present-state branch needs the lock check; skip the
@@ -556,7 +629,7 @@ export async function findOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
     orphans.push({ runId: candidate.runId, conversationId, agentId: candidate.agentId, reason: decision.reason });
   }
 
-  return { scanned: candidates.size, orphans, kept };
+  return { scanned: candidates.size, orphans, terminalRuns, kept };
 }
 
 /**
@@ -589,7 +662,26 @@ export async function reapOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
 
   const details: Array<{ runId: string; reason: string }> = [];
   let reaped = 0;
+  let reconciled = 0;
   let keptForRecovery = 0;
+
+  // A terminal Redis state is proof that the publisher reached its terminal
+  // path. Reconcile any lagging durable `running` rows while that state still
+  // exists, before its TTL expires and the run could be mistaken for an orphan.
+  for (const terminal of found.terminalRuns) {
+    const marked = await markRunTerminal({
+      redis,
+      db,
+      runId: terminal.runId,
+      reason: `durable reconciliation from Redis terminal state (${terminal.status})`,
+      conversationId: terminal.conversationId,
+      agentId: terminal.agentId,
+      now: terminal.completedAt ?? now,
+      status: terminal.status,
+      collections,
+    });
+    if (marked.durableModified > 0) reconciled++;
+  }
 
   for (const orphan of found.orphans) {
     if (await hasRecoveryClaim(redis, orphan.runId)) {
@@ -611,7 +703,13 @@ export async function reapOrphanedRuns(options: ReapOrphanedRunsOptions): Promis
     details.push({ runId: orphan.runId, reason: orphan.reason });
   }
 
-  return { scanned: found.scanned, reaped, kept: found.kept + keptForRecovery, details };
+  return {
+    scanned: found.scanned,
+    reaped,
+    reconciled,
+    kept: found.kept + keptForRecovery,
+    details,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -762,9 +860,10 @@ export class OrphanReaper {
         now: this.now(),
         staleAfterMs: this.staleAfterMs,
       });
-      if (result.reaped > 0 || kind === 'startup') {
+      if (result.reaped > 0 || result.reconciled > 0 || kind === 'startup') {
         console.log(
-          `[orphan-reaper] ${kind} sweep: reaped ${result.reaped}, kept ${result.kept}, scanned ${result.scanned}` +
+          `[orphan-reaper] ${kind} sweep: reaped ${result.reaped}, reconciled ${result.reconciled}, ` +
+            `kept ${result.kept}, scanned ${result.scanned}` +
             (result.reaped > 0 ? ` — ${result.details.map((d) => d.runId).join(', ')}` : ''),
         );
       }

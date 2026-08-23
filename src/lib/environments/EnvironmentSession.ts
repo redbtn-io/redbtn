@@ -63,7 +63,14 @@
  */
 
 import { EventEmitter } from 'events';
-import { Client, type ConnectConfig, type SFTPWrapper, type Stats, type FileEntryWithStats } from 'ssh2';
+import {
+  Client,
+  type ClientChannel,
+  type ConnectConfig,
+  type SFTPWrapper,
+  type Stats,
+  type FileEntryWithStats,
+} from 'ssh2';
 import type { IEnvironmentSession } from './IEnvironmentSession';
 import {
   type IEnvironment,
@@ -509,39 +516,58 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
       let settled = false;
       let timeoutTimer: NodeJS.Timeout | null = null;
       let abortListener: (() => void) | null = null;
-      let stream: ReturnType<typeof streamAccessor> | null = null;
+      let stream: ClientChannel | null = null;
       let remotePid: number | null = null;
+      let killing = false;
 
       // Kill the remote process group via a side-channel exec on the SAME
-      // (pooled, persistent) connection. Unlike the one-shot ssh_shell path,
-      // the session connection outlives settle(), so the kill can run
-      // detached — no need to hold the caller's promise open for it.
-      const killRemoteGroup = (why: string, isRetry = false) => {
+      // pooled connection. The caller stays pending until the kill channel
+      // closes (or a bounded 2.5s cap fires): settling first lets the parent
+      // run finish and the engine exit while its remote child is still alive.
+      const killRemoteGroup = async (why: string): Promise<void> => {
+        if (!remotePid || remotePid <= 1) {
+          // Marker may still be in flight when cancellation lands moments
+          // after exec starts. Keep stderr listeners alive for a brief window.
+          await new Promise<void>((done) => setTimeout(done, 300));
+        }
         const pid = remotePid;
         if (!pid || pid <= 1) {
-          // Marker may still be in flight when the kill lands moments after
-          // exec starts — retry once after a short window.
-          if (!isRetry) {
-            setTimeout(() => killRemoteGroup(why, true), 300);
-          }
           return;
         }
-        if (!this.client) return;
+        const client = this.client;
+        if (!client) return;
         console.log(`[EnvironmentSession] ${this.environmentId}: killing remote pgroup ${pid} (${why})`);
-        try {
-          this.client.exec(`kill -TERM -- -${pid} 2>/dev/null; sleep 0.5; kill -KILL -- -${pid} 2>/dev/null; true`, (kerr, kstream) => {
-            if (kerr) {
-              console.warn(`[EnvironmentSession] ${this.environmentId}: kill side-channel failed: ${kerr.message}`);
-              return;
-            }
-            kstream.on('close', () => console.log(`[EnvironmentSession] ${this.environmentId}: pgroup ${pid} kill exec completed`));
-            kstream.on('error', () => { /* logged via close-less path; ignore */ });
-            kstream.resume();
-            kstream.stderr.resume();
-          });
-        } catch (e: unknown) {
-          console.warn(`[EnvironmentSession] ${this.environmentId}: kill side-channel threw:`, e instanceof Error ? e.message : String(e));
-        }
+        await new Promise<void>((done) => {
+          let finished = false;
+          const finish = () => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(cap);
+            done();
+          };
+          const cap = setTimeout(() => {
+            console.warn(`[EnvironmentSession] ${this.environmentId}: pgroup ${pid} kill confirmation timed out`);
+            finish();
+          }, 2500);
+          try {
+            client.exec(`kill -TERM -- -${pid} 2>/dev/null; sleep 0.5; kill -KILL -- -${pid} 2>/dev/null; true`, (kerr, kstream) => {
+              if (kerr) {
+                console.warn(`[EnvironmentSession] ${this.environmentId}: kill side-channel failed: ${kerr.message}`);
+                return finish();
+              }
+              kstream.once('close', () => {
+                console.log(`[EnvironmentSession] ${this.environmentId}: pgroup ${pid} kill exec completed`);
+                finish();
+              });
+              kstream.once('error', finish);
+              kstream.resume();
+              kstream.stderr.resume();
+            });
+          } catch (e: unknown) {
+            console.warn(`[EnvironmentSession] ${this.environmentId}: kill side-channel threw:`, e instanceof Error ? e.message : String(e));
+            finish();
+          }
+        });
       };
 
       const clearLocal = () => {
@@ -576,6 +602,17 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
         resolve(result);
       };
 
+      const killThenSettle = (why: string, error: Error) => {
+        if (settled || killing) return;
+        killing = true;
+        clearLocal();
+        try { stream?.signal('KILL'); } catch { /* best-effort */ }
+        void killRemoteGroup(why).finally(() => {
+          try { stream?.close(); } catch { /* best-effort */ }
+          settle(error, null);
+        });
+      };
+
       // The exec callback signature: (err, stream)
       this.client!.exec(fullCommand, (err, channelStream) => {
         if (err) {
@@ -589,32 +626,22 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
         // what actually ends the work.
         if (opts.timeout && opts.timeout > 0) {
           timeoutTimer = setTimeout(() => {
-            try {
-              channelStream.signal('KILL');
-            } catch { /* best-effort */ }
-            killRemoteGroup('timeout');
-            try {
-              channelStream.close();
-            } catch { /* best-effort */ }
-            settle(new EnvironmentTimeoutError(this.environmentId, opts.timeout!), null);
+            killThenSettle(
+              'timeout',
+              new EnvironmentTimeoutError(this.environmentId, opts.timeout!),
+            );
           }, opts.timeout);
         }
 
         // External abort signal — same kill semantics as timeout.
+        let preAborted = false;
         if (opts.abortSignal) {
           if (opts.abortSignal.aborted) {
-            try { channelStream.signal('KILL'); } catch { /* ignore */ }
-            killRemoteGroup('abort');
-            try { channelStream.close(); } catch { /* ignore */ }
-            return settle(new Error('exec aborted'), null);
+            preAborted = true;
+          } else {
+            abortListener = () => killThenSettle('abort', new Error('exec aborted'));
+            opts.abortSignal.addEventListener('abort', abortListener, { once: true });
           }
-          abortListener = () => {
-            try { channelStream.signal('KILL'); } catch { /* ignore */ }
-            killRemoteGroup('abort');
-            try { channelStream.close(); } catch { /* ignore */ }
-            settle(new Error('exec aborted'), null);
-          };
-          opts.abortSignal.addEventListener('abort', abortListener, { once: true });
         }
 
         channelStream.on('data', (data: Buffer) => {
@@ -646,14 +673,22 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
         });
 
         channelStream.on('close', (code: number | null) => {
+          if (killing) return;
           exitCode = typeof code === 'number' ? code : null;
           // Give a moment for any final 'data' bytes to land before settling.
           setTimeout(() => settle(null, exitCode), EXEC_DRAIN_GRACE_MS).unref?.();
         });
 
         channelStream.on('error', (streamErr: Error) => {
+          if (killing) return;
           settle(streamErr, exitCode);
         });
+
+        // Defer a pre-aborted signal until after stderr listeners are attached,
+        // otherwise the PID marker can be lost and only the channel signal runs.
+        if (preAborted) {
+          killThenSettle('abort', new Error('exec aborted'));
+        }
       });
     });
   }
@@ -1302,7 +1337,3 @@ function tail(s: string, max: number): string {
   if (s.length <= max) return s;
   return s.slice(s.length - max);
 }
-
-// Type accessor used to keep the inline closure types tidy without exposing
-// the full ssh2 ClientChannel surface.
-function streamAccessor(): unknown { return undefined; }
