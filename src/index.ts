@@ -166,6 +166,7 @@ export type {
   ReaperRedis,
   ReaperDbProvider,
   OrphanRunInfo,
+  TerminalRunInfo,
   FindOrphanedRunsResult,
   ReapOrphanedRunsOptions,
   ReapOrphanedRunsResult,

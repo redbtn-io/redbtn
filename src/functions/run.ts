@@ -1451,11 +1451,13 @@ export async function run(
   console.log(`[run] Acquired lock for conversation ${lockKey}${agentId ? ` agent=${agentId}` : ''}`);
 
   let automationRunsCollection: { updateOne: (filter: Record<string, unknown>, update: Record<string, unknown>) => Promise<{ matchedCount?: number; modifiedCount?: number }> } | undefined;
+  let runEventsCollection: { updateOne: (filter: Record<string, unknown>, update: Record<string, unknown>) => Promise<{ matchedCount?: number; modifiedCount?: number }> } | undefined;
   let generationsCollection: { updateOne: (filter: Record<string, unknown>, update: Record<string, unknown>) => Promise<{ matchedCount?: number; modifiedCount?: number }> } | undefined;
   try {
     const mongoose = await import('mongoose');
     const db = mongoose.default.connection?.db;
     if (db) {
+      runEventsCollection = db.collection('runEvents');
       generationsCollection = db.collection('generations');
       if (options.automationRunId) {
         automationRunsCollection = db.collection('automationruns');
@@ -1477,6 +1479,7 @@ export async function run(
     log: red.redlog,
     automationRunId: options.automationRunId,
     automationRunsCollection,
+    runEventsCollection,
     generationId: runId,
     generationsCollection,
     concurrencySlot: options.concurrencySlot,

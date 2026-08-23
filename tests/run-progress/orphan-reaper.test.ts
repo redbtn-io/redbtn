@@ -153,6 +153,15 @@ describe('decideOrphan', () => {
     expect(decideOrphan(snap({ stateFound: false, isStale: true }), true).reap).toBe(true);
   });
 
+  it('never reaps a run whose Redis state is already terminal', () => {
+    const d = decideOrphan(
+      snap({ stateFound: true, isStale: true, terminalStatus: 'completed' }),
+      false,
+    );
+    expect(d.reap).toBe(false);
+    expect(d.reason).toMatch(/terminal/);
+  });
+
   it('keeps a live actively-progressing run (fresh heartbeat)', () => {
     const d = decideOrphan(snap({ stateFound: true, isStale: false }), false);
     expect(d.reap).toBe(false);
@@ -201,6 +210,22 @@ describe('readRunLiveness', () => {
     const snap = await readRunLiveness(redis, 'run-stale', { now: NOW, staleAfterMs: STALE_MS });
     expect(snap.stateFound).toBe(true);
     expect(snap.isStale).toBe(true);
+  });
+
+  it('surfaces a completed cached state for durable reconciliation', async () => {
+    const state = createInitialRunState({ runId: 'run-complete', userId: 'u', graphId: 'g', graphName: 'G', input: {} });
+    state.status = 'completed';
+    state.completedAt = NOW.getTime();
+    state.lastProgressAt = iso(-STALE_MS - 1000);
+    const redis = makeRedis({ [RunKeys.state('run-complete')]: state });
+
+    const snap = await readRunLiveness(redis, 'run-complete', { now: NOW, staleAfterMs: STALE_MS });
+    expect(snap).toMatchObject({
+      stateFound: true,
+      isStale: true,
+      terminalStatus: 'completed',
+      completedAt: NOW,
+    });
   });
 
   it('treats missing run-state as stale + not found', async () => {
@@ -365,6 +390,27 @@ describe('markRunTerminal', () => {
     expect(redis.store.get(RunKeys.conversationRun('conv-z'))).toBe('fresh-z');
     expect(redis.store.get(RunKeys.lock('conv-z'))).toBe('fresh-token');
   });
+
+  it('never overwrites an already-completed cached state while a stale reap races finalization', async () => {
+    const state = createInitialRunState({
+      runId: 'run-finished',
+      userId: 'u',
+      graphId: 'g',
+      graphName: 'G',
+      input: {},
+    });
+    state.status = 'completed';
+    state.completedAt = NOW.getTime();
+    const redis = makeRedis({ [RunKeys.state('run-finished')]: state });
+    const db = makeDb({ runEvents: [{ runId: 'run-finished', status: 'completed' }] });
+
+    await markRunTerminal({ redis, db, runId: 'run-finished', reason: 'stale reap', now: NOW });
+
+    expect(db.state.runEvents.docs[0].status).toBe('completed');
+    const cached = JSON.parse(redis.store.get(RunKeys.state('run-finished'))!);
+    expect(cached.status).toBe('completed');
+    expect(cached.error).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -399,6 +445,34 @@ describe('releaseConversationPointerIfOwner', () => {
 // ---------------------------------------------------------------------------
 
 describe('reapOrphanedRuns', () => {
+  it('reconciles a cached completed state instead of reaping it after archive delivery lag', async () => {
+    const state = createInitialRunState({
+      runId: 'complete-lag',
+      userId: 'u',
+      graphId: 'g',
+      graphName: 'G',
+      input: {},
+    });
+    state.status = 'completed';
+    state.completedAt = NOW.getTime();
+    state.lastProgressAt = iso(-STALE_MS - 5000);
+    const redis = makeRedis({ [RunKeys.state('complete-lag')]: state });
+    const db = makeDb({
+      runEvents: [{ runId: 'complete-lag', status: 'running', startedAt: date(-3_600_000) }],
+      automationruns: [{ runId: 'complete-lag', status: 'running', startedAt: date(-3_600_000) }],
+      generations: [{ runId: 'complete-lag', status: 'running', startedAt: date(-3_600_000) }],
+    });
+
+    const res = await reapOrphanedRuns({ redis, db, now: NOW, staleAfterMs: STALE_MS });
+
+    expect(res.reaped).toBe(0);
+    expect(res.reconciled).toBe(1);
+    expect(db.state.runEvents.docs[0].status).toBe('completed');
+    expect(db.state.automationruns.docs[0].status).toBe('completed');
+    expect(db.state.generations.docs[0].status).toBe('completed');
+    expect(JSON.parse(redis.store.get(RunKeys.state('complete-lag'))!).status).toBe('completed');
+  });
+
   it('reaps a backlog orphan whose Redis state has TTL-expired (missing)', async () => {
     const redis = makeRedis(); // no run-state at all
     const db = makeDb({ runEvents: [{ runId: 'old-1', status: 'running', startedAt: date(-3_600_000) }] });
