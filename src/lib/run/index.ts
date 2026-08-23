@@ -92,6 +92,7 @@ export {
   type OrphanReaperDeps,
   type OrphanDecision,
   type OrphanRunInfo,
+  type TerminalRunInfo,
   type FindOrphanedRunsResult,
   type RunLivenessSnapshot,
   type ReaperDb,

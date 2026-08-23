@@ -54,9 +54,19 @@ function makeRedis(seed: Record<string, unknown> = {}): FakeRedis {
       const matched = [...store.keys()].filter((k) => re.test(k));
       return ['0', matched] as [string, string[]];
     }),
-    // Minimal Lua interpreter for the reaper's compare-and-delete pointer script:
-    // `if get(KEYS[1]) == ARGV[1] then del(KEYS[1]) else 0`.
-    eval: vi.fn(async (_script: string, _numKeys: number, key: string, arg: string) => {
+    // Minimal Lua interpreter for the reaper's two ownership scripts.
+    eval: vi.fn(async (script: string, _numKeys: number, key: string, arg: string) => {
+      if (script.includes('cjson.decode')) {
+        const current = store.get(key);
+        if (current) {
+          try {
+            const state = JSON.parse(current);
+            if (['completed', 'error', 'interrupted'].includes(state.status)) return current;
+          } catch { /* corrupt non-terminal state is replaced */ }
+        }
+        store.set(key, arg);
+        return arg;
+      }
       if (store.get(key) === arg) {
         store.delete(key);
         return 1;
@@ -153,6 +163,15 @@ describe('decideOrphan', () => {
     expect(decideOrphan(snap({ stateFound: false, isStale: true }), true).reap).toBe(true);
   });
 
+  it('never reaps a run whose Redis state is already terminal', () => {
+    const d = decideOrphan(
+      snap({ stateFound: true, isStale: true, terminalStatus: 'completed' }),
+      false,
+    );
+    expect(d.reap).toBe(false);
+    expect(d.reason).toMatch(/terminal/);
+  });
+
   it('keeps a live actively-progressing run (fresh heartbeat)', () => {
     const d = decideOrphan(snap({ stateFound: true, isStale: false }), false);
     expect(d.reap).toBe(false);
@@ -201,6 +220,22 @@ describe('readRunLiveness', () => {
     const snap = await readRunLiveness(redis, 'run-stale', { now: NOW, staleAfterMs: STALE_MS });
     expect(snap.stateFound).toBe(true);
     expect(snap.isStale).toBe(true);
+  });
+
+  it('surfaces a completed cached state for durable reconciliation', async () => {
+    const state = createInitialRunState({ runId: 'run-complete', userId: 'u', graphId: 'g', graphName: 'G', input: {} });
+    state.status = 'completed';
+    state.completedAt = NOW.getTime();
+    state.lastProgressAt = iso(-STALE_MS - 1000);
+    const redis = makeRedis({ [RunKeys.state('run-complete')]: state });
+
+    const snap = await readRunLiveness(redis, 'run-complete', { now: NOW, staleAfterMs: STALE_MS });
+    expect(snap).toMatchObject({
+      stateFound: true,
+      isStale: true,
+      terminalStatus: 'completed',
+      completedAt: NOW,
+    });
   });
 
   it('treats missing run-state as stale + not found', async () => {
@@ -365,6 +400,82 @@ describe('markRunTerminal', () => {
     expect(redis.store.get(RunKeys.conversationRun('conv-z'))).toBe('fresh-z');
     expect(redis.store.get(RunKeys.lock('conv-z'))).toBe('fresh-token');
   });
+
+  it('never overwrites an already-completed cached state while a stale reap races finalization', async () => {
+    const state = createInitialRunState({
+      runId: 'run-finished',
+      userId: 'u',
+      graphId: 'g',
+      graphName: 'G',
+      input: {},
+    });
+    state.status = 'completed';
+    state.completedAt = NOW.getTime();
+    const redis = makeRedis({ [RunKeys.state('run-finished')]: state });
+    const db = makeDb({ runEvents: [{ runId: 'run-finished', status: 'completed' }] });
+
+    await markRunTerminal({ redis, db, runId: 'run-finished', reason: 'stale reap', now: NOW });
+
+    expect(db.state.runEvents.docs[0].status).toBe('completed');
+    const cached = JSON.parse(redis.store.get(RunKeys.state('run-finished'))!);
+    expect(cached.status).toBe('completed');
+    expect(cached.error).toBeUndefined();
+  });
+
+  it('atomically spares completion that lands between the reaper read and terminal write', async () => {
+    const running = createInitialRunState({
+      runId: 'run-finish-race',
+      userId: 'u',
+      graphId: 'g',
+      graphName: 'G',
+      input: {},
+    });
+    const completed = { ...running, status: 'completed' as const, completedAt: NOW.getTime() };
+    const stateKey = RunKeys.state('run-finish-race');
+    const redis = makeRedis({ [stateKey]: running });
+    const db = makeDb({ runEvents: [{ runId: 'run-finish-race', status: 'running' }] });
+
+    // Simulate the publisher committing completion after markRunTerminal's GET
+    // but before its Lua compare-and-set executes.
+    vi.mocked(redis.eval).mockImplementationOnce(async () => {
+      redis.store.set(stateKey, JSON.stringify(completed));
+      return JSON.stringify(completed);
+    });
+
+    await markRunTerminal({ redis, db, runId: 'run-finish-race', reason: 'stale reap', now: NOW });
+
+    expect(db.state.runEvents.docs[0].status).toBe('completed');
+    const cached = JSON.parse(redis.store.get(stateKey)!);
+    expect(cached.status).toBe('completed');
+    expect(cached.error).toBeUndefined();
+  });
+
+  it('fails safe without durable writes when the atomic terminal claim fails', async () => {
+    const state = createInitialRunState({
+      runId: 'run-claim-failed',
+      userId: 'u',
+      graphId: 'g',
+      graphName: 'G',
+      input: {},
+    });
+    state.status = 'running';
+    const stateKey = RunKeys.state('run-claim-failed');
+    const redis = makeRedis({ [stateKey]: state });
+    vi.mocked(redis.eval).mockRejectedValueOnce(new Error('redis unavailable'));
+    const db = makeDb({ runEvents: [{ runId: 'run-claim-failed', status: 'running' }] });
+
+    const result = await markRunTerminal({
+      redis,
+      db,
+      runId: 'run-claim-failed',
+      reason: 'stale reap',
+      now: NOW,
+    });
+
+    expect(result).toMatchObject({ durableModified: 0, redisCleaned: false });
+    expect(db.state.runEvents.docs[0].status).toBe('running');
+    expect(JSON.parse(redis.store.get(stateKey)!).status).toBe('running');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -399,6 +510,34 @@ describe('releaseConversationPointerIfOwner', () => {
 // ---------------------------------------------------------------------------
 
 describe('reapOrphanedRuns', () => {
+  it('reconciles a cached completed state instead of reaping it after archive delivery lag', async () => {
+    const state = createInitialRunState({
+      runId: 'complete-lag',
+      userId: 'u',
+      graphId: 'g',
+      graphName: 'G',
+      input: {},
+    });
+    state.status = 'completed';
+    state.completedAt = NOW.getTime();
+    state.lastProgressAt = iso(-STALE_MS - 5000);
+    const redis = makeRedis({ [RunKeys.state('complete-lag')]: state });
+    const db = makeDb({
+      runEvents: [{ runId: 'complete-lag', status: 'running', startedAt: date(-3_600_000) }],
+      automationruns: [{ runId: 'complete-lag', status: 'running', startedAt: date(-3_600_000) }],
+      generations: [{ runId: 'complete-lag', status: 'running', startedAt: date(-3_600_000) }],
+    });
+
+    const res = await reapOrphanedRuns({ redis, db, now: NOW, staleAfterMs: STALE_MS });
+
+    expect(res.reaped).toBe(0);
+    expect(res.reconciled).toBe(1);
+    expect(db.state.runEvents.docs[0].status).toBe('completed');
+    expect(db.state.automationruns.docs[0].status).toBe('completed');
+    expect(db.state.generations.docs[0].status).toBe('completed');
+    expect(JSON.parse(redis.store.get(RunKeys.state('complete-lag'))!).status).toBe('completed');
+  });
+
   it('reaps a backlog orphan whose Redis state has TTL-expired (missing)', async () => {
     const redis = makeRedis(); // no run-state at all
     const db = makeDb({ runEvents: [{ runId: 'old-1', status: 'running', startedAt: date(-3_600_000) }] });
@@ -424,6 +563,20 @@ describe('reapOrphanedRuns', () => {
     const res = await reapOrphanedRuns({ redis, db, now: NOW, staleAfterMs: STALE_MS });
     expect(res.reaped).toBe(1);
     expect(res.details[0]).toMatchObject({ runId: 'dead-1' });
+  });
+
+  it('keeps an orphan for retry when its atomic terminal claim fails', async () => {
+    const redis = makeRedis(); // missing state makes this an orphan candidate
+    vi.mocked(redis.eval).mockRejectedValueOnce(new Error('redis unavailable'));
+    const db = makeDb({
+      runEvents: [{ runId: 'retry-claim', status: 'running', startedAt: date(-3_600_000) }],
+    });
+
+    const res = await reapOrphanedRuns({ redis, db, now: NOW, staleAfterMs: STALE_MS });
+
+    expect(res).toMatchObject({ reaped: 0, kept: 1, details: [] });
+    expect(db.state.runEvents.docs[0].status).toBe('running');
+    expect(redis.store.has(RunKeys.state('retry-claim'))).toBe(false);
   });
 
   it('NEVER reaps a live actively-progressing run (fresh heartbeat)', async () => {
@@ -533,18 +686,16 @@ describe('reapOrphanedRuns', () => {
     });
 
     // Interleave the race deterministically: right AFTER the reaper decides to
-    // reap (liveness read via get + hasOwningLock) and rewrites the orphan's
-    // terminal run-state (the first redis.set in markRunTerminal), a fresh run
-    // has ALREADY acquired the same conversation — it holds a live lock and has
-    // repointed the conversation at itself. The reaper's shared-key cleanup runs
-    // immediately after this set, so this models "fresh acquirer wins between the
-    // check and the delete." Implementation-agnostic (hooks a call both the
-    // buggy blind-delete and the fixed CAS cleanup make).
-    const realSet = redis.set as any;
+    // reap (liveness read via get + hasOwningLock) and atomically claims the
+    // orphan's terminal run-state, a fresh run acquires the same conversation —
+    // it holds a live lock and repoints the conversation at itself. The reaper's
+    // shared-key cleanup runs immediately after, modeling "fresh acquirer wins
+    // between the check and the delete."
+    const realEval = redis.eval as any;
     let acquired = false;
-    (redis.set as any) = vi.fn(async (...args: any[]) => {
-      const out = await realSet(...args);
-      if (!acquired) {
+    (redis.eval as any) = vi.fn(async (...args: any[]) => {
+      const out = await realEval(...args);
+      if (!acquired && String(args[0]).includes('cjson.decode')) {
         acquired = true;
         redis.store.set(RunKeys.lock(conv), freshToken); // fresh run's live lock
         redis.store.set(RunKeys.conversationRun(conv), freshId); // fresh run repoints

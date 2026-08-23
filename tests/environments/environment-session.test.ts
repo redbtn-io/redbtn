@@ -26,6 +26,7 @@ import { EnvironmentSession } from '../../src/lib/environments/EnvironmentSessio
 import {
   buildSession,
   buildEnv,
+  MockSshChannel,
   MockSshClient,
   flushAsync,
   sleep,
@@ -766,6 +767,55 @@ describe('EnvironmentSession — archiveOutputLogs record shape', () => {
 // ---------------------------------------------------------------------------
 
 describe('EnvironmentSession — remote process-group kill on abort/timeout', () => {
+  it('does not settle an abort until the remote pgroup kill is confirmed', async () => {
+    let client!: MockSshClient;
+    let killChannel: MockSshChannel | null = null;
+    const env = buildEnv({});
+    const session = new EnvironmentSession({
+      env,
+      sshKey: 'k',
+      userId: env.userId,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      clientFactory: (() => {
+        client = new MockSshClient();
+        client.behaviour.onExec = (command, channel) => {
+          if (command.includes('kill -TERM')) {
+            // Deliberately hold the kill channel open: the caller must remain
+            // pending until remote ownership cleanup is confirmed.
+            killChannel = channel;
+            return;
+          }
+          channel.pushStderr('__RDBTN_PID__=31337\n');
+        };
+        return client as any;
+      }) as any,
+    });
+    await session.open();
+
+    const ac = new AbortController();
+    const execPromise = session.exec('sleep 100', { abortSignal: ac.signal });
+    let outcome: unknown;
+    void execPromise.then(
+      (value) => { outcome = value; },
+      (error) => { outcome = error; },
+    );
+    for (let i = 0; i < 20 && !client.execCalls.some((c) => c.includes('sleep 100')); i += 1) {
+      await flushAsync();
+    }
+
+    ac.abort();
+    for (let i = 0; i < 50 && killChannel === null; i += 1) {
+      await flushAsync();
+    }
+
+    expect(killChannel).not.toBeNull();
+    expect(outcome).toBeUndefined();
+
+    killChannel!.finish(0);
+    await expect(execPromise).rejects.toThrow('exec aborted');
+    await session.close();
+  });
+
   it('abort kills the remote pgroup via a side-channel exec on the pooled connection', async () => {
     let client!: MockSshClient;
     const env = buildEnv({});
@@ -798,7 +848,7 @@ describe('EnvironmentSession — remote process-group kill on abort/timeout', ()
     ac.abort();
     await expect(p).rejects.toThrow('exec aborted');
 
-    // The detached kill exec lands on the SAME client (pooled connection).
+    // The awaited kill exec lands on the SAME client (pooled connection).
     for (
       let i = 0;
       i < 50 && !client.execCalls.some((c) => c.includes('kill -TERM -- -4242'));

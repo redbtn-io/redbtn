@@ -152,6 +152,8 @@ export interface RunPublisherOptions {
   automationRunId?: string;
   /** Optional automationruns collection handle for Mongo heartbeat mirroring. */
   automationRunsCollection?: AutomationRunsCollection;
+  /** Optional runEvents collection handle for awaited terminal-status mirroring. */
+  runEventsCollection?: AutomationRunsCollection;
   /** Optional generation id to mirror progress heartbeat into Mongo. Defaults to runId. */
   generationId?: string;
   /** Optional generations collection handle for Mongo heartbeat mirroring. */
@@ -194,6 +196,7 @@ export class RunPublisher {
   private readonly agentId?: string;
   private readonly automationRunId?: string;
   private readonly automationRunsCollection?: AutomationRunsCollection;
+  private readonly runEventsCollection?: AutomationRunsCollection;
   private readonly generationId: string;
   private readonly generationsCollection?: GenerationsCollection;
   private readonly stateTtl: number;
@@ -240,6 +243,7 @@ export class RunPublisher {
     this.agentId = options.agentId;
     this.automationRunId = options.automationRunId;
     this.automationRunsCollection = options.automationRunsCollection;
+    this.runEventsCollection = options.runEventsCollection;
     this.generationId = options.generationId ?? options.runId;
     this.generationsCollection = options.generationsCollection;
     this.stateTtl = options.stateTtl ?? RunConfig.STATE_TTL_SECONDS;
@@ -288,6 +292,68 @@ export class RunPublisher {
     } catch (err) {
       console.warn(`[RunPublisher] concurrency release failed for ${this.runId}:`, err);
     }
+  }
+
+  /**
+   * Mirror a terminal verdict directly into the durable status stores before
+   * the terminal event/log is emitted. The BullMQ archiver remains responsible
+   * for the full event trace, but its enqueue is intentionally a side-channel;
+   * status correctness cannot depend on that fire-and-forget delivery winning
+   * a race with process shutdown or the Redis run-state TTL.
+   *
+   * Every write is compare-and-set from a non-terminal status. That makes this
+   * safe against the orphan reaper and worker finalizer: whichever terminal
+   * verdict lands first cannot be overwritten by a later stale cleanup.
+   */
+  private async persistDurableTerminalStatus(
+    status: 'completed' | 'error' | 'interrupted',
+    error?: string,
+  ): Promise<void> {
+    const completedAt = new Date(this.state?.completedAt ?? Date.now());
+    const nonTerminalFilter = { $in: ['pending', 'queued', 'running'] };
+    const writes: Array<Promise<void>> = [];
+
+    const write = (
+      label: string,
+      collection: AutomationRunsCollection | undefined,
+      runId: string | undefined,
+      durableStatus: string,
+      includeError: boolean,
+    ) => {
+      if (!collection || !runId) return;
+      writes.push((async () => {
+        try {
+          await collection.updateOne(
+            { runId, status: nonTerminalFilter },
+            {
+              $set: {
+                status: durableStatus,
+                completedAt,
+                updatedAt: completedAt,
+                ...(includeError && error ? { error } : {}),
+              },
+            },
+          );
+        } catch (err) {
+          // Do not turn a successfully-executed graph into run_error because a
+          // mirror is temporarily unavailable. The awaited archive job and the
+          // terminal-state reconciliation in orphan-reaper.ts are backstops.
+          console.warn(`[RunPublisher] durable ${label} finalization failed for ${runId}:`, err);
+        }
+      })());
+    };
+
+    write('runEvents', this.runEventsCollection, this.runId, status, false);
+    write(
+      'automationruns',
+      this.automationRunsCollection,
+      this.automationRunId,
+      status === 'error' ? 'failed' : status,
+      true,
+    );
+    write('generations', this.generationsCollection, this.generationId, status, true);
+
+    await Promise.all(writes);
   }
 
   get id(): string {
@@ -499,6 +565,7 @@ export class RunPublisher {
     this.state!.status = 'completed';
     this.state!.completedAt = Date.now();
     await this.saveState();
+    await this.persistDurableTerminalStatus('completed');
     if (this.state!.conversationId) {
       // Compare-and-delete: only clear the pointer while it still names THIS run,
       // so a run that already superseded us in this conversation keeps its pointer.
@@ -648,6 +715,7 @@ export class RunPublisher {
     this.state!.error = error;
     this.state!.completedAt = Date.now();
     await this.saveState();
+    await this.persistDurableTerminalStatus('error', error);
     if (this.state!.conversationId) {
       // Compare-and-delete: spare a superseding run's pointer (see complete()).
       await releaseConversationPointerIfOwner(this.redis, this.state!.conversationId, this.runId);
@@ -736,6 +804,7 @@ export class RunPublisher {
     this.state!.completedAt = Date.now();
     if (reason) this.state!.error = `interrupted: ${reason}`;
     await this.saveState();
+    await this.persistDurableTerminalStatus('interrupted', this.state!.error);
     if (this.state!.conversationId) {
       // Compare-and-delete: spare a superseding run's pointer (see complete()).
       // Critical on the interrupt path — interrupts are how one run supersedes
@@ -1457,8 +1526,15 @@ export class RunPublisher {
       // progress) does. No-op for non-automation runs.
       await this.heartbeatConcurrencySlot();
     }
-    // Fire-and-forget archive job — non-blocking, non-fatal
-    this._enqueueArchive(event).catch(() => {});
+    // Terminal delivery is awaited so a process cannot emit/log completion and
+    // then exit before the durable archive job has even reached BullMQ. Other
+    // high-volume events remain fire-and-forget; the direct Mongo status mirror
+    // above and orphan reconciliation protect terminal correctness.
+    if (isTerminalRunEvent(event)) {
+      await this._enqueueArchive(event);
+    } else {
+      this._enqueueArchive(event).catch(() => {});
+    }
 
     // Forward audio_chunk to the conversation stream so the chat UI receives
     // server-side TTS audio. Catches BOTH the publishAudioChunk() path and the
@@ -1608,6 +1684,13 @@ function isProgressEvent(event: RunEvent): boolean {
     case 'init':
       return false;
   }
+}
+
+function isTerminalRunEvent(event: RunEvent): boolean {
+  return event.type === 'run_complete' ||
+    event.type === 'run_error' ||
+    event.type === 'run_failed' ||
+    event.type === 'run_interrupted';
 }
 
 /**
