@@ -238,7 +238,28 @@ const sshShell: NativeToolDefinition = {
     // single-quoted bash so backticks, $, `!`, and friends in any prompt
     // stay literal.
     const PID_MARKER = '__RDBTN_PID__=';
-    fullCommand = `set -m; echo ${PID_MARKER}$$ 1>&2; exec bash -c ${shQuote(fullCommand)}`;
+    // Long commands ride the channel's STDIN (`bash -s`) instead of the exec
+    // command line. SSH exec command strings traverse the remote host's
+    // process-spawn machinery, which on Windows OpenSSH (cmd/Git-Bash
+    // marshalling) silently truncates around 8191 chars — chopping the
+    // closing quote off the `bash -c '…'` wrapper and failing the run with
+    // "unexpected EOF while looking for matching `'`" (2026-08-24 Become
+    // Agent incident: a long Discord message + attachment URLs pushed the
+    // PowerShell -EncodedCommand blob past the limit). Stdin is a stream
+    // with no length cliff, verified to carry 40KB+ through the same sshd.
+    // Threshold is conservative: well under 8191 minus wrapper overhead.
+    // Caveat: in stdin mode the executed script's own stdin is the script
+    // channel (consumed/EOF) — commands that READ stdin must pipe internally,
+    // which every graph-built CLI command already does (printf … | cli -).
+    const STDIN_EXEC_THRESHOLD = 6000;
+    let stdinScript: string | null = null;
+    if (fullCommand.length > STDIN_EXEC_THRESHOLD) {
+      stdinScript = fullCommand;
+      fullCommand = `set -m; echo ${PID_MARKER}$$ 1>&2; exec bash -s`;
+      console.log(`[ssh_shell] Command length ${stdinScript.length} > ${STDIN_EXEC_THRESHOLD} — sending via stdin (bash -s)`);
+    } else {
+      fullCommand = `set -m; echo ${PID_MARKER}$$ 1>&2; exec bash -c ${shQuote(fullCommand)}`;
+    }
 
     return new Promise((resolve) => {
       const conn = sshClientFactory();
@@ -499,6 +520,19 @@ const sshShell: NativeToolDefinition = {
           if (err) {
             console.error('[ssh_shell] exec() failed:', err.message);
             return settle(err);
+          }
+
+          // Stdin mode: feed the script to the remote `bash -s`, then EOF so
+          // it starts executing. Must happen before any output handling — the
+          // remote produces nothing until the script arrives.
+          if (stdinScript !== null) {
+            try {
+              stream.write(stdinScript);
+              stream.end();
+            } catch (werr) {
+              console.error('[ssh_shell] failed to write stdin script:', (werr as Error).message);
+              return settle(werr as Error);
+            }
           }
 
           // Kill-then-settle: terminate the REMOTE process group, then — and

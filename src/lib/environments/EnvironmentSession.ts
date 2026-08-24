@@ -114,6 +114,8 @@ const EXEC_DRAIN_GRACE_MS = 100;
  * closing the channel (which leaves the remote process running).
  */
 const ENV_PID_MARKER = '__RDBTN_PID__=';
+/** Above this, commands go via channel stdin (`bash -s`) — see execRaw(). */
+const ENV_STDIN_EXEC_THRESHOLD = 6000;
 
 /** Bash-safe single-quote escape (same idiom as ssh-shell.ts shQuote). */
 function shQuoteEnv(s: string): string {
@@ -503,7 +505,19 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
     // Wrap for pid capture so timeout/abort can force-kill the remote
     // process group. `set -m` + `exec` keeps the captured $$ valid as the
     // group leader (see ssh-shell.ts for the full rationale).
-    fullCommand = `set -m; echo ${ENV_PID_MARKER}$$ 1>&2; exec bash -c ${shQuoteEnv(fullCommand)}`;
+    //
+    // Long commands ride the channel's STDIN (`bash -s`) instead of the exec
+    // command line — Windows OpenSSH marshalling truncates exec command
+    // strings around 8191 chars, chopping the closing quote off the
+    // `bash -c '…'` wrapper (see ssh-shell.ts, 2026-08-24 Become Agent
+    // incident). Same threshold + semantics as ssh-shell.ts.
+    let stdinScript: string | null = null;
+    if (fullCommand.length > ENV_STDIN_EXEC_THRESHOLD) {
+      stdinScript = fullCommand;
+      fullCommand = `set -m; echo ${ENV_PID_MARKER}$$ 1>&2; exec bash -s`;
+    } else {
+      fullCommand = `set -m; echo ${ENV_PID_MARKER}$$ 1>&2; exec bash -c ${shQuoteEnv(fullCommand)}`;
+    }
 
     const startTime = Date.now();
     let stdout = '';
@@ -619,6 +633,17 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
           return settle(err, null);
         }
         stream = channelStream;
+
+        // Stdin mode: feed the script to the remote `bash -s`, then EOF so it
+        // starts executing (see ssh-shell.ts for rationale).
+        if (stdinScript !== null) {
+          try {
+            channelStream.write(stdinScript);
+            channelStream.end();
+          } catch (werr) {
+            return settle(werr as Error, null);
+          }
+        }
 
         // Hard timeout — kill the remote process group, then the stream.
         // Closing the channel alone does NOT stop the remote command; the
