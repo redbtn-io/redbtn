@@ -329,6 +329,45 @@ describe('trigger_automation — wait:true polling', () => {
     expect(body.runDurationMs).toBe(1234);
   });
 
+  test('aborts wait polling when context abortSignal fires', async () => {
+    const controller = new AbortController();
+    let pollCalls = 0;
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const u = typeof input === 'string' ? input : (input as URL).toString();
+      if (u.endsWith('/trigger')) {
+        return new Response(
+          JSON.stringify({ runId: 'run_abort', run: { status: 'queued' } }),
+          { status: 200 },
+        );
+      }
+      if (u.includes('/runs/run_abort')) {
+        pollCalls += 1;
+        if (pollCalls === 1) {
+          controller.abort('run-interrupted');
+          return new Response(
+            JSON.stringify({ run: { runId: 'run_abort', status: 'running' } }),
+            { status: 200 },
+          );
+        }
+        throw new Error('poll loop should stop after abort');
+      }
+      return new Response('not found', { status: 404 });
+    }) as unknown as typeof globalThis.fetch;
+
+    const r = await triggerAutomationTool.handler(
+      { automationId: 'auto_abort', wait: true, pollIntervalMs: 250, timeoutMs: 10_000 },
+      makeMockContext({ abortSignal: controller.signal }),
+    );
+
+    expect(pollCalls).toBe(1);
+    expect(r.isError).toBe(true);
+    const body = JSON.parse(r.content[0].text);
+    expect(body.error).toBe('Aborted');
+    expect(body.status).toBe('cancelled');
+    expect(body.runId).toBe('run_abort');
+  });
+
   test('terminal status:failed surfaces as isError:true', async () => {
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const u = typeof input === 'string' ? input : (input as URL).toString();
