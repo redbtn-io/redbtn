@@ -348,10 +348,18 @@ export async function validateGraphConfig(
     }
     if (edge.to) referencedNodes.add(edge.to);
 
-    // ------- conditional edges ---------------------------------------------
-    if (isConditional) {
-      const hasTargets = edge.targets && Object.keys(edge.targets).length > 0;
-      const hasFallback = Boolean(edge.fallback);
+      // ------- conditional edges ---------------------------------------------
+      if (isConditional) {
+        if (edge.condition !== undefined && typeof edge.condition !== 'string') {
+          err({
+            code: 'CONDITION_BAD_TYPE',
+            edgeIndex,
+            message: `Conditional edge[${edgeIndex}] (from '${edge.from}') has non-string condition of type '${typeof edge.condition}'. Condition must be a string expression when provided.`,
+          });
+        }
+
+        const hasTargets = edge.targets && Object.keys(edge.targets).length > 0;
+        const hasFallback = Boolean(edge.fallback);
 
       if (!hasTargets && !edge.to) {
         err({
@@ -393,7 +401,7 @@ export async function validateGraphConfig(
       if (edge.fallback) referencedNodes.add(edge.fallback);
 
       // Validate the condition expression syntax against the runtime allowlist.
-      if (edge.condition && typeof edge.condition === 'string' && edge.condition.trim()) {
+      if (typeof edge.condition === 'string' && edge.condition.trim()) {
         if (!isSafeConditionExpression(edge.condition)) {
           err({
             code: 'CONDITION_BAD_SYNTAX',
