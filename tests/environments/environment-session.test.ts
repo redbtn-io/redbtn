@@ -214,6 +214,19 @@ describe('EnvironmentSession — openCommand', () => {
 // exec
 // ---------------------------------------------------------------------------
 
+
+/**
+ * Strip the pid-marker + `exec bash -c '…'` wrapper and reverse the shQuote
+ * escaping, so assertions can state the INNER command plainly. (The wrapper
+ * turns every inner `'` into `'\\''`, which makes raw toContain assertions
+ * unreadable.)
+ */
+function unwrapExec(cmd: string): string {
+  const m = cmd.match(/exec bash -c '([\s\S]*)'$/);
+  if (!m) return cmd;
+  return m[1].replace(/'\\''/g, "'");
+}
+
 describe('EnvironmentSession — exec()', () => {
   it('returns stdout, stderr, exitCode, durationMs', async () => {
     const client = new MockSshClient();
@@ -326,8 +339,8 @@ describe('EnvironmentSession — exec()', () => {
     });
     await session.open();
     await session.exec('ls');
-    expect(captured).toContain('cd "/repo/foo"');
-    expect(captured).toContain('ls');
+    expect(unwrapExec(captured)).toContain("cd '/repo/foo'");
+    expect(unwrapExec(captured)).toContain('ls');
   });
 
   it('exec() applies opts.cwd override over env.workingDir', async () => {
@@ -343,8 +356,8 @@ describe('EnvironmentSession — exec()', () => {
     });
     await session.open();
     await session.exec('ls', { cwd: '/repo/bar' });
-    expect(captured).toContain('cd "/repo/bar"');
-    expect(captured).not.toContain('cd "/repo/foo"');
+    expect(unwrapExec(captured)).toContain("cd '/repo/bar'");
+    expect(unwrapExec(captured)).not.toContain("cd '/repo/foo'");
   });
 
   it('exec() injects opts.env exports', async () => {
@@ -357,7 +370,7 @@ describe('EnvironmentSession — exec()', () => {
     const { session } = buildSession({ client });
     await session.open();
     await session.exec('printenv FOO', { env: { FOO: 'bar' } });
-    expect(captured).toContain('export FOO="bar"');
+    expect(unwrapExec(captured)).toContain("export FOO='bar'");
   });
 });
 
@@ -893,5 +906,56 @@ describe('EnvironmentSession — remote process-group kill on abort/timeout', ()
     }
     expect(client.execCalls.some((c) => c.includes('kill -TERM -- -7777'))).toBe(true);
     await session.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cwd / env shell quoting (regression: JSON.stringify let `$(…)` execute)
+// ---------------------------------------------------------------------------
+
+describe('EnvironmentSession — cwd/env quoting', () => {
+  it('single-quotes cwd so $(…), backticks and $VARS stay literal', async () => {
+    const client = new MockSshClient();
+    const seen: string[] = [];
+    client.behaviour.onExec = (cmd, ch) => {
+      seen.push(cmd);
+      ch.pushStdout('ok');
+      ch.finish(0);
+    };
+    const { session } = buildSession({
+      env: { workingDir: '/tmp/evil-$(touch pwned)-`date`-$HOME' },
+      client,
+    });
+    await session.open();
+    await session.exec('echo hi');
+    await session.close('test');
+
+    const ran = seen.find((c) => c.includes('echo hi'));
+    expect(ran).toBeDefined();
+    // The whole cwd rides inside single quotes…
+    expect(unwrapExec(ran!)).toContain("cd '/tmp/evil-$(touch pwned)-`date`-$HOME'");
+    // …and never inside double quotes, where bash would expand it.
+    expect(unwrapExec(ran!)).not.toContain('cd "/tmp/evil');
+  });
+
+  it("single-quotes env values, escaping embedded single quotes as '\\''", async () => {
+    const client = new MockSshClient();
+    const seen: string[] = [];
+    client.behaviour.onExec = (cmd, ch) => {
+      seen.push(cmd);
+      ch.pushStdout('ok');
+      ch.finish(0);
+    };
+    const { session } = buildSession({ env: { workingDir: '' }, client });
+    await session.open();
+    await session.exec('echo hi', { env: { GREETING: "it's $(whoami) o`clock" } });
+    await session.close('test');
+
+    const ran = seen.find((c) => c.includes('echo hi'));
+    expect(ran).toBeDefined();
+    expect(unwrapExec(ran!)).toContain("export GREETING='it'");
+    expect(unwrapExec(ran!)).toContain('$(whoami) o`clock');
+    // The embedded quote is escaped, not left to terminate the string.
+    expect(unwrapExec(ran!)).not.toContain("GREETING='it's");
   });
 });

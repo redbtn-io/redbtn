@@ -490,14 +490,19 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
     }
 
     // Build the full command with cwd + env injection (mirrors ssh-shell.ts).
+    // shQuoteEnv, NOT JSON.stringify: JSON-string syntax is double-quoted and
+    // only escapes `"`, `\` and control chars — backticks, `$` and `!` stay
+    // live inside bash double quotes, so a cwd or env value containing `$(…)`
+    // would execute. Single-quote escaping keeps every character literal
+    // (same rationale as shQuote in ssh-shell.ts).
     let fullCommand = command;
     const cwd = opts.cwd ?? this.env.workingDir;
     if (cwd) {
-      fullCommand = `cd ${JSON.stringify(cwd)} && ${fullCommand}`;
+      fullCommand = `cd ${shQuoteEnv(cwd)} && ${fullCommand}`;
     }
     if (opts.env && Object.keys(opts.env).length > 0) {
       const envExports = Object.entries(opts.env)
-        .map(([k, v]) => `export ${k}=${JSON.stringify(String(v))}`)
+        .map(([k, v]) => `export ${k}=${shQuoteEnv(String(v))}`)
         .join(' && ');
       fullCommand = `${envExports} && ${fullCommand}`;
     }
