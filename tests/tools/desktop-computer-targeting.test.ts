@@ -76,6 +76,16 @@ describe('desktop tools — schema targeting', () => {
     expect(desktopPing.inputSchema.required).toEqual(['environmentId']);
     expect(alertDesktopTool.inputSchema.required).toEqual(['environmentId', 'title', 'body']);
   });
+
+  test('screenshot, click, and move expose an optional integer display selector', () => {
+    for (const tool of [desktopScreenshot, desktopClick, desktopMove]) {
+      expect(tool.inputSchema.properties?.display).toMatchObject({
+        type: 'integer',
+        minimum: 0,
+      });
+      expect(tool.inputSchema.required).not.toContain('display');
+    }
+  });
 });
 
 describe('desktop computer-use tools — strict target handling', () => {
@@ -133,6 +143,57 @@ describe('desktop computer-use tools — strict target handling', () => {
         button: 'right',
         double: false,
       },
+    });
+  });
+
+  test('click and move forward the selected display index', async () => {
+    await desktopClick.handler(
+      { environmentId: 'env_desktop', x: 10, y: 20, display: 2 },
+      makeContext(),
+    );
+    await desktopMove.handler(
+      { environmentId: 'env_desktop', x: 30, y: 40, display: 1 },
+      makeContext(),
+    );
+
+    expect(requestDesktopMock).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      request: expect.objectContaining({ action: 'mouse', op: 'click', display: 2 }),
+    }));
+    expect(requestDesktopMock).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      request: expect.objectContaining({ action: 'mouse', op: 'move', display: 1 }),
+    }));
+  });
+
+  test('screenshot forwards display and echoes captured display geometry', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_1',
+      ok: true,
+      image: {
+        format: 'png',
+        base64: 'abc123',
+        width: 1366,
+        height: 768,
+        sourceWidth: 1920,
+        sourceHeight: 1080,
+        clickSpace: { w: 1366, h: 768 },
+        display: { index: 1, id: 222, x: 1920, y: 0 },
+      },
+    });
+
+    const result = await desktopScreenshot.handler(
+      { environmentId: 'env_desktop', display: 1 },
+      makeContext(),
+    );
+
+    expect(requestDesktopMock).toHaveBeenCalledWith(expect.objectContaining({
+      request: { action: 'screenshot', format: 'png', display: 1 },
+    }));
+    expect(textBody(result)).toMatchObject({
+      sourceWidth: 1920,
+      sourceHeight: 1080,
+      clickSpace: { w: 1366, h: 768 },
+      display: { index: 1, id: 222, x: 1920, y: 0 },
     });
   });
 
