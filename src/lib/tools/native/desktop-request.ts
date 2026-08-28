@@ -57,6 +57,7 @@ export type ComputerAction =
       op: 'move' | 'click' | 'down' | 'up' | 'scroll';
       x?: number;
       y?: number;
+      display?: number;
       button?: 'left' | 'right' | 'middle';
       double?: boolean;
       dx?: number;
@@ -79,6 +80,10 @@ export interface ComputerResultMessage {
     base64: string;
     width: number;
     height: number;
+    display?: { index: number; id: number; x: number; y: number };
+    sourceWidth?: number;
+    sourceHeight?: number;
+    clickSpace?: { w: number; h: number };
   };
   screen?: {
     displays: Array<{
@@ -91,6 +96,7 @@ export interface ComputerResultMessage {
       primary: boolean;
     }>;
   };
+  result?: Record<string, unknown>;
   error?: { code: string; message: string };
 }
 
