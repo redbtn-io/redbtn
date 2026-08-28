@@ -63,6 +63,20 @@ function resolveTimeoutMs(args: AnyObject): number | undefined {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+/** Optional non-negative display index, or null when explicitly invalid. */
+function resolveDisplayIndex(args: AnyObject): number | undefined | null {
+  if (args?.display === undefined) return undefined;
+  const display = args.display;
+  return typeof display === 'number' && Number.isInteger(display) && display >= 0 ? display : null;
+}
+
+function invalidDisplayResult(): NativeMcpResult {
+  return textResult({
+    ok: false,
+    error: { code: 'computer_failed', message: 'display must be a non-negative integer' },
+  }, true);
+}
+
 /** Standard text-only result wrapper. */
 function textResult(value: unknown, isError = false): NativeMcpResult {
   return {
@@ -166,6 +180,11 @@ const desktopScreenshotTool: NativeToolDefinition = {
         description: 'Image encoding. Default png.',
         default: 'png',
       },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info. Omitted means primary.',
+      },
       timeoutMs: {
         type: 'number',
         description: 'Optional round-trip timeout in ms (default 30000).',
@@ -176,7 +195,11 @@ const desktopScreenshotTool: NativeToolDefinition = {
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
     const format: 'png' | 'jpeg' = rawArgs?.format === 'jpeg' ? 'jpeg' : 'png';
-    const result = await runAction(context, { action: 'screenshot', format }, rawArgs);
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+    const request: ComputerAction = { action: 'screenshot', format };
+    if (display !== undefined) request.display = display;
+    const result = await runAction(context, request, rawArgs);
     if (!result) return noUserResult();
 
     if (!result.ok || !result.image) {
@@ -202,6 +225,10 @@ const desktopScreenshotTool: NativeToolDefinition = {
             format: img.format,
             width: img.width,
             height: img.height,
+            sourceWidth: img.sourceWidth,
+            sourceHeight: img.sourceHeight,
+            clickSpace: img.clickSpace,
+            display: img.display,
             mimeType,
             dataUrl,
             base64: img.base64,
@@ -216,7 +243,7 @@ const desktopScreenshotTool: NativeToolDefinition = {
 
 const desktopClickTool: NativeToolDefinition = {
   description:
-    "Click the mouse at absolute virtual-desktop pixel coordinates on the current user's connected desktop (redAgent). Supports left/right/middle button and double-click.",
+    "Click the mouse in the CLICK SPACE reported by desktop_screenshot on the current user's connected desktop (redAgent). Supports display targeting, left/right/middle button, and double-click.",
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -227,6 +254,11 @@ const desktopClickTool: NativeToolDefinition = {
       },
       x: { type: 'number', description: 'Absolute X pixel coordinate. Required.' },
       y: { type: 'number', description: 'Absolute Y pixel coordinate. Required.' },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
       button: {
         type: 'string',
         enum: ['left', 'right', 'middle'],
@@ -247,13 +279,24 @@ const desktopClickTool: NativeToolDefinition = {
     }
     const button: 'left' | 'right' | 'middle' =
       rawArgs?.button === 'right' ? 'right' : rawArgs?.button === 'middle' ? 'middle' : 'left';
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+    const request: ComputerAction = {
+      action: 'mouse',
+      op: 'click',
+      x,
+      y,
+      button,
+      double: rawArgs?.double === true,
+    };
+    if (display !== undefined) request.display = display;
     const result = await runAction(
       context,
-      { action: 'mouse', op: 'click', x, y, button, double: rawArgs?.double === true },
+      request,
       rawArgs,
     );
     if (!result) return noUserResult();
-    return textResult({ ok: result.ok, ...(result.error ? { error: result.error } : {}) });
+    return textResult({ ok: result.ok, ...(result.result ? { result: result.result } : {}), ...(result.error ? { error: result.error } : {}) });
   },
 };
 
@@ -261,7 +304,7 @@ const desktopClickTool: NativeToolDefinition = {
 
 const desktopMoveTool: NativeToolDefinition = {
   description:
-    "Move the mouse pointer (without clicking) to absolute virtual-desktop pixel coordinates on the current user's connected desktop (redAgent).",
+    "Move the mouse pointer (without clicking) in the CLICK SPACE reported by desktop_screenshot on the current user's connected desktop (redAgent).",
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -272,6 +315,11 @@ const desktopMoveTool: NativeToolDefinition = {
       },
       x: { type: 'number', description: 'Absolute X pixel coordinate. Required.' },
       y: { type: 'number', description: 'Absolute Y pixel coordinate. Required.' },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
     required: ['environmentId', 'x', 'y'],
@@ -283,9 +331,13 @@ const desktopMoveTool: NativeToolDefinition = {
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
       return textResult({ ok: false, error: { code: 'computer_failed', message: 'x and y must be finite numbers' } }, true);
     }
-    const result = await runAction(context, { action: 'mouse', op: 'move', x, y }, rawArgs);
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+    const request: ComputerAction = { action: 'mouse', op: 'move', x, y };
+    if (display !== undefined) request.display = display;
+    const result = await runAction(context, request, rawArgs);
     if (!result) return noUserResult();
-    return textResult({ ok: result.ok, ...(result.error ? { error: result.error } : {}) });
+    return textResult({ ok: result.ok, ...(result.result ? { result: result.result } : {}), ...(result.error ? { error: result.error } : {}) });
   },
 };
 
