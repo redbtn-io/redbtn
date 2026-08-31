@@ -1,93 +1,129 @@
+/**
+ * Fetch URL — Native Tool
+ *
+ * Makes an HTTP request to a URL and returns the response status, headers,
+ * and body. Features:
+ *   - Modern browser emulation headers by default
+ *   - Auto-formatting for JSON and HTML (converts HTML to clean Markdown)
+ *   - Configurable format ('auto', 'markdown', 'json', 'text', 'raw')
+ *   - Internal-platform auth forwarding for allowlisted redbtn hosts
+ *   - Robust retry and abort signal support
+ */
+
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { isInternalHost } from './_internal-hosts';
 import { buildHeaders } from './_task-helpers';
+import { parseHtml, DEFAULT_BROWSER_HEADERS } from '../../nodes/scrape/parser';
 
-type AnyObject = Record<string, unknown>;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyObject = Record<string, any>;
+
+interface FetchUrlArgs {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  timeout?: number;
+  followRedirects?: boolean;
+  format?: 'auto' | 'markdown' | 'json' | 'text' | 'raw';
+}
 
 const fetchUrlTool: NativeToolDefinition = {
-  description: 'Make an HTTP request to a URL. Supports all REST methods with custom headers, body, auth, and redirect control. Returns status, response headers, and body.',
+  description:
+    'Fetch content from a URL or make an HTTP API call. Returns status code, headers, title, and body (automatically converted to clean Markdown for HTML pages or pretty JSON for APIs).',
+  server: 'web',
   inputSchema: {
     type: 'object',
     properties: {
       url: {
         type: 'string',
-        description: 'The URL to fetch',
+        description: 'The URL to fetch (must start with http:// or https://).',
       },
       method: {
         type: 'string',
         enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'],
-        description: 'HTTP method (default: GET)',
+        description: 'HTTP method to use (default GET).',
+        default: 'GET',
       },
       headers: {
         type: 'object',
-        description: 'Request headers as key-value pairs',
+        description: 'Optional HTTP request headers as key-value pairs.',
         additionalProperties: { type: 'string' },
       },
       body: {
         type: 'string',
-        description: 'Request body (JSON string for POST/PUT, or raw text)',
+        description: 'Optional request body (for POST, PUT, PATCH).',
       },
       timeout: {
-        type: 'number',
-        description: 'Request timeout in milliseconds (default: 300000, max: 900000)',
+        type: 'integer',
+        description: 'Request timeout in milliseconds (default 30000, max 120000).',
+        minimum: 1,
+        maximum: 120000,
+        default: 30000,
       },
       followRedirects: {
         type: 'boolean',
-        description: 'Follow HTTP redirects (default: true)',
+        description: 'Whether to automatically follow HTTP redirects (default true).',
+        default: true,
+      },
+      format: {
+        type: 'string',
+        enum: ['auto', 'markdown', 'json', 'text', 'raw'],
+        description: 'Output body format: auto (default: Markdown for HTML, JSON for APIs), markdown, json, text, raw.',
+        default: 'auto',
       },
     },
     required: ['url'],
   },
 
-  async handler(args: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
-    const url = (args.url as string || '').trim();
-    const method = ((args.method as string) || 'GET').toUpperCase();
-    const headers = (args.headers as Record<string, string>) || {};
-    const body = args.body as string | undefined;
-    const timeout = Math.min(Number(args.timeout) || 300000, 900000);
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const args = rawArgs as Partial<FetchUrlArgs>;
+    const url = typeof args.url === 'string' ? args.url.trim() : '';
+    const method = (typeof args.method === 'string' ? args.method.toUpperCase() : 'GET') as
+      | 'GET'
+      | 'POST'
+      | 'PUT'
+      | 'PATCH'
+      | 'DELETE'
+      | 'HEAD'
+      | 'OPTIONS';
+    const headers = (args.headers && typeof args.headers === 'object' ? args.headers : {}) as Record<string, string>;
+    const body = typeof args.body === 'string' ? args.body : null;
+    let timeout = Number(args.timeout);
+    if (!Number.isFinite(timeout) || timeout <= 0) {
+      timeout = 30_000;
+    }
+    timeout = Math.min(Math.floor(timeout), 120_000);
     const followRedirects = args.followRedirects !== false;
+    const format = args.format || 'auto';
 
     if (!url) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: 'No URL provided' }) }], isError: true };
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'url is required and must be a non-empty string' }) }],
+        isError: true,
+      };
     }
 
-    const { publisher } = context;
-    console.log('[fetch_url]', `fetch_url ${method} ${url}`);
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'url must start with http:// or https://' }) }],
+        isError: true,
+      };
+    }
 
-    // Pull the run-level abort signal so external interrupt cancels the
-    // in-flight HTTP request immediately (fetch supports AbortSignal natively).
-    // We chain the per-request timeout AbortController to the run signal so
-    // either source can cancel.
-    //
-    // Hoisted above the try/catch (instead of declared inside) so the catch
-    // block can read both `runAbortSignal.aborted` and `timeoutFired` to
-    // distinguish abort sources. Without this, every AbortError is reported
-    // as "Request timed out after Xms" — even when the run was interrupted
-    // in the first 100ms by an external signal.
     const runAbortSignal = context?.abortSignal || null;
-
-    // Set by the per-attempt timer when (and only when) the timeout actually
-    // fires. The run-signal abort path leaves this false.
     let timeoutFired = false;
 
     try {
-      const fetchHeaders: Record<string, string> = { ...headers };
+      const fetchHeaders: Record<string, string> = {
+        ...DEFAULT_BROWSER_HEADERS,
+        ...headers,
+      };
+
       if (body && !fetchHeaders['Content-Type'] && !fetchHeaders['content-type']) {
         fetchHeaders['Content-Type'] = 'application/json';
       }
 
-      // ── Internal-platform auth ───────────────────────────────────────────
-      // When the target is an allowlisted internal redbtn host, transparently
-      // attach the calling run owner's credentials (Bearer JWT / X-User-Id,
-      // resolved from the run context via the shared buildHeaders pattern) so
-      // the request is authorized as the run owner — agents can call platform
-      // APIs without minting a JWT or touching the DB.
-      //
-      // SECURITY: credentials are attached ONLY inside this branch. Every
-      // other host falls through untouched — the run owner's session must
-      // never leak to a third party. A header the caller set explicitly is
-      // never overwritten (case-insensitive check), so an explicit
-      // Authorization header always wins.
       let attachedInternalAuth = false;
       if (isInternalHost(url)) {
         const hasHeader = (name: string): boolean => {
@@ -103,11 +139,7 @@ const fetchUrlTool: NativeToolDefinition = {
           }
         }
       }
-      // Do not let credentials attached for the original internal URL cross a
-      // redirect boundary. A redirect target is not re-checked by this tool's
-      // one-shot allowlist decision, and fetch implementations may preserve
-      // X-User-Id/X-Internal-Key on cross-origin hops. Callers can explicitly
-      // fetch the Location target as a new request, which re-runs the allowlist.
+
       const effectiveRedirect = attachedInternalAuth
         ? 'manual'
         : (followRedirects ? 'follow' : 'manual');
@@ -117,8 +149,6 @@ const fetchUrlTool: NativeToolDefinition = {
       let response: Response | null = null;
 
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        // Abort could land between retry attempts; check per-iteration, not just once
-        // before entering the loop, so a cancellation during backoff is observed.
         if (runAbortSignal?.aborted) {
           const err: Error & { name: string } = new Error('fetch_url aborted before send');
           err.name = 'AbortError';
@@ -130,7 +160,7 @@ const fetchUrlTool: NativeToolDefinition = {
           timeoutFired = true;
           controller.abort();
         }, timeout);
-        // Forward run abort to this request's controller
+
         const runAbortListener = runAbortSignal
           ? () => controller.abort()
           : null;
@@ -154,10 +184,8 @@ const fetchUrlTool: NativeToolDefinition = {
             runAbortSignal.removeEventListener('abort', runAbortListener);
           }
 
-          // Don't retry on success or client errors (4xx)
           if (response.ok || (response.status >= 400 && response.status < 500)) break;
 
-          // Server error (5xx) — retry, but bail immediately if run was aborted.
           if (runAbortSignal?.aborted) {
             const err: Error & { name: string } = new Error('fetch_url aborted between retries');
             err.name = 'AbortError';
@@ -172,7 +200,6 @@ const fetchUrlTool: NativeToolDefinition = {
           if (runAbortSignal && runAbortListener) {
             runAbortSignal.removeEventListener('abort', runAbortListener);
           }
-          // AbortError (from either timeout or run signal) is terminal.
           if (retryErr.name === 'AbortError' || attempt >= MAX_RETRIES) throw retryErr;
           console.log('[fetch_url]', `fetch_url ${method} ${url} → error, retrying (${attempt + 1}/${MAX_RETRIES}): ${retryErr.message}`);
           await new Promise(r => setTimeout(r, BACKOFF[attempt] || 5_000));
@@ -181,28 +208,46 @@ const fetchUrlTool: NativeToolDefinition = {
 
       if (!response) throw new Error('No response after retries');
 
-      // Collect response headers
       const responseHeaders: Record<string, string> = {};
       response.headers.forEach((value, key) => {
         responseHeaders[key] = value;
       });
 
-      // HEAD and OPTIONS don't need body
+      const contentType = response.headers.get('content-type') || '';
       let responseBody = '';
       if (method !== 'HEAD') {
         responseBody = await response.text();
       }
 
-      // Try to pretty-print JSON
-      let output: string;
-      try {
-        const json = JSON.parse(responseBody);
-        output = JSON.stringify(json, null, 2);
-      } catch {
+      let output: string = responseBody;
+      let pageTitle: string | undefined = undefined;
+
+      const isHtml = contentType.includes('text/html') || contentType.includes('application/xhtml');
+      const isJson = contentType.includes('application/json');
+
+      if (format === 'markdown' || (format === 'auto' && isHtml)) {
+        const parsed = parseHtml(responseBody, url);
+        output = parsed.text;
+        pageTitle = parsed.title;
+      } else if (format === 'json' || (format === 'auto' && isJson)) {
+        try {
+          const json = JSON.parse(responseBody);
+          output = JSON.stringify(json, null, 2);
+        } catch {
+          output = responseBody;
+        }
+      } else if (format === 'text') {
+        if (isHtml) {
+          const parsed = parseHtml(responseBody, url);
+          output = parsed.text;
+          pageTitle = parsed.title;
+        } else {
+          output = responseBody;
+        }
+      } else {
         output = responseBody;
       }
 
-      // Truncate large responses
       if (output.length > 500000) {
         output = output.slice(0, 500000) + '...(truncated)';
       }
@@ -215,20 +260,14 @@ const fetchUrlTool: NativeToolDefinition = {
           text: JSON.stringify({
             status: response.status,
             statusText: response.statusText,
+            title: pageTitle || undefined,
+            contentType: contentType || undefined,
             headers: responseHeaders,
             body: output,
           }),
         }],
       };
     } catch (error: any) {
-      // Distinguish abort sources for an accurate error message:
-      //   - run-level abort (external interrupt)  → "aborted by caller"
-      //   - per-attempt timer fired              → "timed out after Xms"
-      //   - everything else                       → fall back to error.message
-      //
-      // The run signal takes precedence: if BOTH the timer and the run signal
-      // are aborted (e.g. timer fires a moment after a run abort), we still
-      // report the higher-level cause that the caller actually triggered.
       let errorMessage: string;
       if (error.name === 'AbortError') {
         if (runAbortSignal?.aborted) {
@@ -236,8 +275,6 @@ const fetchUrlTool: NativeToolDefinition = {
         } else if (timeoutFired) {
           errorMessage = `Request timed out after ${timeout}ms`;
         } else {
-          // Aborted but neither source flag is set — surface the original
-          // message so post-mortems aren't lying about the cause.
           errorMessage = error.message || 'Request aborted (unknown source)';
         }
       } else {
