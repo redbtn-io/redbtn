@@ -1,258 +1,399 @@
 /**
- * HTML parser with smart content extraction
- * Custom algorithm for extracting main content from HTML without external dependencies
+ * HTML parser with intelligent content extraction and Markdown conversion.
+ * Uses Happy-DOM to parse DOM nodes into structured GitHub-Flavored Markdown
+ * preserving headings, code blocks, lists, links, and tables while stripping noise.
  */
 
-const MAX_CONTENT_LENGTH = 50000; // Increased - 50k characters
-const FETCH_TIMEOUT = 15000; // 15 seconds for larger pages
+import { Window } from 'happy-dom';
+
+const MAX_CONTENT_LENGTH = 100000;
+const FETCH_TIMEOUT = 25000;
+
+export const DEFAULT_BROWSER_HEADERS: Record<string, string> = {
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+  Accept:
+    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
+};
 
 export interface ParsedContent {
   title?: string;
+  description?: string;
+  publishedAt?: string;
   text: string;
   contentLength: number;
 }
 
-interface ContentBlock {
-  text: string;
-  score: number;
-  linkDensity: number;
-}
-
 /**
- * Fetch and parse HTML from a URL
+ * Fetch and parse HTML from a URL with browser emulation headers
  */
-export async function fetchAndParse(url: string): Promise<ParsedContent> {
+export async function fetchAndParse(url: string, timeoutMs = FETCH_TIMEOUT): Promise<ParsedContent> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; RedAI/1.0; +https://redbtn.io)',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
+      headers: DEFAULT_BROWSER_HEADERS,
+      redirect: 'follow',
     });
 
-    clearTimeout(timeoutId);
+    clearTimeout(timer);
 
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
 
     const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('text/html') && !contentType.includes('application/xhtml')) {
+    if (!contentType.includes('text/html') && !contentType.includes('application/xhtml') && !contentType.includes('text/plain')) {
       throw new Error(`URL is not HTML (Content-Type: ${contentType})`);
     }
 
     const html = await response.text();
-    return parseHtml(html);
-    
+    return parseHtml(html, url);
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(`Request timeout after ${FETCH_TIMEOUT}ms`);
+      throw new Error(`Request timeout after ${timeoutMs}ms`);
     }
     throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 /**
- * Parse HTML and intelligently extract main content
+ * Parse HTML string and convert main content to clean Markdown
  */
-function parseHtml(html: string): ParsedContent {
-  // Extract title
-  const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
-  const title = titleMatch ? cleanText(titleMatch[1]) : undefined;
+export function parseHtml(html: string, baseUrl?: string): ParsedContent {
+  try {
+    const window = new Window();
+    const doc = window.document;
+    doc.body.innerHTML = html;
 
-  // Remove noise elements
-  html = html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '')
-    .replace(/<iframe[^>]*>[\s\S]*?<\/iframe>/gi, '')
-    .replace(/<!--[\s\S]*?-->/g, '');
+    // Extract title
+    const titleEl = doc.querySelector('title');
+    const ogTitle = doc.querySelector('meta[property="og:title"]')?.getAttribute('content');
+    const title = cleanWhitespace(titleEl?.textContent || ogTitle || '');
 
-  // Remove common non-content areas by id/class patterns
-  html = removeElementsByPattern(html, [
-    'nav', 'header', 'footer', 'sidebar', 'menu', 'advertisement',
-    'ad-', 'cookie', 'banner', 'popup', 'modal', 'comment', 'social',
-    'share', 'related', 'recommended'
-  ]);
+    // Extract description
+    const metaDesc =
+      doc.querySelector('meta[name="description"]')?.getAttribute('content') ||
+      doc.querySelector('meta[property="og:description"]')?.getAttribute('content') ||
+      undefined;
 
-  // Extract content blocks with scoring
-  const blocks = extractContentBlocks(html);
-  
-  // Sort by score and take best blocks
-  blocks.sort((a, b) => b.score - a.score);
-  
-  // Combine top scoring blocks
-  let text = blocks
-    .slice(0, Math.min(10, blocks.length)) // Top 10 blocks
-    .map(b => b.text)
-    .join('\n\n');
+    // Extract published date
+    const metaDate =
+      doc.querySelector('meta[property="article:published_time"]')?.getAttribute('content') ||
+      doc.querySelector('meta[name="date"]')?.getAttribute('content') ||
+      doc.querySelector('meta[name="publishdate"]')?.getAttribute('content') ||
+      undefined;
 
-  // Clean up
-  text = cleanText(text);
+    // Remove noise tags from DOM
+    const noiseSelectors = [
+      'script',
+      'style',
+      'noscript',
+      'iframe',
+      'svg',
+      'canvas',
+      'nav',
+      'footer',
+      'aside',
+      'header',
+      'form',
+      'dialog',
+      '.ad',
+      '.ads',
+      '.advertisement',
+      '.cookie-banner',
+      '.cookie-consent',
+      '.popup',
+      '.modal',
+      '.share-buttons',
+      '.social-share',
+    ];
 
-  // Truncate if needed
-  const originalLength = text.length;
-  if (text.length > MAX_CONTENT_LENGTH) {
-    text = text.substring(0, MAX_CONTENT_LENGTH) + '\n\n[Content truncated...]';
-  }
-
-  return {
-    title,
-    text,
-    contentLength: originalLength,
-  };
-}
-
-/**
- * Remove elements matching common non-content patterns
- */
-function removeElementsByPattern(html: string, patterns: string[]): string {
-  for (const pattern of patterns) {
-    // Remove by class
-    html = html.replace(new RegExp(`<[^>]+class="[^"]*${pattern}[^"]*"[^>]*>[\s\S]*?</[^>]+>`, 'gi'), '');
-    // Remove by id
-    html = html.replace(new RegExp(`<[^>]+id="[^"]*${pattern}[^"]*"[^>]*>[\s\S]*?</[^>]+>`, 'gi'), '');
-  }
-  return html;
-}
-
-/**
- * Extract and score content blocks
- */
-function extractContentBlocks(html: string): ContentBlock[] {
-  const blocks: ContentBlock[] = [];
-  
-  // Find potential content containers (div, section, article, main, p)
-  const containerPattern = /<(div|section|article|main|p)([^>]*)>([\s\S]*?)<\/\1>/gi;
-  let match;
-  
-  while ((match = containerPattern.exec(html)) !== null) {
-    const tag = match[1];
-    const attributes = match[2];
-    const content = match[3];
-    
-    // Skip if it's likely a non-content container
-    if (isNonContentContainer(attributes)) {
-      continue;
+    for (const selector of noiseSelectors) {
+      try {
+        const elements = doc.querySelectorAll(selector);
+        for (const el of elements) {
+          el.remove();
+        }
+      } catch {
+        /* ignore selector errors */
+      }
     }
-    
-    // Extract text from this block (strip nested HTML)
-    const text = extractTextFromHtml(content);
-    
-    if (text.length < 50) continue; // Skip tiny blocks
-    
-    // Calculate score
-    const score = scoreContent(text, content, tag, attributes);
-    const linkDensity = calculateLinkDensity(content, text);
-    
-    blocks.push({
-      text: text.trim(),
-      score,
-      linkDensity
-    });
+
+    // Identify main content container if possible
+    const mainContainer =
+      doc.querySelector('article') ||
+      doc.querySelector('main') ||
+      doc.querySelector('[role="main"]') ||
+      doc.querySelector('#content') ||
+      doc.querySelector('.content') ||
+      doc.querySelector('.post-content') ||
+      doc.querySelector('.article-content') ||
+      doc.body;
+
+    let markdown = domToMarkdown(mainContainer, baseUrl);
+    markdown = normalizeMarkdown(markdown);
+
+    const originalLength = markdown.length;
+    if (markdown.length > MAX_CONTENT_LENGTH) {
+      markdown = markdown.substring(0, MAX_CONTENT_LENGTH) + '\n\n[Content truncated...]';
+    }
+
+    return {
+      title: title || undefined,
+      description: metaDesc ? cleanWhitespace(metaDesc) : undefined,
+      publishedAt: metaDate ? cleanWhitespace(metaDate) : undefined,
+      text: markdown,
+      contentLength: originalLength,
+    };
+  } catch {
+    // Fallback: regex text cleaner if DOM parser fails
+    return fallbackRegexParser(html);
   }
-  
-  return blocks;
 }
 
 /**
- * Check if attributes suggest non-content container
+ * Convert a DOM node and its children into Markdown
  */
-function isNonContentContainer(attributes: string): boolean {
-  const nonContentPatterns = [
-    'nav', 'sidebar', 'menu', 'footer', 'header', 'ad', 'comment',
-    'social', 'share', 'cookie', 'banner', 'popup'
-  ];
-  
-  const attrLower = attributes.toLowerCase();
-  return nonContentPatterns.some(pattern => attrLower.includes(pattern));
-}
+function domToMarkdown(node: any, baseUrl?: string): string {
+  if (!node) return '';
 
-/**
- * Score content block based on multiple signals
- */
-function scoreContent(text: string, html: string, tag: string, attributes: string): number {
-  let score = 0;
-  
-  // Tag bonus
-  if (tag === 'article') score += 30;
-  else if (tag === 'main') score += 25;
-  else if (tag === 'section') score += 10;
-  else if (tag === 'p') score += 5;
-  
-  // Attribute bonus for content indicators
-  const attrLower = attributes.toLowerCase();
-  if (/article|content|main|post|entry|text|body/i.test(attrLower)) {
-    score += 20;
+  // Node type 3: Text node
+  if (node.nodeType === 3) {
+    return cleanInlineWhitespace(node.textContent || '');
   }
-  
-  // Text length bonus (more text = more likely main content)
-  const textLength = text.length;
-  if (textLength > 500) score += 15;
-  if (textLength > 1000) score += 15;
-  if (textLength > 2000) score += 10;
-  
-  // Paragraph count (real articles have multiple paragraphs)
-  const paragraphs = (html.match(/<p[^>]*>/gi) || []).length;
-  score += Math.min(paragraphs * 3, 30);
-  
-  // Sentence structure (periods suggest real content)
-  const sentences = (text.match(/[.!?]+/g) || []).length;
-  score += Math.min(sentences * 2, 20);
-  
-  // Penalize high link density
-  const linkDensity = calculateLinkDensity(html, text);
-  if (linkDensity > 0.5) score -= 30;
-  else if (linkDensity > 0.3) score -= 15;
-  
-  // Penalize very short text
-  if (textLength < 100) score -= 20;
-  
-  return score;
+
+  // Node type 1: Element node
+  if (node.nodeType !== 1) return '';
+
+  const tag = (node.tagName || '').toUpperCase();
+  const children = Array.from(node.childNodes || []);
+
+  const renderChildren = () => children.map(child => domToMarkdown(child, baseUrl)).join('');
+
+  switch (tag) {
+    case 'H1':
+      return `\n\n# ${renderChildren().trim()}\n\n`;
+    case 'H2':
+      return `\n\n## ${renderChildren().trim()}\n\n`;
+    case 'H3':
+      return `\n\n### ${renderChildren().trim()}\n\n`;
+    case 'H4':
+      return `\n\n#### ${renderChildren().trim()}\n\n`;
+    case 'H5':
+      return `\n\n##### ${renderChildren().trim()}\n\n`;
+    case 'H6':
+      return `\n\n###### ${renderChildren().trim()}\n\n`;
+
+    case 'P': {
+      const text = renderChildren().trim();
+      return text ? `\n\n${text}\n\n` : '';
+    }
+
+    case 'BR':
+      return '\n';
+
+    case 'HR':
+      return '\n\n---\n\n';
+
+    case 'B':
+    case 'STRONG': {
+      const text = renderChildren().trim();
+      return text ? ` **${text}** ` : '';
+    }
+
+    case 'I':
+    case 'EM': {
+      const text = renderChildren().trim();
+      return text ? ` *${text}* ` : '';
+    }
+
+    case 'CODE': {
+      const parentTag = (node.parentNode?.tagName || '').toUpperCase();
+      if (parentTag === 'PRE') {
+        return node.textContent || '';
+      }
+      const code = (node.textContent || '').trim();
+      return code ? ` \`${code}\` ` : '';
+    }
+
+    case 'PRE': {
+      const codeEl = node.querySelector('code');
+      const langClass = (codeEl?.getAttribute('class') || node.getAttribute('class') || '');
+      const langMatch = langClass.match(/language-([a-zA-Z0-9_-]+)/);
+      const lang = langMatch ? langMatch[1] : '';
+      const code = (codeEl?.textContent || node.textContent || '').trim();
+      return `\n\n\`\`\`${lang}\n${code}\n\`\`\`\n\n`;
+    }
+
+    case 'BLOCKQUOTE': {
+      const inner = renderChildren().trim();
+      return inner
+        ? '\n\n' + inner.split('\n').map(line => `> ${line}`).join('\n') + '\n\n'
+        : '';
+    }
+
+    case 'UL':
+    case 'OL': {
+      const isOrdered = tag === 'OL';
+      const items = Array.from(node.children || []).filter((el: any) => (el.tagName || '').toUpperCase() === 'LI');
+      if (items.length === 0) return renderChildren();
+      const rendered = items.map((li: any, idx) => {
+        const prefix = isOrdered ? `${idx + 1}. ` : '* ';
+        const itemText = domToMarkdown(li, baseUrl).trim();
+        return `${prefix}${itemText}`;
+      }).join('\n');
+      return `\n\n${rendered}\n\n`;
+    }
+
+    case 'LI': {
+      return renderChildren().trim();
+    }
+
+    case 'A': {
+      const href = node.getAttribute('href');
+      const text = renderChildren().trim();
+      if (!href || href.startsWith('#') || href.startsWith('javascript:')) {
+        return text;
+      }
+      let fullUrl = href;
+      if (baseUrl && !href.startsWith('http://') && !href.startsWith('https://')) {
+        try {
+          fullUrl = new URL(href, baseUrl).toString();
+        } catch {
+          fullUrl = href;
+        }
+      }
+      return text ? `[${text}](${fullUrl})` : '';
+    }
+
+    case 'TABLE': {
+      return renderTable(node, baseUrl);
+    }
+
+    case 'SECTION':
+    case 'ARTICLE':
+    case 'MAIN':
+    case 'DIV': {
+      return renderChildren();
+    }
+
+    default:
+      return renderChildren();
+  }
 }
 
 /**
- * Calculate link density (links vs text ratio)
+ * Convert HTML Table to Markdown Table
  */
-function calculateLinkDensity(html: string, text: string): number {
-  const linkTextLength = (html.match(/<a[^>]*>([\s\S]*?)<\/a>/gi) || [])
-    .map(link => extractTextFromHtml(link).length)
-    .reduce((sum, len) => sum + len, 0);
-    
-  return text.length > 0 ? linkTextLength / text.length : 1;
+function renderTable(tableNode: any, baseUrl?: string): string {
+  try {
+    const rows = Array.from(tableNode.querySelectorAll('tr'));
+    if (rows.length === 0) return '';
+
+    const tableData: string[][] = [];
+    for (const row of rows as any[]) {
+      const cells = Array.from(row.querySelectorAll('th, td'));
+      if (cells.length > 0) {
+        tableData.push(
+          cells.map((cell: any) => {
+            return domToMarkdown(cell, baseUrl).replace(/\n+/g, ' ').replace(/\|/g, '\\|').trim();
+          })
+        );
+      }
+    }
+
+    if (tableData.length === 0) return '';
+
+    const maxCols = Math.max(...tableData.map(r => r.length));
+    if (maxCols === 0) return '';
+
+    const header = tableData[0];
+    while (header.length < maxCols) header.push('');
+    const separator = Array(maxCols).fill('---');
+
+    const lines = [
+      `| ${header.join(' | ')} |`,
+      `| ${separator.join(' | ')} |`,
+    ];
+
+    for (let i = 1; i < tableData.length; i++) {
+      const row = tableData[i];
+      while (row.length < maxCols) row.push('');
+      lines.push(`| ${row.join(' | ')} |`);
+    }
+
+    return `\n\n${lines.join('\n')}\n\n`;
+  } catch {
+    return '';
+  }
 }
 
 /**
- * Extract plain text from HTML (strip all tags)
+ * Clean inline whitespace without removing line breaks
  */
-function extractTextFromHtml(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, ' ') // Remove tags
-    .replace(/\s+/g, ' ')      // Normalize whitespace
-    .trim();
+function cleanInlineWhitespace(text: string): string {
+  return text.replace(/[ \t\r\f]+/g, ' ');
 }
 
 /**
- * Clean and normalize text
+ * Clean global whitespace and decode common HTML entities
  */
-function cleanText(text: string): string {
+function cleanWhitespace(text: string): string {
   return text
-    // Decode HTML entities
     .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-    // Remove excessive whitespace
     .replace(/\s+/g, ' ')
-    .replace(/\n\s*\n\s*\n/g, '\n\n') // Max 2 newlines
     .trim();
+}
+
+/**
+ * Normalize markdown layout (remove excessive blank lines)
+ */
+function normalizeMarkdown(md: string): string {
+  return md
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^[ \t]+/gm, '')
+    .trim();
+}
+
+/**
+ * Regex-based fallback parser
+ */
+function fallbackRegexParser(html: string): ParsedContent {
+  const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
+  const title = titleMatch ? cleanWhitespace(titleMatch[1]) : undefined;
+
+  let cleaned = html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const originalLength = cleaned.length;
+  if (cleaned.length > MAX_CONTENT_LENGTH) {
+    cleaned = cleaned.substring(0, MAX_CONTENT_LENGTH) + '...';
+  }
+
+  return {
+    title,
+    text: cleaned,
+    contentLength: originalLength,
+  };
 }
