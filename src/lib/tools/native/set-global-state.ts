@@ -82,7 +82,7 @@ const setGlobalStateTool: NativeToolDefinition = {
         // any-typed against this tool's schema, so engine-side coercion does not
         // touch it — the webapp validates/coerces it against the namespace's
         // actual schema (see webapp validateNamespaceWriteValue).
-        type: ['string', 'number', 'boolean', 'object', 'array', 'null'],
+        
         description:
           'The value to store. Accepts any JSON-serialisable value (string, number, boolean, object, array, null).',
       },
