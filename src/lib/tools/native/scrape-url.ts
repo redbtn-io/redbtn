@@ -1,21 +1,12 @@
 /**
  * Scrape URL — Native Tool
  *
- * Fetches a URL and extracts its main readable content as markdown / text /
- * raw html. Reuses the existing `fetchAndParse` smart-extractor in
- * `src/lib/nodes/scrape/parser.ts` for the markdown / text path; for raw
- * html we do a separate fetch since the parser strips html.
- *
- * Ported from: src/lib/mcp/servers/web-sse.ts → scrape_url
- *
- * Spec: TOOL-HANDOFF.md §4.1
- *   - inputs: url (required), format ('markdown'|'text'|'html', default 'markdown'),
- *             timeout (ms, default 30000, max 120000)
- *   - output: { url, title, content, contentLength, scrapedAt }
+ * Fetches a URL and extracts its main readable content as structured Markdown,
+ * clean plaintext, or raw HTML using Happy-DOM content extraction.
  */
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
-import { fetchAndParse } from '../../nodes/scrape/parser';
+import { fetchAndParse, DEFAULT_BROWSER_HEADERS } from '../../nodes/scrape/parser';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -34,11 +25,7 @@ function isHttpUrl(value: string): boolean {
 }
 
 /**
- * Fetch raw HTML — used by the `'html'` format only.
- *
- * Mirrors the User-Agent and Accept headers from `fetchAndParse` so that
- * sites that gate on those headers behave the same way regardless of which
- * `format` was requested.
+ * Fetch raw HTML — used by the 'html' format only.
  */
 async function fetchRawHtml(
   url: string,
@@ -48,7 +35,6 @@ async function fetchRawHtml(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  // Forward run-level abort to this request
   const onRunAbort = abortSignal ? () => controller.abort() : null;
   if (abortSignal && onRunAbort) {
     if (abortSignal.aborted) controller.abort();
@@ -58,10 +44,8 @@ async function fetchRawHtml(
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; RedAI/1.0; +https://redbtn.io)',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
+      headers: DEFAULT_BROWSER_HEADERS,
+      redirect: 'follow',
     });
 
     if (!response.ok) {
@@ -83,7 +67,7 @@ async function fetchRawHtml(
 
 const scrapeUrlTool: NativeToolDefinition = {
   description:
-    'Fetch a URL and extract its main readable content as markdown. Use to read article bodies, docs, or any URL whose content you need to summarize.',
+    'Fetch a URL and extract its main readable content as clean Markdown with headings, lists, tables, and code blocks preserved.',
   server: 'web',
   inputSchema: {
     type: 'object',
@@ -170,10 +154,7 @@ const scrapeUrlTool: NativeToolDefinition = {
         title = t;
         content = html;
       } else {
-        // markdown / text — use the smart extractor (returns plain text).
-        // The parser today returns a plaintext-ish form; we surface it as
-        // both 'markdown' (LLM-consumable) and 'text' aliases.
-        const parsed = await fetchAndParse(url);
+        const parsed = await fetchAndParse(url, timeout);
         title = parsed.title;
         content = parsed.text;
       }
@@ -186,7 +167,6 @@ const scrapeUrlTool: NativeToolDefinition = {
         `[scrape_url] ${url} → ${contentLength} chars (${duration}ms, format=${format})`,
       );
 
-      // Best-effort progress event
       const publisher = context?.publisher || null;
       if (publisher) {
         try {
