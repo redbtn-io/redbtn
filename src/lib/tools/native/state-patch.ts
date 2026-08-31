@@ -139,7 +139,7 @@ const statePatchTool: NativeToolDefinition = {
               // engine-side coercion does not touch it — the webapp validates/
               // coerces the resulting document against the namespace's actual
               // schema (see webapp validateNamespaceWriteValue).
-              type: ['string', 'number', 'boolean', 'object', 'array', 'null'],
+              
               description:
                 'Operand value. Required for set/append/prepend/merge/inc; omitted for remove. ' +
                 'For `inc`, must be a number. For `merge`, must be an object.',

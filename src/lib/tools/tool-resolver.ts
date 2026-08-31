@@ -413,6 +413,32 @@ export function partitionToolRefs(refs: ToolRef[]): {
  * `description`, and `schema` (JSON Schema). Some providers may additionally
  * accept `function` shapes; the LangChain core normalises both.
  */
+/**
+ * Recursively sanitize JSON schema for LLM provider function declaration compatibility.
+ * Specifically handles union type arrays (e.g. type: ['string', 'null']) which
+ * Google Gemini / OpenAPI / Protobuf schema parsers reject.
+ */
+export function sanitizeSchemaForProvider(schema: any): any {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) {
+    return schema.map(sanitizeSchemaForProvider);
+  }
+  const clean: Record<string, any> = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'type' && Array.isArray(value)) {
+      const nonNullTypes = value.filter((t) => t !== 'null');
+      if (nonNullTypes.length === 1 && typeof nonNullTypes[0] === 'string') {
+        clean.type = nonNullTypes[0];
+      }
+    } else if (value && typeof value === 'object') {
+      clean[key] = sanitizeSchemaForProvider(value);
+    } else {
+      clean[key] = value;
+    }
+  }
+  return clean;
+}
+
 export function toBindToolsPayload(tools: ResolvedTool[]): Array<{
   name: string;
   description: string;
@@ -421,6 +447,6 @@ export function toBindToolsPayload(tools: ResolvedTool[]): Array<{
   return tools.map((t) => ({
     name: t.name,
     description: t.description,
-    schema: t.inputSchema,
+    schema: sanitizeSchemaForProvider(t.inputSchema || {}),
   }));
 }
