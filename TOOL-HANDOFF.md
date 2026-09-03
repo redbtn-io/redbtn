@@ -190,7 +190,7 @@ All routes live under `/api/v1/state/namespaces`. Reuse `GlobalStateClient` in `
 | `get_global_state` | `namespace`, `key` | `{ value: any, exists: boolean }` |
 | `set_global_state` | `namespace`, `key`, `value`, `description?`, `ttlSeconds?` | `{ ok: true }` |
 | `delete_global_state` | `namespace`, `key` | `{ ok: true, existed: boolean }` |
-| `list_global_state` | `namespace` | `{ values: { [key]: any } }` |
+| `list_global_state` | `namespace`, `limit?`, `offset?`, `keysOnly?`, `maxValueBytes?`, `maxTotalBytes?` | `{ values: { [key]: any }, total, returned, offset, limit, hasMore, nextOffset, bytes, truncatedValues?, notice }` |
 | `list_namespaces` | (none) | `{ namespaces: [{ name, keyCount, lastModified }] }` |
 | `delete_namespace` | `namespace` | `{ ok: true, deletedKeys: number }` |
 
@@ -198,6 +198,13 @@ All routes live under `/api/v1/state/namespaces`. Reuse `GlobalStateClient` in `
 - `value` accepts arbitrary JSON.
 - Description on `set_global_state` is metadata for the UI.
 - TTL is server-enforced.
+- `list_global_state` is **paginated by default** — 25 keys, values over 1024 serialised bytes replaced
+  by a `{ __truncated: true, bytes, fields, preview, hint }` marker, 16 KB page budget. A namespace is
+  unbounded and can be hundreds of KB (measured 2026-09-02: `Red-Projects` = 20 keys / 328,317 chars, of
+  which two keys were 138 KB and 128 KB), which silently exceeds a realtime model's context. Note the
+  skew: a key-count limit alone is not a fix, hence the byte budgets. Pass
+  `limit: 1000, maxValueBytes: 0, maxTotalBytes: 0` for the old unbounded behaviour, or `keysOnly: true`
+  for a cheap "what is in here?" call. `skip` is accepted as an alias for `offset`.
 - Cache: every tool invokes the client fresh — do **not** rely on `GlobalStateClient`'s in-memory cache between tool calls (different requests, different instances).
 
 ### 4.3 Conversation pack
