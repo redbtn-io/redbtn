@@ -155,8 +155,9 @@ function truncationMarker(namespace: string, key: string, value: any, bytes: num
     type: valueType(value),
     hint:
       `Value is ${bytes} bytes, over the ${budget}-byte maxValueBytes budget. ` +
-      `Call get_global_state with namespace "${namespace}" and key "${key}" for the full value, ` +
-      `or re-call list_global_state with a larger maxValueBytes.`,
+      `Call get_global_state with namespace "${namespace}" and key "${key}" to read it — ` +
+      `that tool is bounded the same way, so a huge value comes back a page at a time ` +
+      `(use its path/offset to go deeper) — or re-call list_global_state with a larger maxValueBytes.`,
   };
 
   if (Array.isArray(value)) {
@@ -200,7 +201,7 @@ const listGlobalStateTool: NativeToolDefinition = {
     'Paginated by default (25 keys, values over 1KB replaced with a marker giving the size and a preview, 16KB page budget) ' +
     'because a whole namespace can be hundreds of KB and will not fit in context. ' +
     'The response reports total, returned, hasMore and nextOffset — say "showing X of Y" and call again with offset for more. ' +
-    'Use keysOnly:true to just see what keys exist, and get_global_state to read one large value in full.',
+    'Use keysOnly:true to just see what keys exist, and get_global_state to read one large value (it is paged the same way).',
   server: 'state',
   inputSchema: {
     type: 'object',
@@ -448,7 +449,7 @@ function buildNotice(o: {
     parts.push(
       `${o.truncatedCount} value(s) were too large to inline and appear as ` +
         `{ "__truncated": true, ... } markers listing their real size and a preview — ` +
-        `use get_global_state to read one in full. Do not present a marker as the value.`,
+        `use get_global_state to read one — it pages the same way. Do not present a marker as the value.`,
     );
   }
 
