@@ -187,7 +187,7 @@ All routes live under `/api/v1/state/namespaces`. Reuse `GlobalStateClient` in `
 
 | Tool | Inputs | Output |
 |---|---|---|
-| `get_global_state` | `namespace`, `key` | `{ value: any, exists: boolean }` |
+| `get_global_state` | `namespace`, `key`, `path?`, `offset?`, `limit?`, `keysOnly?`, `maxValueBytes?`, `maxTotalBytes?` | `{ value: any, exists: boolean }` when the whole value fits; otherwise `+ { namespace, key, path?, type, bytes, storedBytes, total, returned, offset, hasMore, nextOffset, truncated, truncatedMembers?, notice }` |
 | `set_global_state` | `namespace`, `key`, `value`, `description?`, `ttlSeconds?` | `{ ok: true }` |
 | `delete_global_state` | `namespace`, `key` | `{ ok: true, existed: boolean }` |
 | `list_global_state` | `namespace`, `limit?`, `offset?`, `keysOnly?`, `maxValueBytes?`, `maxTotalBytes?` | `{ values: { [key]: any }, total, returned, offset, limit, hasMore, nextOffset, bytes, truncatedValues?, notice }` |
@@ -198,6 +198,20 @@ All routes live under `/api/v1/state/namespaces`. Reuse `GlobalStateClient` in `
 - `value` accepts arbitrary JSON.
 - Description on `set_global_state` is metadata for the UI.
 - TTL is server-enforced.
+- `get_global_state` is **bounded by default** — a value over 16384 serialised bytes comes back one page of
+  members at a time, with members over 1024 bytes replaced by a `{ __truncated: true, bytes, type, fields,
+  preview, path, hint }` marker. A single VALUE is unbounded too (measured 2026-09-02: `Red-Projects/Become`
+  = 138,014 B, `eliteEntries` = 127,970 B), and `list_global_state`'s marker points the model straight at
+  this tool, so leaving it unbounded just moved the problem one step downstream. "Member" means an object's
+  fields (sorted by name), an array's elements, or a string's characters — so `offset`/`nextOffset` page
+  every shape of value to completion. `path` is a JSONPath selector (same subset as `json_query`) for
+  drilling into one part of a large value; every marker carries the exact `path` for its own next call.
+  Two deliberate differences from `list_global_state`: a value that already fits is returned **untouched**
+  (no per-member clipping — there is only one value here, so the total budget is the whole story), and when
+  nothing was reduced and nothing extra was asked for the payload is literally `{ value, exists }` with no
+  envelope, so existing callers are byte-for-byte unaffected. Measured on the real namespace: 17 of 20 keys
+  are byte-identical under the defaults; `Become` 138,038 → 10,584 B, `eliteEntries` 127,994 → 8,342 B.
+  `maxValueBytes: 0, maxTotalBytes: 0` restores the old unbounded output exactly. `skip` aliases `offset`.
 - `list_global_state` is **paginated by default** — 25 keys, values over 1024 serialised bytes replaced
   by a `{ __truncated: true, bytes, fields, preview, hint }` marker, 16 KB page budget. A namespace is
   unbounded and can be hundreds of KB (measured 2026-09-02: `Red-Projects` = 20 keys / 328,317 chars, of
