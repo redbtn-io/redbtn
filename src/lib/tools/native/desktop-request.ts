@@ -115,6 +115,29 @@ const REPLY_CHANNEL_PREFIX = 'desktop:reply:';
 // NO desktop is connected (the round-trip timeout is our presence detector).
 const DEFAULT_TIMEOUT_MS = 12_000;
 
+/**
+ * Normalize whatever landed on the id-keyed reply channel into a
+ * `ComputerResultMessage`.
+ *
+ * Exported so the shape the tools receive can be pinned by a test: `result` was
+ * missing from this list, and it is the field carrying the connector's account
+ * of what it actually did (dryRun, op, typed, text, keys, unknownKeys,
+ * foregroundWindow, and the mouse `diag`). Dropping it here meant no tool above
+ * could report input evidence even after the connector started sending it — a
+ * dry-run no-op and a real keystroke both arrived as a bare `{ok:true}`.
+ */
+export function normalizeComputerReply(id: string, parsed: AnyObject): ComputerResultMessage {
+  return {
+    kind: 'computer_result',
+    id,
+    ok: parsed.ok === true,
+    ...(parsed.image ? { image: parsed.image } : {}),
+    ...(parsed.screen ? { screen: parsed.screen } : {}),
+    ...(parsed.result ? { result: parsed.result } : {}),
+    ...(parsed.error ? { error: parsed.error } : {}),
+  };
+}
+
 /** Build a fail-safe `computer_result` carrying a `computer_failed` error. */
 function failResult(id: string, message: string): ComputerResultMessage {
   return {
@@ -199,14 +222,7 @@ export async function requestDesktop(args: RequestDesktopArgs): Promise<Computer
         // exec_result / ack). For computer-use we expect computer_result, but
         // accept whatever lands on this id-keyed channel — it's unique to this
         // request — and normalize to a ComputerResultMessage.
-        finish({
-          kind: 'computer_result',
-          id,
-          ok: parsed.ok === true,
-          ...(parsed.image ? { image: parsed.image } : {}),
-          ...(parsed.screen ? { screen: parsed.screen } : {}),
-          ...(parsed.error ? { error: parsed.error } : {}),
-        });
+        finish(normalizeComputerReply(id, parsed));
       });
 
       // SUBSCRIBE FIRST, then publish — so we can't miss a fast reply.
@@ -350,6 +366,7 @@ export async function requestDesktopRaw(args: RequestDesktopRawArgs): Promise<An
   }
 }
 
-module.exports = { requestDesktop, requestDesktopRaw };
+module.exports = { requestDesktop, requestDesktopRaw, normalizeComputerReply };
 module.exports.requestDesktop = requestDesktop;
 module.exports.requestDesktopRaw = requestDesktopRaw;
+module.exports.normalizeComputerReply = normalizeComputerReply;
