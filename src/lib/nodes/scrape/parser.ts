@@ -39,16 +39,26 @@ export interface ParsedContent {
  * engine runs on the private fleet network — so the fetch goes through
  * `safeFetch`, which refuses private / loopback / link-local targets and
  * re-checks every redirect hop (max 5).
+ *
+ * `options.trusted` is passed straight to the guard and gates ONLY the
+ * `SSRF_ALLOW_HOSTS` escape hatch. It defaults to false, so a caller that does
+ * not know its own trust fails closed. `web_search` deliberately never passes
+ * it: a search-result URL was never typed by an author.
  */
-export async function fetchAndParse(url: string, timeoutMs = FETCH_TIMEOUT): Promise<ParsedContent> {
+export async function fetchAndParse(
+  url: string,
+  timeoutMs = FETCH_TIMEOUT,
+  options: { trusted?: boolean } = {},
+): Promise<ParsedContent> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await safeFetch(url, {
-      signal: controller.signal,
-      headers: DEFAULT_BROWSER_HEADERS,
-    });
+    const response = await safeFetch(
+      url,
+      { signal: controller.signal, headers: DEFAULT_BROWSER_HEADERS },
+      { trusted: options.trusted === true },
+    );
 
     clearTimeout(timer);
 

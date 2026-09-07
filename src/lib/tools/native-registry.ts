@@ -39,12 +39,23 @@ export interface NativeToolContext {
    * # What it means
    *
    * `true` says "the arguments of this tool call were chosen by a language
-   * model, not by a graph author". The only consumer today is `fetch_url`,
-   * which will NOT attach the run's `Authorization` / `X-User-Id` /
-   * `X-Internal-Key` headers when this flag is set — even for an allowlisted
-   * internal host — because a prompt-injected model that picks the URL would
-   * otherwise be handing itself the platform's `INTERNAL_SERVICE_KEY` against
-   * an arbitrary internal endpoint, authenticated as the run's user.
+   * model, not by a graph author". Its consumers:
+   *
+   *   - `fetch_url` will NOT attach the run's `Authorization` / `X-User-Id` /
+   *     `X-Internal-Key` headers when this flag is set — even for an
+   *     allowlisted internal host — because a prompt-injected model that picks
+   *     the URL would otherwise be handing itself the platform's
+   *     `INTERNAL_SERVICE_KEY` against an arbitrary internal endpoint,
+   *     authenticated as the run's user. It is the only tool that attaches
+   *     those headers at all.
+   *   - `send_webhook` (via `native/_outbound-url`) drops a CALLER-supplied
+   *     copy of the same three headers when an untrusted caller aims at an
+   *     allowlisted internal host.
+   *   - `invoke_graph`, `trigger_automation` and `start_stream_session` stamp
+   *     the taint marker into the child run/session they start.
+   *   - every URL-taking tool passes it, inverted, as `trusted` to the SSRF
+   *     guard, where it gates the `SSRF_ALLOW_HOSTS` escape hatch and nothing
+   *     else.
    *
    * # Who sets it
    *
@@ -84,24 +95,50 @@ export interface NativeToolContext {
    *
    * The claim holds only because the taint marker is stamped at every boundary
    * that starts a sub-run from model-chosen arguments, and read at every
-   * boundary that continues one. Today that is:
+   * boundary that continues one. Every such boundary in the tree today, and
+   * its status — this is an inventory, not an aspiration:
    *
    *   - `tool-resolver.resolveGraph` — a neuron invoking a published graph as
-   *     a tool (`markStateModelDriven`);
+   *     a tool (`markStateModelDriven`). STAMPED.
    *   - `invoke_graph` — the native tool, when its own caller is untrusted or
    *     its parent run is already tainted; it rides on the child `input`,
-   *     because `run()`/`buildInitialState` exposes nothing else;
+   *     because `run()`/`buildInitialState` exposes nothing else. STAMPED.
    *   - `graphExecutor` — copies the marker forward across each nested hop,
    *     including the `inputMapping` branch that rebuilds `data` from empty.
+   *     PROPAGATED.
+   *   - `trigger_automation` — a model-chosen `automationId` + `input` start a
+   *     run through the webapp trigger route. STAMPED into `input`, which the
+   *     route spreads into the run's input and therefore into
+   *     `state.data.input`.
+   *   - `start_stream_session` — a model-chosen `streamId` + `metadata` create
+   *     a session. STAMPED into `metadata`, but read the honest caveat in
+   *     `start-stream-session.ts`: the webapp stores it as the session's
+   *     `triggerData` and does not currently spread `triggerData` into the
+   *     input of the runs a session spawns, so today the marker is provenance
+   *     and a forward guarantee rather than an active control on that path.
    *
-   * Any FUTURE path that starts a run or sub-run from model-chosen arguments
-   * must stamp it too, or this sentence stops being true. New model-facing
-   * entry points (the per-run MCP tool bridge, any future CLI/agent surface)
-   * MUST set `untrustedCaller: true`.
+   * And the boundary taint cannot close, stated plainly rather than left to be
+   * discovered: `create_graph` + `update_automation` + a CRON trigger. A model
+   * can author a graph and point an automation at it; when that automation
+   * fires on its own schedule there is no model context in scope to taint, so
+   * the run starts trusted. The fix for that is capability-gating the
+   * graph-authoring tools, not a marker. Do not read the list above as saying
+   * otherwise.
    *
-   * Note that the SSRF guard in `lib/net/ssrf-guard.ts` applies to
-   * URL-fetching tools regardless of this flag — trusted callers are trusted
-   * with credentials, not with reaching the private network.
+   * Any NEW path that starts a run or sub-run from model-chosen arguments must
+   * stamp it too, or this sentence stops being true. New model-facing entry
+   * points (the per-run MCP tool bridge, any future CLI/agent surface) MUST set
+   * `untrustedCaller: true`.
+   *
+   * Note that the SSRF guard in `lib/net/ssrf-guard.ts` applies regardless of
+   * this flag — trusted callers are trusted with credentials, not with reaching
+   * the private network. It covers every tool whose destination is
+   * caller-supplied: `fetch_url`, `scrape_url`, `web_search`'s content
+   * extraction, `ssh_copy(sourceUrl)`, `send_webhook`, `download_file`,
+   * `upload_attachment(url)`, `invoke_function(url)` and
+   * `transcribe_audio(audioUrl)`. That list is maintained in the `ssrf-guard`
+   * module header; a tool whose URL comes from an env var (`BASE_URL`,
+   * `REDRUN_URL`, `STT_URL`, ...) is deliberately not on it.
    */
   untrustedCaller?: boolean;
   /** Callback for real-time chunk interception (used by stream parsers) */

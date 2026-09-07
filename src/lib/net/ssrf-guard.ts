@@ -3,13 +3,33 @@
  *
  * # Why this exists
  *
- * Several native tools fetch a URL the *model* chose (`fetch_url`, `scrape_url`,
- * `ssh_copy(sourceUrl)`, and the pages `web_search` scrapes when
- * `extractContent` is on). The engine runs inside the redbtn worker, which sits
- * on the private fleet network: without a guard, a prompt-injected run can point
- * any of those tools at `http://10.100.0.x/...`, `http://127.0.0.1:<port>/...`
- * or `http://169.254.169.254/...` and use the worker as a proxy into the private
- * network from the outside.
+ * Several native tools fetch a URL the *model* chose. The engine runs inside the
+ * redbtn worker, which sits on the private fleet network: without a guard, a
+ * prompt-injected run can point any of them at `http://10.100.0.x/...`,
+ * `http://127.0.0.1:<port>/...` or `http://169.254.169.254/...` and use the
+ * worker as a proxy into the private network from the outside.
+ *
+ * The complete set of tools whose destination is caller-supplied, and which
+ * therefore route through this module — keep this list honest, it is the one
+ * place that claims coverage:
+ *
+ *   - `fetch_url` (`url`)                — runs its own guarded redirect loop
+ *   - `scrape_url` (`url`)               — via `nodes/scrape/parser.fetchAndParse`
+ *   - `web_search` (`extractContent`)    — same helper, on each result page
+ *   - `ssh_copy` (`sourceUrl`)           — {@link safeFetch}
+ *   - `send_webhook` (`url`)             — {@link safeFetch}
+ *   - `download_file` (`url`)            — {@link safeFetch}
+ *   - `upload_attachment` (`url`)        — {@link safeFetch} on the SOURCE url
+ *                                          only; the upload target is a fixed
+ *                                          internal endpoint from `BASE_URL`
+ *   - `invoke_function` (`url`)          — {@link safeFetch} on submit, poll and
+ *                                          log-stream requests
+ *   - `transcribe_audio` (`audioUrl`)    — {@link safeFetch}
+ *
+ * A tool whose URL is built from an env var (`BASE_URL`, `WEBAPP_URL`,
+ * `REDRUN_URL`, `STT_URL`, `TTS_URL`) is deliberately NOT on this list: the
+ * destination is the deployment's own, not the caller's, and guarding it would
+ * break every worker whose webapp is on `localhost` or the fleet LAN.
  *
  * This module is the single chokepoint that stops that:
  *
@@ -24,6 +44,36 @@
  *     inside `fetch` re-resolves and re-connects without ever consulting us — a
  *     public URL that 302s to `http://10.100.0.10:9000` would otherwise sail
  *     straight through the front-door check.
+ *
+ * # Deploy-time escape hatch: `SSRF_ALLOW_HOSTS`
+ *
+ * The guard blocks every private address, and it does so for AUTHORED graph
+ * steps as well as for model-chosen URLs — an authored `fetch_url` pointed at
+ * `http://10.100.0.3:4000` (the fleet API), `http://192.168.1.5:3000` (a redRun
+ * instance) or a `localhost` `WEBAPP_URL` starts returning
+ * `BLOCKED_PRIVATE_ADDRESS`. That is deliberate. When a deployment genuinely
+ * needs one of those destinations, the answer is an explicit, narrow allowlist,
+ * NOT a weaker guard:
+ *
+ *   SSRF_ALLOW_HOSTS=fleet.internal,10.100.0.3,192.168.1.0/24
+ *
+ * Rules, all of them deliberate:
+ *
+ *   - **Default empty.** No entry ships in the repo, and an unset/blank value
+ *     means the guard behaves exactly as it does without this feature.
+ *   - **Trusted requests only.** The allowlist is consulted only when the
+ *     caller passes `{ trusted: true }`, which every tool derives from
+ *     `NativeToolContext.untrustedCaller` being falsy. A model-chosen URL can
+ *     never reach an allowlisted private address, so the hatch cannot be used
+ *     to re-open the hole this module exists to close.
+ *   - **Exact match only.** An entry is either a whole hostname (compared
+ *     case-insensitively, never as a prefix or suffix), a single IP literal, or
+ *     an IPv4 CIDR. There is no wildcard form: `.internal` matches nothing.
+ *   - **Logged on every use**, with the URL, host and address that was allowed,
+ *     so a private destination in production is visible in the run logs rather
+ *     than silent.
+ *   - It never relaxes the scheme check, and it never makes an unresolvable
+ *     host resolvable.
  *
  * # Known residual risk (documented, not fixed here)
  *
@@ -274,6 +324,138 @@ export function isPrivateAddress(value: string): boolean {
 }
 
 // ===========================================================================
+// Deploy-time allowlist (SSRF_ALLOW_HOSTS) — trusted callers only
+// ===========================================================================
+
+/** Parsed form of `SSRF_ALLOW_HOSTS`. Empty unless the env var is set. */
+interface SsrfAllowList {
+  /** Whole hostnames, lowercased. An entry here allows the URL outright. */
+  hosts: Set<string>;
+  /** Normalised IP literals (`v4:10.100.0.3`, `v6:fe80:...`). */
+  ips: Set<string>;
+  /** IPv4 CIDRs, pre-decomposed into a 32-bit base and prefix length. */
+  nets: Array<{ base: number; bits: number }>;
+  /** True when the list has at least one usable entry. */
+  any: boolean;
+}
+
+const EMPTY_ALLOW_LIST: SsrfAllowList = Object.freeze({
+  hosts: new Set<string>(),
+  ips: new Set<string>(),
+  nets: [] as Array<{ base: number; bits: number }>,
+  any: false,
+}) as SsrfAllowList;
+
+/** Canonical key for an IP literal, so `::1` and `0:0:...:1` compare equal. */
+function normalizeIpKey(value: string): string | null {
+  const stripped = value.trim().replace(/^\[|\]$/g, '');
+  if (!stripped) return null;
+  const v4 = parseIpv4(stripped);
+  if (v4) return `v4:${v4.join('.')}`;
+  const v6 = parseIpv6(stripped);
+  if (v6) return `v6:${v6.map((g) => g.toString(16)).join(':')}`;
+  return null;
+}
+
+/** Pack a dotted quad into a 32-bit unsigned integer. */
+function ipv4ToInt(octets: number[]): number {
+  return ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
+}
+
+/**
+ * Parse `SSRF_ALLOW_HOSTS` into its three match forms.
+ *
+ * Read from the environment on every call rather than cached at import: the
+ * worker reads its env at start-up, but tests set and clear the variable
+ * per-case and a cached parse would leak between them. Parsing a short
+ * comma-separated string is not a cost worth caching.
+ *
+ * Unparseable entries are dropped with a warning — a typo must never widen the
+ * list, and it must never crash a request either.
+ */
+export function parseSsrfAllowList(env: NodeJS.ProcessEnv = process.env): SsrfAllowList {
+  const raw = env.SSRF_ALLOW_HOSTS;
+  if (!raw || !raw.trim()) return EMPTY_ALLOW_LIST;
+
+  const hosts = new Set<string>();
+  const ips = new Set<string>();
+  const nets: Array<{ base: number; bits: number }> = [];
+
+  for (const piece of raw.split(',')) {
+    const entry = piece.trim();
+    if (!entry) continue;
+
+    const slash = entry.indexOf('/');
+    if (slash >= 0) {
+      const octets = parseIpv4(entry.slice(0, slash).trim());
+      const bits = Number(entry.slice(slash + 1).trim());
+      if (!octets || !Number.isInteger(bits) || bits < 0 || bits > 32) {
+        console.warn('[ssrf-guard]', `Ignoring unparseable SSRF_ALLOW_HOSTS entry '${entry}' (expected an IPv4 CIDR)`);
+        continue;
+      }
+      nets.push({ base: ipv4ToInt(octets), bits });
+      continue;
+    }
+
+    const ipKey = normalizeIpKey(entry);
+    if (ipKey) {
+      ips.add(ipKey);
+      continue;
+    }
+
+    // Anything else is treated as a hostname. Reject the shapes that would
+    // read as a wildcard so nobody believes `*.internal` works.
+    if (entry.indexOf('*') >= 0 || entry.startsWith('.')) {
+      console.warn('[ssrf-guard]', `Ignoring SSRF_ALLOW_HOSTS entry '${entry}': wildcards are not supported, list the exact hostname`);
+      continue;
+    }
+    hosts.add(entry.toLowerCase());
+  }
+
+  const any = hosts.size > 0 || ips.size > 0 || nets.length > 0;
+  return { hosts, ips, nets, any };
+}
+
+/** True when `address` is named by an IP or CIDR entry on the allowlist. */
+function allowListMatchesAddress(list: SsrfAllowList, address: string): boolean {
+  const key = normalizeIpKey(address);
+  if (key && list.ips.has(key)) return true;
+  if (!list.nets.length) return false;
+  const octets = parseIpv4(address.trim().replace(/^\[|\]$/g, ''));
+  if (!octets) return false;
+  const value = ipv4ToInt(octets);
+  for (const net of list.nets) {
+    // `bits === 0` would shift by 32, which is a no-op in JS — spell it out.
+    const mask = net.bits === 0 ? 0 : (0xffffffff << (32 - net.bits)) >>> 0;
+    if ((value & mask) >>> 0 === (net.base & mask) >>> 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Record an allowlist hit. Deliberately `warn`, not `debug`: reaching a private
+ * address from the worker is an unusual, security-relevant event even when it
+ * is configured, and it must be greppable in production logs.
+ */
+function logAllowListUse(url: string, host: string, address: string): void {
+  console.warn(
+    '[ssrf-guard]',
+    `SSRF_ALLOW_HOSTS: allowing private address ${address} for trusted request to ${host} (${url})`,
+  );
+}
+
+/** Options accepted by every entry point in this module. */
+export interface SsrfCheckOptions {
+  /**
+   * Honour `SSRF_ALLOW_HOSTS`. Pass `true` ONLY when the request's arguments
+   * were chosen by a graph author rather than a model — i.e. when
+   * `NativeToolContext.untrustedCaller` is falsy. Defaults to `false`, so a
+   * caller that forgets fails closed.
+   */
+  trusted?: boolean;
+}
+
+// ===========================================================================
 // DNS resolution (swappable for tests)
 // ===========================================================================
 
@@ -304,9 +486,15 @@ export function __setSsrfLookupForTests(fn: SsrfLookup | null): void {
  * resolves exclusively to public addresses.
  *
  * @param rawUrl absolute URL to check
+ * @param options `{ trusted: true }` consults `SSRF_ALLOW_HOSTS` — see the
+ *   module header. Omit it (the default) for anything model-chosen.
  * @returns the addresses the host resolved to (the literal itself for an IP URL)
  */
-export async function assertPublicUrl(rawUrl: string): Promise<string[]> {
+export async function assertPublicUrl(
+  rawUrl: string,
+  options: SsrfCheckOptions = {},
+): Promise<string[]> {
+  const allow = options.trusted === true ? parseSsrfAllowList() : EMPTY_ALLOW_LIST;
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -328,8 +516,16 @@ export async function assertPublicUrl(rawUrl: string): Promise<string[]> {
     throw new SsrfBlockedError('BLOCKED_INVALID_URL', `URL has no host: ${rawUrl}`, rawUrl);
   }
 
+  // A hostname named outright on the allowlist is allowed whatever it resolves
+  // to; an IP/CIDR entry is matched against the addresses themselves below.
+  const hostAllowed = allow.any && allow.hosts.has(host);
+
   if (isIP(host)) {
     if (isPrivateAddress(host)) {
+      if (allow.any && (hostAllowed || allowListMatchesAddress(allow, host))) {
+        logAllowListUse(rawUrl, host, host);
+        return [host];
+      }
       throw new SsrfBlockedError(
         'BLOCKED_PRIVATE_ADDRESS',
         `Refusing to request a private/loopback address (${host}). ` +
@@ -369,6 +565,10 @@ export async function assertPublicUrl(rawUrl: string): Promise<string[]> {
   // is not ours to decide.
   for (const entry of addresses) {
     if (isPrivateAddress(entry.address)) {
+      if (allow.any && (hostAllowed || allowListMatchesAddress(allow, entry.address))) {
+        logAllowListUse(rawUrl, host, entry.address);
+        continue;
+      }
       throw new SsrfBlockedError(
         'BLOCKED_PRIVATE_ADDRESS',
         `Refusing to request '${host}' — it resolves to a private/loopback address ` +
@@ -392,7 +592,11 @@ export function isRedirectStatus(status: number): boolean {
  * Resolve a `Location` header against the URL it came from and re-run the
  * guard on the result. Throws {@link SsrfBlockedError} when the hop is refused.
  */
-export async function assertPublicRedirect(currentUrl: string, location: string): Promise<string> {
+export async function assertPublicRedirect(
+  currentUrl: string,
+  location: string,
+  options: SsrfCheckOptions = {},
+): Promise<string> {
   let next: string;
   try {
     next = new URL(location, currentUrl).toString();
@@ -403,7 +607,7 @@ export async function assertPublicRedirect(currentUrl: string, location: string)
       location,
     );
   }
-  await assertPublicUrl(next);
+  await assertPublicUrl(next, options);
   return next;
 }
 
@@ -444,7 +648,7 @@ export function stripSensitiveHeaders(headers: Record<string, string>): Record<s
   return out;
 }
 
-export interface SafeFetchOptions {
+export interface SafeFetchOptions extends SsrfCheckOptions {
   /** Follow redirects manually, re-checking each hop. Default true. */
   followRedirects?: boolean;
   /** Hop budget. Default {@link MAX_REDIRECT_HOPS}. */
@@ -474,7 +678,7 @@ export async function safeFetch(
   let body = init.body;
   let headers = toHeaderRecord(init.headers as HeadersInit | undefined);
 
-  await assertPublicUrl(currentUrl);
+  await assertPublicUrl(currentUrl, options);
 
   for (let hop = 0; ; hop++) {
     const response = await globalThis.fetch(currentUrl, {
@@ -498,7 +702,7 @@ export async function safeFetch(
       );
     }
 
-    const nextUrl = await assertPublicRedirect(currentUrl, location);
+    const nextUrl = await assertPublicRedirect(currentUrl, location, options);
 
     if (new URL(nextUrl).origin !== new URL(currentUrl).origin) {
       headers = stripSensitiveHeaders(headers);

@@ -29,6 +29,27 @@
  *
  * The run-level abort signal is honoured — if the run is interrupted while
  * the webhook is in flight, the request is cancelled.
+ *
+ * # Security
+ *
+ * `url` is caller-supplied and this tool runs on the worker, inside the private
+ * fleet network — so `send_webhook({ url: 'http://10.100.0.10:9000/...' })` was
+ * a one-call read/write proxy into the fleet until the guard below existed
+ * (arbitrary method, arbitrary body, and up to 100 KB of the response handed
+ * back to the model). Two controls, both mandatory, both shared with the other
+ * URL-taking tools via `_outbound-url`:
+ *
+ *   1. Every request goes through `safeFetch`, which refuses a host that
+ *      resolves to a private / loopback / link-local address AT REQUEST TIME
+ *      and re-checks each redirect hop (max 5). This replaced
+ *      `redirect: 'follow'`, which re-resolved and reconnected inside `fetch`
+ *      without ever consulting the guard again — a public URL that 302s to
+ *      `http://10.100.0.10:9000` sailed straight through the front-door check.
+ *   2. This tool attaches NO platform credentials, and never should. What it
+ *      does accept is a caller-supplied `headers` map, so a model-chosen
+ *      `Authorization` aimed at an allowlisted internal redbtn host is dropped
+ *      (`sanitizeOutboundHeaders`). A trusted authored step, and any external
+ *      host, keep their headers untouched.
  */
 
 import type {
@@ -36,6 +57,13 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { safeFetch, SsrfBlockedError } from '../../net/ssrf-guard';
+import {
+  callerIsTrusted,
+  sanitizeOutboundHeaders,
+  ssrfBlockedResult,
+  PUBLIC_HOSTS_ONLY_NOTE,
+} from './_outbound-url';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -141,14 +169,18 @@ const sendWebhookTool: NativeToolDefinition = {
     'application/json content-type when body is an object. Returns ' +
     '{ status, response } where response is the parsed JSON body when possible, ' +
     'or the raw text otherwise. Non-2xx surfaces as an error but still includes ' +
-    'the response body for inspection. Honours the run-level abort signal.',
+    'the response body for inspection. Honours the run-level abort signal. ' +
+    PUBLIC_HOSTS_ONLY_NOTE,
   server: 'system',
   inputSchema: {
     type: 'object',
     properties: {
       url: {
         type: 'string',
-        description: 'The webhook URL to POST/GET/etc. Required.',
+        description:
+          'The webhook URL to POST/GET/etc. Required. Refused when the host ' +
+          'resolves to a private, loopback or link-local address at the time ' +
+          'of the request.',
       },
       method: {
         type: 'string',
@@ -328,16 +360,24 @@ const sendWebhookTool: NativeToolDefinition = {
 
     let response: Response;
     try {
-      response = await fetch(url, {
-        method,
-        headers: finalHeaders,
-        body: serialisedBody,
-        signal: controller.signal,
-        redirect: 'follow',
-      });
+      // SSRF guard + credential-header sanitisation. `safeFetch` follows
+      // redirects by hand so hop 2..n is checked exactly like hop 1.
+      response = await safeFetch(
+        url,
+        {
+          method,
+          headers: sanitizeOutboundHeaders(url, finalHeaders, context, 'send_webhook'),
+          body: serialisedBody,
+          signal: controller.signal,
+        },
+        { trusted: callerIsTrusted(context) },
+      );
     } catch (err: unknown) {
       clearTimeout(timer);
       if (runAbortSignal && onRunAbort) runAbortSignal.removeEventListener('abort', onRunAbort);
+      if (err instanceof SsrfBlockedError) {
+        return ssrfBlockedResult(err, 'send_webhook', { url, method });
+      }
       const e = err as { name?: string; message?: string };
       let message: string;
       if (e?.name === 'AbortError') {

@@ -7,6 +7,7 @@
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { fetchAndParse, DEFAULT_BROWSER_HEADERS } from '../../nodes/scrape/parser';
+import { callerIsTrusted } from './_outbound-url';
 import { safeFetch, SsrfBlockedError } from '../../net/ssrf-guard';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -156,7 +157,9 @@ const scrapeUrlTool: NativeToolDefinition = {
         title = t;
         content = html;
       } else {
-        const parsed = await fetchAndParse(url, timeout);
+        const parsed = await fetchAndParse(url, timeout, {
+          trusted: callerIsTrusted(context),
+        });
         title = parsed.title;
         content = parsed.text;
       }

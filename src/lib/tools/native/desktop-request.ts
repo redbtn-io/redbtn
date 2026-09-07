@@ -51,7 +51,21 @@ type AnyObject = Record<string, any>;
  * `src/shared/protocol.ts` `ComputerAction` EXACTLY.
  */
 export type ComputerAction =
-  | { action: 'screenshot'; display?: number; format?: 'png' | 'jpeg' }
+  /**
+   * Capture the screen.
+   *  - default: DOWNSCALED to the click space (~1366px long edge) — good
+   *    grounding, but small text is unreadable.
+   *  - `region` (CLICK SPACE coords): native-resolution crop of that area —
+   *    the "zoom in" path. The desktop clamps the rect to the display.
+   *  - `fullRes`: whole screen at native resolution (large; escape hatch).
+   */
+  | {
+      action: 'screenshot';
+      display?: number;
+      format?: 'png' | 'jpeg';
+      region?: { x: number; y: number; w: number; h: number };
+      fullRes?: boolean;
+    }
   | {
       action: 'mouse';
       op: 'move' | 'click' | 'down' | 'up' | 'scroll';

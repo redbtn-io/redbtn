@@ -32,6 +32,16 @@
  * geometry+dataUrl in the text block for graph authors who wire a downstream
  * neuron with image input from state.
  *
+ * # Zoom
+ *
+ * The default capture is DOWNSCALED to the click space, which grounds clicks
+ * well but makes small text unreadable. `desktop_screenshot` therefore also
+ * takes `region` (a rectangle in click space — the same coordinates
+ * `desktop_click`/`desktop_move` use — cropped at NATIVE resolution) and
+ * `fullRes` (the whole screen at native resolution). Both are passed to the
+ * desktop verbatim; the desktop clamps the rect to the real display. The text
+ * block echoes `region`/`fullRes` so the model knows which view it is reading.
+ *
  * # Fail-safe
  *
  * `requestDesktop` never throws — it returns a `computer_result` with
@@ -97,6 +107,39 @@ function invalidDisplayResult(): NativeMcpResult {
   return textResult({
     ok: false,
     error: { code: 'computer_failed', message: 'display must be a non-negative integer' },
+  }, true);
+}
+
+/** A screenshot crop rectangle in CLICK SPACE (the coordinate space clicks use). */
+type ScreenshotRegion = { x: number; y: number; w: number; h: number };
+
+/**
+ * Optional crop rectangle, or null when explicitly invalid.
+ *
+ * Types only — NO clamping here. The desktop owns the clamp (`computerUse.ts`
+ * maps click space → native pixels and clamps with Math.max/Math.min against
+ * the real display), and a second, engine-side clamp against dimensions we do
+ * not know would silently move the crop away from what the model asked for.
+ */
+function resolveRegion(args: AnyObject): ScreenshotRegion | undefined | null {
+  const raw = args?.region;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const { x, y, w, h } = raw as AnyObject;
+  const offset = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+  const extent = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 1;
+  if (!offset(x) || !offset(y) || !extent(w) || !extent(h)) return null;
+  return { x, y, w, h };
+}
+
+function invalidRegionResult(): NativeMcpResult {
+  return textResult({
+    ok: false,
+    error: {
+      code: 'computer_failed',
+      message:
+        'region must be { x, y, w, h } integers in click space with x >= 0, y >= 0, w >= 1, h >= 1',
+    },
   }, true);
 }
 
@@ -342,7 +385,7 @@ async function runAction(
 
 const desktopScreenshotTool: NativeToolDefinition = {
   description:
-    "Capture a screenshot of the current user's connected desktop (redAgent) and return it as an image the model can see, plus geometry. Round-trips over Redis to the /ws/desktop gateway; fails safe with a computer_failed error if no desktop is connected.",
+    "Capture a screenshot of the current user's connected desktop (redAgent) and return it as an image the model can see, plus geometry. YOU CAN ZOOM: pass `region` to get a native-resolution crop of part of the screen (use it whenever text or detail is too small to read in the default view), or `fullRes` for the whole screen at native resolution. Round-trips over Redis to the /ws/desktop gateway; fails safe with a computer_failed error if no desktop is connected.",
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -362,6 +405,24 @@ const desktopScreenshotTool: NativeToolDefinition = {
         minimum: 0,
         description: 'Display index from desktop_screen_info. Omitted means primary.',
       },
+      region: {
+        type: 'object',
+        description:
+          'Zoom in on part of the screen to read small text or detail. Coordinates are in the SAME CLICK SPACE that desktop_click / desktop_move use (the dimensions reported as `clickSpace` by a default screenshot) — NOT native pixels. The desktop crops that rectangle at NATIVE resolution, so the crop is sharper than the default downscaled view. A region that is off-screen or too large is clamped to the display by the desktop, so it never fails for being out of bounds. Omit for the normal full-screen overview.',
+        properties: {
+          x: { type: 'integer', minimum: 0, description: 'Left edge in click space.' },
+          y: { type: 'integer', minimum: 0, description: 'Top edge in click space.' },
+          w: { type: 'integer', minimum: 1, description: 'Width in click space.' },
+          h: { type: 'integer', minimum: 1, description: 'Height in click space.' },
+        },
+        required: ['x', 'y', 'w', 'h'],
+      },
+      fullRes: {
+        type: 'boolean',
+        description:
+          'Return the WHOLE screen at full native resolution instead of the default click-space downscale. The image is large and costly — prefer `region` when you only need to read one part of the screen. Ignored when `region` is set. Default false.',
+        default: false,
+      },
       timeoutMs: {
         type: 'number',
         description: 'Optional round-trip timeout in ms (default 30000).',
@@ -374,8 +435,14 @@ const desktopScreenshotTool: NativeToolDefinition = {
     const format: 'png' | 'jpeg' = rawArgs?.format === 'jpeg' ? 'jpeg' : 'png';
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
+    const region = resolveRegion(rawArgs);
+    if (region === null) return invalidRegionResult();
+    const fullRes = rawArgs?.fullRes === true;
     const request: ComputerAction = { action: 'screenshot', format };
     if (display !== undefined) request.display = display;
+    // Passed through verbatim; the desktop clamps the rect (computerUse.ts).
+    if (region !== undefined) request.region = region;
+    if (fullRes) request.fullRes = true;
     const result = await runAction(context, request, rawArgs);
     if (!result) return noUserResult();
 
@@ -409,6 +476,10 @@ const desktopScreenshotTool: NativeToolDefinition = {
             sourceHeight: img.sourceHeight,
             clickSpace: img.clickSpace,
             display: img.display,
+            // What am I looking at? — echoed so the model can tell a zoomed
+            // crop from the default overview without guessing from dimensions.
+            region: region ?? null,
+            fullRes: region === undefined ? fullRes : false,
             mimeType,
             dataUrl,
             base64: img.base64,
