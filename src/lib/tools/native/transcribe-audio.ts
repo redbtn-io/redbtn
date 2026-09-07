@@ -40,6 +40,8 @@
  */
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
+import { safeFetch, SsrfBlockedError } from '../../net/ssrf-guard';
+import { callerIsTrusted, ssrfBlockedResult } from './_outbound-url';
 import {
   defaultSttProvider,
   isSttProvider,
@@ -64,10 +66,22 @@ interface TranscribeArgs {
  * Resolve the audio bytes from either a base64 input or a URL. Returns the
  * decoded buffer + the resolved MIME type (URL fetch may overwrite the
  * caller-supplied type if the upstream sets a Content-Type header).
+ *
+ * SECURITY: `audioUrl` is caller-supplied and this tool runs on the worker,
+ * inside the private fleet network — the same class of sink as `fetch_url` and
+ * `download_file`, and it was the one the first sweep missed. The fetch goes
+ * through `safeFetch` (`lib/net/ssrf-guard`): the host must resolve to a public
+ * address AT REQUEST TIME, and each redirect hop is re-checked (max 5). No
+ * credentials are attached to it and none must ever be — the STT backend's own
+ * key is used later, against the env-configured provider endpoint, not here.
+ *
+ * @param trusted whether the caller's arguments were author-chosen; the only
+ *   thing it gates is the `SSRF_ALLOW_HOSTS` escape hatch.
  */
 async function resolveAudio(
   args: TranscribeArgs,
   abortSignal: AbortSignal | null,
+  trusted: boolean,
 ): Promise<{ buffer: Buffer; mimeType: string }> {
   if (args.audioBase64 && args.audioUrl) {
     const err = new Error(
@@ -111,7 +125,11 @@ async function resolveAudio(
       err.code = 'VALIDATION';
       throw err;
     }
-    const response = await fetch(url, { signal: abortSignal ?? undefined });
+    const response = await safeFetch(
+      url,
+      { signal: abortSignal ?? undefined },
+      { trusted },
+    );
     if (!response.ok) {
       const err = new Error(
         `Failed to fetch audioUrl: HTTP ${response.status} ${response.statusText}`,
@@ -168,7 +186,8 @@ function normaliseSegments(
 
 const transcribeAudioTool: NativeToolDefinition = {
   description:
-    'Transcribe audio to text. Accepts base64 audio or a URL; supports per-segment timestamps when the upstream returns them. Recognises with a local Whisper service by default, or with Gemini or OpenAI when asked.',
+    'Transcribe audio to text. Accepts base64 audio or a URL; supports per-segment timestamps when the upstream returns them. Recognises with a local Whisper service by default, or with Gemini or OpenAI when asked. ' +
+    'When audioUrl is used it must be a public internet host: the request is refused when the host resolves to a private, loopback or link-local address at request time, and every redirect hop is re-checked.',
   server: 'voice',
   inputSchema: {
     type: 'object',
@@ -181,7 +200,8 @@ const transcribeAudioTool: NativeToolDefinition = {
       audioUrl: {
         type: 'string',
         description:
-          'Absolute http(s) URL to fetch audio from. Provide this OR audioBase64, not both.',
+          'Absolute http(s) URL to fetch audio from. Provide this OR audioBase64, not both. ' +
+          'Refused when the host resolves to a private, loopback or link-local address at the time of the request.',
       },
       mimeType: {
         type: 'string',
@@ -241,10 +261,14 @@ const transcribeAudioTool: NativeToolDefinition = {
       const resolved = await resolveAudio(
         args as TranscribeArgs,
         context?.abortSignal ?? null,
+        callerIsTrusted(context),
       );
       buffer = resolved.buffer;
       resolvedMime = resolved.mimeType;
     } catch (err: unknown) {
+      if (err instanceof SsrfBlockedError) {
+        return ssrfBlockedResult(err, 'transcribe_audio', { url: args.audioUrl });
+      }
       const message = err instanceof Error ? err.message : String(err);
       const code = (err as { code?: string })?.code;
       const status = (err as { status?: number })?.status;

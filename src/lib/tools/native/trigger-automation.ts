@@ -29,6 +29,38 @@
  *
  * The trigger route is documented at:
  *   webapp/src/app/api/v1/automations/[automationId]/trigger/route.ts
+ *
+ * # Security — this tool starts a CHILD RUN
+ *
+ * A model calls it with a model-chosen `automationId` and a model-chosen
+ * `input`, and the webapp starts a whole run from them. Without a marker every
+ * tool step in that child run is a TRUSTED caller, so `fetch_url` attaches the
+ * platform's `X-Internal-Key` + the run owner's `X-User-Id` to any URL that
+ * child graph fetches — the hole PR #378 closed for `tool-resolver.resolveGraph`
+ * and `invoke_graph`, reached one indirection further out.
+ *
+ * So this tool stamps `MODEL_DRIVEN_STATE_KEY` into the trigger `input`, on
+ * exactly the same condition `invoke-graph.ts` uses: the caller's own arguments
+ * were model-chosen (`untrustedCaller`), or the parent run is already tainted.
+ * It is a CONDITION, not a blanket stamp — an authored graph step firing a
+ * fixed automation is composing work, exactly like a `graph` step, and stays
+ * trusted; blanket-tainting would strip internal auth from every authored
+ * composition, which is an availability regression rather than a fix.
+ *
+ * The marker rides on `input` because that is the surface the run actually
+ * receives: the webapp route reads `body.input`, runs it through
+ * `buildRunInputForAutomation` (which spreads the raw input on top of the
+ * automation's `defaultInput` + `inputMapping`), and hands the result to the
+ * run as its `input` — which `buildInitialState` puts at `state.data.input`,
+ * exactly where `isModelDrivenState` reads. No webapp change is needed. It is
+ * stamped AFTER the caller's own input so a model passing
+ * `_modelDrivenArgs:false` can only add the taint, never clear it.
+ *
+ * What this does NOT close, and cannot: the same automation fired by its own
+ * CRON trigger has no model context to taint. `create_graph` +
+ * `update_automation` + a scheduled trigger is still a route to an untainted
+ * run from model-authored config. Closing that needs capability-gating on the
+ * graph-authoring tools, which is a separate change.
  */
 
 import type {
@@ -36,6 +68,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { MODEL_DRIVEN_STATE_KEY, isModelDrivenState } from '../caller-trust';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -163,6 +196,36 @@ const triggerAutomationTool: NativeToolDefinition = {
     const triggerBody: Record<string, unknown> = {};
     if (args.input !== undefined) {
       triggerBody.input = args.input as unknown;
+    }
+
+    // Taint the child run when this call's own arguments were model-chosen, or
+    // when the parent run is already tainted. See the security note in the
+    // module header; mirrors `invoke-graph.ts`.
+    const childIsModelDriven =
+      context?.untrustedCaller === true || isModelDrivenState(context?.state);
+    if (childIsModelDriven) {
+      // Only an object input can carry the marker. A scalar / array / null
+      // override is replaced by an object holding just the marker, and that
+      // costs nothing real: the webapp SPREADS the override
+      // (`buildRunInputForAutomation`: `{ ...defaults, ...triggerData }`), so a
+      // string or array input already arrived as `{0:'h',1:'e',...}` — it was
+      // never a usable shape. Failing closed here also means a model cannot
+      // dodge the stamp by passing `input: "text"`.
+      const base =
+        triggerBody.input !== null &&
+        typeof triggerBody.input === 'object' &&
+        !Array.isArray(triggerBody.input)
+          ? (triggerBody.input as Record<string, unknown>)
+          : {};
+      if (triggerBody.input !== undefined && base !== triggerBody.input) {
+        console.warn(
+          '[trigger_automation]',
+          'model-driven call passed a non-object input; replacing it with the taint marker so the child run cannot start trusted',
+        );
+      }
+      // AFTER the spread — a model-supplied `_modelDrivenArgs:false` is
+      // overwritten, never honoured.
+      triggerBody.input = { ...base, [MODEL_DRIVEN_STATE_KEY]: true };
     }
 
     let triggerResponse: Response;

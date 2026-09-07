@@ -34,6 +34,7 @@ import { getCapabilityProfile } from '../../run/contextLookup';
 import { enforceToolCapability } from '../../permissions/enforce';
 import { readAllowlistedSshKey } from './ssh-key-path';
 import { safeFetch } from '../../net/ssrf-guard';
+import { callerIsTrusted } from './_outbound-url';
 
 // Test seam — mirrors ssh_shell's factory so the inline SSH path can be
 // exercised with a mock client (no real network) in unit tests.
@@ -212,7 +213,7 @@ async function resolveFromLibrary(
   return files;
 }
 
-async function resolveFromUrl(args: SshCopyArgs): Promise<FileToTransfer[]> {
+async function resolveFromUrl(args: SshCopyArgs, trusted: boolean): Promise<FileToTransfer[]> {
   const { sourceUrl, filename } = args;
   if (!sourceUrl) throw new Error('sourceUrl is required');
 
@@ -223,7 +224,7 @@ async function resolveFromUrl(args: SshCopyArgs): Promise<FileToTransfer[]> {
   // `fetch(..., { redirect: 'follow' })` would let a public URL bounce into
   // 10.0.0.0/8 and copy the response onto a remote host. No credentials are
   // attached here and none must ever be.
-  const response = await safeFetch(sourceUrl, {}, { followRedirects: true });
+  const response = await safeFetch(sourceUrl, {}, { followRedirects: true, trusted });
   if (!response.ok) {
     throw new Error(`Failed to fetch ${sourceUrl}: ${response.status} ${response.statusText}`);
   }
@@ -416,7 +417,7 @@ const sshCopy: NativeToolDefinition = {
         if (args.libraryId) {
           files = await resolveFromLibrary(args, publisher, nodeId, context);
         } else if (args.sourceUrl) {
-          files = await resolveFromUrl(args);
+          files = await resolveFromUrl(args, callerIsTrusted(context));
         } else if (args.content !== undefined) {
           files = resolveFromContent(args);
         } else {
@@ -470,7 +471,7 @@ const sshCopy: NativeToolDefinition = {
       if (args.libraryId) {
         files = await resolveFromLibrary(args, publisher, nodeId, context);
       } else if (args.sourceUrl) {
-        files = await resolveFromUrl(args);
+        files = await resolveFromUrl(args, callerIsTrusted(context));
       } else if (args.content !== undefined) {
         files = resolveFromContent(args);
       } else {

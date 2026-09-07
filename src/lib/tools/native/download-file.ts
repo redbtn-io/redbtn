@@ -25,6 +25,21 @@
  * (`application/octet-stream`), we fall back to a best-effort guess based on
  * the URL path's extension. The final value is never empty — defaults to
  * `application/octet-stream` when no signal is available.
+ *
+ * # Security
+ *
+ * `url` is caller-supplied, and this tool hands the model up to 10 MB of
+ * whatever answers, base64-encoded. Running on the worker inside the private
+ * fleet network, an unguarded `fetch` made it a read primitive against any
+ * internal HTTP endpoint. Every request therefore goes through `safeFetch`
+ * (`lib/net/ssrf-guard`), which refuses a host resolving to a private /
+ * loopback / link-local address AT REQUEST TIME and re-checks every redirect
+ * hop (max 5) — the previous plain `fetch` followed redirects internally, so a
+ * public URL that 302s into `10.0.0.0/8` was never re-examined.
+ *
+ * The tool attaches no credentials of any kind, to any host, and must not
+ * start: it is a downloader, and the run's identity has no business travelling
+ * with a model-chosen URL. There is no caller `headers` parameter to sanitise.
  */
 
 import type {
@@ -33,6 +48,8 @@ import type {
   NativeMcpResult,
 } from '../native-registry';
 import * as path from 'path';
+import { safeFetch, SsrfBlockedError } from '../../net/ssrf-guard';
+import { callerIsTrusted, ssrfBlockedResult, PUBLIC_HOSTS_ONLY_NOTE } from './_outbound-url';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -112,14 +129,18 @@ const downloadFileTool: NativeToolDefinition = {
   description:
     'Download a remote file (HTTP/HTTPS only) and return its bytes as base64 along with the detected MIME type and size. ' +
     'Use to hand the raw file off to another tool (parse_document, upload_attachment, upload_to_library) without touching disk. ' +
-    'Bounded by a configurable maxSizeBytes (default 10MB, hard ceiling 100MB) and a 60s timeout.',
+    'Bounded by a configurable maxSizeBytes (default 10MB, hard ceiling 100MB) and a 60s timeout. ' +
+    PUBLIC_HOSTS_ONLY_NOTE,
   server: 'system',
   inputSchema: {
     type: 'object',
     properties: {
       url: {
         type: 'string',
-        description: 'The http:// or https:// URL to download.',
+        description:
+          'The http:// or https:// URL to download. Refused when the host ' +
+          'resolves to a private, loopback or link-local address at the time ' +
+          'of the request.',
       },
       maxSizeBytes: {
         type: 'integer',
@@ -244,7 +265,13 @@ const downloadFileTool: NativeToolDefinition = {
     }
 
     try {
-      const response = await fetch(url, { signal: controller.signal });
+      // SSRF guard, and a redirect loop that re-checks every hop rather than
+      // letting `fetch` re-resolve behind our back.
+      const response = await safeFetch(
+        url,
+        { signal: controller.signal },
+        { trusted: callerIsTrusted(context) },
+      );
 
       if (!response.ok) {
         return {
@@ -387,6 +414,9 @@ const downloadFileTool: NativeToolDefinition = {
         ],
       };
     } catch (err: unknown) {
+      if (err instanceof SsrfBlockedError) {
+        return ssrfBlockedResult(err, 'download_file', { url });
+      }
       const error = err as { name?: string; message?: string };
       let message: string;
       if (error?.name === 'AbortError') {

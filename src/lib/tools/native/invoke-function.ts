@@ -5,9 +5,34 @@
  * endpoint until it completes. Also streams function logs in real-time
  * by polling the execution logs endpoint and forwarding output chunks
  * via RunPublisher.toolProgress().
+ *
+ * # Security
+ *
+ * `url` is a REQUIRED caller-supplied argument, and the tool POSTs a
+ * caller-supplied body to `${url}/api/invoke/<fn>`. On the worker, inside the
+ * private fleet network, that was an unguarded write primitive against any
+ * internal HTTP endpoint. Every request this tool makes — the submit, the
+ * status poll and the log stream — now goes through `safeFetch`
+ * (`lib/net/ssrf-guard`): the host must resolve to a public address AT REQUEST
+ * TIME, and each redirect hop is re-checked (max 5).
+ *
+ * The poll and log endpoints are guarded too, and not only for symmetry:
+ * `pollUrl` comes back in the SUBMIT RESPONSE, so it is chosen by whatever
+ * answered the first request rather than by us.
+ *
+ * The only credential in play is the caller's own `apiKey`, sent as
+ * `x-api-key`. The tool never attaches the run's `Authorization` / `X-User-Id`
+ * / `X-Internal-Key`, has no `headers` parameter through which a caller could
+ * add them, and must not gain one.
+ *
+ * A private RedRun instance (e.g. `http://192.168.1.5:3000`) is reachable only
+ * through the explicit, empty-by-default `SSRF_ALLOW_HOSTS` env allowlist, and
+ * then only for a trusted authored step — never for a model-chosen `url`.
  */
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry.js';
+import { safeFetch, SsrfBlockedError } from '../../net/ssrf-guard';
+import { callerIsTrusted, ssrfBlockedResult, PUBLIC_HOSTS_ONLY_NOTE } from './_outbound-url';
 
 const POLL_INTERVAL = 1_000; // 1 second — fast enough for interactive use, low overhead for long functions
 const LOG_POLL_INTERVAL = 2_000; // 2 seconds for log streaming
@@ -16,14 +41,19 @@ const SUBMIT_RETRIES = 3;
 const SUBMIT_BACKOFF = [2_000, 5_000, 10_000]; // 2s, 5s, 10s
 
 const definition: NativeToolDefinition = {
-  description: 'Invoke a RedRun cloud function asynchronously. Submits the job, polls for completion, and returns the result.',
+  description:
+    'Invoke a RedRun cloud function asynchronously. Submits the job, polls for completion, and returns the result. ' +
+    PUBLIC_HOSTS_ONLY_NOTE,
   server: 'system',
   inputSchema: {
     type: 'object',
     properties: {
       url: {
         type: 'string',
-        description: 'Base URL of the RedRun instance (e.g., https://run.redbtn.io)',
+        description:
+          'Base URL of the RedRun instance (e.g., https://run.redbtn.io). ' +
+          'Refused when the host resolves to a private, loopback or link-local ' +
+          'address at the time of the request.',
       },
       functionName: {
         type: 'string',
@@ -46,7 +76,18 @@ const definition: NativeToolDefinition = {
   },
 
   async handler(args, context: NativeToolContext): Promise<NativeMcpResult> {
-    const baseUrl = (args.url as string).replace(/\/$/, '');
+    // `url` is declared required, but a tool call is not schema-validated
+    // before it reaches here — a missing one used to throw a raw TypeError out
+    // of the handler.
+    const rawUrl = typeof args.url === 'string' ? args.url.trim() : '';
+    if (!rawUrl || (!rawUrl.startsWith('http://') && !rawUrl.startsWith('https://'))) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'url is required and must start with http:// or https://', code: 'VALIDATION' }) }],
+        isError: true,
+      };
+    }
+    const baseUrl = rawUrl.replace(/\/$/, '');
+    const trusted = callerIsTrusted(context);
     const functionName = args.functionName as string;
     const apiKey = args.apiKey as string | undefined;
     const rawBody = args.body;
@@ -68,14 +109,19 @@ const definition: NativeToolDefinition = {
     }
 
     let submitData: { executionId: string; pollUrl: string } | null = null;
+    let submitBlocked: SsrfBlockedError | null = null;
     for (let attempt = 0; attempt <= SUBMIT_RETRIES; attempt++) {
       try {
-        const submitRes = await fetch(submitUrl, {
-          method: 'POST',
-          headers,
-          body: bodyStr,
-          signal: AbortSignal.timeout(30_000),
-        });
+        const submitRes = await safeFetch(
+          submitUrl,
+          {
+            method: 'POST',
+            headers,
+            body: bodyStr,
+            signal: AbortSignal.timeout(30_000),
+          },
+          { trusted },
+        );
 
         if (submitRes.ok) {
           submitData = await submitRes.json() as { executionId: string; pollUrl: string };
@@ -94,12 +140,22 @@ const definition: NativeToolDefinition = {
         // Server error — retry with backoff
         console.warn(`[invoke_function] Submit returned ${submitRes.status}, retrying (${attempt + 1}/${SUBMIT_RETRIES}): ${errText.substring(0, 100)}`);
       } catch (fetchErr: any) {
+        // A refused destination is a policy decision, not a flaky upstream —
+        // retrying it three times only delays the same answer.
+        if (fetchErr instanceof SsrfBlockedError) {
+          submitBlocked = fetchErr;
+          break;
+        }
         console.warn(`[invoke_function] Submit error (${attempt + 1}/${SUBMIT_RETRIES}): ${fetchErr.message}`);
       }
 
       if (attempt < SUBMIT_RETRIES) {
         await new Promise(r => setTimeout(r, SUBMIT_BACKOFF[attempt] || 10_000));
       }
+    }
+
+    if (submitBlocked) {
+      return ssrfBlockedResult(submitBlocked, 'invoke_function', { url: baseUrl, functionName });
     }
 
     if (!submitData) {
@@ -125,6 +181,8 @@ const definition: NativeToolDefinition = {
     }
 
     // ── Step 2: Poll for completion + stream logs ──
+    // `pollUrl` is whatever the submit response said, so this destination is
+    // upstream-chosen, not ours — `safeFetch` re-checks it on every poll.
     const pollEndpoint = `${baseUrl}${pollUrl || `/api/executions/${executionId}`}`;
     const logsEndpoint = `${baseUrl}/api/executions/${executionId}/logs`;
     const startTime = Date.now();
@@ -137,10 +195,11 @@ const definition: NativeToolDefinition = {
 
     const streamLogs = async () => {
       try {
-        const logRes = await fetch(logsEndpoint, {
-          headers,
-          signal: AbortSignal.timeout(10_000),
-        });
+        const logRes = await safeFetch(
+          logsEndpoint,
+          { headers, signal: AbortSignal.timeout(10_000) },
+          { trusted },
+        );
         if (!logRes.ok) return;
 
         const logData = await logRes.json() as {
@@ -194,10 +253,11 @@ const definition: NativeToolDefinition = {
         await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
 
         try {
-          const pollRes = await fetch(pollEndpoint, {
-            headers,
-            signal: AbortSignal.timeout(30_000),
-          });
+          const pollRes = await safeFetch(
+            pollEndpoint,
+            { headers, signal: AbortSignal.timeout(30_000) },
+            { trusted },
+          );
           if (!pollRes.ok) {
             const errBody = await pollRes.text().catch(() => '');
             console.warn(`[invoke_function] Poll returned ${pollRes.status}: ${errBody.substring(0, 200)}`);
@@ -255,6 +315,12 @@ const definition: NativeToolDefinition = {
 
           // Still running — continue polling
         } catch (pollErr) {
+          // Same reasoning as the submit: a blocked poll destination will be
+          // blocked on every subsequent attempt, so bail rather than spin for
+          // the whole 15-minute budget.
+          if (pollErr instanceof SsrfBlockedError) {
+            return ssrfBlockedResult(pollErr, 'invoke_function', { url: baseUrl, functionName, executionId });
+          }
           console.warn(`[invoke_function] Poll error:`, pollErr instanceof Error ? pollErr.message : pollErr);
         }
       }

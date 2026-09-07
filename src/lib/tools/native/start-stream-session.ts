@@ -22,6 +22,37 @@
  *
  * Auth follows the standard Bearer / X-User-Id / X-Internal-Key fallback used
  * by the rest of the native API tools.
+ *
+ * # Security — this tool creates a session a model chose
+ *
+ * A model calls it with a model-chosen `streamId` and a model-chosen
+ * `metadata`, and the webapp creates a StreamSession from them. It is the same
+ * family as `invoke_graph` and `trigger_automation`, so it stamps
+ * `MODEL_DRIVEN_STATE_KEY` into `metadata` on the same condition: the caller's
+ * own arguments were model-chosen (`untrustedCaller`), or the parent run is
+ * already tainted. Stamped AFTER the caller's own metadata, so a model passing
+ * `_modelDrivenArgs:false` can only add the taint, never clear it.
+ *
+ * **Be precise about what that buys today.** `metadata` is stored as the
+ * session document's `triggerData`
+ * (`webapp/src/app/api/streams/[streamId]/sessions/route.ts`), and the webapp
+ * does NOT spread `triggerData` into the input of any run the session later
+ * starts:
+ *
+ *   - a startup graph gets an input the hub builds from scratch
+ *     (`session-manager.ts` `runStartupGraph`);
+ *   - a stream tool call gets `call.args` (plus `_source`/`sessionId`), which
+ *     come from the live model on the session's own socket, not from here;
+ *   - `session.input` comes from the stream's `defaultInput` and the session
+ *     creator's input, not from `triggerData`.
+ *
+ * So the marker is provenance on the session document and a forward guarantee
+ * — the moment any of those paths starts carrying `triggerData` into a run
+ * input, the taint is already there — but it is NOT, today, an active control
+ * on the runs a session spawns. The live surface for those is the hub's own
+ * dispatch, which is webapp-side and out of this repo. Saying otherwise is the
+ * prose-overpromise the review has rejected twice; this comment exists so the
+ * next reader does not have to re-derive it.
  */
 
 import type {
@@ -29,6 +60,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { MODEL_DRIVEN_STATE_KEY, isModelDrivenState } from '../caller-trust';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -122,8 +154,18 @@ const startStreamSessionTool: NativeToolDefinition = {
     const baseUrl = getBaseUrl();
     const url = `${baseUrl}/api/v1/streams/${encodeURIComponent(streamId)}/sessions`;
 
+    // Taint the session when this call's own arguments were model-chosen, or
+    // when the parent run is already tainted. See the security note in the
+    // module header — including what it does and does not reach today.
+    const childIsModelDriven =
+      context?.untrustedCaller === true || isModelDrivenState(context?.state);
+
     const body: AnyObject = {};
     if (metadata !== undefined) body.triggerData = metadata;
+    if (childIsModelDriven) {
+      // AFTER the caller's metadata, so `_modelDrivenArgs:false` is overwritten.
+      body.triggerData = { ...(metadata ?? {}), [MODEL_DRIVEN_STATE_KEY]: true };
+    }
 
     try {
       const response = await fetch(url, {

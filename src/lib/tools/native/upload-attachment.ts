@@ -16,11 +16,31 @@
  * without needing a user session token.
  *
  * The `caption` field (optional) is forwarded to the attachment event.
+ *
+ * # Security
+ *
+ * There are two outbound requests here and they are NOT the same kind of thing:
+ *
+ *   - the caller-supplied `url` source download — model-chosen, and therefore
+ *     guarded. It goes through `safeFetch` (`lib/net/ssrf-guard`), which
+ *     refuses a host resolving to a private / loopback / link-local address AT
+ *     REQUEST TIME and re-checks every redirect hop (max 5). Without it,
+ *     `upload_attachment({ url: 'http://10.100.0.10:9000/...' })` copied any
+ *     internal endpoint's response into the attachment store, where the model
+ *     can read it straight back.
+ *   - the upload POST to `${BASE_URL}/api/v1/attachments` with
+ *     `x-internal-key` — the deployment's OWN endpoint, from an env var, not
+ *     from the caller. It is deliberately NOT guarded: `BASE_URL` is routinely
+ *     `http://localhost:3000` or a fleet LAN address, and guarding it would
+ *     break every worker. The service key travels only on this fixed URL and
+ *     never on the caller's.
  */
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import * as fs from 'fs';
 import * as path from 'path';
+import { safeFetch, SsrfBlockedError } from '../../net/ssrf-guard';
+import { callerIsTrusted, ssrfBlockedResult, PUBLIC_HOSTS_ONLY_NOTE } from './_outbound-url';
 
 type AnyObject = Record<string, unknown>;
 
@@ -85,7 +105,8 @@ const uploadAttachmentTool: NativeToolDefinition = {
   description:
     'Upload a file to the redbtn attachment store and publish it to the run stream. ' +
     'Accepts a local file path, base64-encoded data, or a remote URL to download. ' +
-    'Returns attachmentId, fileId, and a download URL.',
+    'Returns attachmentId, fileId, and a download URL. ' +
+    `When downloading from a URL: ${PUBLIC_HOSTS_ONLY_NOTE}`,
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -100,7 +121,10 @@ const uploadAttachmentTool: NativeToolDefinition = {
       },
       url: {
         type: 'string',
-        description: 'Remote URL to download and re-upload',
+        description:
+          'Remote URL to download and re-upload. Refused when the host ' +
+          'resolves to a private, loopback or link-local address at the time ' +
+          'of the request.',
       },
       filename: {
         type: 'string',
@@ -186,7 +210,13 @@ const uploadAttachmentTool: NativeToolDefinition = {
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 60_000);
-        const resp = await fetch(sourceUrl as string, { signal: controller.signal });
+        // SSRF guard on the CALLER's url — see the security note in the module
+        // header for why the upload target below is deliberately exempt.
+        const resp = await safeFetch(
+          sourceUrl as string,
+          { signal: controller.signal },
+          { trusted: callerIsTrusted(context) },
+        );
         clearTimeout(timer);
         if (!resp.ok) {
           return {
@@ -205,6 +235,9 @@ const uploadAttachmentTool: NativeToolDefinition = {
         const ctHeader = resp.headers.get('content-type')?.split(';')[0]?.trim();
         resolvedMimeType = mimeTypeHint || ctHeader || guessMimeType(filename);
       } catch (err: unknown) {
+        if (err instanceof SsrfBlockedError) {
+          return ssrfBlockedResult(err, 'upload_attachment', { url: sourceUrl });
+        }
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: 'text', text: JSON.stringify({ error: `Failed to download URL: ${msg}` }) }],
