@@ -73,6 +73,12 @@ export const URL_BEARING_PARAMS: Readonly<Record<string, readonly string[]>> = O
   send_webhook: ['url'],
   download_file: ['url'],
   upload_attachment: ['url'],
+  invoke_function: ['url'],
+  // `audioUrl` does NOT match URL_NAME_PATTERN — the generic name heuristic
+  // anchors on whole names like `url`/`sourceUrl`, and a prefixed one slips
+  // past it. This entry is the reason a templated `audioUrl` is classified as
+  // a destination at all.
+  transcribe_audio: ['audioUrl'],
 });
 
 /** Parameter names that always denote a request destination. */

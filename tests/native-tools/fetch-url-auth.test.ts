@@ -90,7 +90,17 @@ describe('fetch_url — run-owner auth attachment', () => {
     expect(keys).not.toContain('x-user-id');
   });
 
-  test('does not overwrite a caller-supplied Authorization header', async () => {
+  // RETRACTED, deliberately. These two used to assert that a caller-supplied
+  // `Authorization` WINS over the run's own on an internal host ("does not
+  // overwrite a caller-supplied Authorization header"). Round 3 of the review
+  // of PR #378 (§3b) showed why that is a hole: an authored step with a LITERAL
+  // internal URL is trusted with the destination, correctly — but the same
+  // merge let the model choose `X-User-Id` while `X-Internal-Key` still went
+  // out, which on the webapp side is ADMIN impersonating that user id. The rule
+  // is now: on an internal host the three identity headers are ALWAYS the
+  // run's, and a caller-supplied copy is dropped. See
+  // tests/security/internal-auth-header-override.test.ts.
+  test('a caller-supplied Authorization does NOT survive on an internal host', async () => {
     await fetchUrlTool.handler(
       {
         url: 'https://app.redbtn.io/x',
@@ -98,10 +108,10 @@ describe('fetch_url — run-owner auth attachment', () => {
       },
       ctx({ authToken: 'jwt-abc', userId: 'user-1' }),
     );
-    expect(captured[0].headers['Authorization']).toBe('Bearer caller-token');
+    expect(captured[0].headers['Authorization']).toBe('Bearer jwt-abc');
   });
 
-  test('does not overwrite a caller-supplied lowercase authorization header', async () => {
+  test('a lowercase authorization header is dropped too — casing is not a bypass', async () => {
     await fetchUrlTool.handler(
       {
         url: 'https://app.redbtn.io/x',
@@ -110,8 +120,21 @@ describe('fetch_url — run-owner auth attachment', () => {
       ctx({ authToken: 'jwt-abc', userId: 'user-1' }),
     );
     const h = captured[0].headers;
-    expect(h['authorization']).toBe('Bearer caller-lower');
-    expect(h['Authorization']).toBeUndefined();
+    expect(h['authorization']).toBeUndefined();
+    expect(h['Authorization']).toBe('Bearer jwt-abc');
+  });
+
+  test('a caller-supplied Authorization to a THIRD-PARTY host is untouched', async () => {
+    // The control: only the platform's own hosts are special, and only because
+    // the platform trusts those headers there.
+    await fetchUrlTool.handler(
+      {
+        url: 'https://partner.example.com/x',
+        headers: { Authorization: 'Bearer caller-token' },
+      },
+      ctx({ authToken: 'jwt-abc', userId: 'user-1' }),
+    );
+    expect(captured[0].headers['Authorization']).toBe('Bearer caller-token');
   });
 
   test('attaches X-Internal-Key when env INTERNAL_SERVICE_KEY is set', async () => {

@@ -26,6 +26,16 @@
  *    graph-as-tool — `resolveToolStepTrust` in `lib/tools/caller-trust` decides
  *    that per step, because `renderParameters` would otherwise let
  *    `{ url: '{{data.answer}}' }` reach this tool as a trusted caller.
+ *
+ *    On an internal host those three headers are set from the RUN CONTEXT and
+ *    a caller-supplied copy is DROPPED, whatever the caller's trust. That is
+ *    not tidiness: `{ url:'<literal internal url>', headers:{ 'X-User-Id':
+ *    '{{state.data.answer}}' } }` is a trusted step by the destination test —
+ *    the URL is the author's literal — and the previous "caller's header wins"
+ *    merge let the model choose the PRINCIPAL while `X-Internal-Key` still went
+ *    out. On the webapp side `X-Internal-Key` + `X-User-Id` is ADMIN
+ *    impersonating that user id. The destination was the author's; the identity
+ *    must be the run's.
  * 2. **SSRF guard** (`lib/net/ssrf-guard`) runs on every URL regardless of who
  *    the caller is: the requested URL and each redirect hop must resolve to a
  *    public address *at check time*. The worker sits on the private fleet
@@ -157,7 +167,9 @@ const fetchUrlTool: NativeToolDefinition = {
       let attachedInternalAuth = false;
 
       // Guard the URL the caller asked for before a single byte goes out.
-      await assertPublicUrl(currentUrl);
+      // `trusted` gates ONLY the `SSRF_ALLOW_HOSTS` escape hatch — a
+      // model-chosen URL can never reach an allowlisted private address.
+      await assertPublicUrl(currentUrl, { trusted: !callerIsUntrusted });
       const originalOrigin = new URL(currentUrl).origin;
 
       // ── redirect loop: one guarded hop per iteration ──────────────────────
@@ -172,17 +184,36 @@ const fetchUrlTool: NativeToolDefinition = {
           fetchHeaders['Content-Type'] = 'application/json';
         }
 
+        // On an internal host the platform's identity headers are the run's,
+        // full stop: any caller-supplied copy is removed FIRST, then the
+        // run-context value is written. A caller cannot suppress one of them
+        // either — leaving `X-Internal-Key` in place while the model picks
+        // `X-User-Id` is precisely the escalation this closes.
+        //
+        // This runs for an untrusted caller too, where it only ever deletes:
+        // the attach block below is skipped, so a model-chosen
+        // `Authorization` never reaches an internal redbtn API at all.
+        if (hop === 0 && isInternalHost(currentUrl)) {
+          const dropped: string[] = [];
+          for (const key of Object.keys(fetchHeaders)) {
+            const lower = key.toLowerCase();
+            if (lower === 'authorization' || lower === 'x-user-id' || lower === 'x-internal-key') {
+              delete fetchHeaders[key];
+              dropped.push(key);
+            }
+          }
+          if (dropped.length) {
+            console.warn('[fetch_url]', `Dropped caller-supplied ${dropped.join(', ')} on an internal-host request — these are set from the run context`);
+          }
+        }
+
         // Internal auth is attached to the ORIGINAL request only, never to a
         // redirect hop, and never at all for an untrusted caller.
         if (hop === 0 && !callerIsUntrusted && isInternalHost(currentUrl)) {
-          const hasHeader = (name: string): boolean => {
-            const lower = name.toLowerCase();
-            return Object.keys(fetchHeaders).some(h => h.toLowerCase() === lower);
-          };
           const authHeaders = buildHeaders(context);
           for (const key of ['Authorization', 'X-User-Id', 'X-Internal-Key'] as const) {
             const value = authHeaders[key];
-            if (value && !hasHeader(key)) {
+            if (value) {
               fetchHeaders[key] = value;
               attachedInternalAuth = true;
             }
@@ -275,7 +306,9 @@ const fetchUrlTool: NativeToolDefinition = {
         }
 
         // Re-runs the private-address check on the hop target.
-        const nextUrl = await assertPublicRedirect(currentUrl, location);
+        const nextUrl = await assertPublicRedirect(currentUrl, location, {
+          trusted: !callerIsUntrusted,
+        });
         if (response.status === 303 || ((response.status === 301 || response.status === 302) && method !== 'GET' && method !== 'HEAD')) {
           method = 'GET';
           body = null;
