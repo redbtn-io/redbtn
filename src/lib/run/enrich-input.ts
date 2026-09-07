@@ -335,7 +335,46 @@ export function extractSecretNamesFromConfig(json: string): string[] {
   return [...names];
 }
 
-async function collectGraphReferencedSecretNames(
+/**
+ * The scannable surface of a node document.
+ *
+ * `steps` is the obvious half. `parserConfig` is the other one: a parser node's
+ * outputs (`ttsHeaders`, `deliveryHeaders`, endpoints, `deliveryBody`) sit
+ * OUTSIDE the step array and are exactly where a streaming node's credentials
+ * live, so a scan that stops at `steps` resolves nothing for them and the
+ * config is stuck holding the plaintext value.
+ */
+function nodeSecretScanSurface(doc: Record<string, unknown>): string {
+  const steps = doc.steps;
+  const parserConfig = doc.parserConfig;
+  if (steps === undefined && parserConfig === undefined) return JSON.stringify(doc);
+  return JSON.stringify({ steps: steps ?? null, parserConfig: parserConfig ?? null });
+}
+
+/**
+ * Parser node ids a set of node documents reference via `config.streamParser`.
+ *
+ * A parser node is loaded by id at run time (see parserRegistry) and is NOT a
+ * member of `graph.nodes`, so it is invisible to the graph-node scan above.
+ * Following the reference is what lets a parser's own secret references be
+ * resolved for the run that streams through it.
+ */
+function collectStreamParserIds(docs: Array<Record<string, unknown>>): string[] {
+  const ids = new Set<string>();
+  const re = /"streamParser"\s*:\s*"([^"]+)"/g;
+  for (const doc of docs) {
+    const json = JSON.stringify(doc.steps ?? '');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(json)) !== null) {
+      if (m[1]) ids.add(m[1]);
+    }
+  }
+  return [...ids];
+}
+
+// Exported for unit tests, which drive it against a mocked mongoose connection.
+// Not part of the stable public surface.
+export async function collectGraphReferencedSecretNames(
   graphId: string | undefined,
 ): Promise<string[]> {
   if (!graphId) return [];
@@ -361,14 +400,26 @@ async function collectGraphReferencedSecretNames(
 
     const names = new Set<string>();
     if (nodeIds.length > 0) {
-      const nodeDocs = await db
+      const nodeDocs = (await db
         .collection('nodes')
-        .find({ nodeId: { $in: nodeIds } }, { projection: { steps: 1 } })
-        .toArray();
-      for (const doc of nodeDocs) {
-        for (const name of extractSecretNamesFromConfig(
-          JSON.stringify((doc as { steps?: unknown }).steps ?? doc),
-        )) {
+        .find({ nodeId: { $in: nodeIds } }, { projection: { steps: 1, parserConfig: 1 } })
+        .toArray()) as Array<Record<string, unknown>>;
+
+      const scanned: Array<Record<string, unknown>> = [...nodeDocs];
+
+      // Second hop: the parser nodes those steps name. One extra round trip,
+      // and only when a stream parser is actually configured.
+      const parserIds = collectStreamParserIds(nodeDocs);
+      if (parserIds.length > 0) {
+        const parserDocs = (await db
+          .collection('nodes')
+          .find({ nodeId: { $in: parserIds } }, { projection: { steps: 1, parserConfig: 1 } })
+          .toArray()) as Array<Record<string, unknown>>;
+        scanned.push(...parserDocs);
+      }
+
+      for (const doc of scanned) {
+        for (const name of extractSecretNamesFromConfig(nodeSecretScanSurface(doc))) {
           names.add(name);
         }
       }

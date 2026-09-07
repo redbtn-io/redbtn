@@ -330,6 +330,10 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     runPublisher: runPublisher || null,
                     // GraphRegistry for subgraph output type
                     _graphRegistry: getGraphRegistry(state) || null,
+                    // Run-resolved secrets, so parser outputs and parser tool
+                    // steps can reference a credential by name instead of
+                    // carrying its value in the node document.
+                    _secrets: (inputData as any)._secrets || null,
                 });
                 console.log(`[ToolExecutor] Stream parser "${(config as any).streamParser}" loaded for ${config.toolName} (tool steps enabled)`);
             } else {
