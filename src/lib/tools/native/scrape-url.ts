@@ -7,6 +7,7 @@
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { fetchAndParse, DEFAULT_BROWSER_HEADERS } from '../../nodes/scrape/parser';
+import { safeFetch, SsrfBlockedError } from '../../net/ssrf-guard';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -42,10 +43,11 @@ async function fetchRawHtml(
   }
 
   try {
-    const response = await fetch(url, {
+    // SECURITY: `url` is model-supplied. `safeFetch` refuses private /
+    // loopback / link-local targets and re-checks every redirect hop.
+    const response = await safeFetch(url, {
       signal: controller.signal,
       headers: DEFAULT_BROWSER_HEADERS,
-      redirect: 'follow',
     });
 
     if (!response.ok) {
@@ -199,6 +201,20 @@ const scrapeUrlTool: NativeToolDefinition = {
       };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
+      // A refused URL is a policy decision, not a transport failure — give it
+      // its own code so the model can tell the two apart.
+      if (err instanceof SsrfBlockedError) {
+        console.warn(`[scrape_url] BLOCKED ${err.code}: ${message}`);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: message, code: err.code, url }),
+            },
+          ],
+          isError: true,
+        };
+      }
       console.error(`[scrape_url] error: ${message}`);
 
       return {

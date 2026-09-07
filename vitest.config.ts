@@ -25,6 +25,8 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // Deterministic, offline SSRF-guard DNS stub — see tests/setup/ssrf-lookup.ts
+    setupFiles: ['tests/setup/ssrf-lookup.ts'],
     testTimeout: 60_000,
     hookTimeout: 30_000,
     reporters: ['verbose'],

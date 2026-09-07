@@ -146,6 +146,16 @@ function resolveNative(
         nodeId: null,
         toolId: ctx.toolId,
         abortSignal: ctx.abortSignal,
+        // SECURITY: this is the neuron tool-use loop — the LLM emitted the
+        // tool_call, so every argument (a `fetch_url` URL included) is
+        // model-chosen. Marking the context untrusted stops `fetch_url` from
+        // attaching the run's Authorization / X-User-Id / X-Internal-Key to an
+        // allowlisted internal host, which a prompt-injected model could
+        // otherwise use to call any internal API as the run's user with the
+        // platform service key. Graph `tool` steps (toolExecutor) do NOT set
+        // this: there a graph author fixed the arguments. See
+        // NativeToolContext.untrustedCaller.
+        untrustedCaller: true,
         // The neuron-driven path doesn't currently honour onChunk parsing —
         // the LLM consumes the result wholesale.
         onChunk: undefined,

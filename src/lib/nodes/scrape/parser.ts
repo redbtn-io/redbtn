@@ -5,6 +5,7 @@
  */
 
 import { Window } from 'happy-dom';
+import { safeFetch } from '../../net/ssrf-guard';
 
 const MAX_CONTENT_LENGTH = 100000;
 const FETCH_TIMEOUT = 25000;
@@ -31,17 +32,22 @@ export interface ParsedContent {
 }
 
 /**
- * Fetch and parse HTML from a URL with browser emulation headers
+ * Fetch and parse HTML from a URL with browser emulation headers.
+ *
+ * SECURITY: the URL reaching here is model-supplied (`scrape_url`) or comes
+ * from a search-result page (`web_search` with `extractContent`), and the
+ * engine runs on the private fleet network — so the fetch goes through
+ * `safeFetch`, which refuses private / loopback / link-local targets and
+ * re-checks every redirect hop (max 5).
  */
 export async function fetchAndParse(url: string, timeoutMs = FETCH_TIMEOUT): Promise<ParsedContent> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(url, {
+    const response = await safeFetch(url, {
       signal: controller.signal,
       headers: DEFAULT_BROWSER_HEADERS,
-      redirect: 'follow',
     });
 
     clearTimeout(timer);

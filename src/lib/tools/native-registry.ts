@@ -32,6 +32,43 @@ export interface NativeToolContext {
   toolId: string | null;
   /** AbortSignal for cancellation support */
   abortSignal: AbortSignal | null;
+  /**
+   * Set for callers whose URL/args are model-controlled; disables
+   * internal-auth attachment.
+   *
+   * # What it means
+   *
+   * `true` says "the arguments of this tool call were chosen by a language
+   * model, not by a graph author". The only consumer today is `fetch_url`,
+   * which will NOT attach the run's `Authorization` / `X-User-Id` /
+   * `X-Internal-Key` headers when this flag is set — even for an allowlisted
+   * internal host — because a prompt-injected model that picks the URL would
+   * otherwise be handing itself the platform's `INTERNAL_SERVICE_KEY` against
+   * an arbitrary internal endpoint, authenticated as the run's user.
+   *
+   * # Who sets it
+   *
+   * The neuron tool-use loop (`tool-resolver.ts` `resolveNative`) sets it
+   * unconditionally: in that path the LLM emitted the tool_call and therefore
+   * chose the URL. `invoke_tool` forwards the caller's context unchanged, so
+   * the flag propagates through meta dispatch.
+   *
+   * # Default and how to opt in
+   *
+   * Absent/`false` means "the caller chose these arguments" and internal auth
+   * still attaches. That is the graph `tool` step path (`toolExecutor.ts`),
+   * where `params` are rendered from the node's own configuration by a graph
+   * author — e.g. a step that calls `fetch_url` against a fixed
+   * `https://app.redbtn.io/api/...` URL and needs the run owner's identity.
+   * Such callers keep working with no change; anything model-driven must set
+   * the flag. New model-facing entry points (the per-run MCP tool bridge, any
+   * future CLI/agent surface) MUST set `untrustedCaller: true`.
+   *
+   * Note that the SSRF guard in `lib/net/ssrf-guard.ts` applies to
+   * URL-fetching tools regardless of this flag — trusted callers are trusted
+   * with credentials, not with reaching the private network.
+   */
+  untrustedCaller?: boolean;
   /** Callback for real-time chunk interception (used by stream parsers) */
   onChunk?: (chunk: string, stream: 'stdout' | 'stderr') => void;
   /**

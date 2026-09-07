@@ -33,6 +33,7 @@ import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvi
 import { getCapabilityProfile } from '../../run/contextLookup';
 import { enforceToolCapability } from '../../permissions/enforce';
 import { readAllowlistedSshKey } from './ssh-key-path';
+import { safeFetch } from '../../net/ssrf-guard';
 
 // Test seam — mirrors ssh_shell's factory so the inline SSH path can be
 // exercised with a mock client (no real network) in unit tests.
@@ -216,7 +217,13 @@ async function resolveFromUrl(args: SshCopyArgs): Promise<FileToTransfer[]> {
   if (!sourceUrl) throw new Error('sourceUrl is required');
 
   console.log(`[ssh_copy] Fetching ${sourceUrl}`);
-  const response = await fetch(sourceUrl, { redirect: 'follow' });
+  // SECURITY: `sourceUrl` is model-supplied, and this tool runs on the worker
+  // inside the private fleet network. `safeFetch` refuses private / loopback /
+  // link-local targets and re-checks every redirect hop (max 5) — a plain
+  // `fetch(..., { redirect: 'follow' })` would let a public URL bounce into
+  // 10.0.0.0/8 and copy the response onto a remote host. No credentials are
+  // attached here and none must ever be.
+  const response = await safeFetch(sourceUrl, {}, { followRedirects: true });
   if (!response.ok) {
     throw new Error(`Failed to fetch ${sourceUrl}: ${response.status} ${response.statusText}`);
   }

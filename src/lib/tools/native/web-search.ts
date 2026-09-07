@@ -36,7 +36,13 @@ interface NormalisedResult {
 }
 
 /**
- * Fetch raw items from Google Custom Search
+ * Fetch raw items from Google Custom Search.
+ *
+ * SECURITY: the endpoint host is a hardcoded constant
+ * (`www.googleapis.com`) and only the query string is model-influenced, so
+ * there is no model-supplied URL to guard here. The one model-supplied URL in
+ * this tool is `item.url` in the `extractContent` block, which goes through
+ * `fetchAndParse` → the SSRF guard.
  */
 async function googleSearch(
   apiKey: string,
@@ -97,7 +103,11 @@ async function googleSearch(
 }
 
 /**
- * Fetch search results from DuckDuckGo HTML endpoint
+ * Fetch search results from DuckDuckGo HTML endpoint.
+ *
+ * SECURITY: as with the Google provider, the host is a hardcoded constant
+ * (`html.duckduckgo.com`) — only the query string varies, so no SSRF guard is
+ * required on this call.
  */
 async function duckduckgoSearch(
   query: string,
@@ -361,6 +371,13 @@ const webSearchTool: NativeToolDefinition = {
     }
 
     // 3. Optional deep content extraction for top 2-3 links
+    //
+    // SECURITY: `item.url` comes off a search-results page — i.e. from outside
+    // the platform, steered by a model-supplied query. `fetchAndParse` runs it
+    // through the SSRF guard (private / loopback / link-local refused, every
+    // redirect hop re-checked), so a result that points or bounces into the
+    // fleet network is dropped here rather than proxied. A blocked URL throws
+    // and is swallowed with the other per-item failures below.
     if (extractContent && results.length > 0) {
       const topItems = results.slice(0, 3);
       await Promise.allSettled(
