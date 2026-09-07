@@ -44,6 +44,28 @@ const SFTP_MAX_BYTES = (() => {
   return Number.isFinite(v) && v > 0 ? v : 8 * 1024 * 1024; // 8 MB
 })();
 
+/**
+ * Headroom the relay wait gets ON TOP of the command's own budget, in ms.
+ *
+ * These are two different clocks and they must not be set to the same number.
+ * The connector runs the command under `payload.timeoutMs` and, when that
+ * elapses, kills it and replies with a real exec result. The engine waits
+ * `timeoutMs` for that reply. Set them equal — which is exactly what
+ * `timeoutMs: opts.timeout` did — and the two fire together: the engine
+ * abandons the round trip in the same tick the connector is composing its
+ * answer, so a plain command timeout comes back as
+ * `desktop_failed: No desktop responded within 120000ms`. That message is a
+ * presence error. It sends the reader hunting a disconnected connector when the
+ * connector was connected and answering, and it loses the stdout/stderr the
+ * connector had already captured.
+ *
+ * 30 s covers the connector's kill-and-reply (SIGTERM, drain, publish) plus a
+ * Redis pub/sub hop, with room for a loaded box. Long enough that the connector
+ * always wins the race; short enough that a genuinely absent connector is still
+ * detected inside the step budget.
+ */
+export const RELAY_GRACE_MS = 30_000;
+
 /** Error thrown when a relay op fails (connector error, timeout, oversized). */
 export class DesktopAgentError extends Error {
   constructor(public readonly code: string, message: string) {
@@ -85,16 +107,29 @@ export class DesktopAgentSession extends EventEmitter implements IEnvironmentSes
   // ── exec ────────────────────────────────────────────────────────────────
   exec(command: string, opts: ExecOptions = {}): Promise<ExecResult> {
     return this.serialize(async () => {
+      // The connector's command budget. Falling back to the session budget is
+      // load-bearing, not tidiness: this used to be `opts.timeout` alone, so
+      // every tool that calls exec without a timeout (`read_file`, `glob`,
+      // `grep_files`, `list_dir`, `ssh_shell` at its default of 0) shipped a
+      // payload with NO timeoutMs. The connector then ran the command with no
+      // budget at all, the engine gave up at the session timeout, and the
+      // process stayed alive on the user's machine with nothing left holding a
+      // handle to it. Every exec now carries a budget the far side can enforce.
+      // `ExecOptions.timeout` documents 0 as "no timeout", and a bad caller can
+      // hand over NaN; neither is a budget, so both defer to the session's.
+      const explicit = Number(opts.timeout);
+      const commandTimeoutMs = Number.isFinite(explicit) && explicit > 0 ? explicit : this.timeoutMs;
       const reply = await requestDesktopRaw({
         userId: this.userId,
         installId: this.installId,
         kind: 'exec',
-        timeoutMs: opts.timeout ?? this.timeoutMs,
+        // Strictly longer than the command budget — see RELAY_GRACE_MS.
+        timeoutMs: commandTimeoutMs !== undefined ? commandTimeoutMs + RELAY_GRACE_MS : undefined,
         payload: {
           command,
           ...(opts.cwd ? { cwd: opts.cwd } : {}),
           ...(opts.env ? { env: opts.env } : {}),
-          ...(opts.timeout ? { timeoutMs: opts.timeout } : {}),
+          ...(commandTimeoutMs !== undefined ? { timeoutMs: commandTimeoutMs } : {}),
         },
       });
       if (!reply || reply.ok !== true) {
