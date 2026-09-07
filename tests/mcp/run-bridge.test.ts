@@ -157,6 +157,15 @@ const RUN_COMMAND_SCHEMA = {
   required: ['command'],
 };
 
+const READ_FILE_SCHEMA = {
+  type: 'object',
+  properties: {
+    path: { type: 'string' },
+    environmentId: { type: 'string' },
+  },
+  required: ['path', 'environmentId'],
+};
+
 /**
  * An UNMAPPED tool (no `tool-map` rule ⇒ no capability gate, no exec guard), so
  * arg-shaping can be asserted on the arguments a handler actually received
@@ -178,7 +187,7 @@ function nodeTools(): RunBridgeToolRef[] {
   return [
     { name: 'run_command', description: 'run a command', inputSchema: RUN_COMMAND_SCHEMA, source: 'native' },
     { name: 'bridge_probe', description: 'ungated probe', inputSchema: PROBE_SCHEMA, source: 'native' },
-    { name: 'read_file', description: 'read a file', inputSchema: { type: 'object', properties: { path: { type: 'string' }, environmentId: { type: 'string' } }, required: ['path', 'environmentId'] }, source: 'native' },
+    { name: 'read_file', description: 'read a file', inputSchema: READ_FILE_SCHEMA, source: 'native' },
     { name: 'invoke_tool', description: 'meta pack', inputSchema: { type: 'object', properties: {} }, source: 'native' },
     { name: 'ssh_shell', description: 'unscoped shell', inputSchema: { type: 'object', properties: {} }, source: 'native' },
     { name: 'invoke_graph', description: 'another run', inputSchema: { type: 'object', properties: {} }, source: 'native' },
@@ -218,6 +227,7 @@ let tmpDir: string;
 let bridge: RunToolBridge | null = null;
 let clients: RpcClient[] = [];
 let originalRunCommand: any;
+let originalReadFile: any;
 
 beforeEach(() => {
   received = [];
@@ -232,6 +242,17 @@ beforeEach(() => {
     handler: async (args: any) => {
       received.push({ name: 'bridge_probe', args });
       return { content: [{ type: 'text', text: 'probed' }] };
+    },
+  });
+  // `read_file` is stubbed too, so the suite does not depend on the fs pack's
+  // optional imports having registered in whatever environment CI runs in.
+  originalReadFile = registry.get('read_file');
+  registry.register('read_file', {
+    description: 'read a file',
+    inputSchema: READ_FILE_SCHEMA,
+    handler: async (args: any) => {
+      received.push({ name: 'read_file', args });
+      return { content: [{ type: 'text', text: 'file body' }] };
     },
   });
   originalRunCommand = registry.get('run_command');
@@ -269,6 +290,7 @@ afterEach(async () => {
   vi.unstubAllGlobals();
   const registry = getNativeRegistry();
   if (originalRunCommand) registry.register('run_command', originalRunCommand);
+  if (originalReadFile) registry.register('read_file', originalReadFile);
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
