@@ -7,8 +7,21 @@
 
 /**
  * Supported LLM providers
+ *
+ * `'claude-code'` is not an HTTP model endpoint: it denotes a neuron backed by
+ * a local Claude Code CLI process authenticated with a Claude subscription
+ * token rather than a metered API key. It never reaches
+ * `NeuronRegistry.createModel` — a dedicated executor drives it — but it is a
+ * first-class provider value so the value is accepted by the Mongoose schema,
+ * the neurons API and the capability matrices.
  */
-export type NeuronProvider = 'ollama' | 'openai' | 'anthropic' | 'google' | 'custom';
+export type NeuronProvider =
+  | 'ollama'
+  | 'openai'
+  | 'anthropic'
+  | 'google'
+  | 'custom'
+  | 'claude-code';
 
 /**
  * Neuron role categorization (for UI organization)
