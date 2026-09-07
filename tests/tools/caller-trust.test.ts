@@ -120,14 +120,27 @@ describe('caller-trust — findInterpolatedUrlParam', () => {
     ).toBeNull();
   });
 
-  test('does NOT flag a template that failed to resolve — nothing from state reached the URL', () => {
+  test('does NOT flag a MIXED template that failed to resolve — nothing from state reached the URL', () => {
+    // `renderTemplate` hands an unresolved `{{...}}` back unchanged inside a
+    // mixed string, so rendered === configured and the URL is still the
+    // author's literal text.
     expect(
       findInterpolatedUrlParam(
         'fetch_url',
-        { url: '{{state.missing}}' },
-        { url: '{{state.missing}}' },
+        { url: 'https://app.redbtn.io/api/v1/{{state.missing}}' },
+        { url: 'https://app.redbtn.io/api/v1/{{state.missing}}' },
       ),
     ).toBeNull();
+  });
+
+  test('DOES flag a PURE template that failed to resolve — it renders to undefined', () => {
+    // `resolveValue` falls through to `new Function('state', 'return (state.missing)')`
+    // for a pure `{{state.x}}` and yields `undefined`, which is not
+    // distinguishable from a resolved value here. Reporting it as interpolated
+    // is the safe direction, and the request has no URL to send anyway.
+    expect(
+      findInterpolatedUrlParam('fetch_url', { url: '{{state.missing}}' }, { url: undefined }),
+    ).toBe('url');
   });
 
   test('flags a URL that only looks like one after rendering', () => {

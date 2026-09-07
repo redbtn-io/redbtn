@@ -107,10 +107,14 @@ export function isTemplatedValue(value: unknown): boolean {
  * Returns the dotted path of that leaf, or `null` when every destination in the
  * step is a literal the author typed.
  *
- * A templated value that did NOT substitute (the variable was missing, so
- * `renderTemplate` handed the `{{...}}` text back unchanged) is not treated as
- * interpolated: nothing from state reached the URL, and the request will fail
- * on its own.
+ * A templated value that did NOT substitute is not treated as interpolated:
+ * nothing from state reached the URL, and the request fails on its own. That
+ * only covers the MIXED form (`https://host/{{state.missing}}`), where
+ * `renderTemplate` hands the `{{...}}` text back unchanged. A PURE
+ * `{{state.missing}}` renders to `undefined` (`resolveValue` falls through to
+ * `new Function`), which is indistinguishable here from a resolved value, so it
+ * is reported as interpolated — the safe direction, and the request has no URL
+ * to send anyway.
  */
 export function findInterpolatedUrlParam(
   toolName: string,
