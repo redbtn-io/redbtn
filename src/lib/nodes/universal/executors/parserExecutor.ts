@@ -11,6 +11,24 @@
  */
 import type { NodeConfig, UniversalStep } from '../types';
 import { getToolResultErrorMessage } from './toolResultError';
+// Static, unlike the transform/conditional executors below it: templateRenderer
+// pulls in nothing that reaches back here, and a lazy `require` of it is not
+// resolvable from an ESM caller — which silently turned every parser tool step
+// into a swallowed "Cannot find module" instead of a tool call.
+import { renderTemplate, resolveValue, renderParameters } from '../templateRenderer';
+
+/**
+ * `{{secret:NAME}}` — the reference form output configs use to name a secret
+ * instead of carrying its value.
+ *
+ * Output configs live in a node document, and a node document is readable by
+ * anyone who can call `get_node`. A credential written there is a credential
+ * published, so the config names the secret and the run supplies the value:
+ * enrichInput already scans node configs for these references and resolves
+ * exactly those into `state.data.input._secrets`, which reaches this executor
+ * via `setContext({ _secrets })`.
+ */
+const SECRET_REF_RE = /\{\{\s*secret:([^}]+?)\s*\}\}/g;
 
 interface ParserConfig {
     inputField?: string;
@@ -144,6 +162,15 @@ export class ParserExecutor {
      */
     private _wsSend: ((text: string, isFinal: boolean) => void) | null = null;
 
+    /**
+     * Secrets resolved for THIS run, injected via setContext({ _secrets }).
+     *
+     * Deliberately a field rather than part of `_parserState._context`: the
+     * `{{context.X}}` renderer would otherwise hand the whole map to any output
+     * body that asked for `{{context._secrets}}`.
+     */
+    private _secrets: Record<string, string> = {};
+
     /** Inject context into the parser state (e.g. channelId, triggerType, runPublisher). */
     setContext(ctx: Record<string, any>): void {
         if (ctx.runPublisher !== undefined) {
@@ -155,8 +182,90 @@ export class ParserExecutor {
         if (ctx._wsSend !== undefined) {
             this._wsSend = ctx._wsSend;
         }
-        const { runPublisher: _rp, _graphRegistry: _gr, _wsSend: _ws, ...rest } = ctx;
+        if (ctx._secrets !== undefined) {
+            this._secrets = (ctx._secrets && typeof ctx._secrets === 'object') ? ctx._secrets : {};
+        }
+        const { runPublisher: _rp, _graphRegistry: _gr, _wsSend: _ws, _secrets: _sec, ...rest } = ctx;
         this._parserState._context = { ...this._parserState._context, ...rest };
+    }
+
+    /**
+     * Substitute `{{secret:NAME}}` in one string against this run's secrets.
+     *
+     * Returns null when a referenced name did not resolve. Callers skip the
+     * whole request on null: sending the literal `{{secret:NAME}}` to a
+     * third-party endpoint authenticates as nobody and publishes the config to
+     * whoever is on the other end, so an unresolved reference fails closed.
+     */
+    private _renderSecretRefs(value: string, label: string, field: string): string | null {
+        if (!value.includes('{{secret:') && !value.includes('{{ secret:')) return value;
+        let missing: string | null = null;
+        const rendered = value.replace(SECRET_REF_RE, (_match, rawName: string) => {
+            const name = rawName.trim();
+            const resolved = this._secrets[name];
+            if (typeof resolved !== 'string') {
+                if (!missing) missing = name;
+                return '';
+            }
+            return resolved;
+        });
+        if (missing) {
+            console.error(
+                `[ParserExecutor] Output(${label}) ${field}: secret "${missing}" did not resolve ` +
+                `for this run — skipping the request. Add "${missing}" to the run owner's secrets.`,
+            );
+            return null;
+        }
+        return rendered;
+    }
+
+    /**
+     * Render `{{secret:NAME}}` across an output's credential-bearing fields.
+     *
+     * Accepts strings (endpoints) and flat string maps (headers, body
+     * templates) and leaves everything else alone. Returns null if ANY field
+     * referenced a secret that did not resolve — one missing credential
+     * invalidates the whole request, not just the field that named it.
+     */
+    private _resolveOutputSecrets<T extends Record<string, unknown>>(fields: T, label: string): T | null {
+        const out: Record<string, unknown> = {};
+        for (const [field, value] of Object.entries(fields)) {
+            if (typeof value === 'string') {
+                const rendered = this._renderSecretRefs(value, label, field);
+                if (rendered === null) return null;
+                out[field] = rendered;
+            } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+                const map: Record<string, unknown> = {};
+                for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+                    if (typeof v !== 'string') { map[k] = v; continue; }
+                    const rendered = this._renderSecretRefs(v, label, `${field}.${k}`);
+                    if (rendered === null) return null;
+                    map[k] = rendered;
+                }
+                out[field] = map;
+            } else {
+                out[field] = value;
+            }
+        }
+        return out as T;
+    }
+
+    /**
+     * Swap resolved secret values back for their names before a string is logged.
+     *
+     * The parser logs its rendered tool parameters, and after migration those
+     * parameters legitimately CONTAIN credentials — the whole point of the
+     * reference form is that the value only exists at run time, so it must not
+     * be written to a log line on the way past.
+     */
+    private _redactSecrets(text: string): string {
+        let out = text;
+        for (const [name, value] of Object.entries(this._secrets)) {
+            // Short values are too collision-prone to blind-replace in a log line.
+            if (typeof value !== 'string' || value.length < 8) continue;
+            if (out.includes(value)) out = out.split(value).join(`{{secret:${name}}}`);
+        }
+        return out;
     }
 
     /**
@@ -346,9 +455,24 @@ export class ParserExecutor {
         ps: Record<string, any>,
         ctx: Record<string, any>,
     ): Promise<void> {
-        const { ttsEndpoint, ttsHeaders, ttsVoice, ttsModel, ttsResponsePath,
-                deliveryEndpoint, deliveryHeaders, deliveryBody, sentenceSplit } = output;
-        if (!ttsEndpoint || !deliveryEndpoint) return;
+        const { ttsVoice, ttsResponsePath, sentenceSplit } = output;
+        if (!output.ttsEndpoint || !output.deliveryEndpoint) return;
+
+        const label = output.id || 'tts_http';
+
+        // Resolve `{{secret:NAME}}` in every credential-bearing field BEFORE the
+        // buffer is consumed below: on a missing secret we bail out, and bailing
+        // out after the split would silently swallow the text this output was
+        // asked to speak.
+        const creds = this._resolveOutputSecrets({
+            ttsEndpoint: output.ttsEndpoint as string,
+            ttsHeaders: output.ttsHeaders as Record<string, string> | undefined,
+            deliveryEndpoint: output.deliveryEndpoint as string,
+            deliveryHeaders: output.deliveryHeaders as Record<string, string> | undefined,
+            deliveryBody: output.deliveryBody as Record<string, string> | undefined,
+        }, label);
+        if (!creds) return;
+        const { ttsEndpoint, ttsHeaders, deliveryEndpoint, deliveryHeaders, deliveryBody } = creds;
 
         // Split sentences (same logic as _flushHttpOutput)
         let chunks: string[];
@@ -367,7 +491,6 @@ export class ParserExecutor {
         }
 
         ps._shouldSendText = false;
-        const label = output.id || 'tts_http';
         const voice = ttsVoice || 'Kore';
 
         // Build the TTS request body from config template (provider-agnostic)
@@ -986,10 +1109,14 @@ export class ParserExecutor {
     private async _processUnit(unit: string): Promise<any> {
         if (!unit && this.skipEmpty) return null;
 
-        // Build minimal state for parser steps
+        // Build minimal state for parser steps.
+        // `_secrets` is the run's resolved secret map, so a parser step names a
+        // credential as `{{state._secrets.NAME}}` instead of embedding it in the
+        // node document (see SECRET_REF_RE).
         const state: Record<string, any> = {
             [this.inputField]: unit,
             _parserState: this._parserState,
+            _secrets: this._secrets,
             [this.outputField]: null,
         };
 
@@ -1000,7 +1127,6 @@ export class ParserExecutor {
                     // Check condition if present (transform steps can have conditions too)
                     const tCondition = (step as any).condition;
                     if (tCondition) {
-                        const { resolveValue } = require('../templateRenderer');
                         try {
                             const ok = Boolean(resolveValue(tCondition, state));
                             if (!ok) continue;
@@ -1036,7 +1162,6 @@ export class ParserExecutor {
                         Object.assign(state, result);
                     }
                 } else if (step.type === 'tool' && this._executeTool) {
-                    const { resolveValue, renderTemplate } = require('../templateRenderer');
                     // Check condition if present
                     const condition = (step as any).condition;
                     if (condition) {
@@ -1051,14 +1176,13 @@ export class ParserExecutor {
                     // Render parameters from state
                     const toolConfig = (step as any).config || {};
                     const toolName = renderTemplate(toolConfig.toolName || '', state);
-                    const rawParams = toolConfig.parameters || {};
-                    const rendered: Record<string, any> = {};
-                    for (const [k, v] of Object.entries(rawParams)) {
-                        rendered[k] = typeof v === 'string' ? resolveValue(v, state) : v;
-                    }
+                    // renderParameters (not a flat loop) so nested objects — an
+                    // http tool's `headers`, say — are rendered too; that is where
+                    // a credential reference has to live.
+                    const rendered: Record<string, any> = renderParameters(toolConfig.parameters || {}, state);
                     // Log the tool call for diagnostics (parser tool steps don't
                     // show up in the ToolExecutor's normal logging path).
-                    console.log(`[ParserExecutor] tool step: ${toolName} params=${JSON.stringify(rendered).substring(0, 400)}`);
+                    console.log(`[ParserExecutor] tool step: ${toolName} params=${this._redactSecrets(JSON.stringify(rendered)).substring(0, 400)}`);
                     // If outputField is specified, await the result and store it in _parserState.
                     // Otherwise fire-and-forget (doesn't block parser processing).
                     const outputField = toolConfig.outputField;
