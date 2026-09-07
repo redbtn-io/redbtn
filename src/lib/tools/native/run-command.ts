@@ -29,6 +29,17 @@
  *
  * Returns the same `{ success, exitCode, stdout, stderr, durationMs }` shape
  * as `ssh_shell` so callers that switch between the two see identical output.
+ *
+ * # Timeout
+ *
+ * `timeout` defaults to `DEFAULT_TIMEOUT_MS` (120 000) when the caller omits
+ * it. It used to default to "no timeout at all", which is the wrong default for
+ * a tool an LLM drives: a command that never returns (an interactive prompt, a
+ * dev server, a `read` waiting on stdin) pinned the pooled session's op chain
+ * forever and every later tool call in the run queued behind it with no error
+ * to explain why. A bounded default fails loud instead. Callers that genuinely
+ * need longer pass `timeout` explicitly; anything long-running belongs in
+ * `ssh_run_async`.
  */
 
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
@@ -37,6 +48,20 @@ import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvi
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
+
+/**
+ * Default hard timeout applied when the caller omits `timeout`, in ms.
+ *
+ * Two minutes covers the shell work a coding agent actually does per call
+ * (git, a targeted build, a file edit) and still bounds a hung command.
+ *
+ * Deliberately NOT exported: the file ends with `module.exports = runCommandTool`
+ * (the registry's require contract, shared with every other native tool), which
+ * replaces the CJS exports object wholesale — a named export here would resolve
+ * under vitest's ESM transform and be `undefined` in the built worker. Tests
+ * assert the value through what reaches `session.exec`.
+ */
+const DEFAULT_TIMEOUT_MS = 120_000;
 
 interface RunCommandArgs {
   command: string;
@@ -81,7 +106,7 @@ const runCommandTool: NativeToolDefinition = {
       },
       timeout: {
         type: 'integer',
-        description: 'Timeout in milliseconds. Default: no timeout. Use for commands that might hang.',
+        description: 'Hard timeout in milliseconds; the command is killed when it elapses. Defaults to 120000 (2 minutes) when omitted. Raise it for a slow build, or use ssh_run_async for anything genuinely long-running.',
         minimum: 100,
       },
       env: {
@@ -133,7 +158,8 @@ const runCommandTool: NativeToolDefinition = {
 
     const command = args.command;
     const workingDir = args.cwd;
-    const timeout = args.timeout ?? 0;
+    // Omitted timeout = the 2-minute default, NOT "unbounded" (see DEFAULT_TIMEOUT_MS).
+    const timeout = args.timeout ?? DEFAULT_TIMEOUT_MS;
     const envVars = args.env;
     const startTime = Date.now();
     const publisher = context?.publisher ?? null;
@@ -244,4 +270,5 @@ const runCommandTool: NativeToolDefinition = {
   },
 };
 
-export = runCommandTool;
+export default runCommandTool;
+module.exports = runCommandTool;

@@ -77,6 +77,18 @@ import {
 } from './types';
 
 /**
+ * Floor for a push (desktop-agent/cli) session's relay timeout, in ms.
+ *
+ * `desktop-request` defaults an op with no explicit `timeoutMs` to 12 s, which
+ * is a UI-latency budget, not a command budget: a `run_command`/`ssh_copy`/
+ * `read_file` against a `cli` connector that took longer than 12 s failed with
+ * `No desktop responded within 12000ms` even though the connector answered.
+ * 5 min matches `ENV_DEFAULTS.idleTimeoutMs`, the closest existing per-session
+ * budget. Tools that want less pass `opts.timeout`, which still wins.
+ */
+export const DESKTOP_RELAY_MIN_TIMEOUT_MS = 300_000;
+
+/**
  * Optional dependencies passed into the manager constructor.
  *
  * Tests use `clientFactory` to swap in `MockSshClient` so they can simulate
@@ -164,7 +176,19 @@ export class EnvironmentManager {
     //    implement IEnvironmentSession so the tools don't care which.
     const isPush = env.kind === 'desktop-agent' || env.kind === 'cli';
     const session: IEnvironmentSession = isPush
-      ? new DesktopAgentSession(env, userId, env.installId ?? '')
+      ? new DesktopAgentSession(
+          env,
+          userId,
+          env.installId ?? '',
+          // 4th arg is POSITIONAL `timeoutMs` (see the DesktopAgentSession ctor) —
+          // NOT an options object. Leaving it off (as this call did) leaves
+          // `this.timeoutMs` undefined, so every relay op falls back to
+          // desktop-request's DEFAULT_TIMEOUT_MS of 12 s and any exec/sftp longer
+          // than that dies with `No desktop responded within 12000ms` while the
+          // command keeps running on the connector. Floor at 5 min so a push
+          // connector gets at least the headroom an SSH session gets.
+          Math.max(env.idleTimeoutMs ?? 0, DESKTOP_RELAY_MIN_TIMEOUT_MS),
+        )
       : new EnvironmentSession({
           env,
           sshKey,
