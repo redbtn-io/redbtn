@@ -32,13 +32,26 @@
  *
  * # Timeout
  *
- * `timeout` defaults to `DEFAULT_TIMEOUT_MS` (120 000) when the caller omits
- * it. It used to default to "no timeout at all", which is the wrong default for
- * a tool an LLM drives: a command that never returns (an interactive prompt, a
- * dev server, a `read` waiting on stdin) pinned the pooled session's op chain
- * forever and every later tool call in the run queued behind it with no error
- * to explain why. A bounded default fails loud instead. Callers that genuinely
- * need longer pass `timeout` explicitly; anything long-running belongs in
+ * `timeout` defaults to `DEFAULT_TIMEOUT_MS` (10 minutes, overridable per
+ * deployment with `RUN_COMMAND_DEFAULT_TIMEOUT_MS`) when the caller omits it.
+ *
+ * It used to default to "no timeout at all". That was never literally forever:
+ * `toolExecutor` already wraps every native tool step in a 30-minute idle
+ * watchdog (`NATIVE_TOOL_IDLE_TIMEOUT_MS`) that kills the step and the remote
+ * process group, so the real prior behaviour was "unbounded up to 30 minutes",
+ * not "unbounded". Leaning on that watchdog is still a bad deal, which is why a
+ * default exists: one command that never returns (an interactive prompt, a dev
+ * server, a `read` waiting on stdin) holds the pooled session's serialized op
+ * chain, burns the run's ENTIRE step budget, and then surfaces as a generic
+ * step-level idle kill that names no command. A default well inside the
+ * watchdog fails this one command loudly and leaves the step alive to react.
+ *
+ * So the default has to sit between two walls: comfortably UNDER the 30-minute
+ * watchdog (so `run_command` reports the timeout, with the command in it), and
+ * comfortably OVER the slow-but-normal call — `npm ci`, `docker build` and a
+ * large `git clone` all run past two minutes routinely, and killing those
+ * mid-write is a worse failure than waiting. Callers that need longer still
+ * pass `timeout` explicitly; anything genuinely long-running belongs in
  * `ssh_run_async`.
  */
 
@@ -50,10 +63,28 @@ import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvi
 type AnyObject = Record<string, any>;
 
 /**
+ * Fallback used when `RUN_COMMAND_DEFAULT_TIMEOUT_MS` is unset or unusable, in ms.
+ *
+ * 10 minutes: long enough for the slow-but-normal call (`npm ci`, `docker
+ * build`, a big `git clone`) and a third of `toolExecutor`'s 30-minute native
+ * tool-step idle watchdog, so a timeout here is reported by THIS tool, naming
+ * the command, instead of arriving later as a generic step-level kill.
+ */
+const FALLBACK_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
  * Default hard timeout applied when the caller omits `timeout`, in ms.
  *
- * Two minutes covers the shell work a coding agent actually does per call
- * (git, a targeted build, a file edit) and still bounds a hung command.
+ * Externalised so a deployment can move it without an engine publish plus a
+ * worker deploy (a worker deploy severs in-flight runs, so a hardcoded value is
+ * expensive to correct in prod). Read once at module load, matching how
+ * `toolExecutor` reads `NATIVE_TOOL_IDLE_TIMEOUT_MS`.
+ *
+ * The env value is VALIDATED rather than passed straight to `Number(...)`: a
+ * typo'd `RUN_COMMAND_DEFAULT_TIMEOUT_MS=10m` yields `NaN`, and a `NaN` timeout
+ * is not "no timeout" — it makes the underlying `setTimeout` fire on the next
+ * tick, killing every command instantly. Non-numeric, `NaN`, zero and negative
+ * all fall back to `FALLBACK_TIMEOUT_MS`.
  *
  * Deliberately NOT exported: the file ends with `module.exports = runCommandTool`
  * (the registry's require contract, shared with every other native tool), which
@@ -61,7 +92,10 @@ type AnyObject = Record<string, any>;
  * under vitest's ESM transform and be `undefined` in the built worker. Tests
  * assert the value through what reaches `session.exec`.
  */
-const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_TIMEOUT_MS: number = ((): number => {
+  const raw = Number(process.env.RUN_COMMAND_DEFAULT_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : FALLBACK_TIMEOUT_MS;
+})();
 
 interface RunCommandArgs {
   command: string;
@@ -106,7 +140,7 @@ const runCommandTool: NativeToolDefinition = {
       },
       timeout: {
         type: 'integer',
-        description: 'Hard timeout in milliseconds; the command is killed when it elapses. Defaults to 120000 (2 minutes) when omitted. Raise it for a slow build, or use ssh_run_async for anything genuinely long-running.',
+        description: `Hard timeout in milliseconds; the command is killed when it elapses. Defaults to ${DEFAULT_TIMEOUT_MS} when omitted. Raise it for a slow build, or use ssh_run_async for anything genuinely long-running.`,
         minimum: 100,
       },
       env: {
@@ -158,7 +192,7 @@ const runCommandTool: NativeToolDefinition = {
 
     const command = args.command;
     const workingDir = args.cwd;
-    // Omitted timeout = the 2-minute default, NOT "unbounded" (see DEFAULT_TIMEOUT_MS).
+    // Omitted timeout = DEFAULT_TIMEOUT_MS, NOT "unbounded" (see the constant).
     const timeout = args.timeout ?? DEFAULT_TIMEOUT_MS;
     const envVars = args.env;
     const startTime = Date.now();

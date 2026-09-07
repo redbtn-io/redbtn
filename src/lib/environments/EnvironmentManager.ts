@@ -89,6 +89,41 @@ import {
 export const DESKTOP_RELAY_MIN_TIMEOUT_MS = 300_000;
 
 /**
+ * Ceiling for a push session's relay timeout, in ms.
+ *
+ * `idleTimeoutMs` is a per-environment field an owner edits and Mongo stores
+ * unclamped, so it can arrive as any number at all. Without a ceiling, one
+ * fat-fingered value becomes a relay wait that outlives every bound above it:
+ * `DesktopAgentSession` has no socket to drop and does not observe
+ * `abortSignal`, so nothing shortens the wait once it starts — the op sits on
+ * the session's serialized op chain, holding an ioredis pub/sub pair open, and
+ * a cancelled run cannot reclaim it.
+ *
+ * 30 min is the wall above this one: `toolExecutor`'s native tool-step idle
+ * watchdog (`NATIVE_TOOL_IDLE_TIMEOUT_MS`, also 30 min) kills the step anyway,
+ * so waiting longer buys nothing and only leaves the orphan behind. An explicit
+ * `opts.timeout` is caller intent rather than stored config and is NOT clamped
+ * here.
+ */
+export const DESKTOP_RELAY_MAX_TIMEOUT_MS = 1_800_000;
+
+/**
+ * Resolve the relay timeout a push session should carry, clamped to
+ * `[DESKTOP_RELAY_MIN_TIMEOUT_MS, DESKTOP_RELAY_MAX_TIMEOUT_MS]`.
+ *
+ * A non-numeric or non-finite `idleTimeoutMs` (a legacy doc holding a string, a
+ * `null`, a field that never existed) resolves to the floor rather than to
+ * `NaN`: `Math.max(NaN, 300_000)` is `NaN`, and `desktop-request` treats a
+ * `NaN` timeout as "unset" and silently reapplies its own 12 s default — the
+ * exact bug this floor exists to prevent.
+ */
+export function resolveDesktopRelayTimeoutMs(idleTimeoutMs?: number | null): number {
+  const raw = Number(idleTimeoutMs);
+  const base = Number.isFinite(raw) && raw > 0 ? raw : 0;
+  return Math.min(Math.max(base, DESKTOP_RELAY_MIN_TIMEOUT_MS), DESKTOP_RELAY_MAX_TIMEOUT_MS);
+}
+
+/**
  * Optional dependencies passed into the manager constructor.
  *
  * Tests use `clientFactory` to swap in `MockSshClient` so they can simulate
@@ -185,9 +220,11 @@ export class EnvironmentManager {
           // `this.timeoutMs` undefined, so every relay op falls back to
           // desktop-request's DEFAULT_TIMEOUT_MS of 12 s and any exec/sftp longer
           // than that dies with `No desktop responded within 12000ms` while the
-          // command keeps running on the connector. Floor at 5 min so a push
-          // connector gets at least the headroom an SSH session gets.
-          Math.max(env.idleTimeoutMs ?? 0, DESKTOP_RELAY_MIN_TIMEOUT_MS),
+          // command keeps running on the connector. Clamped both ways: floored so
+          // a push connector gets at least the headroom an SSH session gets,
+          // capped so an unclamped Mongo `idleTimeoutMs` cannot mint a relay wait
+          // that outlives the tool-step watchdog.
+          resolveDesktopRelayTimeoutMs(env.idleTimeoutMs),
         )
       : new EnvironmentSession({
           env,

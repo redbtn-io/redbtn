@@ -3,11 +3,17 @@
  *
  * `run_command` used to compute `args.timeout ?? 0` and then pass
  * `timeout > 0 ? timeout : undefined` to `session.exec`, so a call with no
- * `timeout` ran UNBOUNDED. That is the wrong default for a tool an LLM drives:
- * a command that never returns (an interactive prompt, a dev server, a `read`
- * on stdin) pins the pooled session's serialized op chain forever and every
- * later tool call in the run queues behind it with nothing to explain why.
- * The default is now 120 000 ms; explicit values still win.
+ * `timeout` ran with no budget of its own. That is the wrong default for a tool
+ * an LLM drives: a command that never returns (an interactive prompt, a dev
+ * server, a `read` on stdin) holds the pooled session's serialized op chain and
+ * burns the run's whole step budget before `toolExecutor`'s 30-minute idle
+ * watchdog kills the step with a generic error that names no command.
+ *
+ * The first fix overcorrected to 120 000 ms, turning "up to 30 minutes" into
+ * "2 minutes" for `npm ci`, `docker build` and large clones. The default is now
+ * 10 minutes — under the watchdog, over the slow-but-normal call — and is
+ * externalised as `RUN_COMMAND_DEFAULT_TIMEOUT_MS` so it can be moved without
+ * an engine publish and a worker deploy. Explicit values still win.
  *
  * Mocking mirrors tests/tools/ssh-run-async.test.ts: no Mongo, no redsecrets,
  * no ssh2 — the EnvironmentSession machinery has its own suite.
@@ -34,7 +40,7 @@ import runCommandTool from '../../src/lib/tools/native/run-command';
 import { loadAndResolveEnvironment } from '../../src/lib/environments/loadAndResolveEnvironment';
 import { environmentManager } from '../../src/lib/environments/EnvironmentManager';
 
-const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
 const FAKE_ENV = {
   environmentId: 'env_rc',
@@ -93,8 +99,10 @@ describe('run_command — schema', () => {
 
   test('the timeout description states the default instead of "no timeout"', () => {
     const d = String(runCommandTool.inputSchema.properties.timeout.description);
-    expect(d).toContain('120000');
+    expect(d).toContain(String(DEFAULT_TIMEOUT_MS));
     expect(d.toLowerCase()).not.toContain('default: no timeout');
+    // The stale 2-minute figure must not survive in the text the model reads.
+    expect(d).not.toContain('120000');
   });
 });
 
@@ -104,7 +112,7 @@ describe('run_command — timeout default', () => {
   });
   afterEach(() => vi.clearAllMocks());
 
-  test('an omitted timeout becomes 120000, not undefined', async () => {
+  test('an omitted timeout becomes the default, not undefined', async () => {
     const exec = stubSession();
     const r = await runCommandTool.handler({ command: 'ls' }, makeMockContext());
     expect(r.isError).toBeUndefined();
@@ -141,6 +149,18 @@ describe('run_command — timeout default', () => {
     expect(execOpts(exec).timeout).toBe(900_000);
   });
 
+  test('the default sits under the tool-step watchdog and over a two-minute build', async () => {
+    // Both walls in one assertion, because the regression was crossing the
+    // lower one: toolExecutor already kills a native tool step after 30 min of
+    // idle (NATIVE_TOOL_IDLE_TIMEOUT_MS), so a default at or above that never
+    // reports; a default at 2 min SIGKILLs `npm ci` mid-write.
+    const exec = stubSession();
+    await runCommandTool.handler({ command: 'npm ci' }, makeMockContext());
+    const applied = execOpts(exec).timeout as number;
+    expect(applied).toBeLessThan(30 * 60 * 1000);
+    expect(applied).toBeGreaterThan(120_000);
+  });
+
   test('a timeout under the 100 ms floor is still rejected', async () => {
     const exec = stubSession();
     const r = await runCommandTool.handler({ command: 'ls', timeout: 50 }, makeMockContext());
@@ -174,5 +194,72 @@ describe('run_command — timeout default', () => {
     const exec = stubSession();
     await runCommandTool.handler({ command: 'ls' }, makeMockContext());
     expect(execOpts(exec).timeout).toBe(DEFAULT_TIMEOUT_MS);
+  });
+
+  test('the default no longer equals DesktopAgentSession\'s old relay wait', () => {
+    // 120 000 was both run_command's default AND the value the push session
+    // handed requestDesktopRaw, so the two clocks fired together and a real
+    // command timeout came back as `No desktop responded within 120000ms`.
+    expect(DEFAULT_TIMEOUT_MS).not.toBe(120_000);
+  });
+});
+
+/**
+ * The env override. Read at module load, so each case needs a fresh module
+ * registry — the same reason `toolExecutor`'s idle-timeout constants are not
+ * re-readable at runtime either.
+ */
+describe('run_command — RUN_COMMAND_DEFAULT_TIMEOUT_MS', () => {
+  const original = process.env.RUN_COMMAND_DEFAULT_TIMEOUT_MS;
+
+  afterEach(() => {
+    if (original === undefined) delete process.env.RUN_COMMAND_DEFAULT_TIMEOUT_MS;
+    else process.env.RUN_COMMAND_DEFAULT_TIMEOUT_MS = original;
+    vi.clearAllMocks();
+  });
+
+  /** Re-import run-command with the env as currently set, and return the applied timeout. */
+  async function appliedTimeoutWithEnv(value: string | undefined): Promise<number> {
+    if (value === undefined) delete process.env.RUN_COMMAND_DEFAULT_TIMEOUT_MS;
+    else process.env.RUN_COMMAND_DEFAULT_TIMEOUT_MS = value;
+    vi.resetModules();
+    const mod = await import('../../src/lib/tools/native/run-command');
+    const tool = (mod as { default: typeof runCommandTool }).default;
+    const { loadAndResolveEnvironment: load } =
+      await import('../../src/lib/environments/loadAndResolveEnvironment');
+    const { environmentManager: mgr } = await import('../../src/lib/environments/EnvironmentManager');
+    vi.mocked(load).mockResolvedValue({ env: FAKE_ENV, sshKey: 'k' });
+    const exec = vi.fn(async () => ({
+      stdout: 'ok', stderr: '', exitCode: 0, durationMs: 3, truncated: false,
+    }));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    vi.mocked(mgr.acquire).mockResolvedValue({ exec } as any);
+    await tool.handler({ command: 'ls' }, makeMockContext());
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (exec.mock.calls.at(-1)?.[1] as any).timeout as number;
+  }
+
+  test('a valid value overrides the built-in default', async () => {
+    expect(await appliedTimeoutWithEnv('1800000')).toBe(1_800_000);
+  });
+
+  test('a non-numeric value falls back instead of becoming NaN', async () => {
+    // `Number(process.env.X || fallback)` on "10m" yields NaN, and a NaN
+    // timeout is not "no timeout": the underlying timer fires on the next tick
+    // and every command dies instantly.
+    expect(await appliedTimeoutWithEnv('10m')).toBe(DEFAULT_TIMEOUT_MS);
+  });
+
+  test('zero and negatives fall back rather than disabling or inverting the bound', async () => {
+    expect(await appliedTimeoutWithEnv('0')).toBe(DEFAULT_TIMEOUT_MS);
+    expect(await appliedTimeoutWithEnv('-5000')).toBe(DEFAULT_TIMEOUT_MS);
+  });
+
+  test('an empty string falls back', async () => {
+    expect(await appliedTimeoutWithEnv('')).toBe(DEFAULT_TIMEOUT_MS);
+  });
+
+  test('unset gives the built-in 10 minutes', async () => {
+    expect(await appliedTimeoutWithEnv(undefined)).toBe(DEFAULT_TIMEOUT_MS);
   });
 });

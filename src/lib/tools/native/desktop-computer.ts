@@ -76,6 +76,7 @@
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
 import { requestDesktop, requestDesktopRaw, type ComputerAction, type ComputerResultMessage } from './desktop-request';
+import { RELAY_GRACE_MS } from '../../environments/DesktopAgentSession';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -94,6 +95,27 @@ function resolveTimeoutMs(args: AnyObject): number | undefined {
   const raw = args?.timeoutMs;
   const n = typeof raw === 'number' ? raw : Number(raw);
   return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * How long `desktop_exec` waits for the connector's reply, given the command
+ * budget it is sending the connector.
+ *
+ * `desktop_exec` used to pass the caller's `timeoutMs` to BOTH clocks — the
+ * connector's hard-kill budget (`payload.timeoutMs`) and the engine's wait for
+ * the reply. Equal values race, and the engine loses often enough to matter: a
+ * command that legitimately exceeded its budget came back as
+ * `desktop_failed: No desktop responded within Nms` — a PRESENCE error naming a
+ * connector that was present, answering, and had already captured the
+ * stdout/stderr the caller never got to see. Same defect, same shape, as the
+ * `DesktopAgentSession.exec` one; see `RELAY_GRACE_MS` for the margin.
+ *
+ * With no `timeoutMs` the caller has asked for no hard kill, so there is no
+ * second clock to clear and the relay keeps its own presence-detector default.
+ */
+function resolveExecRelayTimeoutMs(args: AnyObject): number | undefined {
+  const budget = resolveTimeoutMs(args);
+  return budget === undefined ? undefined : budget + RELAY_GRACE_MS;
 }
 
 /** Optional non-negative display index, or null when explicitly invalid. */
@@ -889,7 +911,8 @@ const desktopExecTool: NativeToolDefinition = {
     if (rawArgs.env && typeof rawArgs.env === 'object') payload.env = rawArgs.env;
     if (typeof rawArgs.timeoutMs === 'number') payload.timeoutMs = rawArgs.timeoutMs;
     context?.publisher?.emit?.('log', `desktop_exec → desktop:cmd:${userId}:${installId}`);
-    const reply = await requestDesktopRaw({ userId, kind: 'exec', payload, installId, timeoutMs: resolveTimeoutMs(rawArgs) });
+    // Relay wait STRICTLY outlasts payload.timeoutMs — see resolveExecRelayTimeoutMs.
+    const reply = await requestDesktopRaw({ userId, kind: 'exec', payload, installId, timeoutMs: resolveExecRelayTimeoutMs(rawArgs) });
     return rawResult(reply);
   },
 };
