@@ -33,7 +33,11 @@
  *   4. Every dispatch goes through `NativeToolRegistry.callTool` — never a
  *      handler directly — so the capability profile, the fail-closed exec gate,
  *      the kill switches, `EXEC_RATE_MAX` and the fail-closed audit all apply
- *      exactly as they do for an API neuron.
+ *      exactly as they do for an API neuron. The context carries
+ *      `untrustedCaller: true`, and that flag is READ BACK through
+ *      `callerIsTrusted` before the call leaves this file, so a rename of the
+ *      caller-trust contract fails the call instead of quietly handing a
+ *      model-chosen URL the platform's internal credentials.
  *   5. The connection is nonce-gated: the first line must be the auth frame,
  *      compared in constant time. Three failures revoke the session and fail
  *      the step. An unauthenticated peer gets `AUTH_DEADLINE_MS` and
@@ -44,13 +48,27 @@
  *      credential patterns and bounded in size before they reach the run
  *      archive — never before the result is returned, because the model needs
  *      the real bytes. A credential the model passes as an ARGUMENT is worth
- *      exactly as much as one that comes back in a result.
+ *      exactly as much as one that comes back in a result. Scrubbing is by
+ *      VALUE SHAPE and by KEY NAME, because `_secrets`, a `password` and a
+ *      connection's `apiKey` have no recognisable shape at all.
  *   7. Every `tools/call` frame is charged against the session budget BEFORE
  *      the allowlist and the args check, so the two denial branches — the
  *      cheapest frames an attacker can send, and the ones that publish two
  *      run-archive writes each — are capped like everything else.
- *   8. Attacker-controlled bytes (a bogus tool name, an unvalidated args blob)
- *      are truncated on their way into an error message or the archive.
+ *   8. Attacker-controlled bytes (a bogus tool name, an unvalidated args blob,
+ *      a JSON-RPC `id`, a `protocolVersion`) are truncated on their way into an
+ *      error message, a response echo or the archive.
+ *   9. The peer cannot make the worker starve or swell. Reads are pumped in
+ *      bounded batches so a pipelined burst cannot stall the event loop; writes
+ *      apply backpressure and a peer that will not drain is dropped;
+ *      `tools/call` is capped by budget and by concurrency; and every archive
+ *      write the bridge awaits has a deadline. The one deliberate exception is
+ *      `callTool` itself — a tool owns its own timeout and holds one of four
+ *      inflight slots, not the session.
+ *  10. The socket lives 0600 inside a 0700 directory and both are removed on
+ *      every ordinary exit path — and, through a single `process.on('exit')`
+ *      sweep, on the ones where `close()` never runs. The step directory holds
+ *      the CLI's `mcp.json`, which holds the nonce.
  *
  * # What this is NOT
  *
@@ -66,6 +84,7 @@ import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { StringDecoder } from 'string_decoder';
 
 import type {
   JsonRpcRequest,
@@ -79,6 +98,7 @@ import type { NativeToolContext } from '../tools/native-registry';
 import { coerceArgsToSchema } from '../tools/coerce-args';
 import { getDataToolRule } from '../permissions/tool-map';
 import { runControlRegistry } from '../run/RunControlRegistry';
+import { callerIsTrusted } from '../tools/native/_outbound-url';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -93,8 +113,36 @@ export const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 /** Server identity reported in `initialize`. */
 export const BRIDGE_SERVER_NAME = 'redbtn';
 
-/** Max bytes of a single newline-delimited frame before the peer is dropped. */
+/**
+ * Max size of the unparsed read buffer before the peer is dropped.
+ *
+ * The buffer is drained of complete lines on every turn and the socket is
+ * paused while a pump is yielding, so in practice this bounds ONE pending
+ * frame. Measured in UTF-16 code units, which is >= the byte count for ASCII
+ * JSON and never more than 2x under it: it is a ceiling, not an accountant.
+ */
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Frames parsed per event-loop turn before the pump yields.
+ *
+ * A peer may pipeline: `JSON.parse` + dispatch of every complete line in one
+ * synchronous `while` was a way to buy an unbounded stall of the worker's event
+ * loop with one 8 MB write of tiny frames. The pump processes a bounded batch,
+ * pauses the socket, and resumes on the next tick.
+ */
+const MAX_FRAMES_PER_TICK = 64;
+
+/**
+ * Userspace write backlog tolerated before the peer is destroyed.
+ *
+ * `socket.write` buffers in the heap without bound when the peer stops
+ * reading. A CLI child that pipelines `tools/list` and never drains is the
+ * cheapest heap-exhaustion primitive on the socket, so writes apply
+ * backpressure (pause the reader) and a backlog past this ceiling is a peer
+ * that is not going to drain.
+ */
+const MAX_WRITE_BACKLOG_BYTES = 8 * 1024 * 1024;
 
 /** Failed auth frames tolerated before the whole session is revoked. */
 const MAX_AUTH_FAILURES = 3;
@@ -122,6 +170,17 @@ export const MAX_PREAUTH_BYTES = 4 * 1024;
 const MAX_PUBLISHED_INPUT_BYTES = 64 * 1024;
 
 /**
+ * Byte bound on the RESULT published for an accepted call.
+ *
+ * The module contract says both halves of a call are bounded before they reach
+ * the archive; the result half was not, and a result's size is as
+ * caller-chosen as an argument's (`read_file` on a big file, a `run_command`
+ * that writes megabytes to stdout). Larger than the input bound because a
+ * legitimate result usually is.
+ */
+const MAX_PUBLISHED_RESULT_BYTES = 256 * 1024;
+
+/**
  * Byte bound on the `input` published for a DENIED call. Much tighter: these
  * args never passed a schema, were never coerced, and are the payload of
  * choice for a child trying to write megabytes into the run archive.
@@ -136,6 +195,35 @@ const MAX_ECHOED_NAME = 64;
 
 /** `sun_path` is 108 bytes on Linux; leave headroom for the NUL. */
 const MAX_SOCKET_PATH = 100;
+
+/** Recursion bound when copying prototype-polluting keys out of an args blob. */
+const MAX_STRIP_DEPTH = 12;
+
+/** Chars of a client-chosen JSON-RPC `id` we will echo back. */
+const MAX_RPC_ID_CHARS = 128;
+
+/** Chars of a client-chosen `protocolVersion` we will echo back. */
+const MAX_PROTOCOL_VERSION_CHARS = 32;
+
+/** A protocol version we are willing to repeat to the client verbatim. */
+const PROTOCOL_VERSION_PATTERN = /^[A-Za-z0-9._:-]+$/;
+
+/**
+ * Deadline on one run-archive write.
+ *
+ * The publisher is a network write. Left unbounded it holds a `tools/call`
+ * slot (there are four) or, on the denial path, one pending promise per frame.
+ * A missed archive write is logged and abandoned; it never fails the call.
+ */
+const PUBLISHER_TIMEOUT_MS = 15_000;
+
+/**
+ * Absolute ceiling on `maxCalls`, whatever `maxToolIterations` the node config
+ * carries. The node config is not model-chosen, so this is a bound on operator
+ * error rather than on an attacker, but every one of those calls is an archive
+ * write and the budget should not be able to name a number with no roof.
+ */
+export const MAX_CALLS_CEILING = 2_000;
 
 /** Default `--max-turns` assumption when the node does not set one. */
 const DEFAULT_MAX_TOOL_ITERATIONS = 50;
@@ -159,11 +247,12 @@ const DEFAULT_RUN_COMMAND_TIMEOUT_MS = 300_000;
  *     That is arbitrary-host exfiltration with the model choosing the host, so
  *     it is forbidden outright rather than parked behind the caller-trust gate
  *     below: that fix is about model-chosen URLs and will not touch inline SSH.
- *   - `send_webhook` — arbitrary `url` + `method` + `headers` + `body`, no SSRF
- *     blocklist, and unmapped in `tool-map`, so it gets neither the capability
- *     check (`native-registry.ts` `enforceToolCapability`) nor the exec guard.
- *     It is precisely the model-chooses-the-destination egress primitive, with
- *     a request body attached. (`send_email` is a fixed relay — the model picks
+ *   - `send_webhook` — arbitrary `url` + `method` + `headers` + `body`, and
+ *     unmapped in `tool-map`, so it gets neither the capability check
+ *     (`native-registry.ts` `enforceToolCapability`) nor the exec guard. PR
+ *     #386 did put it behind the SSRF guard, so the fleet-proxy half is closed;
+ *     the ungated half is not, and an egress primitive with a request body and
+ *     no capability rule stays off. (`send_email` is a fixed relay — the model picks
  *     a recipient, not a host — and is left servable; if that is judged too
  *     generous it belongs in this list too.)
  *   - `alert_desktop` and every `desktop_*` tool — see `FORBIDDEN_TOOL_PREFIXES`.
@@ -247,6 +336,11 @@ const FORBIDDEN_RESOURCES: ReadonlySet<string> = new Set(['computer', 'environme
  * lifts. `send_webhook` is likewise unconditional: it is unmapped in
  * `tool-map`, so no amount of caller-trust plumbing gives it a capability
  * check or an exec guard.
+ *
+ * The gate has now lifted — #378 and #386 are merged — so these three ARE
+ * served. What keeps them safe is `untrustedCaller: true` on every dispatch,
+ * asserted at run time against `callerIsTrusted` before the call leaves this
+ * file (see `assertUntrustedContext`).
  */
 export const NETWORK_TOOLS: ReadonlySet<string> = new Set([
   'fetch_url',
@@ -255,25 +349,22 @@ export const NETWORK_TOOLS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * True when this build carries the caller-trust / SSRF fix (engine PR #378).
+ * True when this build carries the caller-trust / SSRF fix (engine PRs #378 and
+ * #386). Both are merged, so this is `true` — and it is now derived from a
+ * STATIC IMPORT rather than a `require.resolve` probe.
  *
- * Detected rather than declared, and it fails SAFE: any doubt (module missing,
- * `require` unavailable under an ESM test runner, resolution throwing) reads as
- * "not present", which forbids the network tools.
+ * The probe was wrong in a way that mattered: `require.resolve` cannot resolve
+ * a `.ts` sibling under vitest's ESM loader, so the constant read `false` in
+ * every test and `true` in the compiled CJS `dist`. The branch that actually
+ * ships — network tools SERVED to a model — was therefore the one branch the
+ * suite never executed. A static import is the same answer in both worlds, and
+ * it fails at COMPILE time rather than silently flipping a security gate if
+ * `_outbound-url` is ever moved or renamed.
+ *
+ * `isForbiddenForBridge` keeps reading it so the intent stays legible and so a
+ * build that somehow lacks the helper still fails closed at run time.
  */
-export const CALLER_TRUST_FIX_PRESENT: boolean = detectCallerTrustFix();
-
-function detectCallerTrustFix(): boolean {
-  try {
-    // `require` is absent under an ESM loader; treat that as "unknown" ⇒ safe.
-    if (typeof require !== 'function' || typeof require.resolve !== 'function') return false;
-    require.resolve('../net/ssrf-guard');
-    require.resolve('../tools/caller-trust');
-    return true;
-  } catch {
-    return false;
-  }
-}
+export const CALLER_TRUST_FIX_PRESENT: boolean = typeof callerIsTrusted === 'function';
 
 /** Credential shapes scrubbed out of published tool text. */
 const SECRET_PATTERNS: readonly RegExp[] = [
@@ -290,6 +381,26 @@ const SECRET_PATTERNS: readonly RegExp[] = [
 ];
 
 const SCRUBBED = '[REDACTED]';
+
+/**
+ * Property names whose VALUE is a credential whatever it looks like.
+ *
+ * {@link SECRET_PATTERNS} only catches credentials with a recognisable shape.
+ * A run's `_secrets` bag, a `password`, a connection's `apiKey` and an
+ * `Authorization` header are none of those — they are arbitrary strings — and
+ * a bridge caller can put any of them into a tool argument and read them back
+ * out of the run archive. The key is the signal the value cannot give.
+ *
+ * Numbers and booleans are exempt so a legitimate `maxTokens: 500` is not
+ * redacted into uselessness; a secret is never a number.
+ */
+const SECRET_KEY_PATTERN =
+  /^_?secrets?$|secret|token|password|passwd|passphrase|api[_-]?key|apikey|access[_-]?key|private[_-]?key|ssh[_-]?key|credential|authorization|bearer/i;
+
+/** True when `key` names a value that must never reach the run archive. */
+export function isSecretKey(key: string): boolean {
+  return SECRET_KEY_PATTERN.test(key);
+}
 
 /**
  * Replace credential-shaped substrings. Applied to text content on its way to
@@ -438,10 +549,24 @@ const PROTO_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'pr
  * prototype of the object we hand to a tool.
  */
 export function stripPrototypeKeys(raw: Record<string, unknown>): Record<string, unknown> {
+  return stripPrototypeKeysDeep(raw, 0) as Record<string, unknown>;
+}
+
+/**
+ * The recursive half. A top-level-only strip left
+ * `{ options: { __proto__: { isAdmin: true } } }` intact, and any downstream
+ * tool that deep-merges its options — or hands them to a library that does —
+ * turns that into prototype pollution. Depth-bounded for the same reason
+ * {@link scrubValueForPublish} is: the args came off a socket.
+ */
+function stripPrototypeKeysDeep(value: unknown, depth: number): unknown {
+  if (depth >= MAX_STRIP_DEPTH) return value;
+  if (Array.isArray(value)) return value.map((item) => stripPrototypeKeysDeep(item, depth + 1));
+  if (!isPlainObject(value)) return value;
   const out: Record<string, unknown> = {};
-  for (const key of Object.keys(raw)) {
+  for (const key of Object.keys(value)) {
     if (PROTO_KEYS.has(key)) continue;
-    out[key] = raw[key];
+    out[key] = stripPrototypeKeysDeep(value[key], depth + 1);
   }
   return out;
 }
@@ -515,7 +640,17 @@ export function scrubValueForPublish(value: unknown, depth = 0): unknown {
   if (Array.isArray(value)) return value.map((item) => scrubValueForPublish(item, depth + 1));
   if (isPlainObject(value)) {
     const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value)) out[key] = scrubValueForPublish(value[key], depth + 1);
+    for (const key of Object.keys(value)) {
+      const inner = value[key];
+      // A key that NAMES a credential redacts its value whatever the shape:
+      // `_secrets` is an object, an `apiKey` is a string with no pattern, and
+      // both are the model's to choose as a tool argument.
+      if (isSecretKey(key) && inner !== null && inner !== undefined && typeof inner !== 'number' && typeof inner !== 'boolean') {
+        out[key] = SCRUBBED;
+        continue;
+      }
+      out[key] = scrubValueForPublish(inner, depth + 1);
+    }
     return out;
   }
   return value;
@@ -527,9 +662,15 @@ export function scrubValueForPublish(value: unknown, depth = 0): unknown {
  * alternative is letting a peer choose how many megabytes land in the archive.
  */
 export function boundPublishedInput(raw: unknown, maxBytes: number): unknown {
-  const scrubbed = scrubValueForPublish(raw);
+  let scrubbed: unknown;
   let json: string;
+  // The scrub is INSIDE the try: it reads every own property of the value, and
+  // a getter that throws (or any exotic object) would otherwise take the whole
+  // publish down instead of degrading to a marker. `JSON.stringify` throws on
+  // its own for a BigInt. Cycles do NOT reach here — `MAX_SCRUB_DEPTH` severs
+  // them during the scrub — so this branch is for the hostile-value cases.
   try {
+    scrubbed = scrubValueForPublish(raw);
     json = JSON.stringify(scrubbed) ?? 'null';
   } catch {
     return { _bridgeTruncated: true, _reason: 'unserialisable' };
@@ -591,6 +732,131 @@ export function scrubResultForPublish(result: unknown): unknown {
   };
 }
 
+/**
+ * Assert that the context this bridge is about to dispatch with really reads as
+ * untrusted under the merged caller-trust contract.
+ *
+ * `untrustedCaller: true` is the whole reason `fetch_url` / `scrape_url` /
+ * `web_search` are servable at all: it is what stops a model-chosen URL from
+ * borrowing `INTERNAL_SERVICE_KEY` and what turns off the `SSRF_ALLOW_HOSTS`
+ * escape hatch. Setting a boolean and hoping is not enough — if that property
+ * is ever renamed, every bridge call silently becomes a TRUSTED call with a
+ * model-chosen destination. So the flag is read back through the same
+ * predicate the tools use, and a mismatch fails the call instead.
+ */
+export function assertUntrustedContext(context: NativeToolContext): void {
+  if (callerIsTrusted(context)) {
+    throw new Error(
+      'run-bridge: refusing to dispatch — the bridge context does not read as untrusted. ' +
+        'The caller-trust contract changed under this module; see lib/tools/native/_outbound-url.',
+    );
+  }
+}
+
+/**
+ * Await one run-archive write under a deadline.
+ *
+ * Publishing is a network write and it is not on the critical path of the tool
+ * call: a write that misses {@link PUBLISHER_TIMEOUT_MS} is logged and
+ * abandoned. Errors are swallowed for the same reason — a broken archive must
+ * not turn a successful tool call into an error the model has to reason about.
+ */
+async function publishBounded(label: string, work: Promise<void> | void): Promise<void> {
+  if (!work || typeof (work as Promise<void>).then !== 'function') return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work as Promise<void>,
+      new Promise<void>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`timed out after ${PUBLISHER_TIMEOUT_MS} ms`)),
+          PUBLISHER_TIMEOUT_MS,
+        );
+        timer.unref?.();
+      }),
+    ]);
+  } catch (err) {
+    console.warn(`[RunBridge] publisher ${label} failed:`, err instanceof Error ? err.message : err);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// =============================================================================
+// Orphan cleanup
+// =============================================================================
+
+/**
+ * Sockets and step directories a live bridge owns, keyed by socket path.
+ *
+ * `close()` unlinks both, and libuv unlinks the socket when the server handle
+ * closes — but neither runs if the worker dies between `listen()` and `close()`
+ * (an uncaught exception, an OOM kill of the step, `process.exit` from a fatal
+ * path). What is left behind is a step directory that holds the CLI's
+ * `mcp.json`, and that file holds the run's nonce. Registering here gives the
+ * process one best-effort sweep on the way out.
+ */
+const ACTIVE_BRIDGE_PATHS = new Map<string, { dir: string }>();
+let exitHookInstalled = false;
+
+/**
+ * Unlink every socket + step directory a live bridge still owns. Synchronous
+ * on purpose: it runs from `process.on('exit')`, where nothing async survives.
+ * Exported so a worker can sweep on its own shutdown path, and so the sweep is
+ * testable without emitting a process event.
+ */
+export function cleanupOrphanedBridges(): void {
+  for (const [socketPath, entry] of ACTIVE_BRIDGE_PATHS) {
+    try {
+      fs.unlinkSync(socketPath);
+    } catch {
+      /* already gone */
+    }
+    try {
+      fs.rmSync(entry.dir, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+  ACTIVE_BRIDGE_PATHS.clear();
+}
+
+function registerForExitCleanup(socketPath: string, dir: string): void {
+  ACTIVE_BRIDGE_PATHS.set(socketPath, { dir });
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  // ONE listener for every bridge this process ever starts, so a worker running
+  // many concurrent steps cannot trip `MaxListenersExceededWarning`.
+  //
+  // `exit` only. A `SIGTERM`/`SIGINT` listener would SUPPRESS the default
+  // termination for the entire worker process, which is not this module's
+  // decision to make.
+  process.on('exit', cleanupOrphanedBridges);
+}
+
+/**
+ * Refuse a step directory that `close({ removeDir: true })` must not be pointed
+ * at. `close` ends in `fs.rmSync(dir, { recursive: true, force: true })`, and
+ * the caller supplies `dir`, so an empty string, a relative path or a top-level
+ * directory is worth failing on at construction rather than at teardown.
+ */
+function assertUsableStepDir(dir: unknown): string {
+  if (typeof dir !== 'string' || !dir.trim()) {
+    throw new Error('run-bridge: `dir` is required');
+  }
+  const resolved = path.resolve(dir);
+  if (!path.isAbsolute(dir)) {
+    throw new Error(`run-bridge: \`dir\` must be an absolute path: ${dir}`);
+  }
+  // `/x` splits to ['', 'x'] — two segments, one of them empty. A step dir is
+  // always nested at least one level below a container (`<tmp>/<run>/<step>`).
+  const segments = resolved.split(path.sep).filter(Boolean);
+  if (segments.length < 2) {
+    throw new Error(`run-bridge: \`dir\` is too close to the filesystem root to remove: ${resolved}`);
+  }
+  return resolved;
+}
+
 // =============================================================================
 // The bridge
 // =============================================================================
@@ -626,20 +892,25 @@ export async function startRunToolBridge(
   const toolsByName = new Map<string, Tool>(tools.map((t) => [t.name, t]));
   const nonce = crypto.randomBytes(32).toString('hex');
   const iterations =
-    typeof maxToolIterations === 'number' && maxToolIterations > 0
+    typeof maxToolIterations === 'number' && Number.isFinite(maxToolIterations) && maxToolIterations > 0
       ? maxToolIterations
       : DEFAULT_MAX_TOOL_ITERATIONS;
-  const maxCalls = iterations * 4 + 8;
+  const maxCalls = Math.min(Math.floor(iterations) * 4 + 8, MAX_CALLS_CEILING);
 
   // The step directory is the access control: 0700 there makes 0600 on the
   // socket. We deliberately do NOT flip the process-global umask around
   // `listen()` — the worker runs concurrent steps in one process, so a global
   // umask window is a race that could loosen an unrelated file. Explicit modes
   // give the same result deterministically.
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(dir, 0o700);
+  const stepDir = assertUsableStepDir(dir);
+  fs.mkdirSync(stepDir, { recursive: true, mode: 0o700 });
+  // An EXISTING directory keeps whatever mode it had, so re-assert it: 0700 on
+  // the directory is what makes the socket unreachable to another uid, and it
+  // is the half of the story that is not a race (the socket is chmod'ed after
+  // `listen`, and the window between the two is covered by this).
+  fs.chmodSync(stepDir, 0o700);
 
-  const socketPath = path.join(dir, 'bridge.sock');
+  const socketPath = path.join(stepDir, 'bridge.sock');
   if (Buffer.byteLength(socketPath) > MAX_SOCKET_PATH) {
     throw new Error(
       `run-bridge: socket path too long (${Buffer.byteLength(socketPath)} > ${MAX_SOCKET_PATH}): ${socketPath}`,
@@ -653,6 +924,15 @@ export async function startRunToolBridge(
 
   const stats: RunBridgeStats = { callsTotal: 0, denied: 0, authFailures: 0, capped: 0 };
   const sockets = new Set<net.Socket>();
+  /**
+   * Read-flow state per peer.
+   *
+   * Two independent reasons to stop reading — the peer is not draining our
+   * writes (`writeBlocked`), and the frame pump is yielding the event loop
+   * (`pumpYield`) — so they are tracked separately and reconciled by
+   * `syncFlow`, or one would clobber the other's resume.
+   */
+  const peerFlow = new WeakMap<net.Socket, { writeBlocked: boolean; pumpYield: boolean; syncFlow(): void }>();
   let inflight = 0;
   let seq = 0;
   let revoked = false;
@@ -718,11 +998,14 @@ export async function startRunToolBridge(
     }
     if (removeDir) {
       try {
-        fs.rmSync(dir, { recursive: true, force: true });
+        fs.rmSync(stepDir, { recursive: true, force: true });
       } catch (err) {
-        console.warn(`[RunBridge] failed to remove step dir ${dir}:`, err);
+        console.warn(`[RunBridge] failed to remove step dir ${stepDir}:`, err);
       }
     }
+    // Whatever `removeDir` said, this bridge no longer needs the exit sweep:
+    // either the directory is gone, or the caller asked to keep it.
+    ACTIVE_BRIDGE_PATHS.delete(socketPath);
   }
 
   // ── JSON-RPC plumbing ──────────────────────────────────────────────────────
@@ -737,8 +1020,38 @@ export async function startRunToolBridge(
 
   function write(socket: net.Socket, payload: JsonRpcResponse): void {
     if (socket.destroyed) return;
+    let line: string;
     try {
-      socket.write(`${JSON.stringify(payload)}\n`);
+      line = `${JSON.stringify(payload)}\n`;
+    } catch (err) {
+      // A native tool may return something `JSON.stringify` refuses (a BigInt,
+      // a cyclic structure). Dropping the response would hang the client on an
+      // id it will never see, so answer with a well-formed error instead.
+      console.warn('[RunBridge] response is not serialisable:', err);
+      line = `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: (payload as AnyObject).id ?? 0,
+        error: { code: -32603, message: 'Internal error: tool result is not serialisable' },
+      })}\n`;
+    }
+    try {
+      // Backpressure. `socket.write` returning false means the kernel buffer is
+      // full and Node is now buffering in the heap with no bound of its own, so
+      // stop reading from this peer until it drains. A peer that never drains
+      // is not a client, and past the ceiling it is dropped.
+      if (!socket.write(line)) {
+        const flow = peerFlow.get(socket);
+        if (flow) {
+          flow.writeBlocked = true;
+          flow.syncFlow();
+        }
+      }
+      if (socket.writableLength > MAX_WRITE_BACKLOG_BYTES) {
+        console.warn(
+          `[RunBridge] peer write backlog over ${MAX_WRITE_BACKLOG_BYTES} bytes; dropping peer`,
+        );
+        socket.destroy();
+      }
     } catch (err) {
       console.warn('[RunBridge] failed to write response:', err);
     }
@@ -763,14 +1076,20 @@ export async function startRunToolBridge(
       // as well — a credential the model passes as an ARGUMENT would otherwise
       // reach the archive in the clear while the same string in a result is
       // redacted.
-      await publisher.toolStart(toolId, safeName, 'native', {
-        input: boundPublishedInput(args, MAX_DENIED_INPUT_BYTES),
-        triggeredBy: 'neuron',
-        neuronStepId,
-        bridge: true,
-        denied: true,
-      });
-      await publisher.toolError(toolId, reason, { triggeredBy: 'neuron', neuronStepId });
+      await publishBounded(
+        'toolStart(denied)',
+        publisher.toolStart(toolId, safeName, 'native', {
+          input: boundPublishedInput(args, MAX_DENIED_INPUT_BYTES),
+          triggeredBy: 'neuron',
+          neuronStepId,
+          bridge: true,
+          denied: true,
+        }),
+      );
+      await publishBounded(
+        'toolError(denied)',
+        publisher.toolError(toolId, reason, { triggeredBy: 'neuron', neuronStepId }),
+      );
     } catch (err) {
       console.warn('[RunBridge] failed to publish denial audit:', err);
     }
@@ -870,22 +1189,27 @@ export async function startRunToolBridge(
 
     try {
       if (publisher) {
-        await publisher.toolStart(toolId, name, 'native', {
-          // Scrubbed and bounded, exactly like the result at `toolComplete`:
-          // an API key handed to a tool as an argument is the same secret in
-          // the same archive as one that comes back in a result.
-          input: boundPublishedInput(args, MAX_PUBLISHED_INPUT_BYTES),
-          triggeredBy: 'neuron',
-          neuronStepId,
-          bridge: true,
-        });
+        await publishBounded(
+          'toolStart',
+          publisher.toolStart(toolId, name, 'native', {
+            // Scrubbed and bounded, exactly like the result at `toolComplete`:
+            // an API key handed to a tool as an argument is the same secret in
+            // the same archive as one that comes back in a result.
+            input: boundPublishedInput(args, MAX_PUBLISHED_INPUT_BYTES),
+            triggeredBy: 'neuron',
+            neuronStepId,
+            bridge: true,
+          }),
+        );
       }
 
-      // `untrustedCaller` is what the caller-trust fix (PR #378) reads. It is
-      // declared through an intersection rather than added to
-      // `NativeToolContext` here so this file does not collide with that PR;
-      // once it lands the property is simply part of the interface.
-      const context: NativeToolContext & { untrustedCaller?: boolean } = {
+      // `untrustedCaller` is the property `lib/tools/caller-trust`,
+      // `_outbound-url` and every URL-taking tool read. It is now a declared
+      // member of `NativeToolContext` (PR #378 landed), so this is typed as the
+      // plain interface — the intersection this file used to carry would have
+      // let a RENAME of the property typecheck while silently making every
+      // bridge call a trusted one.
+      const context: NativeToolContext = {
         publisher: null,
         state: state as AnyObject,
         runId,
@@ -895,26 +1219,42 @@ export async function startRunToolBridge(
         credentials: (credentials ?? null) as NativeToolContext['credentials'],
         untrustedCaller: true,
       };
+      // Belt: read the flag back through the predicate the tools use.
+      assertUntrustedContext(context);
 
+      // Deliberately NOT wrapped in a timeout. A tool owns its own deadline
+      // (`run_command` is given one above when the CLI omits it), it is handed
+      // the run's `abortSignal`, and a hung tool costs one of
+      // `MAX_INFLIGHT_CALLS` slots rather than the session. A blanket deadline
+      // here would kill legitimate long work with no way for a node to opt out.
       const result = await getNativeRegistry().callTool(name, args, context);
 
       if (publisher) {
-        await publisher.toolComplete(
-          toolId,
-          scrubResultForPublish(result),
-          { neuronStep: neuronStepId, bridge: true },
-          { triggeredBy: 'neuron', neuronStepId },
+        await publishBounded(
+          'toolComplete',
+          publisher.toolComplete(
+            toolId,
+            // Two passes, and both are load-bearing. `scrubResultForPublish`
+            // knows the MCP content shape; `boundPublishedInput` then scrubs
+            // EVERY remaining string (a secret in `structuredContent` or any
+            // other field the spread carried through), redacts credential-named
+            // keys, and caps the size — a result is as caller-chosen as an
+            // argument, and it was the one half of the call the module contract
+            // claimed to bound but did not.
+            boundPublishedInput(scrubResultForPublish(result), MAX_PUBLISHED_RESULT_BYTES),
+            { neuronStep: neuronStepId, bridge: true },
+            { triggeredBy: 'neuron', neuronStepId },
+          ),
         );
       }
       return result as CallToolResult;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (publisher) {
-        try {
-          await publisher.toolError(toolId, message, { triggeredBy: 'neuron', neuronStepId });
-        } catch (pubErr) {
-          console.warn('[RunBridge] failed to publish tool error:', pubErr);
-        }
+        await publishBounded(
+          'toolError',
+          publisher.toolError(toolId, message, { triggeredBy: 'neuron', neuronStepId }),
+        );
       }
       return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
     } finally {
@@ -930,6 +1270,18 @@ export async function startRunToolBridge(
 
     if (isNotification) return;
 
+    // The id is echoed on EVERY response, including the cheap error ones. A
+    // peer that names itself with a megabyte gets that megabyte back on every
+    // frame, out of the worker's heap, for free. Ids are short by every
+    // convention; a long one is not a client.
+    if (typeof id === 'string' && id.length > MAX_RPC_ID_CHARS) {
+      replyError(socket, 0, {
+        code: -32600,
+        message: `Invalid Request: id exceeds ${MAX_RPC_ID_CHARS} characters`,
+      });
+      return;
+    }
+
     if (revoked) {
       replyError(socket, id, { code: -32000, message: `Session revoked: ${revokedReason}` });
       return;
@@ -938,8 +1290,15 @@ export async function startRunToolBridge(
     switch (method) {
       case 'initialize': {
         const requested = (params as AnyObject | undefined)?.protocolVersion;
+        // The handshake echoes the client's version, so bound and shape it
+        // first — same reason as the id above.
+        const echoable =
+          typeof requested === 'string' &&
+          requested.length > 0 &&
+          requested.length <= MAX_PROTOCOL_VERSION_CHARS &&
+          PROTOCOL_VERSION_PATTERN.test(requested);
         reply(socket, id, {
-          protocolVersion: typeof requested === 'string' && requested ? requested : DEFAULT_PROTOCOL_VERSION,
+          protocolVersion: echoable ? requested : DEFAULT_PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: BRIDGE_SERVER_NAME, version: '1.0.0' },
         });
@@ -982,6 +1341,26 @@ export async function startRunToolBridge(
 
     let authed = false;
     let buffer = '';
+    /**
+     * Chunk boundaries do not respect UTF-8. `chunk.toString('utf8')` on a
+     * buffer that ends mid-character yields U+FFFD and corrupts the frame,
+     * which is a real bug for any tool argument carrying non-ASCII text. The
+     * decoder holds the trailing bytes until the rest of the character lands.
+     */
+    const decoder = new StringDecoder('utf8');
+
+    /** Read-flow state for this peer; see `peerFlow`. */
+    const flow = {
+      writeBlocked: false,
+      pumpYield: false,
+      syncFlow(): void {
+        if (socket.destroyed) return;
+        const shouldPause = flow.writeBlocked || flow.pumpYield;
+        if (shouldPause && !socket.isPaused()) socket.pause();
+        else if (!shouldPause && socket.isPaused()) socket.resume();
+      },
+    };
+    peerFlow.set(socket, flow);
 
     /**
      * An unauthenticated peer gets a few seconds and a few kilobytes.
@@ -1022,8 +1401,102 @@ export async function startRunToolBridge(
       }
     }
 
+    /**
+     * Consume one complete line. Returns `false` when the peer is gone and the
+     * pump must stop touching it.
+     */
+    function handleLine(line: string): boolean {
+      if (!line) {
+        // A blank line is free to send and free to ignore, which made it a
+        // way to keep an unauthenticated socket alive without ever failing
+        // auth. After auth it stays what it always was: noise.
+        if (!authed) {
+          failAuth('blank line before the auth frame');
+          return false;
+        }
+        return true;
+      }
+
+      if (!authed) {
+        let frame: AnyObject | null = null;
+        try {
+          frame = JSON.parse(line);
+        } catch {
+          failAuth('first line is not JSON');
+          return false;
+        }
+        if (!frame || frame.redbtn !== 'auth' || typeof frame.nonce !== 'string') {
+          failAuth('first line is not an auth frame');
+          return false;
+        }
+        if (!nonceMatches(frame.nonce, nonce)) {
+          failAuth('nonce mismatch');
+          return false;
+        }
+        authed = true;
+        clearAuthTimer();
+        return true;
+      }
+
+      let req: JsonRpcRequest;
+      try {
+        req = JSON.parse(line) as JsonRpcRequest;
+      } catch {
+        write(socket, {
+          jsonrpc: '2.0',
+          id: 0,
+          error: { code: -32700, message: 'Parse error' },
+        });
+        return !socket.destroyed;
+      }
+      // Dispatched concurrently, on purpose: an MCP client matches responses
+      // by `id`, Claude emits parallel `tool_use` blocks, and serialising here
+      // would both stall those and make the inflight cap unreachable. The
+      // cap is what bounds concurrency, and it is checked and incremented
+      // with no `await` between the two, so a burst cannot race past it.
+      void handleRequest(socket, req).catch((err) => {
+        console.warn('[RunBridge] request handler threw:', err);
+      });
+      return !socket.destroyed;
+    }
+
+    /**
+     * Drain complete lines from `buffer` — at most `MAX_FRAMES_PER_TICK` per
+     * event-loop turn.
+     *
+     * The old loop drained the WHOLE buffer synchronously, so one 8 MB write of
+     * one-byte frames bought hundreds of thousands of `JSON.parse` calls in a
+     * single tick: an event-loop stall on a worker that is also running other
+     * steps, timers and sockets. Yielding costs a tick per batch and gives the
+     * rest of the process a turn. The socket is paused across the yield so the
+     * buffer cannot grow while the pump is away.
+     */
+    function pump(): void {
+      if (socket.destroyed) return;
+      let processed = 0;
+      let idx = buffer.indexOf('\n');
+      while (idx !== -1) {
+        if (processed >= MAX_FRAMES_PER_TICK) {
+          flow.pumpYield = true;
+          flow.syncFlow();
+          setImmediate(() => {
+            flow.pumpYield = false;
+            pump();
+          });
+          return;
+        }
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        processed += 1;
+        if (!handleLine(line)) return;
+        idx = buffer.indexOf('\n');
+      }
+      flow.pumpYield = false;
+      flow.syncFlow();
+    }
+
     socket.on('data', (chunk) => {
-      buffer += chunk.toString('utf8');
+      buffer += decoder.write(chunk);
       if (buffer.length > MAX_FRAME_BYTES) {
         console.warn(`[RunBridge] frame over ${MAX_FRAME_BYTES} bytes; dropping peer`);
         socket.destroy();
@@ -1043,63 +1516,13 @@ export async function startRunToolBridge(
           return;
         }
       }
-      let idx = buffer.indexOf('\n');
-      while (idx !== -1) {
-        const line = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 1);
-        idx = buffer.indexOf('\n');
-        if (!line) {
-          // A blank line is free to send and free to ignore, which made it a
-          // way to keep an unauthenticated socket alive without ever failing
-          // auth. After auth it stays what it always was: noise.
-          if (!authed) {
-            failAuth('blank line before the auth frame');
-            return;
-          }
-          continue;
-        }
+      pump();
+    });
 
-        if (!authed) {
-          let frame: AnyObject | null = null;
-          try {
-            frame = JSON.parse(line);
-          } catch {
-            failAuth('first line is not JSON');
-            return;
-          }
-          if (!frame || frame.redbtn !== 'auth' || typeof frame.nonce !== 'string') {
-            failAuth('first line is not an auth frame');
-            return;
-          }
-          if (!nonceMatches(frame.nonce, nonce)) {
-            failAuth('nonce mismatch');
-            return;
-          }
-          authed = true;
-          clearAuthTimer();
-          continue;
-        }
-
-        let req: JsonRpcRequest;
-        try {
-          req = JSON.parse(line) as JsonRpcRequest;
-        } catch {
-          write(socket, {
-            jsonrpc: '2.0',
-            id: 0,
-            error: { code: -32700, message: 'Parse error' },
-          });
-          continue;
-        }
-        // Dispatched concurrently, on purpose: an MCP client matches responses
-        // by `id`, Claude emits parallel `tool_use` blocks, and serialising here
-        // would both stall those and make the inflight cap unreachable. The
-        // cap is what bounds concurrency, and it is checked and incremented
-        // with no `await` between the two, so a burst cannot race past it.
-        void handleRequest(socket, req).catch((err) => {
-          console.warn('[RunBridge] request handler threw:', err);
-        });
-      }
+    // The peer drained what we wrote: it may be read from again.
+    socket.on('drain', () => {
+      flow.writeBlocked = false;
+      flow.syncFlow();
     });
 
     socket.on('error', (err) => {
@@ -1108,6 +1531,7 @@ export async function startRunToolBridge(
     socket.on('close', () => {
       clearAuthTimer();
       sockets.delete(socket);
+      peerFlow.delete(socket);
     });
   });
 
@@ -1123,6 +1547,9 @@ export async function startRunToolBridge(
     });
   });
   fs.chmodSync(socketPath, 0o600);
+  // From here on the socket and the step directory exist on disk. `close()`
+  // removes both; this covers the paths where `close()` never runs.
+  registerForExitCleanup(socketPath, stepDir);
 
   // Cancellation: one registration does all three jobs — kill the CLI child
   // (the executor's callback), revoke the session, close the server.

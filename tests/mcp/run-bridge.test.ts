@@ -42,6 +42,9 @@ import {
   scrubValueForPublish,
   boundPublishedInput,
   echoName,
+  isSecretKey,
+  cleanupOrphanedBridges,
+  assertUntrustedContext,
   FORBIDDEN_TOOLS,
   FORBIDDEN_TOOL_PREFIXES,
   NETWORK_TOOLS,
@@ -49,6 +52,7 @@ import {
   DEFAULT_PROTOCOL_VERSION,
   MAX_CONNECTIONS,
   MAX_PREAUTH_BYTES,
+  MAX_CALLS_CEILING,
   type RunToolBridge,
   type RunBridgeToolRef,
 } from '../../src/lib/mcp/run-bridge';
@@ -150,6 +154,12 @@ let received: Array<{ name: string; args: any }> = [];
 
 /** `state.data.environmentId` as a dispatched tool saw it. */
 let stateEnvSeen: Array<string | undefined> = [];
+
+/** `context.untrustedCaller` as a dispatched tool saw it. */
+let trustSeen: unknown[] = [];
+
+/** Whole contexts a dispatched tool saw, for the caller-trust assertions. */
+let contextsSeen: any[] = [];
 
 /** Resolvers for every `bridge_slow` call still parked in its handler. */
 let gateResolvers: Array<() => void> = [];
@@ -304,6 +314,8 @@ const originalForbidden = new Map<string, any>();
 beforeEach(() => {
   received = [];
   stateEnvSeen = [];
+  trustSeen = [];
+  contextsSeen = [];
   gateResolvers = [];
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'run-bridge-'));
 
@@ -336,6 +348,8 @@ beforeEach(() => {
     handler: async (args: any, context: any) => {
       received.push({ name: 'bridge_state_probe', args });
       stateEnvSeen.push(context?.state?.data?.environmentId);
+      trustSeen.push(context?.untrustedCaller);
+      contextsSeen.push(context);
       return { content: [{ type: 'text', text: 'probed state' }] };
     },
   });
@@ -1400,15 +1414,392 @@ describe('published input', () => {
     });
   });
 
-  it('survives an unserialisable input', () => {
+  it('severs a cycle during the scrub instead of failing to serialise it', () => {
+    // The depth cap in `scrubValueForPublish` rebuilds the value and replaces
+    // anything past `MAX_SCRUB_DEPTH` with '[TRUNCATED]', so by the time
+    // `JSON.stringify` sees it there is no cycle left to fail on. This test
+    // used to assert the `unserialisable` marker; the marker was never
+    // reachable for cyclic input and the assertion was simply wrong.
     const cyclic: any = { a: 1 };
     cyclic.self = cyclic;
-    expect(boundPublishedInput(cyclic, 1024)).toEqual({ _bridgeTruncated: true, _reason: 'unserialisable' });
+    const out = boundPublishedInput(cyclic, 1024) as any;
+    expect(out._bridgeTruncated).toBeUndefined();
+    expect(() => JSON.stringify(out)).not.toThrow();
+    expect(JSON.stringify(out)).toContain('[TRUNCATED]');
+    expect(out.a).toBe(1);
+  });
+
+  it('returns the unserialisable marker for a value JSON cannot express', () => {
+    // A BigInt survives the scrub untouched (it is not a string, an array or a
+    // plain object) and `JSON.stringify` throws on it. This is what the
+    // defensive `catch` is actually for.
+    expect(boundPublishedInput({ n: BigInt(7) }, 1024)).toEqual({
+      _bridgeTruncated: true,
+      _reason: 'unserialisable',
+    });
+  });
+
+  it('returns the unserialisable marker when reading a property throws', () => {
+    // The scrub reads every own property, so a throwing getter takes the
+    // publish down unless the scrub itself is inside the guard.
+    const hostile: any = { safe: 'ok' };
+    Object.defineProperty(hostile, 'boom', {
+      enumerable: true,
+      get() {
+        throw new Error('nope');
+      },
+    });
+    expect(boundPublishedInput(hostile, 1024)).toEqual({
+      _bridgeTruncated: true,
+      _reason: 'unserialisable',
+    });
   });
 
   it('echoName bounds and never returns an empty label', () => {
     expect(echoName('run_command')).toBe('run_command');
     expect(echoName('')).toBe('(missing)');
     expect(echoName('z'.repeat(5000)).length).toBeLessThanOrEqual(65);
+  });
+});
+
+// =============================================================================
+// 13. Caller trust — the reason the network tools are servable at all
+// =============================================================================
+
+describe('caller trust', () => {
+  it('is decided statically, not by a require.resolve probe', () => {
+    // The probe could not resolve a `.ts` sibling under vitest's ESM loader, so
+    // the constant read `false` in every test and `true` in the compiled CJS
+    // build: the branch that ships — network tools SERVED — was the one branch
+    // the suite never ran. A static import is the same answer in both worlds.
+    expect(CALLER_TRUST_FIX_PRESENT).toBe(true);
+  });
+
+  it('serves the network tools now that the fix is in the build', async () => {
+    for (const name of NETWORK_TOOLS) expect(isForbiddenForBridge(name)).toBe(false);
+
+    // `fetch_url` registers from a module that may not have loaded in this
+    // process, and the bridge serves only `node.tools ∩ registry`. Stub it: the
+    // claim under test is that the BRIDGE no longer removes it.
+    const registry = getNativeRegistry();
+    const previous = registry.get('fetch_url');
+    registry.register('fetch_url', {
+      description: 'fetch a url',
+      inputSchema: { type: 'object', properties: { url: { type: 'string' } } },
+      handler: async () => ({ content: [{ type: 'text', text: 'fetched' }] }),
+    } as any);
+    try {
+      const { bridge: b } = await start();
+      const names: string[] = (await (await client(b)).send('tools/list')).result.tools.map(
+        (t: any) => t.name,
+      );
+      expect(names).toContain('fetch_url');
+    } finally {
+      if (previous) registry.register('fetch_url', previous);
+    }
+  });
+
+  it('dispatches every call with untrustedCaller: true', async () => {
+    const { bridge: b } = await start({
+      resolvedTools: [
+        { name: 'bridge_state_probe', description: 'state probe', inputSchema: PROBE_SCHEMA, source: 'native' },
+      ],
+    });
+    const c = await client(b);
+    await c.send('tools/call', { name: 'bridge_state_probe', arguments: { note: 'hi' } });
+    expect(trustSeen).toEqual([true]);
+    // And the flag is read back through the predicate the tools themselves use,
+    // so a rename of the caller-trust contract cannot silently make every
+    // bridge call a TRUSTED one with a model-chosen destination.
+    expect(() => assertUntrustedContext(contextsSeen[0])).not.toThrow();
+    expect(() => assertUntrustedContext({ ...contextsSeen[0], untrustedCaller: false })).toThrow(
+      /does not read as untrusted/,
+    );
+  });
+});
+
+// =============================================================================
+// 14. Secrets with no shape — `_secrets`, `password`, `apiKey`
+// =============================================================================
+
+describe('published input — credential-named keys', () => {
+  it('redacts by key name, because a secret bag has no recognisable shape', () => {
+    const out: any = scrubValueForPublish({
+      _secrets: { STRIPE: 'whatever-this-is', nested: { deep: 'also-gone' } },
+      apiKey: 'plain-looking-string',
+      api_key: 'another',
+      password: 'hunter2',
+      Authorization: 'Bearer opaque',
+      sshKey: '...',
+      maxTokens: 500,
+      tokensUsed: 12,
+      streaming: true,
+      command: 'ls -la',
+    });
+    expect(out._secrets).toBe('[REDACTED]');
+    expect(out.apiKey).toBe('[REDACTED]');
+    expect(out.api_key).toBe('[REDACTED]');
+    expect(out.password).toBe('[REDACTED]');
+    expect(out.Authorization).toBe('[REDACTED]');
+    expect(out.sshKey).toBe('[REDACTED]');
+    // Numbers and booleans are exempt: a secret is never a number, and a
+    // legitimate `maxTokens` should stay legible in the archive.
+    expect(out.maxTokens).toBe(500);
+    expect(out.tokensUsed).toBe(12);
+    expect(out.streaming).toBe(true);
+    expect(out.command).toBe('ls -la');
+  });
+
+  it('names the keys that count', () => {
+    for (const key of ['_secrets', 'secrets', 'apiKey', 'API_KEY', 'password', 'authorization', 'privateKey', 'credentials', 'bearerToken']) {
+      expect(isSecretKey(key)).toBe(true);
+    }
+    for (const key of ['command', 'cwd', 'path', 'note', 'url', 'timeout']) {
+      expect(isSecretKey(key)).toBe(false);
+    }
+  });
+
+  it('keeps a secret bag passed as an ARGUMENT out of the run archive', async () => {
+    const { bridge: b, published } = await start();
+    const c = await client(b);
+    await c.send('tools/call', {
+      name: 'bridge_probe',
+      arguments: { note: 'hi', secrets: { OPENAI: 'shapeless-value-123' } },
+    });
+    const input = JSON.stringify(published.starts[0].options.input);
+    expect(input).not.toContain('shapeless-value-123');
+    expect(input).toContain('[REDACTED]');
+  });
+});
+
+// =============================================================================
+// 15. The published RESULT is bounded and scrubbed everywhere, not just in
+//     `content[].text`
+// =============================================================================
+
+describe('published result', () => {
+  it('scrubs fields the content-shape scrub never looked at', async () => {
+    const registry = getNativeRegistry();
+    registry.register('bridge_leaky', {
+      description: 'returns a secret outside content[].text',
+      inputSchema: PROBE_SCHEMA,
+      handler: async () => ({
+        content: [{ type: 'text', text: 'fine' }],
+        // `scrubResultForPublish` spreads everything else through untouched.
+        structuredContent: { token: 'rpat_zzzzzzzzzzzzzzzz', apiKey: 'shapeless-abc' },
+      }),
+    } as any);
+    const { bridge: b, published } = await start({
+      resolvedTools: [
+        { name: 'bridge_leaky', description: 'leaky', inputSchema: PROBE_SCHEMA, source: 'native' },
+      ],
+    });
+    const c = await client(b);
+    const res = await c.send('tools/call', { name: 'bridge_leaky', arguments: { note: 'x' } });
+
+    // the MODEL still gets the real bytes
+    expect(JSON.stringify(res.result)).toContain('rpat_zzzzzzzzzzzzzzzz');
+    // the ARCHIVE does not
+    const archived = JSON.stringify(published.completes[0].result);
+    expect(archived).not.toContain('rpat_zzzzzzzzzzzzzzzz');
+    expect(archived).not.toContain('shapeless-abc');
+    expect(archived).toContain('[REDACTED]');
+  });
+
+  it('bounds a giant result instead of writing it whole to the archive', async () => {
+    const registry = getNativeRegistry();
+    registry.register('bridge_firehose', {
+      description: 'returns a lot',
+      inputSchema: PROBE_SCHEMA,
+      handler: async () => ({ content: [{ type: 'text', text: 'F'.repeat(1024 * 1024) }] }),
+    } as any);
+    const { bridge: b, published } = await start({
+      resolvedTools: [
+        { name: 'bridge_firehose', description: 'firehose', inputSchema: PROBE_SCHEMA, source: 'native' },
+      ],
+    });
+    const c = await client(b);
+    const res = await c.send('tools/call', { name: 'bridge_firehose', arguments: { note: 'x' } });
+
+    // the model got all of it
+    expect(res.result.content[0].text).toHaveLength(1024 * 1024);
+    // the archive got a bounded stand-in
+    const archived: any = published.completes[0].result;
+    expect(archived._bridgeTruncated).toBe(true);
+    expect(JSON.stringify(archived).length).toBeLessThan(1024 * 1024);
+  });
+});
+
+// =============================================================================
+// 16. Prototype pollution below the top level
+// =============================================================================
+
+describe('stripPrototypeKeys', () => {
+  it('strips a nested __proto__, not just a top-level one', () => {
+    const raw = JSON.parse('{"a":1,"__proto__":{"x":1},"opts":{"__proto__":{"isAdmin":true},"keep":2},"list":[{"__proto__":{"y":1},"ok":3}]}');
+    const out: any = stripPrototypeKeys(raw);
+    expect(Object.keys(out)).toEqual(['a', 'opts', 'list']);
+    expect(Object.keys(out.opts)).toEqual(['keep']);
+    expect(Object.keys(out.list[0])).toEqual(['ok']);
+    expect(({} as any).isAdmin).toBeUndefined();
+  });
+
+  it('does not blow the stack on hostile nesting', () => {
+    let deep: any = { ok: 1 };
+    for (let i = 0; i < 5000; i++) deep = { next: deep };
+    expect(() => stripPrototypeKeys(deep)).not.toThrow();
+  });
+
+  it('reaches a tool with the nested key already gone', async () => {
+    const { bridge: b } = await start();
+    const c = await client(b);
+    c.raw(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 9001,
+        method: 'tools/call',
+        params: { name: 'bridge_probe', arguments: JSON.parse('{"note":"n","cwd":"/ws","extra":{"__proto__":{"pwned":true}}}') },
+      }) + '\n',
+    );
+    await until(() => received.length > 0);
+    expect(JSON.stringify(received[0].args)).not.toContain('__proto__');
+  });
+});
+
+// =============================================================================
+// 17. The peer cannot stall or swell the worker
+// =============================================================================
+
+describe('flow control', () => {
+  it('answers a pipelined burst of frames without dropping or reordering any', async () => {
+    // One write, many frames. The pump processes them in bounded batches across
+    // several ticks; every one must still be answered, in order.
+    const { bridge: b } = await start();
+    const c = await client(b);
+    const results = await Promise.all(
+      Array.from({ length: 400 }, () => c.send('ping')),
+    );
+    expect(results).toHaveLength(400);
+    for (const r of results) expect(r.result).toEqual({});
+  });
+
+  it('keeps a multi-byte character intact when it is split across chunks', async () => {
+    const { bridge: b } = await start();
+    const socket = net.connect(b.socketPath);
+    await new Promise((resolve) => socket.on('connect', resolve));
+    socket.write(`${JSON.stringify({ redbtn: 'auth', nonce: b.nonce })}\n`);
+
+    const note = '日本語 — ünïcödé 🎈';
+    const frame = Buffer.from(
+      `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'bridge_probe', arguments: { note } } })}\n`,
+      'utf8',
+    );
+    // Split inside the first multi-byte character.
+    const cut = frame.indexOf(Buffer.from('日', 'utf8')) + 1;
+    socket.write(frame.subarray(0, cut));
+    await new Promise((r) => setTimeout(r, 20));
+    socket.write(frame.subarray(cut));
+
+    await until(() => received.length > 0, 2000);
+    socket.destroy();
+    expect(received[0].args.note).toBe(note);
+  });
+});
+
+// =============================================================================
+// 18. Bounds on everything the bridge echoes back
+// =============================================================================
+
+describe('echo bounds', () => {
+  it('refuses a JSON-RPC id it would have to echo forever', async () => {
+    const { bridge: b } = await start();
+    const c = await client(b);
+    c.raw(
+      JSON.stringify({ jsonrpc: '2.0', id: 'x'.repeat(4096), method: 'ping' }) + '\n',
+    );
+    await until(() => c.lines.length > 0, 2000);
+    const msg = JSON.parse(c.lines[c.lines.length - 1]);
+    expect(msg.error.code).toBe(-32600);
+    expect(msg.id).toBe(0);
+    expect(JSON.stringify(msg).length).toBeLessThan(512);
+  });
+
+  it('echoes a sane protocolVersion and substitutes the default for anything else', async () => {
+    const { bridge: b } = await start();
+    const c = await client(b);
+    expect((await c.send('initialize', { protocolVersion: '2025-03-26' })).result.protocolVersion).toBe('2025-03-26');
+    expect((await c.send('initialize', { protocolVersion: 'y'.repeat(5000) })).result.protocolVersion).toBe(DEFAULT_PROTOCOL_VERSION);
+    expect((await c.send('initialize', { protocolVersion: '<script>' })).result.protocolVersion).toBe(DEFAULT_PROTOCOL_VERSION);
+    expect((await c.send('initialize', {})).result.protocolVersion).toBe(DEFAULT_PROTOCOL_VERSION);
+  });
+});
+
+// =============================================================================
+// 19. The socket and the step dir are cleaned up on every exit path
+// =============================================================================
+
+describe('cleanup', () => {
+  it('sweeps a bridge whose close() never ran', async () => {
+    // The step dir holds the CLI's `mcp.json`, which holds the nonce. A worker
+    // that dies between `listen()` and `close()` must not leave it behind.
+    const dir = path.join(tmpDir, 'orphan');
+    const { bridge: b } = await start({ dir });
+    fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(b.mcpConfig));
+    expect(fs.existsSync(b.socketPath)).toBe(true);
+
+    cleanupOrphanedBridges();
+
+    expect(fs.existsSync(b.socketPath)).toBe(false);
+    expect(fs.existsSync(dir)).toBe(false);
+    // A second sweep is a no-op, and close() still resolves.
+    cleanupOrphanedBridges();
+    await b.close({ removeDir: true });
+  });
+
+  it('deregisters on close, so a later sweep cannot delete a kept directory', async () => {
+    const dir = path.join(tmpDir, 'kept');
+    const { bridge: b } = await start({ dir });
+    await b.close({ removeDir: false });
+    bridge = null;
+    fs.writeFileSync(path.join(dir, 'keep-me'), 'x');
+
+    cleanupOrphanedBridges();
+
+    expect(fs.existsSync(path.join(dir, 'keep-me'))).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('installs exactly one process exit listener however many bridges start', async () => {
+    const before = process.listenerCount('exit');
+    const a = await start({ dir: path.join(tmpDir, 'l1') });
+    await a.bridge.close({ removeDir: true });
+    const c = await start({ dir: path.join(tmpDir, 'l2') });
+    await c.bridge.close({ removeDir: true });
+    bridge = null;
+    expect(process.listenerCount('exit') - before).toBeLessThanOrEqual(1);
+  });
+});
+
+// =============================================================================
+// 20. Construction-time guards
+// =============================================================================
+
+describe('construction guards', () => {
+  it('refuses a step dir that close() must not be pointed at', async () => {
+    // `close()` ends in `rmSync(dir, { recursive: true, force: true })`.
+    await expect(start({ dir: 'relative/step' })).rejects.toThrow(/absolute/);
+    await expect(start({ dir: '/tmp' })).rejects.toThrow(/too close to the filesystem root/);
+    await expect(start({ dir: '' })).rejects.toThrow(/required/);
+    bridge = null;
+  });
+
+  it('clamps the call budget however large maxToolIterations is', async () => {
+    const { bridge: b } = await start({ maxToolIterations: 10_000_000 });
+    expect(b.maxCalls).toBe(MAX_CALLS_CEILING);
+  });
+
+  it('keeps the documented budget for an ordinary node', async () => {
+    const { bridge: b } = await start({ maxToolIterations: 12 });
+    expect(b.maxCalls).toBe(12 * 4 + 8);
   });
 });
