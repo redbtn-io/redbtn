@@ -44,6 +44,8 @@ import {
   mapModelUsageEntry,
   resolveWorkspaceMount,
   resolveEffort,
+  resolveModel,
+  DEFAULT_MODEL,
   looksLikeAuthFailure,
   sanitizeSegment,
   uuidv5,
@@ -55,6 +57,7 @@ import {
   __claudeCodeSlotsInUse,
   type ClaudeInitEvent,
 } from '../../src/lib/nodes/universal/executors/claudeCodeExecutor';
+import { DEFAULT_CLAUDE_CODE_EFFORT } from '../../src/lib/types/neuron';
 import { runControlRegistry } from '../../src/lib/run/RunControlRegistry';
 
 // =============================================================================
@@ -607,11 +610,46 @@ describe('helpers', () => {
     );
   });
 
-  it('only accepts efforts the CLI knows', () => {
-    expect(resolveEffort({ parameters: { effort: 'xhigh' } }, {})).toBe('xhigh');
+  it('only accepts efforts the CLI knows, and defaults to xhigh', () => {
+    expect(resolveEffort({ parameters: { effort: 'low' } }, {})).toBe('low');
+    // The neuron doc is the normal source — `NeuronRegistry.getConfig` now
+    // carries `parameters` through, which it did not before.
     expect(resolveEffort({}, { parameters: { effort: 'high' } })).toBe('high');
-    expect(resolveEffort({ parameters: { effort: 'ludicrous' } }, {})).toBeUndefined();
-    expect([...EFFORT_LEVELS]).toContain('max');
+    // The step's own parameters win over the neuron doc's.
+    expect(resolveEffort({ parameters: { effort: 'low' } }, { parameters: { effort: 'max' } })).toBe(
+      'low',
+    );
+    // Unknown level: warn and fall back, rather than fail the step. Effort does
+    // not change *which* model runs, so a stale doc degrades instead of erroring.
+    expect(resolveEffort({ parameters: { effort: 'ludicrous' } }, {})).toBe('xhigh');
+    // Nothing named anywhere: these neurons exist to spend a flat-rate
+    // subscription on hard work.
+    expect(resolveEffort({}, {})).toBe(DEFAULT_CLAUDE_CODE_EFFORT);
+    expect(DEFAULT_CLAUDE_CODE_EFFORT).toBe('xhigh');
+    // The list is the CLI's own (`claude --help` on 2.1.263).
+    expect([...EFFORT_LEVELS].sort()).toEqual(['high', 'low', 'max', 'medium', 'xhigh']);
+  });
+
+  it('validates the neuron model before it becomes an argv token', () => {
+    // Both forms the CLI documents, both exercised live against 2.1.263.
+    expect(resolveModel('claude-opus-5')).toBe('claude-opus-5');
+    expect(resolveModel('claude-fable-5-1')).toBe('claude-fable-5-1');
+    expect(resolveModel('opus')).toBe('opus');
+    // A doc with no model at all still runs.
+    expect(resolveModel(undefined)).toBe(DEFAULT_MODEL);
+    expect(resolveModel('')).toBe(DEFAULT_MODEL);
+    // A flag-shaped or whitespace-bearing value is a config error, not a
+    // silent substitution: running a different (dearer) model than the neuron
+    // advertises is worse than failing the step.
+    for (const bad of ['--dangerously-skip-permissions', '-p', 'opus 5', 'claude opus', 'A/../b']) {
+      expect(() => resolveModel(bad)).toThrow(/not a usable --model value/);
+    }
+    expect(() => resolveModel(42 as unknown as string)).toThrow(/not a usable --model value/);
+    try {
+      resolveModel('--restricted');
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('claude_code_bad_model');
+    }
   });
 
   it('detects a 401 from the text, never from apiKeySource', () => {
@@ -908,6 +946,50 @@ describe('runClaudeCodeStep', () => {
     await expect(run({ timeoutMs: 500 }).promise).rejects.toMatchObject({
       code: 'claude_code_timeout',
     });
+  });
+
+  it('kills the whole process group, not just the CLI', async () => {
+    // The CLI is never a leaf — it spawns the bridge's stdio shim, and any
+    // other MCP server it is configured with. A kill that reaches only
+    // `claude` leaves those holding the socket and, for a real CLI, still
+    // burning subscription quota against an abandoned run.
+    const grandchildPid = path.join(tmpRoot, 'grandchild.pid');
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT}
+       const kid = require('child_process').spawn(
+         process.execPath,
+         ['-e', 'setInterval(() => {}, 1000)'],
+         { stdio: 'ignore' },
+       );
+       fs.writeFileSync(${JSON.stringify(grandchildPid)}, String(kid.pid));
+       setInterval(() => {}, 1000);`,
+    );
+
+    await expect(run({ timeoutMs: 700 }).promise).rejects.toMatchObject({
+      code: 'claude_code_timeout',
+    });
+
+    const pid = Number(fs.readFileSync(grandchildPid, 'utf8'));
+    expect(Number.isInteger(pid)).toBe(true);
+
+    // SIGTERM propagates through the group; give it a moment to land.
+    let alive = true;
+    for (let i = 0; i < 40 && alive; i++) {
+      try {
+        process.kill(pid, 0); // signal 0 = existence check
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      } catch {
+        alive = false;
+      }
+    }
+    if (alive) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* nothing to clean up */
+      }
+    }
+    expect(alive, `grandchild ${pid} outlived the group kill`).toBe(false);
   });
 
   it('refuses to start when the run is already aborted', async () => {

@@ -65,6 +65,7 @@ import * as crypto from 'crypto';
 import * as readline from 'readline';
 
 import type { NeuronStepConfig } from '../types';
+import { CLAUDE_CODE_EFFORT_LEVELS, DEFAULT_CLAUDE_CODE_EFFORT } from '../../../types/neuron';
 import { renderTemplate, getNestedProperty } from '../templateRenderer';
 import { resolveTools, partitionToolRefs } from '../../../tools/tool-resolver';
 import {
@@ -118,14 +119,58 @@ export const STDERR_TAIL_BYTES = 2048;
 /** A single stdout line longer than this is dropped rather than parsed. */
 const MAX_STREAM_LINE_BYTES = 8 * 1024 * 1024;
 
-/** `--effort` levels the 2.1.263 CLI accepts (verified from `--help`). */
-export const EFFORT_LEVELS: ReadonlySet<string> = new Set([
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
-]);
+/**
+ * `--effort` levels the 2.1.263 CLI accepts.
+ *
+ * VERIFIED live on 2026-09-07: `claude --help` reads "Effort level for the
+ * current session (low, medium, high, xhigh, max)". The list itself lives in
+ * `lib/types/neuron.ts` so the Mongoose schema validates writes against the
+ * same values this validates reads against.
+ */
+export const EFFORT_LEVELS: ReadonlySet<string> = new Set(CLAUDE_CODE_EFFORT_LEVELS);
+
+/**
+ * Model identifiers the CLI's `--model` accepts.
+ *
+ * VERIFIED live on 2026-09-07 from `claude --help`: "Provide an alias for the
+ * latest model (e.g. 'fable', 'opus', or 'sonnet') or a model's full name
+ * (e.g. 'claude-fable-5')." Both forms were exercised against the real CLI:
+ * `--model opus` resolves to `claude-opus-5` in the init event, and
+ * `--model claude-fable-5-1` is echoed verbatim and keys `modelUsage`.
+ *
+ * The shape is validated rather than passed through because it becomes an
+ * argv token. `spawn` without a shell means there is no shell injection to
+ * worry about, but a value beginning with `-` turns into a flag-shaped
+ * argument and a value carrying whitespace or NUL is never a real model, so
+ * both are refused with a config error instead of a confusing CLI parse
+ * failure two seconds into a subscription turn.
+ */
+const MODEL_ID_PATTERN = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/;
+
+/** Fallback when a `claude-code` neuron doc somehow carries no model. */
+export const DEFAULT_MODEL = 'opus';
+
+/**
+ * Validate the neuron's `model` for use as a `--model` value.
+ *
+ * Returns the model to spawn with. Throws `claude_code_bad_model` rather than
+ * silently substituting: a neuron doc that names a model the CLI cannot parse
+ * is a configuration error, and quietly running a *different* (possibly far
+ * more expensive) model than the one the neuron advertises is worse than
+ * failing the step.
+ */
+export function resolveModel(raw: unknown): string {
+  if (raw === undefined || raw === null || raw === '') return DEFAULT_MODEL;
+  if (typeof raw !== 'string' || !MODEL_ID_PATTERN.test(raw)) {
+    const err = new Error(
+      `neuron model ${JSON.stringify(raw)} is not a usable --model value; ` +
+        `expected an alias ('opus', 'fable', 'sonnet') or a full id ('claude-opus-5')`,
+    );
+    (err as AnyObject).code = 'claude_code_bad_model';
+    throw err;
+  }
+  return raw;
+}
 
 /**
  * Root of the per-step private directories.
@@ -350,7 +395,22 @@ export function buildChildEnv(params: {
   };
 }
 
-/** Resolve `--effort`, preferring the node's parameters over the neuron doc. */
+/**
+ * Resolve `--effort`, preferring the node's parameters over the neuron doc.
+ *
+ * The neuron doc is the normal source: `NeuronRegistry.getConfig` now carries
+ * `parameters` into `NeuronConfig` (it did not before — the field was declared
+ * on neither the Mongoose schema nor the config, so `parameters.effort` could
+ * not reach here at all and `--effort` was unpassable).
+ *
+ * An unknown level is dropped with a warning rather than throwing: unlike
+ * `--model`, effort does not change *which* model runs, so degrading to the
+ * default is the proportionate response to a stale doc.
+ *
+ * When nothing names a level, `DEFAULT_CLAUDE_CODE_EFFORT` ('xhigh') applies:
+ * these neurons exist to spend a flat-rate subscription on hard work, and a
+ * step that wants it cheaper says so.
+ */
 export function resolveEffort(state: AnyObject, neuronCfg: AnyObject): string | undefined {
   const candidates = [state?.parameters?.effort, neuronCfg?.parameters?.effort];
   for (const candidate of candidates) {
@@ -361,7 +421,7 @@ export function resolveEffort(state: AnyObject, neuronCfg: AnyObject): string | 
         `(known: ${[...EFFORT_LEVELS].join(', ')})`,
     );
   }
-  return undefined;
+  return DEFAULT_CLAUDE_CODE_EFFORT;
 }
 
 // =============================================================================
@@ -738,7 +798,7 @@ export async function runClaudeCodeStep(
     );
   }
 
-  const model = typeof neuronCfg?.model === 'string' && neuronCfg.model ? neuronCfg.model : 'opus';
+  const model = resolveModel(neuronCfg?.model);
   const mount = resolveWorkspaceMount(state);
   const maxTurns =
     typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0
@@ -798,23 +858,45 @@ export async function runClaudeCodeStep(
     timedOut: boolean;
   } = { killReason: null, initFailure: null, timedOut: false };
 
-  /** Idempotent SIGTERM → 10 s → SIGKILL. */
+  /**
+   * Signal the child's whole PROCESS GROUP, not just the child.
+   *
+   * The CLI is not a leaf: it spawns the stdio shim for the bridge, and any
+   * other MCP server it is configured with. `child.kill()` signals only the
+   * `claude` process itself, so a CLI that dies without reaping its own
+   * children — or one wedged enough to ignore SIGTERM — leaves them behind
+   * holding the bridge socket and, worse, still burning subscription quota
+   * against a run the platform has already given up on.
+   *
+   * `spawn(..., { detached: true })` makes the child a process-group leader
+   * (pgid == pid), which is what makes `process.kill(-pid, …)` safe: without
+   * it the child shares the WORKER's group and a negative pid would signal
+   * the worker itself. The two facts belong together — do not remove
+   * `detached` without removing this.
+   */
+  const signalGroup = (signal: NodeJS.Signals): void => {
+    const pid = child?.pid;
+    if (!pid) return;
+    try {
+      process.kill(-pid, signal);
+    } catch {
+      // ESRCH: the group is already gone, or (on a platform without process
+      // groups) never existed. Fall back to the direct child.
+      try {
+        child?.kill(signal);
+      } catch {
+        /* already gone */
+      }
+    }
+  };
+
+  /** Idempotent SIGTERM → 10 s → SIGKILL, both to the whole group. */
   const requestKill = (reason: string): void => {
     if (ctl.killReason) return;
     ctl.killReason = reason;
     console.warn(`[ClaudeCode] killing CLI child for run ${runId}: ${reason}`);
-    try {
-      child?.kill('SIGTERM');
-    } catch {
-      /* already gone */
-    }
-    killTimer = setTimeout(() => {
-      try {
-        child?.kill('SIGKILL');
-      } catch {
-        /* already gone */
-      }
-    }, SIGKILL_GRACE_MS);
+    signalGroup('SIGTERM');
+    killTimer = setTimeout(() => signalGroup('SIGKILL'), SIGKILL_GRACE_MS);
     killTimer.unref?.();
   };
 
@@ -911,7 +993,10 @@ export async function runClaudeCodeStep(
       argv: redactArgvForLog(args),
     });
 
-    child = spawn(bin, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    // `detached: true` puts the CLI in its own process group so `signalGroup`
+    // can take down the shim and any other grandchild with it. See the comment
+    // there — the two are a pair.
+    child = spawn(bin, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
 
     // ── cancellation, abort, wall clock, run-record poll ───────────────────
     unregisterCancel = runControlRegistry.registerOnCancel(runId, () =>

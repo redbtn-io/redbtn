@@ -38,6 +38,13 @@ export type NeuronRole = 'chat' | 'worker' | 'specialist';
  *   - `audio`  — the model accepts inline audio content parts. Used today
  *     by Gemini's audio-input path; placeholder for other providers as
  *     they roll out audio support.
+ *   - `tools`  — the neuron can call tools at all. Descriptive only: the
+ *     engine still decides *how* through `capability-matrix.ts`
+ *     (`toolStrategy`), which is `'none'` for `claude-code` because the CLI
+ *     runs its own loop and is handed tools over the run bridge instead.
+ *   - `streaming` — the neuron can emit incremental text. Descriptive only,
+ *     for studio pickers; the executor gates real streaming on the node's
+ *     own `config.stream`.
  *
  * Override semantics: when present (true OR false), the explicit value
  * always wins. When absent, callers consult the static matrix
@@ -46,6 +53,48 @@ export type NeuronRole = 'chat' | 'worker' | 'specialist';
 export interface NeuronCapabilities {
   vision?: boolean;
   audio?: boolean;
+  tools?: boolean;
+  streaming?: boolean;
+}
+
+/**
+ * `--effort` levels the Claude Code CLI accepts.
+ *
+ * VERIFIED against `claude --help` on 2.1.263 (the version the worker image
+ * pins): "Effort level for the current session (low, medium, high, xhigh,
+ * max)". Lives here, not in the executor, so the Mongoose schema can validate
+ * writes against the same list the executor validates reads against.
+ */
+export const CLAUDE_CODE_EFFORT_LEVELS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const;
+
+export type ClaudeCodeEffort = (typeof CLAUDE_CODE_EFFORT_LEVELS)[number];
+
+/**
+ * Effort used when a `claude-code` neuron doc names none.
+ *
+ * `xhigh` rather than the CLI's own default because these neurons exist to
+ * spend a flat-rate subscription on hard work; a step that wants it cheaper
+ * says so explicitly.
+ */
+export const DEFAULT_CLAUDE_CODE_EFFORT: ClaudeCodeEffort = 'xhigh';
+
+/**
+ * Provider-specific knobs carried on the neuron document.
+ *
+ * Deliberately a *closed* shape rather than a free-form bag: the Mongoose
+ * schema declares exactly these keys, so an unknown key written by any caller
+ * is dropped by strict mode instead of reaching a child process's command
+ * line. Adding a knob is a schema change on purpose.
+ */
+export interface NeuronParameters {
+  /** `claude-code` only — maps to the CLI's `--effort <level>`. */
+  effort?: ClaudeCodeEffort;
 }
 
 /**
@@ -80,6 +129,11 @@ export interface NeuronConfig {
    * consults `vision-matrix.ts` (and audio-matrix.ts in a future phase).
    */
   capabilities?: NeuronCapabilities;
+  /**
+   * Provider-specific knobs from the neuron document. Today only
+   * `parameters.effort`, read by the `claude-code` executor.
+   */
+  parameters?: NeuronParameters;
 }
 
 /**
@@ -122,4 +176,9 @@ export interface NeuronDocument {
    * Resolved via vision-matrix when unset.
    */
   capabilities?: NeuronCapabilities;
+  /**
+   * Provider-specific knobs on the persisted document. Declared in the
+   * Mongoose schema (strict mode drops anything else).
+   */
+  parameters?: NeuronParameters;
 }
