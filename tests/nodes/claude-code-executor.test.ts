@@ -583,8 +583,16 @@ describe('helpers', () => {
 
   it('makes an outputField safe as one path segment', () => {
     expect(sanitizeSegment('data.coderSummary', 'step')).toBe('data.coderSummary');
-    expect(sanitizeSegment('../../etc/passwd', 'step')).toBe('_._etc_passwd');
     expect(sanitizeSegment('', 'step')).toBe('step');
+    // The point is that nothing can traverse: no separator survives, and a
+    // segment can never BE `.` or `..`.
+    for (const hostile of ['../../etc/passwd', '..', '.', '/', 'a/../../b']) {
+      const seg = sanitizeSegment(hostile, 'step');
+      expect(seg).not.toContain('/');
+      expect(seg).not.toBe('.');
+      expect(seg).not.toBe('..');
+    }
+    expect(sanitizeSegment('../../etc/passwd', 'step')).toBe('__.._etc_passwd');
   });
 
   it('falls back to a stable placeholder workspace', () => {
