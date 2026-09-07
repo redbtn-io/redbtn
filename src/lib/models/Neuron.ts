@@ -72,7 +72,10 @@ const neuronSchema = new mongoose.Schema<NeuronDocument>({
   provider: {
     type: String,
     required: true,
-    enum: ['ollama', 'openai', 'anthropic', 'google', 'custom'],
+    // Keep in sync with `NeuronProvider` in lib/types/neuron.ts. `create_neuron`
+    // saves through this schema, so a provider missing here is rejected at
+    // validation time no matter what the TypeScript union says.
+    enum: ['ollama', 'openai', 'anthropic', 'google', 'custom', 'claude-code'],
   },
   endpoint: {
     type: String,

@@ -32,6 +32,78 @@ export interface NativeToolContext {
   toolId: string | null;
   /** AbortSignal for cancellation support */
   abortSignal: AbortSignal | null;
+  /**
+   * Set for callers whose URL/args are model-controlled; disables
+   * internal-auth attachment.
+   *
+   * # What it means
+   *
+   * `true` says "the arguments of this tool call were chosen by a language
+   * model, not by a graph author". The only consumer today is `fetch_url`,
+   * which will NOT attach the run's `Authorization` / `X-User-Id` /
+   * `X-Internal-Key` headers when this flag is set — even for an allowlisted
+   * internal host — because a prompt-injected model that picks the URL would
+   * otherwise be handing itself the platform's `INTERNAL_SERVICE_KEY` against
+   * an arbitrary internal endpoint, authenticated as the run's user.
+   *
+   * # Who sets it
+   *
+   * - `tool-resolver.ts` `resolveNative` — the neuron tool-use loop. Always
+   *   set: the LLM emitted the tool_call, so it chose the URL.
+   * - The stream-parser tool executors in `neuronExecutor.ts` and
+   *   `toolExecutor.ts`. Always set: those args are parsed out of a model's (or
+   *   a remote agent's) streamed stdout.
+   * - `toolExecutor.ts` for a graph `tool` step — CONDITIONALLY, decided by
+   *   `resolveToolStepTrust` in `lib/tools/caller-trust.ts`.
+   * - `invoke_tool` forwards the caller's context unchanged, so the flag
+   *   propagates through meta dispatch.
+   *
+   * # Default, and why a graph `tool` step is not automatically trusted
+   *
+   * Absent/`false` means "the caller chose these arguments" and internal auth
+   * still attaches. Do NOT read that as "graph tool steps are trusted": every
+   * parameter of a tool step goes through
+   * `renderParameters(config.parameters, state)`, so a step configured as
+   * `{ toolName:'fetch_url', parameters:{ url:'{{data.answer}}' } }` puts a
+   * fully model-chosen URL in front of this flag — and so does a template that
+   * renders to an OBJECT with a `url` inside it, which is the shape
+   * `invoke_tool` takes. Nor is the flag inherited across a graph-as-tool
+   * boundary — both `tool-resolver`'s `resolveGraph` and the `invoke_graph`
+   * native tool start a whole sub-run — so a neuron could otherwise
+   * re-escalate through any published sub-graph that fetches a templated URL.
+   *
+   * `resolveToolStepTrust` closes both: a graph tool step stays trusted only
+   * while its URL-bearing parameters are literals the author typed (any
+   * templated leaf that renders to a non-scalar counts as a destination), and
+   * a step running inside a model-invoked sub-graph is untrusted outright. The
+   * still-trusted case is the intended one — a step calling a fixed
+   * `https://app.redbtn.io/api/...` URL that needs the run owner's identity,
+   * even if its BODY is templated.
+   *
+   * # Exactly what "inside a model-invoked sub-graph" covers
+   *
+   * The claim holds only because the taint marker is stamped at every boundary
+   * that starts a sub-run from model-chosen arguments, and read at every
+   * boundary that continues one. Today that is:
+   *
+   *   - `tool-resolver.resolveGraph` — a neuron invoking a published graph as
+   *     a tool (`markStateModelDriven`);
+   *   - `invoke_graph` — the native tool, when its own caller is untrusted or
+   *     its parent run is already tainted; it rides on the child `input`,
+   *     because `run()`/`buildInitialState` exposes nothing else;
+   *   - `graphExecutor` — copies the marker forward across each nested hop,
+   *     including the `inputMapping` branch that rebuilds `data` from empty.
+   *
+   * Any FUTURE path that starts a run or sub-run from model-chosen arguments
+   * must stamp it too, or this sentence stops being true. New model-facing
+   * entry points (the per-run MCP tool bridge, any future CLI/agent surface)
+   * MUST set `untrustedCaller: true`.
+   *
+   * Note that the SSRF guard in `lib/net/ssrf-guard.ts` applies to
+   * URL-fetching tools regardless of this flag — trusted callers are trusted
+   * with credentials, not with reaching the private network.
+   */
+  untrustedCaller?: boolean;
   /** Callback for real-time chunk interception (used by stream parsers) */
   onChunk?: (chunk: string, stream: 'stdout' | 'stderr') => void;
   /**
@@ -313,9 +385,18 @@ export class NativeToolRegistry {
    * # Data-permissions gate (fail-closed)
    *
    * Before dispatching, we enforce the run's capability profile for DATA tools
-   * (State + Knowledge). This is the single chokepoint every native tool call
-   * passes through (the universal-node tool executor AND the neuron-driven
-   * tool-resolver both call `callTool`), so it's the right place to gate.
+   * (State + Knowledge). This is the chokepoint native tool calls pass through
+   * — the universal-node tool executor, the neuron-driven tool-resolver, and
+   * the stream-parser tool executors in `toolExecutor`/`neuronExecutor` all
+   * call `callTool` — so it's the right place to gate.
+   *
+   * **Never call `def.handler(...)` directly.** Doing so skips
+   * `enforceToolCapability` AND `runExecGuard` (exec kill switch,
+   * `EXEC_RATE_MAX`, fail-closed audit) for that call. Two call sites used to,
+   * and a parser-dispatched `run_command` ran completely ungated as a result.
+   * The one remaining direct-handler dispatch is `invoke_tool`
+   * (`native/invoke-tool.ts`), which is itself reached through `callTool` but
+   * forwards to the inner tool's handler; see the security note in that file.
    *
    * Semantics:
    *   - Unprofiled run (no `capabilityProfile` on the run context) → unchanged

@@ -107,6 +107,13 @@ const MATRIX: Record<NeuronProvider, MatrixEntry[]> = {
   custom: [
     { patterns: ['*'], strategy: 'native' },
   ],
+  // Claude Code (subscription CLI) — the CLI runs its own tool loop and never
+  // hands back `tool_calls`, so there is nothing to bind. Strategy is always
+  // `'none'`: the executor reads `config.tools` itself and offers them over the
+  // per-run MCP bridge instead.
+  'claude-code': [
+    { patterns: ['*'], strategy: 'none' },
+  ],
 };
 
 /**
@@ -123,6 +130,8 @@ const PROVIDER_DEFAULTS: Record<NeuronProvider, ToolStrategy> = {
   google: 'none',
   ollama: 'prompt-injection',
   custom: 'native',
+  // See the MATRIX comment: tools are offered over the run bridge, never bound.
+  'claude-code': 'none',
 };
 
 /**
@@ -250,6 +259,9 @@ const HOSTED_MATRIX: Record<NeuronProvider, HostedMatrixEntry[]> = {
   // No hosted tools exist for self-hosted / OpenAI-compatible endpoints.
   ollama: [],
   custom: [],
+  // Claude Code exposes its own server-side tools through CLI flags, not
+  // through `bindTools()`. Nothing to map here.
+  'claude-code': [],
 };
 
 /**

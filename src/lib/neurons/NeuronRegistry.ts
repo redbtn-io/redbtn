@@ -487,6 +487,14 @@ export class NeuronRegistry {
           configuration: { baseURL: config.endpoint },
           streamUsage: true, // count streamed usage (see openai case)
         });
+      case 'claude-code':
+        // Not a chat model. `claude-code` neurons drive a Claude Code CLI
+        // process through a dedicated executor (claudeCodeExecutor), which is
+        // entered before `getModel()` is ever reached. Landing here means a
+        // caller took the BaseChatModel path for a subscription neuron.
+        throw new NeuronProviderError(
+          'claude-code neurons run via claudeCodeExecutor, not createModel',
+        );
       default:
         throw new NeuronProviderError(`Unknown provider: ${(config as NeuronConfig).provider}`);
     }

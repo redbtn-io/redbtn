@@ -20,6 +20,7 @@
 
 import type { ToolRef } from '../nodes/universal/types';
 import { getNativeRegistry } from './native-registry';
+import { markStateModelDriven } from './caller-trust';
 import { getMcpClient, getGraphRegistry } from '../run/contextLookup';
 
 // =============================================================================
@@ -146,6 +147,23 @@ function resolveNative(
         nodeId: null,
         toolId: ctx.toolId,
         abortSignal: ctx.abortSignal,
+        // SECURITY: this is the neuron tool-use loop — the LLM emitted the
+        // tool_call, so every argument (a `fetch_url` URL included) is
+        // model-chosen. Marking the context untrusted stops `fetch_url` from
+        // attaching the run's Authorization / X-User-Id / X-Internal-Key to an
+        // allowlisted internal host, which a prompt-injected model could
+        // otherwise use to call any internal API as the run's user with the
+        // platform service key.
+        //
+        // A graph `tool` step does NOT set this unconditionally — it decides
+        // per step, in `resolveToolStepTrust`. Do not read that as "a graph
+        // author fixed the arguments": `toolExecutor` renders every parameter
+        // with `renderParameters(config.parameters, state)`, so a step
+        // configured `{ url:'{{data.answer}}' }` carries a model-chosen URL,
+        // and a step whose template renders to an OBJECT can hide one. Such a
+        // step is untrusted too; only a literal destination stays trusted. See
+        // NativeToolContext.untrustedCaller and lib/tools/caller-trust.
+        untrustedCaller: true,
         // The neuron-driven path doesn't currently honour onChunk parsing —
         // the LLM consumes the result wholesale.
         onChunk: undefined,
@@ -315,7 +333,14 @@ async function resolveGraph(
         } as any,
         // Synthesize a state that has the args injected into data so the
         // subgraph picks them up via data.input or its own inputMapping.
-        {
+        //
+        // SECURITY: `markStateModelDriven` stamps the taint marker read by
+        // `toolExecutor`. `untrustedCaller` is a per-call context flag and does
+        // NOT cross this boundary on its own — the sub-graph runs its own tool
+        // steps with their own contexts — so without the marker a neuron could
+        // re-escalate to the platform service key through any published
+        // sub-graph that fetches a templated URL. See lib/tools/caller-trust.
+        markStateModelDriven({
           ...ctx.state,
           data: {
             ...((ctx.state as any).data || {}),
@@ -324,7 +349,7 @@ async function resolveGraph(
               ...args,
             },
           },
-        },
+        }),
         // Runtime override: also inject args into the subgraph's data.input
         { input: args },
       );

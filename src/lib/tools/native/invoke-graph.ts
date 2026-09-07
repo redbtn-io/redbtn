@@ -63,6 +63,7 @@ import type {
 } from '../native-registry';
 import { isSystemResource } from '../../system-resource';
 import { getGraphRegistry, getNeuronRegistry, getMemory, getMcpClient } from '../../run/contextLookup';
+import { MODEL_DRIVEN_STATE_KEY, isModelDrivenState } from '../caller-trust';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -363,10 +364,37 @@ const invokeGraphTool: NativeToolDefinition = {
     // `_invokeGraphDepth` will end up under `state.data.input.*` in the
     // child's graph state — readable by templates and by deeper invoke_graph
     // calls that need to compute their own depth.
+    // SECURITY: `invoke_graph` is the SECOND graph-as-tool boundary, and the
+    // taint has to cross it too.
+    //
+    // `tool-resolver.resolveGraph` marks the state it synthesises for a
+    // sub-graph, so a neuron cannot re-escalate through a published graph that
+    // fetches a templated URL. This tool reaches the same place by a different
+    // road: a model calls it with a model-chosen `graphId` and `input`, and it
+    // starts a whole child run through `run()`. Without the marker every tool
+    // step in that child run is a TRUSTED caller and `fetch_url` attaches the
+    // platform's `X-Internal-Key` again — the original hole, one indirection
+    // further out.
+    //
+    // Condition, not a blanket stamp: a graph author who writes an
+    // `invoke_graph` step with literal parameters is composing graphs, exactly
+    // like a `graph` step, and stays trusted. The child is tainted when the
+    // caller's own arguments were model-chosen (`untrustedCaller`, set by the
+    // neuron tool-use loop, the stream parsers and the MCP bridge) or when the
+    // parent run is already tainted.
+    //
+    // It rides on `input` because that is the only surface `run()` gives a
+    // caller — `buildInitialState` puts it at `state.data.input`, which
+    // `isModelDrivenState` reads. Stamped AFTER `...childInput` so a model
+    // that passes `_modelDrivenArgs:false` cannot clear it.
+    const childIsModelDriven =
+      context?.untrustedCaller === true || isModelDrivenState(context?.state);
+
     const enrichedInput: Record<string, unknown> = {
       ...childInput,
       parentRunId,
       _invokeGraphDepth: childDepth,
+      ...(childIsModelDriven ? { [MODEL_DRIVEN_STATE_KEY]: true } : {}),
       _trigger: {
         type: 'invoke_graph',
         metadata: {
@@ -382,6 +410,12 @@ const invokeGraphTool: NativeToolDefinition = {
     // Generate child runId up front so we can return it immediately for
     // wait:false. `run()` accepts the runId in its options.
     const childRunId = `run_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+
+    if (childIsModelDriven) {
+      console.log(
+        `[invoke_graph] child run ${childRunId} marked model-driven — tool steps inside it are untrusted callers`,
+      );
+    }
 
     // Lazy-import run() to avoid a circular dependency at module-load time.
     // The engine entrypoint pulls in tools/native-registry which would
