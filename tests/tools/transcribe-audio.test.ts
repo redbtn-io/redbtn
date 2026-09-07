@@ -1,15 +1,17 @@
 /**
  * Vitest for native tool: transcribe_audio (Voice pack §4.5)
  *
- * Per TOOL-HANDOFF.md §6.1 — happy path + validation error + upstream error.
+ * Per TOOL-HANDOFF.md §6.1 — happy path + validation error + upstream error,
+ * plus the provider switch (whisper / gemini / openai) added 2026-09-07.
  *
- * The handler talks to a local Whisper-compatible STT service via global
- * `fetch`. We mock fetch to make these tests offline.
+ * The handler talks to its recogniser via global `fetch`. We mock fetch to
+ * make these tests offline; no live provider is ever called here.
  */
 
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { NativeToolContext } from '../../src/lib/tools/native-registry';
 import transcribeAudioTool from '../../src/lib/tools/native/transcribe-audio';
+import { STT_PROVIDERS } from '../../src/lib/voice/stt-request';
 
 function makeMockContext(overrides?: Partial<NativeToolContext>): NativeToolContext {
   return {
@@ -34,6 +36,148 @@ describe('transcribe_audio — schema', () => {
     expect(transcribeAudioTool.inputSchema.properties.mimeType).toBeDefined();
     expect(transcribeAudioTool.inputSchema.properties.language).toBeDefined();
     expect(transcribeAudioTool.server).toBe('voice');
+  });
+
+  test('advertises the provider switch, generated from the canonical list', () => {
+    // Derived, so adding a recogniser to STT_PROVIDERS updates the tool schema
+    // the model sees without a second edit.
+    expect(transcribeAudioTool.inputSchema.properties.provider.enum).toEqual([
+      ...STT_PROVIDERS,
+    ]);
+  });
+});
+
+/**
+ * The provider switch. `whisper` stays the default so a graph that never
+ * mentions a provider keeps its audio on the LAN; the cloud recognisers are
+ * opt-in and billed.
+ */
+describe('transcribe_audio — provider selection', () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalSttUrl: string | undefined;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    originalSttUrl = process.env.STT_URL;
+    process.env.STT_URL = 'http://test-whisper.local:8787';
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    if (originalSttUrl === undefined) delete process.env.STT_URL;
+    else process.env.STT_URL = originalSttUrl;
+    delete process.env.GOOGLE_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.STT_PROVIDER;
+    vi.restoreAllMocks();
+  });
+
+  test('defaults to the LAN Whisper service', async () => {
+    let receivedUrl = '';
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      receivedUrl = typeof input === 'string' ? input : (input as URL).toString();
+      return new Response(JSON.stringify({ text: 'ok' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    const result = await transcribeAudioTool.handler(
+      { audioBase64: FAKE_AUDIO_B64, mimeType: 'audio/wav' },
+      makeMockContext(),
+    );
+    expect(receivedUrl).toBe('http://test-whisper.local:8787/v1/audio/transcriptions');
+    expect(JSON.parse(result.content[0].text).provider).toBe('whisper');
+  });
+
+  test('provider:gemini posts the audio inline to generateContent', async () => {
+    process.env.GOOGLE_API_KEY = 'test-key';
+    let receivedUrl = '';
+    let receivedBody = '';
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      receivedUrl = typeof input === 'string' ? input : (input as URL).toString();
+      receivedBody = String(init?.body ?? '');
+      return new Response(
+        JSON.stringify({ candidates: [{ content: { parts: [{ text: 'from gemini' }] } }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as typeof globalThis.fetch;
+
+    const result = await transcribeAudioTool.handler(
+      { audioBase64: FAKE_AUDIO_B64, mimeType: 'audio/wav', provider: 'gemini' },
+      makeMockContext(),
+    );
+    expect(result.isError).toBeFalsy();
+    expect(receivedUrl).toContain('generativelanguage.googleapis.com');
+    expect(JSON.parse(receivedBody).contents[0].parts.some(
+      (p: { inlineData?: unknown }) => p.inlineData,
+    )).toBe(true);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.text).toBe('from gemini');
+    expect(body.provider).toBe('gemini');
+  });
+
+  test('a missing credential is an ERROR the graph can branch on', async () => {
+    // Not an empty transcript: "nobody spoke" and "this deployment has no key"
+    // must not look the same to a graph.
+    let called = 0;
+    globalThis.fetch = vi.fn(async () => {
+      called++;
+      return new Response('{}', { status: 200 });
+    }) as unknown as typeof globalThis.fetch;
+
+    for (const provider of ['gemini', 'openai']) {
+      const result = await transcribeAudioTool.handler(
+        { audioBase64: FAKE_AUDIO_B64, mimeType: 'audio/wav', provider },
+        makeMockContext(),
+      );
+      expect(result.isError).toBe(true);
+      const body = JSON.parse(result.content[0].text);
+      expect(body.code).toBe('unconfigured');
+      expect(body.provider).toBe(provider);
+    }
+    expect(called).toBe(0);
+  });
+
+  test('an exhausted quota is its own error code, never silence', async () => {
+    process.env.GOOGLE_API_KEY = 'test-key';
+    globalThis.fetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          error: { message: 'Quota exceeded', status: 'RESOURCE_EXHAUSTED', code: 429 },
+        }),
+        { status: 429, headers: { 'content-type': 'application/json' } },
+      ),
+    ) as unknown as typeof globalThis.fetch;
+
+    const result = await transcribeAudioTool.handler(
+      { audioBase64: FAKE_AUDIO_B64, mimeType: 'audio/wav', provider: 'gemini' },
+      makeMockContext(),
+    );
+    expect(result.isError).toBe(true);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.code).toBe('quota');
+    expect(body.status).toBe(429);
+  });
+
+  test('an unknown provider is rejected instead of silently substituted', async () => {
+    const result = await transcribeAudioTool.handler(
+      { audioBase64: FAKE_AUDIO_B64, mimeType: 'audio/wav', provider: 'nope' },
+      makeMockContext(),
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).code).toBe('VALIDATION');
+  });
+
+  test('STT_PROVIDER sets the default without a code change', async () => {
+    process.env.STT_PROVIDER = 'openai';
+    const result = await transcribeAudioTool.handler(
+      { audioBase64: FAKE_AUDIO_B64, mimeType: 'audio/wav' },
+      makeMockContext(),
+    );
+    // No OPENAI_API_KEY here, so this proves the routing without a live call.
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).provider).toBe('openai');
   });
 });
 

@@ -1,26 +1,53 @@
 /**
  * Transcribe Audio — Native Tool (Voice pack §4.5)
  *
- * Transcribes audio to text via a local Whisper service. Mirrors the existing
- * webapp proxy at `/api/v1/voice/transcribe` but is callable from inside graphs.
+ * Turns audio into text from inside a graph. Recognition is how Red HEARS;
+ * `synthesize_speech` is the other direction.
  *
  * Inputs:
  *   - audioBase64 OR audioUrl   (one of the two is required)
  *   - mimeType                  (required — e.g. 'audio/wav', 'audio/webm')
  *   - language?                 (default 'auto')
+ *   - provider?                 (default: STT_PROVIDER env, else 'whisper')
  *
  * Output:
- *   { text, language, segments?: [{ start, end, text }] }
+ *   { text, language, provider, segments?: [{ start, end, text }] }
  *
- * Backend: faster-whisper at `${STT_URL}/v1/audio/transcriptions`. We POST a
- * multipart form with the audio file and ask for the verbose JSON response so
- * that segments are returned when the upstream supports it.
+ * Backends live in `lib/voice/stt-request.ts` — the SAME switch the webapp hub
+ * uses, mirrored into this repo at the same relative path so a graph and the
+ * hub cannot transcribe differently:
+ *
+ *   whisper (default) — faster-whisper at `${STT_URL}/v1/audio/transcriptions`,
+ *                       with vad_filter + temperature=0. Verbose response, so
+ *                       per-segment timestamps survive where the server emits
+ *                       them.
+ *   gemini            — generateContent with the audio inline and a
+ *                       transcribe-verbatim system instruction.
+ *   openai            — the same OpenAI-compatible multipart against
+ *                       api.openai.com.
+ *
+ * A provider failure is an ERROR, not an empty transcript: the tool returns
+ * `isError` with the provider's `kind` (`unconfigured` / `quota` /
+ * `unsupported-media` / `upstream` / `network`) so a graph can branch on a
+ * dead credential or an exhausted quota instead of concluding nobody spoke.
+ * It never silently retries on a different provider.
  *
  * Environment:
- *   STT_URL — Whisper endpoint base (default: http://192.168.1.3:8787)
+ *   STT_PROVIDER   — default recogniser: whisper | gemini | openai
+ *   STT_URL        — Whisper endpoint base (default: http://192.168.1.3:8787)
+ *   GOOGLE_API_KEY — required when `provider: 'gemini'`
+ *   OPENAI_API_KEY — required when `provider: 'openai'`
  */
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
+import {
+  defaultSttProvider,
+  isSttProvider,
+  SttError,
+  STT_PROVIDERS,
+  transcribe,
+  type SttProvider,
+} from '../../voice/stt-request';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -30,25 +57,7 @@ interface TranscribeArgs {
   audioUrl?: string;
   mimeType: string;
   language?: string;
-}
-
-const DEFAULT_STT_BASE = 'http://192.168.1.3:8787';
-
-/**
- * Pick a sensible filename extension from a MIME type so the Whisper server
- * can sniff the format. Defaults to `bin` if unknown — Whisper still tries
- * to decode based on file contents.
- */
-function extensionFor(mimeType: string): string {
-  const lower = mimeType.toLowerCase();
-  if (lower.includes('wav')) return 'wav';
-  if (lower.includes('webm')) return 'webm';
-  if (lower.includes('ogg')) return 'ogg';
-  if (lower.includes('mp3') || lower.includes('mpeg')) return 'mp3';
-  if (lower.includes('mp4') || lower.includes('m4a') || lower.includes('aac')) return 'm4a';
-  if (lower.includes('flac')) return 'flac';
-  if (lower.includes('pcm')) return 'pcm';
-  return 'bin';
+  provider?: SttProvider;
 }
 
 /**
@@ -128,24 +137,23 @@ async function resolveAudio(
 }
 
 /**
- * Normalise the Whisper response. faster-whisper / OpenAI-compatible servers
- * may return a plain `{ text }` object or a verbose response with `segments`
- * and `language`. We surface whatever is present.
+ * Normalise the verbose transcription body. An OpenAI-compatible server may
+ * return a plain `{ text }` object or a verbose response with `segments` and
+ * `language`; Gemini returns neither. We surface whatever is present.
  */
-function normaliseWhisperResponse(
+function normaliseSegments(
   raw: AnyObject,
   fallbackLanguage: string,
-): { text: string; language: string; segments?: Array<{ start: number; end: number; text: string }> } {
-  const text = typeof raw.text === 'string' ? raw.text.trim() : '';
+): { language: string; segments?: Array<{ start: number; end: number; text: string }> } {
   const language =
-    typeof raw.language === 'string' && raw.language
+    raw && typeof raw.language === 'string' && raw.language
       ? raw.language
       : fallbackLanguage === 'auto'
         ? 'auto'
         : fallbackLanguage;
 
   let segments: Array<{ start: number; end: number; text: string }> | undefined;
-  if (Array.isArray(raw.segments) && raw.segments.length > 0) {
+  if (raw && Array.isArray(raw.segments) && raw.segments.length > 0) {
     segments = raw.segments
       .filter((s: AnyObject) => s && typeof s === 'object')
       .map((s: AnyObject) => ({
@@ -155,12 +163,12 @@ function normaliseWhisperResponse(
       }));
   }
 
-  return segments ? { text, language, segments } : { text, language };
+  return segments ? { language, segments } : { language };
 }
 
 const transcribeAudioTool: NativeToolDefinition = {
   description:
-    'Transcribe audio to text using a local Whisper STT service. Accepts base64 audio or a URL; supports per-segment timestamps when the upstream returns them.',
+    'Transcribe audio to text. Accepts base64 audio or a URL; supports per-segment timestamps when the upstream returns them. Recognises with a local Whisper service by default, or with Gemini or OpenAI when asked.',
   server: 'voice',
   inputSchema: {
     type: 'object',
@@ -183,8 +191,14 @@ const transcribeAudioTool: NativeToolDefinition = {
       language: {
         type: 'string',
         description:
-          "ISO language code (e.g. 'en', 'fr') or 'auto' to let Whisper detect. Default 'auto'.",
+          "ISO language code (e.g. 'en', 'fr') or 'auto' to let the recogniser detect. Default 'auto'.",
         default: 'auto',
+      },
+      provider: {
+        type: 'string',
+        enum: [...STT_PROVIDERS],
+        description:
+          "Which engine transcribes. 'whisper' (default) is a local service and keeps the audio on the LAN; 'gemini' and 'openai' are cloud APIs and are billed.",
       },
     },
     required: ['mimeType'],
@@ -193,19 +207,26 @@ const transcribeAudioTool: NativeToolDefinition = {
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
     const args = rawArgs as Partial<TranscribeArgs>;
 
+    const fail = (payload: AnyObject): NativeMcpResult => ({
+      content: [{ type: 'text', text: JSON.stringify(payload) }],
+      isError: true,
+    });
+
     if (!args.mimeType || typeof args.mimeType !== 'string') {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              error: 'mimeType is required and must be a string',
-              code: 'VALIDATION',
-            }),
-          },
-        ],
-        isError: true,
-      };
+      return fail({ error: 'mimeType is required and must be a string', code: 'VALIDATION' });
+    }
+
+    // An unrecognised provider is a validation error, not a silent substitution:
+    // the caller is choosing whether its audio leaves the LAN.
+    let provider: SttProvider = defaultSttProvider();
+    if (args.provider !== undefined && args.provider !== null) {
+      if (!isSttProvider(args.provider)) {
+        return fail({
+          error: `provider must be one of ${STT_PROVIDERS.join(', ')}`,
+          code: 'VALIDATION',
+        });
+      }
+      provider = args.provider;
     }
 
     const language = typeof args.language === 'string' && args.language.trim()
@@ -227,104 +248,62 @@ const transcribeAudioTool: NativeToolDefinition = {
       const message = err instanceof Error ? err.message : String(err);
       const code = (err as { code?: string })?.code;
       const status = (err as { status?: number })?.status;
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              error: message,
-              ...(code ? { code } : {}),
-              ...(status ? { status } : {}),
-            }),
-          },
-        ],
-        isError: true,
-      };
+      return fail({
+        error: message,
+        ...(code ? { code } : {}),
+        ...(status ? { status } : {}),
+      });
     }
 
-    const sttBase = process.env.STT_URL || DEFAULT_STT_BASE;
-    const url = `${sttBase.replace(/\/$/, '')}/v1/audio/transcriptions`;
-
     console.log(
-      `[transcribe_audio] mimeType=${resolvedMime} language=${language} bytes=${buffer.length} stt=${url}`,
+      `[transcribe_audio] provider=${provider} mimeType=${resolvedMime} ` +
+        `language=${language} bytes=${buffer.length}`,
     );
 
     try {
-      const filename = `audio.${extensionFor(resolvedMime)}`;
-      const form = new FormData();
-      // Cast Buffer to satisfy Blob's BlobPart type — Node 18+'s Buffer is a
-      // Uint8Array, which Blob accepts at runtime even if the TS lib type is
-      // a touch picky.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      form.append('file', new Blob([buffer as any], { type: resolvedMime }), filename);
-      form.append('model', 'whisper-1');
-      form.append('response_format', 'verbose_json');
-      if (language && language !== 'auto') {
-        form.append('language', language);
-      }
-
-      const response = await fetch(url, {
-        method: 'POST',
-        body: form,
+      const result = await transcribe({
+        audio: new Uint8Array(buffer),
+        provider,
+        mimeType: resolvedMime,
+        language: language === 'auto' ? null : language,
+        verbose: true,
         signal: context?.abortSignal ?? undefined,
       });
 
-      if (!response.ok) {
-        let body = '';
-        try {
-          body = await response.text();
-        } catch {
-          /* ignore */
-        }
-        const err = new Error(
-          `Whisper STT HTTP ${response.status} ${response.statusText}` +
-            (body ? `: ${body.slice(0, 200)}` : ''),
-        ) as Error & { status?: number };
-        err.status = response.status;
-        throw err;
-      }
+      const { language: detected, segments } = normaliseSegments(
+        (result.raw ?? {}) as AnyObject,
+        language,
+      );
+      const payload = {
+        text: result.text,
+        language: detected,
+        provider: result.provider,
+        ...(segments ? { segments } : {}),
+      };
 
-      // Whisper-compat servers may emit JSON or plain text depending on
-      // `response_format`. We asked for verbose_json, but be defensive.
-      const contentType = response.headers.get('content-type') || '';
-      let parsed: AnyObject;
-      if (contentType.includes('application/json')) {
-        parsed = (await response.json()) as AnyObject;
-      } else {
-        const text = await response.text();
-        parsed = { text };
-      }
-
-      const result = normaliseWhisperResponse(parsed, language);
       const elapsed = Date.now() - startTime;
       console.log(
-        `[transcribe_audio] ok textLength=${result.text.length} segments=${result.segments?.length ?? 0} elapsed=${elapsed}ms`,
+        `[transcribe_audio] ok provider=${result.provider} textLength=${result.text.length} ` +
+          `segments=${segments?.length ?? 0} elapsed=${elapsed}ms`,
       );
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(result),
-          },
-        ],
-      };
+      return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
     } catch (err: unknown) {
+      if (err instanceof SttError) {
+        console.error(
+          `[transcribe_audio] error provider=${err.provider} kind=${err.kind}` +
+            `${err.status ? ` status=${err.status}` : ''}: ${err.message}`,
+        );
+        return fail({
+          error: err.message,
+          provider: err.provider,
+          code: err.kind,
+          ...(err.status ? { status: err.status } : {}),
+        });
+      }
       const message = err instanceof Error ? err.message : String(err);
-      const status = (err as { status?: number })?.status;
       console.error(`[transcribe_audio] error: ${message}`);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              error: message,
-              ...(status ? { status } : {}),
-            }),
-          },
-        ],
-        isError: true,
-      };
+      return fail({ error: message });
     }
   },
 };
