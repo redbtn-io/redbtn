@@ -48,21 +48,37 @@ export interface NativeToolContext {
    *
    * # Who sets it
    *
-   * The neuron tool-use loop (`tool-resolver.ts` `resolveNative`) sets it
-   * unconditionally: in that path the LLM emitted the tool_call and therefore
-   * chose the URL. `invoke_tool` forwards the caller's context unchanged, so
-   * the flag propagates through meta dispatch.
+   * - `tool-resolver.ts` `resolveNative` — the neuron tool-use loop. Always
+   *   set: the LLM emitted the tool_call, so it chose the URL.
+   * - The stream-parser tool executors in `neuronExecutor.ts` and
+   *   `toolExecutor.ts`. Always set: those args are parsed out of a model's (or
+   *   a remote agent's) streamed stdout.
+   * - `toolExecutor.ts` for a graph `tool` step — CONDITIONALLY, decided by
+   *   `resolveToolStepTrust` in `lib/tools/caller-trust.ts`.
+   * - `invoke_tool` forwards the caller's context unchanged, so the flag
+   *   propagates through meta dispatch.
    *
-   * # Default and how to opt in
+   * # Default, and why a graph `tool` step is not automatically trusted
    *
    * Absent/`false` means "the caller chose these arguments" and internal auth
-   * still attaches. That is the graph `tool` step path (`toolExecutor.ts`),
-   * where `params` are rendered from the node's own configuration by a graph
-   * author — e.g. a step that calls `fetch_url` against a fixed
-   * `https://app.redbtn.io/api/...` URL and needs the run owner's identity.
-   * Such callers keep working with no change; anything model-driven must set
-   * the flag. New model-facing entry points (the per-run MCP tool bridge, any
-   * future CLI/agent surface) MUST set `untrustedCaller: true`.
+   * still attaches. Do NOT read that as "graph tool steps are trusted": every
+   * parameter of a tool step goes through
+   * `renderParameters(config.parameters, state)`, so a step configured as
+   * `{ toolName:'fetch_url', parameters:{ url:'{{data.answer}}' } }` puts a
+   * fully model-chosen URL in front of this flag. Nor is the flag inherited
+   * across a graph-as-tool boundary — `tool-resolver`'s `resolveGraph` starts a
+   * whole sub-graph run — so a neuron could otherwise re-escalate through any
+   * published sub-graph that fetches a templated URL.
+   *
+   * `resolveToolStepTrust` closes both: a graph tool step stays trusted only
+   * while its URL-bearing parameters are literals the author typed, and any
+   * step running inside a model-invoked sub-graph (marked by
+   * `markStateModelDriven`) is untrusted outright. The still-trusted case is
+   * the intended one — a step calling a fixed `https://app.redbtn.io/api/...`
+   * URL that needs the run owner's identity, even if its BODY is templated.
+   *
+   * New model-facing entry points (the per-run MCP tool bridge, any future
+   * CLI/agent surface) MUST set `untrustedCaller: true`.
    *
    * Note that the SSRF guard in `lib/net/ssrf-guard.ts` applies to
    * URL-fetching tools regardless of this flag — trusted callers are trusted
@@ -350,9 +366,18 @@ export class NativeToolRegistry {
    * # Data-permissions gate (fail-closed)
    *
    * Before dispatching, we enforce the run's capability profile for DATA tools
-   * (State + Knowledge). This is the single chokepoint every native tool call
-   * passes through (the universal-node tool executor AND the neuron-driven
-   * tool-resolver both call `callTool`), so it's the right place to gate.
+   * (State + Knowledge). This is the chokepoint native tool calls pass through
+   * — the universal-node tool executor, the neuron-driven tool-resolver, and
+   * the stream-parser tool executors in `toolExecutor`/`neuronExecutor` all
+   * call `callTool` — so it's the right place to gate.
+   *
+   * **Never call `def.handler(...)` directly.** Doing so skips
+   * `enforceToolCapability` AND `runExecGuard` (exec kill switch,
+   * `EXEC_RATE_MAX`, fail-closed audit) for that call. Two call sites used to,
+   * and a parser-dispatched `run_command` ran completely ungated as a result.
+   * The one remaining direct-handler dispatch is `invoke_tool`
+   * (`native/invoke-tool.ts`), which is itself reached through `callTool` but
+   * forwards to the inner tool's handler; see the security note in that file.
    *
    * Semantics:
    *   - Unprofiled run (no `capabilityProfile` on the run context) → unchanged

@@ -52,14 +52,21 @@ export const MAX_REDIRECT_HOPS = 5;
 /**
  * Request headers that must never survive a cross-origin redirect. Lowercased;
  * comparison is case-insensitive.
+ *
+ * Exported because it is the ONE list: every caller that follows redirects by
+ * hand (notably `fetch_url`, which runs its own hop loop so it can attach
+ * internal auth to hop 0 only) must strip exactly these. A second copy
+ * elsewhere drifts — an earlier revision of `fetch_url` kept its own and had
+ * already lost `proxy-authorization`, which meant a model-supplied
+ * `Proxy-Authorization` survived a cross-origin hop.
  */
-const SENSITIVE_HEADERS = [
+export const SENSITIVE_HEADERS: readonly string[] = Object.freeze([
   'authorization',
   'cookie',
   'x-user-id',
   'x-internal-key',
   'proxy-authorization',
-];
+]);
 
 /**
  * Error thrown when a URL is refused. Carries machine-readable detail so
@@ -422,8 +429,13 @@ function toHeaderRecord(init: HeadersInit | undefined): Record<string, string> {
   return { ...(init as Record<string, string>) };
 }
 
-/** Drop credential-bearing headers — used when a redirect changes origin. */
-function stripSensitiveHeaders(headers: Record<string, string>): Record<string, string> {
+/**
+ * Drop credential-bearing headers — used when a redirect changes origin.
+ *
+ * Exported for callers that run their own redirect loop; see
+ * {@link SENSITIVE_HEADERS}.
+ */
+export function stripSensitiveHeaders(headers: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const key of Object.keys(headers)) {
     if (SENSITIVE_HEADERS.indexOf(key.toLowerCase()) >= 0) continue;

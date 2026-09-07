@@ -8,7 +8,8 @@
  *   - Configurable format ('auto', 'markdown', 'json', 'text', 'raw')
  *   - Internal-platform auth forwarding for allowlisted redbtn hosts,
  *     suppressed entirely for model-controlled (untrusted) callers
- *   - SSRF guard on the requested URL and on every redirect hop
+ *   - SSRF guard on the requested URL and on every redirect hop (best-effort:
+ *     see the DNS-rebinding residual in `lib/net/ssrf-guard`)
  *   - Robust retry and abort signal support
  *
  * # Security
@@ -20,11 +21,21 @@
  *    when `context.untrustedCaller` is falsy. The neuron tool-use loop sets
  *    that flag, so a model that picks the URL can never borrow the run's
  *    identity or the platform service key against an internal API. A graph
- *    `tool` step, whose URL a human author fixed, still authenticates.
+ *    `tool` step still authenticates, but only while its URL is a literal the
+ *    author typed and the run was not entered through a model-invoked
+ *    graph-as-tool — `resolveToolStepTrust` in `lib/tools/caller-trust` decides
+ *    that per step, because `renderParameters` would otherwise let
+ *    `{ url: '{{data.answer}}' }` reach this tool as a trusted caller.
  * 2. **SSRF guard** (`lib/net/ssrf-guard`) runs on every URL regardless of who
  *    the caller is: the requested URL and each redirect hop must resolve to a
- *    public address. The worker sits on the private fleet network, so an
- *    unguarded fetch is a proxy into it.
+ *    public address *at check time*. The worker sits on the private fleet
+ *    network, so an unguarded fetch is a proxy into it. The check is not
+ *    atomic with the connection — a name that answers public once and private
+ *    on the connect (DNS rebinding) still gets through; closing that needs the
+ *    checked address pinned into the dispatcher, and the tool's own
+ *    descriptions are worded to promise only what the guard actually delivers.
+ *    Do not restore absolute wording ("only public hosts are reachable") to
+ *    the schema: the model reads those strings as a guarantee.
  *
  * Redirects are followed manually (max 5 hops) so hop 2..n gets the same
  * check as hop 1. Internal credentials are attached to the FIRST request only
@@ -38,6 +49,7 @@ import {
   assertPublicUrl,
   assertPublicRedirect,
   isRedirectStatus,
+  stripSensitiveHeaders,
   SsrfBlockedError,
   MAX_REDIRECT_HOPS,
 } from '../../net/ssrf-guard';
@@ -56,28 +68,16 @@ interface FetchUrlArgs {
   format?: 'auto' | 'markdown' | 'json' | 'text' | 'raw';
 }
 
-/** Headers that must never survive a redirect to a different origin. */
-const SENSITIVE_HEADERS = ['authorization', 'cookie', 'x-user-id', 'x-internal-key'];
-
-function stripSensitive(headers: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const key of Object.keys(headers)) {
-    if (SENSITIVE_HEADERS.indexOf(key.toLowerCase()) >= 0) continue;
-    out[key] = headers[key];
-  }
-  return out;
-}
-
 const fetchUrlTool: NativeToolDefinition = {
   description:
-    'Fetch content from a URL or make an HTTP API call. Returns status code, headers, title, and body (automatically converted to clean Markdown for HTML pages or pretty JSON for APIs). Only public internet hosts are reachable.',
+    'Fetch content from a URL or make an HTTP API call. Returns status code, headers, title, and body (automatically converted to clean Markdown for HTML pages or pretty JSON for APIs). Intended for public internet hosts: a URL is refused when its host resolves to a private, loopback or link-local address at request time, and every redirect hop is re-checked.',
   server: 'web',
   inputSchema: {
     type: 'object',
     properties: {
       url: {
         type: 'string',
-        description: 'The URL to fetch (must start with http:// or https://). Private, loopback and link-local addresses are refused.',
+        description: 'The URL to fetch (must start with http:// or https://). Refused when the host resolves to a private, loopback or link-local address at the time of the request.',
       },
       method: {
         type: 'string',
@@ -166,7 +166,7 @@ const fetchUrlTool: NativeToolDefinition = {
         // they were addressed to; a redirect off that origin drops them.
         const crossOrigin = hop > 0 && new URL(currentUrl).origin !== originalOrigin;
         const merged: Record<string, string> = { ...DEFAULT_BROWSER_HEADERS, ...headers };
-        const fetchHeaders: Record<string, string> = crossOrigin ? stripSensitive(merged) : merged;
+        const fetchHeaders: Record<string, string> = crossOrigin ? stripSensitiveHeaders(merged) : merged;
 
         if (body && !fetchHeaders['Content-Type'] && !fetchHeaders['content-type']) {
           fetchHeaders['Content-Type'] = 'application/json';

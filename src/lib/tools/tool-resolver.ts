@@ -20,6 +20,7 @@
 
 import type { ToolRef } from '../nodes/universal/types';
 import { getNativeRegistry } from './native-registry';
+import { markStateModelDriven } from './caller-trust';
 import { getMcpClient, getGraphRegistry } from '../run/contextLookup';
 
 // =============================================================================
@@ -325,7 +326,14 @@ async function resolveGraph(
         } as any,
         // Synthesize a state that has the args injected into data so the
         // subgraph picks them up via data.input or its own inputMapping.
-        {
+        //
+        // SECURITY: `markStateModelDriven` stamps the taint marker read by
+        // `toolExecutor`. `untrustedCaller` is a per-call context flag and does
+        // NOT cross this boundary on its own — the sub-graph runs its own tool
+        // steps with their own contexts — so without the marker a neuron could
+        // re-escalate to the platform service key through any published
+        // sub-graph that fetches a templated URL. See lib/tools/caller-trust.
+        markStateModelDriven({
           ...ctx.state,
           data: {
             ...((ctx.state as any).data || {}),
@@ -334,7 +342,7 @@ async function resolveGraph(
               ...args,
             },
           },
-        },
+        }),
         // Runtime override: also inject args into the subgraph's data.input
         { input: args },
       );

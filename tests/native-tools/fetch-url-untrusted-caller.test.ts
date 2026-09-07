@@ -22,7 +22,11 @@
 
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import fetchUrlTool from '../../src/lib/tools/native/fetch-url';
-import { __setSsrfLookupForTests } from '../../src/lib/net/ssrf-guard';
+import {
+  __setSsrfLookupForTests,
+  SENSITIVE_HEADERS,
+  stripSensitiveHeaders,
+} from '../../src/lib/net/ssrf-guard';
 
 function ctx(overrides: Record<string, unknown> = {}): any {
   return {
@@ -322,5 +326,102 @@ describe('fetch_url — redirect hops are re-checked', () => {
     expect(sent[0]['Authorization']).toBe('Bearer model-supplied');
     expect(sent[1]['Authorization']).toBeUndefined();
     expect(sent[1]['X-Trace']).toBe('keep-me');
+  });
+
+  /**
+   * `fetch_url` runs its OWN redirect loop (it has to: internal auth attaches
+   * to hop 0 only), so it needs its own strip. It used to carry a private copy
+   * of the header list, and that copy had drifted — it was missing
+   * `proxy-authorization`, which the guard's list has always had. `fetch_url`
+   * is the one tool where the MODEL supplies arbitrary headers, so a
+   * model-set `Proxy-Authorization` survived a cross-origin hop and was
+   * replayed to whatever host the redirect named.
+   *
+   * The fix was to delete the copy and import
+   * `stripSensitiveHeaders` / `SENSITIVE_HEADERS` from the guard. These two
+   * tests fail if anyone re-introduces a local list.
+   */
+  test('drops EVERY header on the guard list across a cross-origin hop, proxy-authorization included', async () => {
+    __setSsrfLookupForTests(async () => [{ address: '203.0.113.10', family: 4 }]);
+    const sent: Record<string, string>[] = [];
+    globalThis.fetch = vi.fn(async (u: any, init: any) => {
+      sent.push({ ...(init?.headers || {}) });
+      if (String(u) === 'https://a.example.com/1') {
+        return new Response(null, { status: 302, headers: { location: 'https://b.example.com/2' } });
+      }
+      return new Response('ok', { status: 200 });
+    }) as any;
+
+    // Model-supplied headers, one per name on the guard's list, in mixed case
+    // (the strip is case-insensitive) plus one innocuous header as a control.
+    await fetchUrlTool.handler(
+      {
+        url: 'https://a.example.com/1',
+        headers: {
+          Authorization: 'Bearer model-supplied',
+          Cookie: 'session=abc',
+          'X-User-Id': 'user-1',
+          'X-Internal-Key': 'svc-key',
+          'Proxy-Authorization': 'Basic ZGVhZDpiZWVm',
+          'X-Trace': 'keep-me',
+        },
+      },
+      ctx({ untrustedCaller: true }),
+    );
+
+    expect(sent).toHaveLength(2);
+    for (const name of SENSITIVE_HEADERS) {
+      const survived = Object.keys(sent[1]).filter((k) => k.toLowerCase() === name);
+      expect(survived, `header '${name}' must not survive a cross-origin redirect`).toEqual([]);
+    }
+    // Only the credential-bearing ones go; everything else is preserved.
+    expect(sent[1]['X-Trace']).toBe('keep-me');
+  });
+
+  test('keeps the guard list as the single source of truth', () => {
+    // A regression fence: `proxy-authorization` was the header the duplicated
+    // list had lost. If someone trims the guard's list, this fails here rather
+    // than silently in `fetch_url`.
+    expect(SENSITIVE_HEADERS).toContain('proxy-authorization');
+    expect(SENSITIVE_HEADERS).toContain('authorization');
+    expect(SENSITIVE_HEADERS).toContain('cookie');
+    expect(SENSITIVE_HEADERS).toContain('x-user-id');
+    expect(SENSITIVE_HEADERS).toContain('x-internal-key');
+    // Lowercased, so the case-insensitive comparison in the strip is correct.
+    for (const name of SENSITIVE_HEADERS) expect(name).toBe(name.toLowerCase());
+    // The strip itself honours the whole list, whatever it holds.
+    const stripped = stripSensitiveHeaders(
+      Object.fromEntries([...SENSITIVE_HEADERS.map((h) => [h.toUpperCase(), 'x']), ['X-Keep', 'y']]),
+    );
+    expect(Object.keys(stripped)).toEqual(['X-Keep']);
+  });
+});
+
+/**
+ * The schema strings are the model's only description of what the tool
+ * guarantees. The guard cannot promise "only public hosts are reachable" —
+ * `ssrf-guard`'s module header documents an unclosed DNS-rebinding TOCTOU
+ * between the check and the connection — so promising it in the description
+ * teaches the model (and any human reading the tool listing) something false
+ * about a security control.
+ */
+describe('fetch_url — descriptions promise only what the guard delivers', () => {
+  const strings = [
+    fetchUrlTool.description,
+    (fetchUrlTool.inputSchema as any).properties.url.description,
+  ];
+
+  test('no absolute reachability claim', () => {
+    for (const text of strings) {
+      expect(text).not.toMatch(/only public internet hosts are reachable/i);
+      expect(text).not.toMatch(/private, loopback and link-local addresses are refused\./i);
+    }
+  });
+
+  test('states the condition under which a host is refused', () => {
+    for (const text of strings) {
+      expect(text).toMatch(/at (the time of the )?request/i);
+      expect(text).toMatch(/private/i);
+    }
   });
 });

@@ -20,6 +20,7 @@ import {
     clearSubgraphProfile,
 } from '../../../run/contextLookup';
 import { resolveCapabilityProfile } from '../../../permissions/resolve';
+import { MODEL_DRIVEN_STATE_KEY, isModelDrivenState } from '../../../tools/caller-trust';
 
 export interface GraphStepConfig {
     /** ID of the graph to invoke (must exist in MongoDB graphs collection) */
@@ -205,6 +206,16 @@ export async function executeGraph(
 
     // Always propagate essential execution context
     subInput.data.userId = userId;
+    // SECURITY: the model-driven taint must survive EVERY subgraph hop.
+    // `tool-resolver.resolveGraph` stamps it when a neuron invokes a graph as a
+    // tool, and `toolExecutor` reads it to refuse internal auth to tool steps
+    // inside that run. The `inputMapping` branch above starts from an empty
+    // `data` and would otherwise drop the marker one level down, handing a
+    // nested sub-graph its trust back. See lib/tools/caller-trust.
+    if (isModelDrivenState(state)) {
+        subInput[MODEL_DRIVEN_STATE_KEY] = true;
+        subInput.data[MODEL_DRIVEN_STATE_KEY] = true;
+    }
     if (subInput.callerUserId) subInput.data.callerUserId = subInput.callerUserId;
     subInput.data.accountTier = state.data?.accountTier;
     subInput.data.defaultNeuronId = state.data?.defaultNeuronId;

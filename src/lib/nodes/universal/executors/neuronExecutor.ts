@@ -868,12 +868,27 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
             const nativeReg = getNativeRegistry();
             const parserToolExecutor: ParserToolExecutor = async (toolName, params) => {
               if (nativeReg.has(toolName)) {
-                const tool = nativeReg.get(toolName)!;
-                // SECURITY: parser-driven tool calls are built from the model's
-                // own streamed output, so the args are model-controlled — mark
-                // the context untrusted so `fetch_url` never attaches the run's
-                // internal credentials. See NativeToolContext.untrustedCaller.
-                return tool.handler(params, { untrustedCaller: true } as any);
+                // SECURITY: dispatch through `callTool`, never `tool.handler`.
+                // `callTool` is the single chokepoint where the run's
+                // capability profile (`enforceToolCapability`) and the exec
+                // runtime gates (`runExecGuard`: kill switch, EXEC_RATE_MAX,
+                // fail-closed audit) are applied — calling the handler directly
+                // skipped both for every parser-dispatched tool.
+                //
+                // Parser-driven calls are built from the model's own streamed
+                // output, so the args are model-controlled: `untrustedCaller`
+                // is unconditional, which keeps `fetch_url` from attaching the
+                // run's internal credentials. See
+                // NativeToolContext.untrustedCaller.
+                return nativeReg.callTool(toolName, params, {
+                  publisher: null,
+                  state,
+                  runId: callRunId ?? null,
+                  nodeId: null,
+                  toolId: null,
+                  abortSignal: abortSignal ?? null,
+                  untrustedCaller: true,
+                });
               }
               const mcp = getMcpClient(state);
               if (mcp) {
