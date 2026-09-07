@@ -8,7 +8,8 @@
  *   - inputs: neuronId? (string), config: NeuronConfig
  *   - output: { neuronId, createdAt }
  *
- * NeuronConfig: { name, provider (ollama|openai|anthropic|google|custom),
+ * NeuronConfig: { name, provider (ollama|openai|anthropic|google|custom|
+ * claude-code),
  * model, endpoint?, apiKey?, temperature?, maxTokens?, topP?,
  * audioOptimized?, role?, description?, tags? }.
  *
@@ -54,7 +55,7 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
 
 const createNeuronTool: NativeToolDefinition = {
   description:
-    'Create a new neuron (LLM endpoint config). Wraps an LLM provider (Ollama/OpenAI/Anthropic/Google/custom) with model selection and inference parameters. Used by graph nodes via neuron step type.',
+    'Create a new neuron (LLM endpoint config). Wraps an LLM provider (Ollama/OpenAI/Anthropic/Google/custom, or claude-code for a Claude subscription CLI worker) with model selection and inference parameters. Used by graph nodes via neuron step type.',
   server: 'platform',
   inputSchema: {
     type: 'object',
@@ -67,7 +68,7 @@ const createNeuronTool: NativeToolDefinition = {
       config: {
         type: 'object',
         description:
-          'NeuronConfig: { name (required), provider (required: ollama|openai|anthropic|google|custom), model (required), endpoint?, apiKey?, temperature? (default 0.7), maxTokens? (default 4096), topP?, audioOptimized?, role? (chat|worker|specialist), description?, tags? }.',
+          'NeuronConfig: { name (required), provider (required: ollama|openai|anthropic|google|custom|claude-code), model (required), endpoint? (use claude-code://worker for claude-code), apiKey?, secretName?, temperature? (default 0.7), maxTokens? (default 4096), topP?, audioOptimized?, role? (chat|worker|specialist), description?, tags? }.',
       },
     },
     required: ['config'],

@@ -90,6 +90,12 @@ const MATRIX: Record<NeuronProvider, MatrixEntry[]> = {
   custom: [
     { patterns: ['*'], hasVision: true },
   ],
+  // Claude Code (subscription CLI) — the CLI is driven with a text prompt over
+  // stdin and returns text; there is no image content-part channel into it.
+  // Vision is false for every model until the CLI grows an image input path.
+  'claude-code': [
+    { patterns: ['*'], hasVision: false },
+  ],
 };
 
 const PROVIDER_DEFAULTS: Record<NeuronProvider, boolean> = {
@@ -98,6 +104,7 @@ const PROVIDER_DEFAULTS: Record<NeuronProvider, boolean> = {
   google: false,
   ollama: false,
   custom: false,
+  'claude-code': false,
 };
 
 /**
