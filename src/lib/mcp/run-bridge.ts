@@ -36,10 +36,21 @@
  *      exactly as they do for an API neuron.
  *   5. The connection is nonce-gated: the first line must be the auth frame,
  *      compared in constant time. Three failures revoke the session and fail
- *      the step.
- *   6. Text results are scrubbed for credential patterns before they are
- *      PUBLISHED (the run archive stores tool results in the clear) — never
- *      before they are returned, because the model needs the real bytes.
+ *      the step. An unauthenticated peer gets `AUTH_DEADLINE_MS` and
+ *      `MAX_PREAUTH_BYTES` and is then destroyed, and the listener accepts at
+ *      most `MAX_CONNECTIONS` sockets at once: one CLI child needs one socket,
+ *      and this heap is shared with every other step on the replica.
+ *   6. BOTH the published `input` and the published result are scrubbed for
+ *      credential patterns and bounded in size before they reach the run
+ *      archive — never before the result is returned, because the model needs
+ *      the real bytes. A credential the model passes as an ARGUMENT is worth
+ *      exactly as much as one that comes back in a result.
+ *   7. Every `tools/call` frame is charged against the session budget BEFORE
+ *      the allowlist and the args check, so the two denial branches — the
+ *      cheapest frames an attacker can send, and the ones that publish two
+ *      run-archive writes each — are capped like everything else.
+ *   8. Attacker-controlled bytes (a bogus tool name, an unvalidated args blob)
+ *      are truncated on their way into an error message or the archive.
  *
  * # What this is NOT
  *
@@ -91,6 +102,38 @@ const MAX_AUTH_FAILURES = 3;
 /** Concurrent `tools/call` dispatches allowed per session. */
 const MAX_INFLIGHT_CALLS = 4;
 
+/**
+ * Peer sockets the listener will hold at once.
+ *
+ * One CLI child dials in once. Anything beyond a small ceiling is either a bug
+ * or a same-uid process squatting on the socket, and every held socket owns a
+ * receive buffer on a worker replica whose whole heap is 1792 MB and is shared
+ * with every other concurrent step.
+ */
+export const MAX_CONNECTIONS = 4;
+
+/** How long a peer may hold a socket without a valid auth frame. */
+export const AUTH_DEADLINE_MS = 5_000;
+
+/** Bytes an UNAUTHENTICATED peer may buffer. The real auth frame is ~90. */
+export const MAX_PREAUTH_BYTES = 4 * 1024;
+
+/** Byte bound on the `input` published for an ACCEPTED call. */
+const MAX_PUBLISHED_INPUT_BYTES = 64 * 1024;
+
+/**
+ * Byte bound on the `input` published for a DENIED call. Much tighter: these
+ * args never passed a schema, were never coerced, and are the payload of
+ * choice for a child trying to write megabytes into the run archive.
+ */
+const MAX_DENIED_INPUT_BYTES = 512;
+
+/** Recursion bound when walking a published `input` (hostile nesting). */
+const MAX_SCRUB_DEPTH = 12;
+
+/** Bound on an attacker-supplied tool name echoed into an error or an audit. */
+const MAX_ECHOED_NAME = 64;
+
 /** `sun_path` is 108 bytes on Linux; leave headroom for the NUL. */
 const MAX_SOCKET_PATH = 100;
 
@@ -109,15 +152,28 @@ const DEFAULT_RUN_COMMAND_TIMEOUT_MS = 300_000;
  *   - `invoke_graph` — starts another run, with another profile, off this jail.
  *   - `ssh_shell` — inline mode carries its own host/credentials and is
  *     unscoped by `environmentId`, so pinning the session's env does nothing.
+ *   - `ssh_copy` — the same hole, in a tool that also moves bytes. With no
+ *     `environmentId` the pin is a `delete` (see the option docs), and
+ *     `ssh-copy.ts` then falls back to inline `host`/`user`/`sshKey`/`password`
+ *     — while `libraryId` reads a Knowledge Library straight out of GridFS.
+ *     That is arbitrary-host exfiltration with the model choosing the host, so
+ *     it is forbidden outright rather than parked behind the caller-trust gate
+ *     below: that fix is about model-chosen URLs and will not touch inline SSH.
+ *   - `send_webhook` — arbitrary `url` + `method` + `headers` + `body`, no SSRF
+ *     blocklist, and unmapped in `tool-map`, so it gets neither the capability
+ *     check (`native-registry.ts` `enforceToolCapability`) nor the exec guard.
+ *     It is precisely the model-chooses-the-destination egress primitive, with
+ *     a request body attached. (`send_email` is a fixed relay — the model picks
+ *     a recipient, not a host — and is left servable; if that is judged too
+ *     generous it belongs in this list too.)
+ *   - `alert_desktop` and every `desktop_*` tool — see `FORBIDDEN_TOOL_PREFIXES`.
  *   - `workspace_checkout` / `workspace_checkin` / `workspace_release` — the
  *     worker owns workspace lifecycle; a run must not move its own fence.
  *   - `create_neuron` / `update_neuron` / `delete_neuron` — self-modification
  *     of the model layer that runs the next step.
  *
- * `computer:*` and `environment:*` tools are excluded separately, by their
- * `tool-map` resource, so a new desktop tool is forbidden the day it is added
- * rather than the day someone remembers this list. The URL-fetching tools are
- * excluded by `NETWORK_TOOLS` + `CALLER_TRUST_FIX_PRESENT` below.
+ * The URL-fetching tools are excluded separately by `NETWORK_TOOLS` +
+ * `CALLER_TRUST_FIX_PRESENT` below, because that exclusion lifts itself.
  */
 export const FORBIDDEN_TOOLS: ReadonlySet<string> = new Set([
   'invoke_tool',
@@ -125,6 +181,9 @@ export const FORBIDDEN_TOOLS: ReadonlySet<string> = new Set([
   'get_tool_schema',
   'invoke_graph',
   'ssh_shell',
+  'ssh_copy',
+  'send_webhook',
+  'alert_desktop',
   'workspace_checkout',
   'workspace_checkin',
   'workspace_release',
@@ -133,16 +192,45 @@ export const FORBIDDEN_TOOLS: ReadonlySet<string> = new Set([
   'delete_neuron',
 ]);
 
-/** Resources whose tools are forbidden wholesale, keyed off `tool-map`. */
+/**
+ * Name prefixes forbidden wholesale.
+ *
+ * The desktop pack is George's actual keyboard, mouse and shell on a machine a
+ * human is sitting at, and it CANNOT be excluded by `tool-map` resource:
+ *
+ *   - `desktop_exec` is `resource: 'exec'` (`tool-map.ts:208`), the same
+ *     resource as `run_command`, so a resource-only rule serves it;
+ *   - `desktop_settings`, `desktop_list` and `desktop_ping` are absent from
+ *     `tool-map` entirely, so `getDataToolRule` returns `undefined` for them
+ *     and a resource-only rule serves those too;
+ *   - only the seven `computer:control` tools (`desktop_click`, `desktop_type`,
+ *     …) were ever covered.
+ *
+ * A prefix is the only rule that survives someone adding `desktop_paste` next
+ * month, so the prefix is the rule and the resource check below is the belt.
+ */
+export const FORBIDDEN_TOOL_PREFIXES: readonly string[] = ['desktop_'];
+
+/**
+ * Resources whose tools are forbidden wholesale, keyed off `tool-map`.
+ *
+ * `computer` is the live half: it covers the seven computer-use tools.
+ * `environment` covers NOTHING today and is not pretending to — no rule in
+ * `permissions/tool-map.ts` uses it, and `permissions/types.ts:52` marks it
+ * "reserved: managing env configs (not gated yet)". It is listed so that the
+ * day a rule does claim that resource, those tools are forbidden here by
+ * default instead of silently served. Read this set as `computer` plus a
+ * placeholder, never as two resources' worth of coverage.
+ */
 const FORBIDDEN_RESOURCES: ReadonlySet<string> = new Set(['computer', 'environment']);
 
 /**
  * URL-fetching tools, forbidden while this build predates the caller-trust fix.
  *
- * `fetch_url`, `scrape_url`, `web_search` and `ssh_copy` in `sourceUrl` mode
- * run ON THE WORKER, and today `fetch-url.ts` attaches `Authorization`,
- * `X-User-Id` and `X-Internal-Key` (= `INTERNAL_SERVICE_KEY`) to any request
- * aimed at `app.redbtn.io` / `run.redbtn.io` / `WEBAPP_URL`. On the webapp side
+ * `fetch_url`, `scrape_url` and `web_search` run ON THE WORKER, and today
+ * `fetch-url.ts` attaches `Authorization`, `X-User-Id` and `X-Internal-Key`
+ * (= `INTERNAL_SERVICE_KEY`) to any request aimed at `app.redbtn.io` /
+ * `run.redbtn.io` / `WEBAPP_URL`. On the webapp side
  * `X-Internal-Key` + `X-User-Id` resolves as an ADMIN impersonating that user.
  * A model that picks the URL therefore picks an admin request — so until the
  * fix lands these are not served to a model-driven caller at all.
@@ -152,12 +240,18 @@ const FORBIDDEN_RESOURCES: ReadonlySet<string> = new Set(['computer', 'environme
  * makes those tools honour it, and ships `src/lib/net/ssrf-guard.ts`. The
  * detection below keys on that module so this gate lifts itself when the fix is
  * merged rather than waiting for someone to remember a constant.
+ *
+ * `ssh_copy` is NOT in this set. It also takes a `sourceUrl`, but its inline
+ * SSH mode is a separate and larger hole that #378 does not address, so it is
+ * in `FORBIDDEN_TOOLS` unconditionally and does not come back when the gate
+ * lifts. `send_webhook` is likewise unconditional: it is unmapped in
+ * `tool-map`, so no amount of caller-trust plumbing gives it a capability
+ * check or an exec guard.
  */
 export const NETWORK_TOOLS: ReadonlySet<string> = new Set([
   'fetch_url',
   'scrape_url',
   'web_search',
-  'ssh_copy',
 ]);
 
 /**
@@ -248,7 +342,21 @@ export interface StartRunToolBridgeOptions {
   publisher: RunBridgePublisher | null;
   /** Tools the node declared, already resolved. Intersected with the registry. */
   resolvedTools: RunBridgeToolRef[];
-  /** Environment every call is pinned to. Empty ⇒ no env tool can be targeted. */
+  /**
+   * Environment every call is pinned to.
+   *
+   * Non-empty: `args.environmentId` is OVERWRITTEN with this on every call, so
+   * a CLI that guesses another environment id cannot retarget a tool.
+   *
+   * Empty: the key is UNSET on every call. That is not the same as "no env tool
+   * can be targeted" — each tool then resolves an environment its own way.
+   * `run_command` falls back to `state.data.environmentId`
+   * (`run-command.ts:110-115`), which is normally the same environment the step
+   * is working in; `ssh_copy` falls back to inline `host`/`user`/`sshKey`,
+   * which is exactly why it is in `FORBIDDEN_TOOLS`. An empty pin removes the
+   * bridge's override, it does not remove the tool's own resolution — the
+   * capability profile is still what decides which environment is reachable.
+   */
   environmentId: string;
   /** Default `cwd` / `workingDir` for calls whose schema declares one. */
   workingDir: string;
@@ -268,10 +376,17 @@ export interface StartRunToolBridgeOptions {
   onFatal?: (err: Error) => void;
   /** Called on run cancellation — the executor kills the CLI child here. */
   onCancel?: () => void;
+  /** Auth deadline per connection (ms). Defaults to `AUTH_DEADLINE_MS`. */
+  authDeadlineMs?: number;
 }
 
 export interface RunBridgeStats {
-  /** `tools/call` requests accepted for dispatch (denials included). */
+  /**
+   * `tools/call` frames charged against the budget. Denials are charged too —
+   * a denial publishes two run-archive events, so it is work, and leaving it
+   * free made the denial path the one unbounded path in the bridge.
+   * Frames rejected BY the cap itself are not charged (see `capped`).
+   */
   callsTotal: number;
   /** Calls refused by the allowlist. */
   denied: number;
@@ -353,6 +468,7 @@ export function stripEnvironmentIdFromSchema(schema: unknown): Tool['inputSchema
 /** Is this tool forbidden for a bridge caller, whatever the node declared? */
 export function isForbiddenForBridge(name: string): boolean {
   if (FORBIDDEN_TOOLS.has(name)) return true;
+  if (FORBIDDEN_TOOL_PREFIXES.some((prefix) => name.startsWith(prefix))) return true;
   const rule = getDataToolRule(name);
   if (rule && FORBIDDEN_RESOURCES.has(rule.resource)) return true;
   if (!CALLER_TRUST_FIX_PRESENT && NETWORK_TOOLS.has(name)) return true;
@@ -385,6 +501,52 @@ export function buildBridgeToolTable(resolvedTools: RunBridgeToolRef[]): Tool[] 
     });
   }
   return out;
+}
+
+/**
+ * Deep-scrub credential shapes out of a value on its way to the run archive.
+ *
+ * Depth-bounded: a hostile child can nest JSON as deep as `JSON.parse` will go,
+ * and an unbounded walk of that is a stack overflow in the worker.
+ */
+export function scrubValueForPublish(value: unknown, depth = 0): unknown {
+  if (typeof value === 'string') return scrubSecretsForPublish(value);
+  if (depth >= MAX_SCRUB_DEPTH) return '[TRUNCATED]';
+  if (Array.isArray(value)) return value.map((item) => scrubValueForPublish(item, depth + 1));
+  if (isPlainObject(value)) {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value)) out[key] = scrubValueForPublish(value[key], depth + 1);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * What actually gets published as a tool event's `input`: scrubbed, and bounded
+ * in bytes. Over the bound it collapses to a marker plus a prefix, because the
+ * alternative is letting a peer choose how many megabytes land in the archive.
+ */
+export function boundPublishedInput(raw: unknown, maxBytes: number): unknown {
+  const scrubbed = scrubValueForPublish(raw);
+  let json: string;
+  try {
+    json = JSON.stringify(scrubbed) ?? 'null';
+  } catch {
+    return { _bridgeTruncated: true, _reason: 'unserialisable' };
+  }
+  const bytes = Buffer.byteLength(json, 'utf8');
+  if (bytes <= maxBytes) return scrubbed;
+  return {
+    _bridgeTruncated: true,
+    _bytes: bytes,
+    preview: Buffer.from(json, 'utf8').subarray(0, maxBytes).toString('utf8'),
+  };
+}
+
+/** Bound an attacker-supplied name before it reaches a message or the archive. */
+export function echoName(name: string): string {
+  if (typeof name !== 'string' || !name) return '(missing)';
+  return name.length > MAX_ECHOED_NAME ? `${name.slice(0, MAX_ECHOED_NAME)}…` : name;
 }
 
 function generateBridgeToolId(name: string, seq: number): string {
@@ -457,6 +619,7 @@ export async function startRunToolBridge(
     maxToolIterations,
     onFatal,
     onCancel,
+    authDeadlineMs = AUTH_DEADLINE_MS,
   } = options;
 
   const tools = buildBridgeToolTable(resolvedTools ?? []);
@@ -499,6 +662,9 @@ export async function startRunToolBridge(
   let abortHandler: (() => void) | null = null;
 
   const server = net.createServer();
+  // Node destroys anything past this before `connection` even fires, so the
+  // ceiling holds whether or not the handler below ever runs.
+  server.maxConnections = MAX_CONNECTIONS;
 
   function revoke(reason: string): void {
     if (revoked) return;
@@ -587,10 +753,18 @@ export async function startRunToolBridge(
    */
   async function auditDenial(name: string, args: unknown, reason: string): Promise<void> {
     if (!publisher) return;
-    const toolId = generateBridgeToolId(name || 'unknown', ++seq);
+    const safeName = echoName(name);
+    // The tool id embeds the name, so it is built from the BOUNDED one.
+    const toolId = generateBridgeToolId(safeName, ++seq);
     try {
-      await publisher.toolStart(toolId, name || 'unknown', 'native', {
-        input: args,
+      // NOTHING here is trusted: the name and the args are whatever the peer
+      // put on the wire, they never passed a schema, and this is the path a
+      // hostile child would spam. Both are bounded, and the args are scrubbed
+      // as well — a credential the model passes as an ARGUMENT would otherwise
+      // reach the archive in the clear while the same string in a result is
+      // redacted.
+      await publisher.toolStart(toolId, safeName, 'native', {
+        input: boundPublishedInput(args, MAX_DENIED_INPUT_BYTES),
         triggeredBy: 'neuron',
         neuronStepId,
         bridge: true,
@@ -608,20 +782,13 @@ export async function startRunToolBridge(
     const name = typeof params?.name === 'string' ? params.name : '';
     const rawArgs = params?.arguments;
 
-    if (!name || !toolsByName.has(name)) {
-      stats.denied += 1;
-      const reason = `Tool '${name || '(missing)'}' is not available to this run.`;
-      await auditDenial(name, rawArgs, `bridge denied: ${reason}`);
-      return { rpcError: { code: -32602, message: reason } };
-    }
-
-    if (rawArgs !== undefined && !isPlainObject(rawArgs)) {
-      stats.denied += 1;
-      const reason = `Invalid arguments for '${name}': expected a JSON object.`;
-      await auditDenial(name, rawArgs, `bridge denied: ${reason}`);
-      return { rpcError: { code: -32602, message: reason } };
-    }
-
+    // ── The caps come FIRST, before the allowlist and before the args check ──
+    // Those two branches each publish a `tool_start` and a `tool_error` to the
+    // run archive, and an unknown tool name with a multi-megabyte argument blob
+    // is the cheapest frame a hostile child can produce. Checking the caps
+    // after them made the denial path the one path in this bridge with no
+    // budget and no bound: a loop of `{"name":"nope","arguments":{"pad":<7MB>}}`
+    // bought two concurrent archive writes per frame, forever.
     if (stats.callsTotal >= maxCalls) {
       stats.capped += 1;
       return {
@@ -647,6 +814,26 @@ export async function startRunToolBridge(
         ],
         isError: true,
       };
+    }
+
+    // Charged here, synchronously, before the first `await`: every frame that
+    // gets past the caps costs one unit of budget whether it is served or
+    // denied. (A frame the cap itself refused is not charged — otherwise a
+    // capped session could never report a stable `callsTotal`.)
+    stats.callsTotal += 1;
+
+    if (!name || !toolsByName.has(name)) {
+      stats.denied += 1;
+      const reason = `Tool '${echoName(name)}' is not available to this run.`;
+      await auditDenial(name, rawArgs, `bridge denied: ${reason}`);
+      return { rpcError: { code: -32602, message: reason } };
+    }
+
+    if (rawArgs !== undefined && !isPlainObject(rawArgs)) {
+      stats.denied += 1;
+      const reason = `Invalid arguments for '${echoName(name)}': expected a JSON object.`;
+      await auditDenial(name, rawArgs, `bridge denied: ${reason}`);
+      return { rpcError: { code: -32602, message: reason } };
     }
 
     const served = toolsByName.get(name)!;
@@ -678,14 +865,16 @@ export async function startRunToolBridge(
       args.timeout = DEFAULT_RUN_COMMAND_TIMEOUT_MS;
     }
 
-    stats.callsTotal += 1;
     inflight += 1;
     const toolId = generateBridgeToolId(name, ++seq);
 
     try {
       if (publisher) {
         await publisher.toolStart(toolId, name, 'native', {
-          input: args,
+          // Scrubbed and bounded, exactly like the result at `toolComplete`:
+          // an API key handed to a tool as an argument is the same secret in
+          // the same archive as one that comes back in a result.
+          input: boundPublishedInput(args, MAX_PUBLISHED_INPUT_BYTES),
           triggeredBy: 'neuron',
           neuronStepId,
           bridge: true,
@@ -782,7 +971,9 @@ export async function startRunToolBridge(
   // ── Connections ────────────────────────────────────────────────────────────
 
   server.on('connection', (socket) => {
-    if (revoked) {
+    // Belt for `maxConnections` above: the ceiling is enforced twice, once by
+    // Node against its own connection count and once against the set we hold.
+    if (revoked || sockets.size >= MAX_CONNECTIONS) {
       socket.destroy();
       return;
     }
@@ -792,7 +983,29 @@ export async function startRunToolBridge(
     let authed = false;
     let buffer = '';
 
-    const failAuth = (why: string): void => {
+    /**
+     * An unauthenticated peer gets a few seconds and a few kilobytes.
+     *
+     * Without a deadline a peer that connects and says nothing — or that
+     * dribbles bytes with no newline — holds a socket and its receive buffer
+     * for the life of the step, against a heap shared with every other step on
+     * the replica. `unref` so a pending deadline never keeps the worker alive.
+     */
+    let authTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      authTimer = null;
+      if (!authed) failAuth(`no valid auth frame within ${authDeadlineMs} ms`);
+    }, authDeadlineMs);
+    authTimer.unref?.();
+
+    const clearAuthTimer = (): void => {
+      if (authTimer) {
+        clearTimeout(authTimer);
+        authTimer = null;
+      }
+    };
+
+    function failAuth(why: string): void {
+      clearAuthTimer();
       stats.authFailures += 1;
       console.warn(`[RunBridge] auth failure (${stats.authFailures}/${MAX_AUTH_FAILURES}) for run ${runId}: ${why}`);
       try {
@@ -807,7 +1020,7 @@ export async function startRunToolBridge(
           ),
         );
       }
-    };
+    }
 
     socket.on('data', (chunk) => {
       buffer += chunk.toString('utf8');
@@ -816,12 +1029,35 @@ export async function startRunToolBridge(
         socket.destroy();
         return;
       }
+      // Before auth the peer is a stranger, and the only frame a stranger gets
+      // read is the auth frame (~90 bytes). Bound the FIRST LINE, not the whole
+      // buffer: a legitimate client may pipeline its auth frame and its first
+      // request into one chunk, and dropping that would be a bug. A stranger
+      // that dribbles bytes with no newline is measured the same way, so it can
+      // never accumulate its way to `MAX_FRAME_BYTES`.
+      if (!authed) {
+        const firstBreak = buffer.indexOf('\n');
+        const firstLineBytes = firstBreak === -1 ? buffer.length : firstBreak;
+        if (firstLineBytes > MAX_PREAUTH_BYTES) {
+          failAuth(`auth frame over ${MAX_PREAUTH_BYTES} bytes`);
+          return;
+        }
+      }
       let idx = buffer.indexOf('\n');
       while (idx !== -1) {
         const line = buffer.slice(0, idx).trim();
         buffer = buffer.slice(idx + 1);
         idx = buffer.indexOf('\n');
-        if (!line) continue;
+        if (!line) {
+          // A blank line is free to send and free to ignore, which made it a
+          // way to keep an unauthenticated socket alive without ever failing
+          // auth. After auth it stays what it always was: noise.
+          if (!authed) {
+            failAuth('blank line before the auth frame');
+            return;
+          }
+          continue;
+        }
 
         if (!authed) {
           let frame: AnyObject | null = null;
@@ -840,6 +1076,7 @@ export async function startRunToolBridge(
             return;
           }
           authed = true;
+          clearAuthTimer();
           continue;
         }
 
@@ -869,6 +1106,7 @@ export async function startRunToolBridge(
       console.warn('[RunBridge] socket error:', err?.message ?? err);
     });
     socket.on('close', () => {
+      clearAuthTimer();
       sockets.delete(socket);
     });
   });
