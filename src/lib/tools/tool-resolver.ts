@@ -153,9 +153,16 @@ function resolveNative(
         // attaching the run's Authorization / X-User-Id / X-Internal-Key to an
         // allowlisted internal host, which a prompt-injected model could
         // otherwise use to call any internal API as the run's user with the
-        // platform service key. Graph `tool` steps (toolExecutor) do NOT set
-        // this: there a graph author fixed the arguments. See
-        // NativeToolContext.untrustedCaller.
+        // platform service key.
+        //
+        // A graph `tool` step does NOT set this unconditionally — it decides
+        // per step, in `resolveToolStepTrust`. Do not read that as "a graph
+        // author fixed the arguments": `toolExecutor` renders every parameter
+        // with `renderParameters(config.parameters, state)`, so a step
+        // configured `{ url:'{{data.answer}}' }` carries a model-chosen URL,
+        // and a step whose template renders to an OBJECT can hide one. Such a
+        // step is untrusted too; only a literal destination stays trusted. See
+        // NativeToolContext.untrustedCaller and lib/tools/caller-trust.
         untrustedCaller: true,
         // The neuron-driven path doesn't currently honour onChunk parsing —
         // the LLM consumes the result wholesale.

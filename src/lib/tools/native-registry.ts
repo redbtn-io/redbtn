@@ -65,20 +65,39 @@ export interface NativeToolContext {
    * parameter of a tool step goes through
    * `renderParameters(config.parameters, state)`, so a step configured as
    * `{ toolName:'fetch_url', parameters:{ url:'{{data.answer}}' } }` puts a
-   * fully model-chosen URL in front of this flag. Nor is the flag inherited
-   * across a graph-as-tool boundary — `tool-resolver`'s `resolveGraph` starts a
-   * whole sub-graph run — so a neuron could otherwise re-escalate through any
-   * published sub-graph that fetches a templated URL.
+   * fully model-chosen URL in front of this flag — and so does a template that
+   * renders to an OBJECT with a `url` inside it, which is the shape
+   * `invoke_tool` takes. Nor is the flag inherited across a graph-as-tool
+   * boundary — both `tool-resolver`'s `resolveGraph` and the `invoke_graph`
+   * native tool start a whole sub-run — so a neuron could otherwise
+   * re-escalate through any published sub-graph that fetches a templated URL.
    *
    * `resolveToolStepTrust` closes both: a graph tool step stays trusted only
-   * while its URL-bearing parameters are literals the author typed, and any
-   * step running inside a model-invoked sub-graph (marked by
-   * `markStateModelDriven`) is untrusted outright. The still-trusted case is
-   * the intended one — a step calling a fixed `https://app.redbtn.io/api/...`
-   * URL that needs the run owner's identity, even if its BODY is templated.
+   * while its URL-bearing parameters are literals the author typed (any
+   * templated leaf that renders to a non-scalar counts as a destination), and
+   * a step running inside a model-invoked sub-graph is untrusted outright. The
+   * still-trusted case is the intended one — a step calling a fixed
+   * `https://app.redbtn.io/api/...` URL that needs the run owner's identity,
+   * even if its BODY is templated.
    *
-   * New model-facing entry points (the per-run MCP tool bridge, any future
-   * CLI/agent surface) MUST set `untrustedCaller: true`.
+   * # Exactly what "inside a model-invoked sub-graph" covers
+   *
+   * The claim holds only because the taint marker is stamped at every boundary
+   * that starts a sub-run from model-chosen arguments, and read at every
+   * boundary that continues one. Today that is:
+   *
+   *   - `tool-resolver.resolveGraph` — a neuron invoking a published graph as
+   *     a tool (`markStateModelDriven`);
+   *   - `invoke_graph` — the native tool, when its own caller is untrusted or
+   *     its parent run is already tainted; it rides on the child `input`,
+   *     because `run()`/`buildInitialState` exposes nothing else;
+   *   - `graphExecutor` — copies the marker forward across each nested hop,
+   *     including the `inputMapping` branch that rebuilds `data` from empty.
+   *
+   * Any FUTURE path that starts a run or sub-run from model-chosen arguments
+   * must stamp it too, or this sentence stops being true. New model-facing
+   * entry points (the per-run MCP tool bridge, any future CLI/agent surface)
+   * MUST set `untrustedCaller: true`.
    *
    * Note that the SSRF guard in `lib/net/ssrf-guard.ts` applies to
    * URL-fetching tools regardless of this flag — trusted callers are trusted
