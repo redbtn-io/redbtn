@@ -23,8 +23,30 @@
  * Context pass-through:
  *   - The full NativeToolContext is forwarded unchanged to the underlying
  *     tool's handler. That means publisher / runId / state / abortSignal /
- *     credentials all flow through transparently — the dispatched tool
- *     behaves exactly as it would if called directly via the registry.
+ *     credentials all flow through transparently — including
+ *     `untrustedCaller`, so a neuron dispatching `fetch_url` through meta
+ *     dispatch is still an untrusted caller and still gets no internal auth.
+ *
+ * # KNOWN GAP — meta dispatch skips the registry's runtime gates
+ *
+ * `invoke_tool` reaches the inner tool through `def.handler(...)`, not through
+ * `NativeToolRegistry.callTool`. `callTool` ran the capability check and the
+ * exec runtime gates against the name `invoke_tool`, which maps to neither, so
+ * the INNER tool is dispatched without `enforceToolCapability` and without
+ * `runExecGuard` (exec kill switch, `EXEC_RATE_MAX`, fail-closed audit):
+ * `invoke_tool({ toolName:'run_command', args:{...} })` is an exec call that no
+ * exec gate sees.
+ *
+ * This is deliberately NOT changed in the same patch that routed the two
+ * stream-parser executors through `callTool`. Because `enforceToolCapability`
+ * is fail-CLOSED for exec/computer/environment resources on an unprofiled run,
+ * routing meta dispatch through it would deny exec for every existing agent
+ * that reaches for it without a capability profile — a live availability change
+ * for the CLI agents in production, which needs its own change, its own
+ * profile audit and its own release window. Rule 2's `state.toolToolsConfig`
+ * allow/deny list is the only gate on meta dispatch until then; a profile that
+ * grants a neuron `invoke_tool` should be read as granting it every tool that
+ * is not denied there.
  */
 
 import type {
@@ -148,7 +170,14 @@ const invokeToolTool: NativeToolDefinition = {
 
     try {
       // Pass the context through unchanged — the dispatched tool sees the same
-      // publisher / state / runId / abortSignal it would if called directly.
+      // publisher / state / runId / abortSignal / untrustedCaller it would if
+      // called directly.
+      //
+      // SECURITY (known gap, see the module header): this is a direct handler
+      // call, so the inner tool skips `callTool`'s capability check and exec
+      // runtime gates. Do not "fix" it by swapping in `callTool` without first
+      // auditing which live agents dispatch exec tools this way — the check is
+      // fail-closed on an unprofiled run and would deny them.
       const result = await tool.handler(innerArgs, context);
       return result;
     } catch (err: unknown) {

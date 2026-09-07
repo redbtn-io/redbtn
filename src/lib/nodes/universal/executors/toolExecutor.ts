@@ -14,6 +14,7 @@ import { runControlRegistry } from '../../../run/RunControlRegistry';
 import { getRunPublisher, getMcpClient, getConnectionManager, getGraphRegistry, getMeteringClient } from '../../../run/contextLookup';
 import { ToolHangError, withToolIdleWatchdog, type ToolIdleWatchdogHandle } from '../../../tools/tool-idle-watchdog';
 import { getNativeRegistry } from '../../../tools/native-registry';
+import { resolveToolStepTrust } from '../../../tools/caller-trust';
 import type { ToolStepConfig } from '../types';
 
 function getNativeRegistryLazy(): any {
@@ -262,8 +263,31 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                 const nativeReg = getNativeRegistryLazy();
                 const parserToolExecutor = async (toolName: string, params: Record<string, any>) => {
                     if (nativeReg.has(toolName)) {
-                        const tool = nativeReg.get(toolName);
-                        return tool.handler(params, {});
+                        // SECURITY: go through `callTool`, never `tool.handler`.
+                        //
+                        // Two things ride on this. (a) `callTool` is the single
+                        // chokepoint where `enforceToolCapability` and
+                        // `runExecGuard` (exec kill switch, EXEC_RATE_MAX,
+                        // fail-closed audit) run; calling the handler direct
+                        // skipped both, so a parser-dispatched `run_command`
+                        // executed ungated. (b) The context must carry the real
+                        // run state — `{}` gave the tool an empty context whose
+                        // `untrustedCaller` was falsy, so `fetch_url` attached
+                        // the platform's `X-Internal-Key` from `process.env`.
+                        //
+                        // These params are parsed out of the tool's own streamed
+                        // stdout — an agent/CLI tool whose output an attacker can
+                        // influence — so they are model-controlled by definition:
+                        // `untrustedCaller` is unconditional here.
+                        return nativeReg.callTool(toolName, params, {
+                            publisher: null,
+                            state,
+                            runId: state?.data?.runId || state?.runId || null,
+                            nodeId: null,
+                            toolId: null,
+                            abortSignal: getRunSignal(state) || null,
+                            untrustedCaller: true,
+                        });
                     }
                     // Fall back to MCP — pass abort signal so parser-driven tool
                     // calls also honor mid-step interrupt. Signal comes from the
@@ -547,6 +571,24 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                 if (parserOnChunk) return parserOnChunk(chunk, streamType);
             };
 
+            // SECURITY: a graph `tool` step is only a trusted caller while the
+            // destination is the literal one its author typed. `renderedParams`
+            // above is `renderParameters(config.parameters, state)`, so a step
+            // configured `{ url: '{{data.answer}}' }` carries a model-chosen URL;
+            // and a sub-graph a neuron invoked as a tool re-enters here with a
+            // fresh state. Both cases lose internal auth. See lib/tools/caller-trust.
+            const trust = resolveToolStepTrust({
+                toolName: config.toolName,
+                configParams: config.parameters,
+                renderedParams,
+                state,
+            });
+            if (trust.untrustedCaller) {
+                console.log(
+                    `[ToolExecutor] ${config.toolName}: treating caller as UNTRUSTED (${trust.reason}) — internal auth suppressed`,
+                );
+            }
+
             // Build context for the native tool handler
             // Signal resolved from RunControlRegistry — survives checkpoints.
             const nativeContext = {
@@ -556,6 +598,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                 nodeId: state.nodeConfig?.graphNodeId || state.nodeConfig?.nodeId || null,
                 toolId: toolId,
                 abortSignal: getRunSignal(state) || null,
+                untrustedCaller: trust.untrustedCaller,
                 onChunk,
                 credentials: resolvedCredentials,
             };

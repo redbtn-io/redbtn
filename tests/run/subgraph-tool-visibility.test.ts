@@ -22,6 +22,11 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { RunPublisher } from '../../src/lib/run/run-publisher';
 import type { RunState } from '../../src/lib/run/types';
 import { executeGraph } from '../../src/lib/nodes/universal/executors/graphExecutor';
+import {
+  MODEL_DRIVEN_STATE_KEY,
+  isModelDrivenState,
+  markStateModelDriven,
+} from '../../src/lib/tools/caller-trust';
 
 // graphExecutor lazily `require`s contextLookup at call time. We stub it so
 // getGraphRegistry returns the registry the tests inject via state._graphRegistry
@@ -218,5 +223,64 @@ describe('Subgraph tool visibility — graphExecutor propagation', () => {
 
     expect(captured.data._subgraph.depth).toBe(2);
     expect(captured._subgraphDepth).toBe(2);
+  });
+
+  /**
+   * SECURITY. `markStateModelDriven` taints the state a neuron's graph-as-tool
+   * call synthesises, and `toolExecutor` reads that taint to refuse internal
+   * auth (`X-Internal-Key` = admin-impersonating the run's owner) to every tool
+   * step inside the sub-graph run.
+   *
+   * The `inputMapping` branch of graphExecutor starts `subInput.data` EMPTY and
+   * copies only the mapped fields — the same shape that once dropped
+   * `data.runId`. If it drops the taint too, a nested sub-graph gets its trust
+   * back and the escalation is open again one level down.
+   */
+  it('propagates the model-driven taint into a subgraph, inputMapping included', async () => {
+    let captured: any;
+    const fakeRegistry = {
+      getGraph: vi.fn(async () => ({
+        graph: { invoke: vi.fn(async (input: any) => { captured = input; return { data: {} }; }) },
+      })),
+      getConfig: vi.fn(async () => ({ graphId: 'tainted', name: 'Tainted' })),
+    };
+    const parentState = markStateModelDriven({
+      runId: 'parent-run-3',
+      userId: 'user-1',
+      _graphRegistry: fakeRegistry,
+      data: { runId: 'parent-run-3', userId: 'user-1', query: { message: 'hi' } },
+    });
+
+    await executeGraph(
+      { graphId: 'tainted', outputField: 'data.r', inputMapping: { q: '{{state.data.query.message}}' } },
+      parentState,
+    );
+
+    expect(isModelDrivenState(captured)).toBe(true);
+    // `data` is the only declared LangGraph channel, so the marker has to be
+    // there specifically — a top-level-only mark is dropped by the graph.
+    expect(captured.data[MODEL_DRIVEN_STATE_KEY]).toBe(true);
+  });
+
+  it('does NOT invent the taint for an ordinary parent run', async () => {
+    let captured: any;
+    const fakeRegistry = {
+      getGraph: vi.fn(async () => ({
+        graph: { invoke: vi.fn(async (input: any) => { captured = input; return { data: {} }; }) },
+      })),
+      getConfig: vi.fn(async () => ({ graphId: 'clean', name: 'Clean' })),
+    };
+
+    await executeGraph(
+      { graphId: 'clean', outputField: 'data.r' },
+      {
+        runId: 'parent-run-4',
+        userId: 'user-1',
+        _graphRegistry: fakeRegistry,
+        data: { runId: 'parent-run-4', userId: 'user-1' },
+      },
+    );
+
+    expect(isModelDrivenState(captured)).toBe(false);
   });
 });

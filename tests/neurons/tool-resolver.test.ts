@@ -7,12 +7,13 @@
  * inputSchema, invoke fn presence).
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi } from 'vitest';
 import {
   resolveTools,
   toBindToolsPayload,
 } from '../../src/lib/tools/tool-resolver';
 import { getNativeRegistry } from '../../src/lib/tools/native-registry';
+import { isModelDrivenState } from '../../src/lib/tools/caller-trust';
 
 describe('resolveTools', () => {
   beforeAll(() => {
@@ -148,6 +149,52 @@ describe('resolveTools', () => {
         properties: { topic: { type: 'string' } },
         required: ['topic'],
       });
+    });
+
+    /**
+     * SECURITY. `untrustedCaller` is a per-call context flag; a graph-as-tool
+     * starts a whole sub-graph run, whose `tool` steps build their own
+     * contexts, so the flag cannot travel with it. Without an explicit marker
+     * on the synthesised state, a neuron re-escalates to the platform service
+     * key through any published sub-graph that fetches a templated URL:
+     * `toolExecutor` would see an author-written step in an ordinary run and
+     * attach `X-Internal-Key`.
+     *
+     * `markStateModelDriven` stamps `_modelDrivenArgs` at the top level AND
+     * inside `data` (sub-executors rebuild the outer object but copy `data`
+     * forward), and `resolveToolStepTrust` reads it for every tool step at any
+     * depth.
+     */
+    it('taints the sub-graph state so trust does not cross the graph-as-tool boundary', async () => {
+      const seen: Record<string, unknown>[] = [];
+      vi.doMock('../../src/lib/nodes/universal/executors/graphExecutor', () => ({
+        executeGraph: async (_cfg: unknown, state: Record<string, unknown>) => {
+          seen.push(state);
+          return { _subgraphResult: { ok: true } };
+        },
+      }));
+
+      const fakeRegistry = {
+        getConfig: async () => ({ graphId: 'sub-graph', publishAsTool: true }),
+      };
+      const resolved = await resolveTools(
+        ['graph:sub-graph'],
+        { _graphRegistry: fakeRegistry, data: { userId: 'u1' } },
+      );
+
+      await resolved[0].invoke(
+        { topic: 'anything' },
+        { state: { runId: 'r1', data: { userId: 'u1' } }, runId: 'r1', toolId: 't1', abortSignal: null } as any,
+      );
+
+      expect(seen).toHaveLength(1);
+      expect(isModelDrivenState(seen[0])).toBe(true);
+      // Marked on the copy that survives into nested executors, too.
+      expect(isModelDrivenState({ data: (seen[0] as any).data })).toBe(true);
+      // The args still reached the sub-graph as its input.
+      expect((seen[0] as any).data.input.topic).toBe('anything');
+
+      vi.doUnmock('../../src/lib/nodes/universal/executors/graphExecutor');
     });
   });
 
