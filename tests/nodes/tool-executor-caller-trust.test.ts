@@ -28,6 +28,30 @@ import { getNativeRegistry } from '../../src/lib/tools/native-registry';
 import { getParserRegistry } from '../../src/lib/nodes/universal/executors/parserRegistry';
 import { markStateModelDriven } from '../../src/lib/tools/caller-trust';
 
+/**
+ * Stub `ParserExecutor` and keep the tool callback `toolExecutor` hands it.
+ * `vi.hoisted` is required: `vi.mock` is lifted above the imports, so the
+ * capture array has to exist before the factory runs.
+ */
+const stub = vi.hoisted(() => ({
+  callbacks: [] as Array<(name: string, params: Record<string, unknown>) => Promise<unknown>>,
+}));
+
+vi.mock('../../src/lib/nodes/universal/executors/parserExecutor', () => ({
+  ParserExecutor: class {
+    constructor(
+      _config: unknown,
+      _parserConfig: unknown,
+      executeTool?: (name: string, params: Record<string, unknown>) => Promise<unknown>,
+    ) {
+      if (executeTool) stub.callbacks.push(executeTool);
+    }
+    setContext(): void { /* no-op */ }
+    async processChunk(): Promise<unknown[]> { return []; }
+    async flush(): Promise<unknown> { return null; }
+  },
+}));
+
 const INTERNAL_URL = 'https://app.redbtn.io/api/v1/graphs';
 
 let seq = 0;
@@ -136,56 +160,46 @@ describe('toolExecutor — untrustedCaller on a graph tool step', () => {
 
 describe('toolExecutor — the stream-parser tool callback', () => {
   /**
-   * Drive the real ParserExecutor: a host tool streams one line of "agent
-   * stdout", a parser `tool` step turns that line into a tool call. That is the
-   * prompt-injection path — the line is attacker-influenced text.
+   * `ParserExecutor` is stubbed rather than driven. Its step loop reaches for
+   * `require('../templateRenderer')` and `require('./transformExecutor')` —
+   * fine in production, which runs the compiled CJS in `dist`, but not under
+   * vitest's ESM transform, where the throw is swallowed by the parser's own
+   * error handling and the test just hangs. Driving it here would test the
+   * harness, not the fix.
+   *
+   * What this patch changed is the CALLBACK `toolExecutor` hands that class, so
+   * the stub captures the callback and the tests invoke it exactly as the
+   * parser's `tool` step does: `executeTool(toolName, renderedParams)`.
    */
-  async function runParserDispatch(): Promise<{ dispatched: any[]; callToolNames: string[]; targetName: string }> {
+  async function captureParserCallback(): Promise<{
+    callback: (name: string, params: Record<string, unknown>) => Promise<unknown>;
+    targetName: string;
+    dispatched: any[];
+    callToolNames: string[];
+  }> {
     const hostName = uniqueName('parser_host');
     const targetName = uniqueName('parser_target');
     const parserId = uniqueName('parser_def');
-
     const dispatched: any[] = [];
-    let resolveDispatched!: () => void;
-    const dispatchedOnce = new Promise<void>((resolve) => {
-      resolveDispatched = resolve;
-    });
 
     getNativeRegistry().register(targetName, {
       description: targetName,
       inputSchema: { type: 'object' },
       handler: async (args: any, context: any) => {
         dispatched.push({ args, context });
-        resolveDispatched();
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true }) }] };
       },
     });
-
     getNativeRegistry().register(hostName, {
       description: hostName,
       inputSchema: { type: 'object' },
-      handler: async (_args: any, context: any) => {
-        // One complete line of "agent stdout" — the parser buffers on newline.
-        context.onChunk(`${INTERNAL_URL}\n`, 'stdout');
-        await dispatchedOnce;
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true }) }] };
-      },
+      handler: async () => ({ content: [{ type: 'text', text: JSON.stringify({ ok: true }) }] }),
     });
 
+    // The registry lookup is real, so the parser has to exist; its contents are
+    // irrelevant because the executor class is stubbed.
     getParserRegistry().registerBuiltin(parserId, {
-      config: {
-        steps: [
-          {
-            type: 'tool',
-            config: {
-              toolName: targetName,
-              // The URL comes straight out of the streamed line.
-              parameters: { url: '{{state.chunk}}' },
-              outputField: 'dispatchResult',
-            },
-          },
-        ],
-      } as any,
+      config: { steps: [] } as any,
       parserConfig: { inputField: 'chunk', outputField: 'parsed', bufferMode: 'line', skipEmpty: true },
     });
 
@@ -197,6 +211,7 @@ describe('toolExecutor — the stream-parser tool callback', () => {
       return realCallTool(name, args, context);
     });
 
+    stub.callbacks.length = 0;
     await executeTool(
       {
         toolName: hostName,
@@ -208,33 +223,46 @@ describe('toolExecutor — the stream-parser tool callback', () => {
       { runId: 'run-parser', runPublisher: makeRunPublisher() },
     );
 
-    return { dispatched, callToolNames, targetName };
+    // toolExecutor built a ParserExecutor and gave it a tool callback.
+    expect(stub.callbacks).toHaveLength(1);
+    return { callback: stub.callbacks[0], targetName, dispatched, callToolNames };
   }
 
   test('dispatches through registry.callTool, not the raw handler', async () => {
-    const { callToolNames, targetName } = await runParserDispatch();
+    const { callback, targetName, callToolNames } = await captureParserCallback();
+    callToolNames.length = 0;
+
+    await callback(targetName, { url: INTERNAL_URL });
+
     // If the callback reverts to `tool.handler(...)`, the target never appears
-    // here — and with it goes enforceToolCapability + runExecGuard.
-    expect(callToolNames).toContain(targetName);
+    // here — and with it go enforceToolCapability + runExecGuard.
+    expect(callToolNames).toEqual([targetName]);
   });
 
   test('marks the parser-dispatched call as an UNTRUSTED caller', async () => {
-    const { dispatched } = await runParserDispatch();
+    const { callback, targetName, dispatched } = await captureParserCallback();
+
+    await callback(targetName, { url: INTERNAL_URL });
+
     expect(dispatched).toHaveLength(1);
     expect(dispatched[0].context.untrustedCaller).toBe(true);
-    // The parser really did put the streamed line into the tool's URL — this
-    // is the escalation the flag defuses.
+    // The args the parser built reach the tool unchanged; with a URL parsed out
+    // of streamed agent stdout, that is the escalation the flag defuses.
     expect(dispatched[0].args.url).toBe(INTERNAL_URL);
   });
 
   test('hands the tool the REAL run context, not an empty object', async () => {
     // `tool.handler(params, {})` gave `buildHeaders({})` a context with no
     // state at all, which still returned `X-Internal-Key` from process.env.
-    const { dispatched } = await runParserDispatch();
+    const { callback, targetName, dispatched } = await captureParserCallback();
+
+    await callback(targetName, { url: INTERNAL_URL });
+
     const context = dispatched[0].context;
     expect(context.state).toBeTruthy();
     expect(context.state.runId).toBe('run-parser');
     expect(context.runId).toBe('run-parser');
     expect('abortSignal' in context).toBe(true);
+    expect(context.publisher).toBeNull();
   });
 });
