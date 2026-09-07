@@ -163,11 +163,65 @@ describe('caller-trust — findInterpolatedUrlParam', () => {
     ).toBe('options.sourceUrl');
   });
 
+  test('walks nested parameter ARRAYS, keeping the container name', () => {
+    // `isUrlBearingParam` would see the key '0', which reads as nothing, so an
+    // array element inherits its container's name for the name test. The
+    // reported path keeps the index.
+    expect(
+      findInterpolatedUrlParam(
+        'ssh_copy',
+        { sourceUrl: ['{{state.x}}'] },
+        { sourceUrl: ['https://app.redbtn.io/api/v1/graphs'] },
+      ),
+    ).toBe('sourceUrl.0');
+  });
+
+  test('flags a templated leaf that rendered to an OBJECT — the round-2 blocker', () => {
+    // The walker recursed into config objects but classified a templated LEAF
+    // with a heuristic that only reads strings, so an object render hid the
+    // URL. `invoke_tool` takes exactly this shape. Full end-to-end repro in
+    // tests/security/invoke-tool-object-template.test.ts.
+    expect(
+      findInterpolatedUrlParam(
+        'invoke_tool',
+        { toolName: 'fetch_url', args: '{{state.data.answer}}' },
+        { toolName: 'fetch_url', args: { url: 'https://app.redbtn.io/api/v1/graphs' } },
+      ),
+    ).toBe('args');
+  });
+
+  test('flags an object render even when it holds no URL at all', () => {
+    // Deny-by-default: the walker does not look inside, so it cannot rule the
+    // value out. An opaque render is a possible destination.
+    expect(
+      findInterpolatedUrlParam(
+        'invoke_tool',
+        { toolName: 'send_email', args: '{{state.data.answer}}' },
+        { toolName: 'send_email', args: { subject: 'hello' } },
+      ),
+    ).toBe('args');
+  });
+
+  test('a templated leaf that rendered to a SCALAR is judged on its content', () => {
+    // The trusted case has to survive: numbers, booleans and non-URL strings
+    // are legible, so they are not destinations.
+    expect(
+      findInterpolatedUrlParam(
+        'fetch_url',
+        { url: 'https://app.redbtn.io/api/v1/state', timeout: '{{state.timeout}}', retries: '{{state.retries}}' },
+        { url: 'https://app.redbtn.io/api/v1/state', timeout: 5000, retries: false },
+      ),
+    ).toBeNull();
+  });
+
   test('tolerates missing/odd inputs instead of throwing', () => {
     expect(findInterpolatedUrlParam('fetch_url', null, null)).toBeNull();
     expect(findInterpolatedUrlParam('fetch_url', undefined, {})).toBeNull();
     expect(findInterpolatedUrlParam('fetch_url', { url: 42 }, { url: 42 })).toBeNull();
     expect(findInterpolatedUrlParam('fetch_url', {}, undefined)).toBeNull();
+    // A rendered shape that does not match the config shape must not be read
+    // positionally — it just means nothing rendered under that key.
+    expect(findInterpolatedUrlParam('fetch_url', { url: 'literal' }, [])).toBeNull();
   });
 });
 
