@@ -114,13 +114,19 @@ describe('run_command — timeout default', () => {
     expect(execOpts(exec).timeout).not.toBeUndefined();
   });
 
-  test('a null timeout also falls back to the default', async () => {
+  test('an explicit null timeout is a validation error, not the default', async () => {
+    // `??` only covers undefined here in practice: validation runs first and
+    // `timeout !== undefined && typeof timeout !== 'number'` rejects null. A
+    // model that emits `"timeout": null` gets told so rather than silently
+    // inheriting a default it did not ask for.
     const exec = stubSession();
-    await runCommandTool.handler(
+    const r = await runCommandTool.handler(
       { command: 'ls', timeout: null as unknown as number },
       makeMockContext(),
     );
-    expect(execOpts(exec).timeout).toBe(DEFAULT_TIMEOUT_MS);
+    expect(r.isError).toBe(true);
+    expect(JSON.parse(r.content[0].text).code).toBe('VALIDATION');
+    expect(exec).not.toHaveBeenCalled();
   });
 
   test('an explicit timeout still wins', async () => {
