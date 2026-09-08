@@ -28,8 +28,12 @@
  *      overwritten from the session on every call, so a CLI that guesses an
  *      environment id cannot retarget a tool at another machine (every env tool
  *      accepts an override, and `hasAccess` is owner-or-`isPublic`).
- *   3. `cwd` / `workingDir` default to the session's workingDir; `run_command`
- *      gets a default `timeout` so a hung command cannot pin a relay forever.
+ *   3. `cwd` / `workingDir` default to the session's workingDir. The bridge no
+ *      longer injects a `run_command` timeout: PR #379 gave the tool its own
+ *      operator-tunable default (`RUN_COMMAND_DEFAULT_TIMEOUT_MS`), and a
+ *      hardcoded shadow here would silently override that knob for CLI steps
+ *      only — a stricter, invisible, untunable limit that an API neuron
+ *      running the same tool does not get.
  *   4. Every dispatch goes through `NativeToolRegistry.callTool` — never a
  *      handler directly — so the capability profile, the fail-closed exec gate,
  *      the kill switches, `EXEC_RATE_MAX` and the fail-closed audit all apply
@@ -227,9 +231,6 @@ export const MAX_CALLS_CEILING = 2_000;
 
 /** Default `--max-turns` assumption when the node does not set one. */
 const DEFAULT_MAX_TOOL_ITERATIONS = 50;
-
-/** Default `run_command` timeout injected when the CLI omits one (ms). */
-const DEFAULT_RUN_COMMAND_TIMEOUT_MS = 300_000;
 
 /**
  * Tools that are NEVER served and NEVER callable through the bridge, even when
@@ -1179,9 +1180,6 @@ export async function startRunToolBridge(
       if (schemaProps?.workingDir && (args.workingDir === undefined || args.workingDir === '')) {
         args.workingDir = workingDir;
       }
-    }
-    if (name === 'run_command' && args.timeout === undefined) {
-      args.timeout = DEFAULT_RUN_COMMAND_TIMEOUT_MS;
     }
 
     inflight += 1;

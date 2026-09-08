@@ -729,12 +729,20 @@ describe('environmentId pin', () => {
     expect(received[1].args.cwd).toBe('/ws/indy/tree/sub');
   });
 
-  it('gives run_command a default timeout when the CLI omits one', async () => {
+  it('does NOT shadow run_command\'s own default timeout', async () => {
+    // The bridge used to inject 300_000 ms here, back when `run_command` had no
+    // default at all. PR #379 gave it one, read from
+    // `RUN_COMMAND_DEFAULT_TIMEOUT_MS` so a deployment can move it without an
+    // engine publish. Injecting on top of that would pin CLI steps to a
+    // stricter, invisible, untunable limit that an API neuron running the same
+    // tool does not get — so the bridge passes the omission through and lets
+    // the tool decide.
     const { bridge: b } = await start();
     const c = await client(b);
     await c.send('tools/call', { name: 'run_command', arguments: { command: 'sleep 1' } });
-    expect(received[0].args.timeout).toBe(300_000);
+    expect(received[0].args.timeout).toBeUndefined();
 
+    // An explicit timeout still reaches the tool untouched.
     await c.send('tools/call', { name: 'run_command', arguments: { command: 'sleep 1', timeout: 5000 } });
     expect(received[1].args.timeout).toBe(5000);
   });
