@@ -2,6 +2,17 @@
 
 A complete implementation of the Model Context Protocol (MCP) using JSON-RPC 2.0 over Redis pub/sub as the transport layer.
 
+> **Not the only MCP surface in this folder.** Everything below describes the
+> Redis-transport `McpServer` / `McpClient` pair. It has no live subclass — the
+> bundled MCP servers were removed (`src/index.ts`) and their tools are native
+> tools now. The surface that is actually SERVED to a model lives in
+> `run-bridge.ts` + `run-bridge-shim.ts`: a per-run MCP server on a Unix domain
+> socket, nonce-gated, that hands a `claude -p` child exactly the tools its
+> graph node declared, pinned to one environment, through
+> `NativeToolRegistry.callTool`. It shares only `types.ts` with the code below.
+> See the module header of `run-bridge.ts` for the security contract; the tests
+> are `tests/mcp/run-bridge.test.ts`.
+
 ## Overview
 
 This implementation follows the MCP specification with a custom Redis-based transport layer instead of the standard stdio or HTTP transports. This provides:
