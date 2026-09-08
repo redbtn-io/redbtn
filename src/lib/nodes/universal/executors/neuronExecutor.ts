@@ -39,6 +39,14 @@ import {
   truncateReason,
   type FallbackRecord,
 } from './neuronFallback';
+import {
+  supportsPromptCache,
+  applySystemCacheControl,
+  applyToolCacheControl,
+  shouldCacheHistoryPrefix,
+  historyCacheInvokeOptions,
+  extractCacheUsage,
+} from '../../../neurons/prompt-cache';
 
 /**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
@@ -475,6 +483,25 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       });
     }
 
+    // ── Anthropic prompt caching ────────────────────────────────────────────
+    // Deliberate cache breakpoints on the tool block and the system prompt (a
+    // third, on the history prefix, is added per call when there is history to
+    // re-read). Anthropic only — see prompt-cache.ts for why and for the
+    // byte-stability rules the prefix has to keep.
+    //
+    // The markers are applied at each provider call site, NOT here: the
+    // streaming path re-runs `normalizeMessages()`, which flattens a marked
+    // system block array back to a plain string.
+    const promptCache = supportsPromptCache(early?.provider, early?.model);
+    /** Marked copy of `msgs` + the call options that carry the history breakpoint. */
+    const withPromptCache = (msgs: any[]): { messages: any[]; invokeOptions?: Record<string, unknown> } => {
+      if (!promptCache) return { messages: msgs };
+      return {
+        messages: applySystemCacheControl(msgs),
+        invokeOptions: shouldCacheHistoryPrefix(msgs) ? historyCacheInvokeOptions() : undefined,
+      };
+    };
+
     let model: any = await neuronRegistry.getModel(
       neuronId,
       userId,
@@ -581,7 +608,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
           model: neuronCfg?.model,
           capabilities: hostedCapabilities,
         });
-        model = model.bindTools(hostedSpecs);
+        model = model.bindTools(promptCache ? applyToolCacheControl(hostedSpecs) : hostedSpecs);
         if (config.structuredOutput && typeof model.withStructuredOutput !== 'function') {
           throw new Error(
             'Neuron step config error: hosted tools + structuredOutput is not supported for this ' +
@@ -619,6 +646,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
             baseMessages: await buildBaseMessagesForToolLoop(config, state),
             resolvedTools: resolved,
             hostedSpecs,
+            promptCache,
             neuronId,
             userId,
             callRunId,
@@ -854,20 +882,23 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
         // For Ollama, pass the format option at invocation time.
         // Signal threads through to the underlying HTTP request so external
         // interrupt cancels a stuck Ollama call instead of hanging.
-        rawResponse = await neuronRegistry.callNeuron(neuronId, userId, messages, {
+        const cached = withPromptCache(messages);
+        rawResponse = await neuronRegistry.callNeuron(neuronId, userId, cached.messages, {
           signal: abortSignal,
           runId: callRunId,
           stream: false,
           modelOverride: model,
-          invokeOptions: { format: config.structuredOutput.schema },
+          invokeOptions: { ...cached.invokeOptions, format: config.structuredOutput.schema },
         });
       } else {
         // For other providers using withStructuredOutput
-        rawResponse = await neuronRegistry.callNeuron(neuronId, userId, messages, {
+        const cached = withPromptCache(messages);
+        rawResponse = await neuronRegistry.callNeuron(neuronId, userId, cached.messages, {
           signal: abortSignal,
           runId: callRunId,
           stream: false,
           modelOverride: model,
+          invokeOptions: cached.invokeOptions,
         });
       }
 
@@ -952,15 +983,19 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       // after grace period). LangChain's BaseChatModel.stream still honors
       // the AbortSignal cooperatively, so this is belt-and-suspenders for
       // providers where signal forwarding is incomplete.
+      // Cache markers go on AFTER this path's own `normalizeMessages()` pass —
+      // normalization flattens a marked system block array back to a string.
+      const cachedStream = withPromptCache(normalizedMessages);
       const streamPromise = neuronRegistry.callNeuron(
         neuronId,
         userId,
-        normalizedMessages,
+        cachedStream.messages,
         {
           signal: abortSignal,
           runId: callRunId,
           stream: true,
           modelOverride: model,
+          invokeOptions: cachedStream.invokeOptions,
         },
       );
       const timeoutPromise = new Promise<never>((_, reject) => {
@@ -1384,6 +1419,12 @@ export interface NativeToolUseLoopArgs {
    * these itself, so they never produce tool_calls and never enter the loop.
    */
   hostedSpecs?: HostedToolSpec[];
+  /**
+   * True when the neuron's provider/model supports Anthropic prompt caching.
+   * Resolved by the caller (which already has the neuron config) so the loop
+   * doesn't re-look it up per iteration.
+   */
+  promptCache?: boolean;
   neuronId: string;
   userId: string;
   callRunId: string | undefined;
@@ -1430,7 +1471,8 @@ function emitNeuronUsage(params: {
       // executions of the same node across graph edge-cycles don't dedupe-collide.
       const baseStepId = params.stepIdOverride || params.config?.outputField;
       const execToken = typeof s?._nodeExecToken === 'number' ? `:x${s._nodeExecToken}` : '';
-      neuron.recordNeuronCall({
+      const cacheUsage = extractCacheUsage(params.providerResponse);
+      const recorded = neuron.recordNeuronCall({
         state: s,
         runId: params.callRunId || 'unknown',
         accountId: params.userId || 'anonymous',
@@ -1441,7 +1483,27 @@ function emitNeuronUsage(params: {
         loopIteration: typeof s?.loopIteration === 'number' ? s.loopIteration : undefined,
         conversationId: s?.data?.conversationId || s?.conversationId,
         graphId: s?.graphId || s?.data?.graphId || s?.data?.options?.graphId,
+        // Forwarded for a future redToken that reads them directly; the
+        // installed client ignores unknown input keys, hence the sample
+        // enrichment below.
+        ...(cacheUsage ?? {}),
       });
+      // Surface the cache split on the usage sample redToken just appended to
+      // `state.metadata.tokens` (`recordNeuronCall` returns the very object it
+      // pushed). Strictly ADDITIVE — `inputTokens` keeps its meaning, which on
+      // every provider that reports a cache is the TOTAL input including the
+      // cached tokens, so the Rater's arithmetic is untouched and a later rate
+      // card can price `cacheReadInputTokens` at its own rate.
+      if (cacheUsage && recorded?.sample) {
+        recorded.sample.cacheCreationInputTokens = cacheUsage.cacheCreationInputTokens;
+        recorded.sample.cacheReadInputTokens = cacheUsage.cacheReadInputTokens;
+        recorded.sample.uncachedInputTokens = Math.max(
+          0,
+          (recorded.sample.inputTokens ?? 0) -
+            cacheUsage.cacheCreationInputTokens -
+            cacheUsage.cacheReadInputTokens,
+        );
+      }
     } catch (e) {
       console.warn('[metering] neuron emit failed (non-fatal):', e instanceof Error ? e.message : e);
     }
@@ -1483,6 +1545,7 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
     abortSignal,
     neuronRegistry,
   } = args;
+  const promptCache = args.promptCache === true;
 
   const runPublisher: any = getRunPublisher(state);
   const maxIterations = typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0
@@ -1533,10 +1596,15 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
     }
     // Client tools flatten to function declarations; hosted specs (provider-
     // executed — googleSearch, web_search_preview, …) ride along verbatim.
-    boundModel = model.bindTools([
+    // The tool block is byte-identical for every iteration AND every run of
+    // this node, so it is the cheapest cache breakpoint available: mark the
+    // last client tool and the whole schema list is served from cache from the
+    // second call onward (see prompt-cache.ts).
+    const toolPayload = [
       ...toBindToolsPayload(resolvedTools),
       ...(args.hostedSpecs ?? []),
-    ]);
+    ];
+    boundModel = model.bindTools(promptCache ? applyToolCacheControl(toolPayload) : toolPayload);
   } catch (bindErr: any) {
     throw new Error(
       `Failed to bind tools to model for neuron '${neuronId}': ${bindErr instanceof Error ? bindErr.message : String(bindErr)}`
@@ -1565,11 +1633,23 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
     // same approach used by langchain's standard agent loop.
     let response: any;
     try {
-      response = await neuronRegistry.callNeuron(neuronId, userId, messages, {
+      // Mark the system block, and (from the second iteration on, once the
+      // list holds an assistant turn + tool results) the history prefix, so
+      // each iteration re-reads the previous one instead of re-paying for it.
+      const cachedTurn = promptCache
+        ? {
+            messages: applySystemCacheControl(messages),
+            invokeOptions: shouldCacheHistoryPrefix(messages)
+              ? historyCacheInvokeOptions()
+              : undefined,
+          }
+        : { messages, invokeOptions: undefined };
+      response = await neuronRegistry.callNeuron(neuronId, userId, cachedTurn.messages, {
         signal: abortSignal,
         runId: callRunId,
         stream: false,
         modelOverride: boundModel,
+        invokeOptions: cachedTurn.invokeOptions,
       });
     } catch (invokeErr: any) {
       throw new Error(
