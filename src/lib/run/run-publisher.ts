@@ -63,6 +63,7 @@ import { ConversationPublisher, createConversationPublisher } from '../conversat
 import { assertChatComponentSpec } from '../chat-components/spec-schema';
 import { heartbeatAutomationSlot, releaseAutomationSlot } from './automation-concurrency';
 import { redactSensitive } from '../utils/redact-sensitive';
+import { clampForLog } from '../utils/clamp-for-log';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -391,7 +392,14 @@ export class RunPublisher {
           conversationId: this.state?.conversationId,
           generationId: this.runId,
         },
-        metadata: redactSensitive(meta),
+        // Redact first, then clamp: a clipped prefix of a secret is still a
+        // leak, and clamping cannot mask what it has already thrown away.
+        //
+        // Clamped at the sink rather than at each call site because the record
+        // that killed the worker was `Run started`, whose metadata is just the
+        // run input, and any future record carrying a trigger body would do
+        // exactly the same thing. See lib/utils/clamp-for-log.
+        metadata: clampForLog(redactSensitive(meta)),
       });
     } catch (error) {
       if (DEBUG) console.error('[RunPublisher] redlog error:', error);
