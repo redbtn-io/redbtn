@@ -15,7 +15,7 @@
  *                                                        ▼
  *                                            native registry → `now`
  *
- * There are two cases, and the second is the important one:
+ * There are three cases, and the second is the important one:
  *
  *   1. the bridge tool is reachable  — `mcp(redbtn/*)` is granted, so the model
  *      calls `now` and answers with a timestamp it cannot have invented.
@@ -23,6 +23,9 @@
  *      command that would leave a file on disk, the CLI is refused by the
  *      permission policy, the file does not exist afterwards, and the step
  *      fails with `agy_tool_denied` rather than quietly returning "".
+ *   3. a prompt far past the old argv ceiling arrives WHOLE — the model answers
+ *      a question written after 150 KB of document, which it can only do if the
+ *      NDJSON message on stdin was delivered to the last byte.
  *
  * Case 2 is the whole security argument for this provider, so it is asserted
  * against the real binary rather than against a fake that was told to say no.
@@ -52,6 +55,7 @@ import {
   buildAgyHome,
   buildAgySpawnArgs,
   buildAgyChildEnv,
+  buildAgyStdinMessage,
   parseAgyEnvelope,
 } from '../../src/lib/nodes/universal/executors/agyCliExecutor';
 import { runDirRoot } from '../../src/lib/nodes/universal/executors/claudeCodeExecutor';
@@ -394,20 +398,24 @@ describe.skipIf(!LIVE)('agy-cli executor, live against the real CLI', () => {
       const args = buildAgySpawnArgs({
         model: MODEL,
         effort: 'low',
-        prompt:
-          `Use your shell tool to run exactly: touch ${marker} && echo done. ` +
-          `Then use write_to_file to create ${marker}.txt containing PWNED. ` +
-          `Report whether each worked.`,
         printTimeoutMs: 90_000,
       });
 
+      // The prompt goes in on stdin, exactly as the executor sends it: one
+      // NDJSON `user` event, then EOF, which is what makes the CLI run one turn
+      // and exit.
       const raw = execFileSync(BIN, args, {
         cwd,
         env: buildAgyChildEnv({ home, dir: path.join(tmpRoot, 'policy-tmp') }),
+        input: buildAgyStdinMessage(
+          `Use your shell tool to run exactly: touch ${marker} && echo done. ` +
+            `Then use write_to_file to create ${marker}.txt containing PWNED. ` +
+            `Report whether each worked.`,
+        ),
         encoding: 'utf8',
         timeout: 180_000,
         maxBuffer: 16 * 1024 * 1024,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
 
       const envelope = parseAgyEnvelope(raw);
@@ -449,6 +457,57 @@ describe.skipIf(!LIVE)('agy-cli executor, live against the real CLI', () => {
       }
     },
     300_000,
+  );
+
+  it(
+    'carries a 150 KB+ prompt to the real CLI, whole, over stdin',
+    async () => {
+      // The reason this provider stopped putting the prompt in argv. Anything
+      // over ~100 KB was refused outright under `MAX_ARG_STRLEN`, a ceiling the
+      // Gemini API itself does not have.
+      //
+      // The proof is a needle placed after the last byte of a long document: a
+      // model answering `84317` has been shown the WHOLE message. A pipe that
+      // truncated anywhere before the end gets the CLI's own "the document was
+      // truncated before the end" reply instead, which fails this test.
+      const lines: string[] = [];
+      let bytes = 0;
+      for (let i = 1; bytes < 155_000; i += 1) {
+        const line =
+          `Paragraph ${i}: The Boulanger Institute ledger records entry ` +
+          `${(i * 37) % 9973} for fiscal year ${1900 + (i % 120)}.\n`;
+        lines.push(line);
+        bytes += line.length;
+      }
+      const document = lines.join('');
+      const userPrompt =
+        'Below is a long document. Read it, then answer the question at the very end.\n\n' +
+        `<document>\n${document}\nSECRET-NEEDLE-VALUE: 84317\n</document>\n\n` +
+        'Question: what is the SECRET-NEEDLE-VALUE stated inside the document? ' +
+        'Reply with only that number and nothing else.';
+
+      expect(Buffer.byteLength(userPrompt, 'utf8')).toBeGreaterThan(150 * 1024);
+
+      const { out } = await live(
+        {
+          systemPrompt: 'Answer from the document you are given. Be terse.',
+          userPrompt,
+          tools: [],
+          timeoutMs: 300_000,
+        },
+        'data.needle',
+      );
+
+      const answer = String(out['data.needle']);
+      expect(answer, `the CLI did not read to the end of the prompt: ${answer}`).toContain('84317');
+
+      // And the accounting proves the size actually crossed the wire: a
+      // 150 KB document cannot be billed as a few thousand input tokens.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const cli = (out['data._cli'] as any)['data.needle'];
+      expect(cli.usage.input_tokens).toBeGreaterThan(30_000);
+    },
+    360_000,
   );
 
   it(

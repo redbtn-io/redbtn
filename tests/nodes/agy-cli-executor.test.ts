@@ -32,7 +32,7 @@
  * the shell on a fleet node exports production database URIs.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -41,6 +41,7 @@ import {
   runAgyCliStep,
   buildAgyChildEnv,
   buildAgySpawnArgs,
+  buildAgyStdinMessage,
   buildAgyHome,
   parseAgyEnvelope,
   mapAgyUsage,
@@ -62,7 +63,8 @@ import {
   AGY_MODELS,
   AGY_HOME_PATHS,
   DEFAULT_MODEL,
-  MAX_PROMPT_ARG_BYTES,
+  MAX_PROMPT_BYTES,
+  PROMPT_TRUNCATION_WARN_BYTES,
   EFFORT_LEVELS,
   __agySlotsInUse,
   __agyLiveChildCount,
@@ -144,6 +146,38 @@ const AUTH_ENVELOPE = {
   },
 };
 
+/** The `init` line every `stream-json` run opens with. */
+const INIT_EVENT = JSON.stringify({
+  event: 'init',
+  conversation_id: 'b01a9675-99d1-4481-a44a-8a872a2da48a',
+  init: {
+    model: 'gemini-3.8-flash',
+    cwd: '/tmp/agy',
+    tools: ['call_mcp_tool', 'run_command'],
+    permission_mode: 'request-review',
+  },
+});
+
+/** One `step_update`. The answer text arrives here as a delta, before the result. */
+const STEP_EVENT = (text: string) =>
+  JSON.stringify({
+    event: 'step_update',
+    step_update: {
+      conversation_id: 'b01a9675-99d1-4481-a44a-8a872a2da48a',
+      step_index: 1,
+      state: 'DONE',
+      step_type: 'agent_response',
+      text_delta: text,
+    },
+  });
+
+/** The one line that carries the envelope. */
+const RESULT_EVENT = (envelope: unknown) => JSON.stringify({ event: 'result', result: envelope });
+
+/** A whole `stream-json` stdout for one turn. */
+const STREAM_JSON_STDOUT = (envelope: { response?: string }) =>
+  `${INIT_EVENT}\n${STEP_EVENT(envelope.response ?? '')}\n${RESULT_EVENT(envelope)}\n`;
+
 /** The stderr the CLI prints while it waits for an interactive login. */
 const AUTH_STDERR =
   'Authentication required. Please visit the URL to log in:\n' +
@@ -206,9 +240,21 @@ afterEach(() => {
 });
 
 /**
- * Write a fake `agy`. The body runs immediately — unlike the Claude CLI this
- * one is spawned with stdin IGNORED, so a fake that waited for `stdin.end`
- * would hang forever.
+ * Write a fake `agy` that speaks the real protocol: it READS one NDJSON message
+ * off stdin and WRITES `stream-json` events back.
+ *
+ * The body is plain JavaScript with three things in scope:
+ *
+ *   - `out(envelope)` — emit a whole turn: an `init` line, a `step_update`, and
+ *     the `{"event":"result","result":<envelope>}` line the executor parses.
+ *     Every fixture below is the bare envelope, so the wrapping lives here.
+ *   - `emit(obj)` — one raw NDJSON line, for the malformed-stream cases.
+ *   - `whenPrompt(fn)` — run `fn(turn)` once stdin has closed, where `turn` is
+ *     the parsed NDJSON message. This is the only way to see the prompt now: it
+ *     is not an argument any more.
+ *
+ * A body that answers synchronously still works — `process.stdin` keeps the
+ * child alive until EOF, and the executor closes stdin immediately.
  */
 function writeFakeAgy(body: string): string {
   const file = path.join(tmpRoot, `fake-agy-${Math.random().toString(36).slice(2, 8)}.js`);
@@ -219,8 +265,25 @@ function writeFakeAgy(body: string): string {
       'const fs = require("fs");\n' +
       // Synchronous writes: a `process.stdout.write` to a pipe is async, so an
       // `out(...); process.exit(0)` pair can truncate the envelope.
-      'const out = (o) => fs.writeSync(1, typeof o === "string" ? o : JSON.stringify(o) + "\\n");\n' +
+      'const emit = (o) => fs.writeSync(1, typeof o === "string" ? o : JSON.stringify(o) + "\\n");\n' +
+      'const out = (o) => {\n' +
+      '  emit({event: "init", conversation_id: (o && o.conversation_id) || "", init: {model: "gemini-3.8-flash", cwd: process.cwd(), tools: ["call_mcp_tool"], permission_mode: "request-review"}});\n' +
+      '  emit({event: "step_update", step_update: {step_index: 0, state: "DONE", step_type: "user_input"}});\n' +
+      '  emit({event: "result", result: o});\n' +
+      '};\n' +
       'const err = (s) => fs.writeSync(2, s);\n' +
+      'let STDIN = "";\n' +
+      'let TURN = null;\n' +
+      'const waiting = [];\n' +
+      'const whenPrompt = (fn) => { waiting.push(fn); };\n' +
+      'process.stdin.setEncoding("utf8");\n' +
+      'process.stdin.on("error", () => {});\n' +
+      'process.stdin.on("data", (c) => { STDIN += c; });\n' +
+      'process.stdin.on("end", () => {\n' +
+      '  const line = STDIN.split("\\n").filter(Boolean)[0];\n' +
+      '  TURN = line ? JSON.parse(line) : null;\n' +
+      '  for (const fn of waiting) fn(TURN);\n' +
+      '});\n' +
       body +
       '\n',
     { mode: 0o755 },
@@ -228,12 +291,13 @@ function writeFakeAgy(body: string): string {
   return file;
 }
 
-/** Dump argv, env and cwd so the spawn contract can be asserted. */
+/** Dump argv, env, cwd and the PROMPT so the spawn contract can be asserted. */
 function dumpLine(dumpPath: string): string {
   // `cwdEntries` is captured by the CHILD, because the step directory the cwd
   // may fall back into is removed by the executor's `finally` before the test
-  // gets to look at it.
-  return `fs.writeFileSync(${JSON.stringify(dumpPath)}, JSON.stringify({argv: process.argv.slice(2), env: process.env, cwd: process.cwd(), cwdEntries: fs.readdirSync(process.cwd()), homeToken: fs.readFileSync(require("path").join(process.env.HOME, ".gemini/antigravity-cli/antigravity-oauth-token"), "utf8"), grants: fs.readFileSync(require("path").join(process.env.HOME, ".gemini/config/config.json"), "utf8")}));`;
+  // gets to look at it. The dump waits for stdin because the prompt arrives
+  // there, and the child stays alive until then.
+  return `whenPrompt((turn) => fs.writeFileSync(${JSON.stringify(dumpPath)}, JSON.stringify({argv: process.argv.slice(2), env: process.env, cwd: process.cwd(), cwdEntries: fs.readdirSync(process.cwd()), stdin: STDIN, turn: turn, prompt: turn && turn.message && turn.message.content, homeToken: fs.readFileSync(require("path").join(process.env.HOME, ".gemini/antigravity-cli/antigravity-oauth-token"), "utf8"), grants: fs.readFileSync(require("path").join(process.env.HOME, ".gemini/config/config.json"), "utf8")})));`;
 }
 
 interface FakePublisher {
@@ -303,23 +367,53 @@ describe('buildAgySpawnArgs', () => {
       buildAgySpawnArgs({
         model: 'gemini-3.8-flash',
         effort: 'high',
-        prompt: 'PROMPT',
         printTimeoutMs: 120_000,
       }),
     ).toEqual([
-      '-p',
-      'PROMPT',
+      '-p=',
       '--model',
       'gemini-3.8-flash',
       '--effort',
       'high',
+      '--input-format',
+      'stream-json',
       '--output-format',
-      'json',
+      'stream-json',
       '--disable-slash-commands',
       '--sandbox',
       '--print-timeout',
       '120s',
     ]);
+  });
+
+  it('carries no prompt at all: it goes over stdin', () => {
+    // The whole point of the NDJSON path. `-p=` is ONE token — print mode with
+    // an empty inline prompt — because `-p` followed by another flag makes the
+    // CLI take that flag as the prompt, and a bare trailing `-p` is refused.
+    const args = buildAgySpawnArgs({
+      model: 'gemini-3.8-flash',
+      effort: 'low',
+      printTimeoutMs: 1000,
+    });
+    expect(args[0]).toBe('-p=');
+    expect(args).not.toContain('-p');
+    expect(args).not.toContain('--prompt');
+    // And the CLI refuses `--input-format stream-json` without its output twin.
+    expect(args[args.indexOf('--input-format') + 1]).toBe('stream-json');
+    expect(args[args.indexOf('--output-format') + 1]).toBe('stream-json');
+  });
+
+  it('frames the prompt as one NDJSON `user` EVENT, newline-terminated', () => {
+    // VERIFIED against agy 1.1.27: the discriminator is `event`. A message keyed
+    // `type` is rejected with `stream input message is missing the "event"
+    // field`, which would burn a spawn and return no result.
+    const line = buildAgyStdinMessage('hello\nworld');
+    expect(line.endsWith('\n')).toBe(true);
+    expect(line.trimEnd()).not.toContain('\n');
+    expect(JSON.parse(line)).toEqual({
+      event: 'user',
+      message: { role: 'user', content: 'hello\nworld' },
+    });
   });
 
   it('NEVER passes --dangerously-skip-permissions', () => {
@@ -330,7 +424,6 @@ describe('buildAgySpawnArgs', () => {
       const args = buildAgySpawnArgs({
         model: 'gemini-3.8-flash',
         effort,
-        prompt: 'p',
         printTimeoutMs: 1000,
         jsonSchema: '{}',
         conversationId: 'c',
@@ -346,7 +439,6 @@ describe('buildAgySpawnArgs', () => {
     const args = buildAgySpawnArgs({
       model: 'claude-sonnet-4-6',
       effort: undefined,
-      prompt: 'p',
       printTimeoutMs: 1000,
     });
     expect(args).not.toContain('--effort');
@@ -355,7 +447,6 @@ describe('buildAgySpawnArgs', () => {
   it('passes --json-schema and --conversation when given', () => {
     const args = buildAgySpawnArgs({
       model: 'gemini-3.8-flash-low',
-      prompt: 'p',
       printTimeoutMs: 90_000,
       jsonSchema: '{"type":"object"}',
       conversationId: 'abc-123',
@@ -366,16 +457,15 @@ describe('buildAgySpawnArgs', () => {
   });
 
   it('converts the print timeout to whole seconds, never below 1', () => {
-    const short = buildAgySpawnArgs({ model: 'gemini-3.8-flash', prompt: 'p', printTimeoutMs: 10 });
+    const short = buildAgySpawnArgs({ model: 'gemini-3.8-flash', printTimeoutMs: 10 });
     expect(short[short.indexOf('--print-timeout') + 1]).toBe('1s');
   });
 
-  it('elides the prompt and the schema from a log line', () => {
+  it('elides the schema from a log line', () => {
     const args = buildAgySpawnArgs({
       model: 'gemini-3.8-flash',
-      prompt: 'x'.repeat(4096),
       printTimeoutMs: 1000,
-      jsonSchema: '{"a":1}',
+      jsonSchema: `{"a":"${'x'.repeat(4088)}"}`,
     });
     const logged = redactArgvForLog(args);
     expect(logged.join(' ')).not.toContain('xxxx');
@@ -616,13 +706,31 @@ describe('resolveAgyEffort', () => {
 // =============================================================================
 
 describe('parseAgyEnvelope', () => {
-  it('parses the ordinary single-object stdout', () => {
+  it('unwraps the `result` event out of a stream-json stdout', () => {
+    // The shipped shape: `init`, a `step_update` per step, then one `result`
+    // whose payload is the same envelope `--output-format json` used to print.
+    expect(parseAgyEnvelope(STREAM_JSON_STDOUT(SUCCESS_ENVELOPE))).toEqual(SUCCESS_ENVELOPE);
+  });
+
+  it('never mistakes `init` or `step_update` for the result', () => {
+    // Both are well-formed JSON objects that arrive BEFORE the result, and a
+    // `step_update` carries the answer text as a delta. Stopping at either one
+    // would report a finished turn as having no usage and no `denied_actions`.
+    expect(parseAgyEnvelope(`${INIT_EVENT}\n${STEP_EVENT('partial')}\n`)).toBeNull();
+    const full = `${INIT_EVENT}\n${STEP_EVENT('ok-e1\n')}\n${RESULT_EVENT(SUCCESS_ENVELOPE)}\n`;
+    expect(parseAgyEnvelope(full)).toEqual(SUCCESS_ENVELOPE);
+  });
+
+  it('still parses the bare envelope of `--output-format json`', () => {
+    // Kept because the executor is not the only caller: the live policy test
+    // and anything invoking `agy -p` by hand get the older single-object shape.
     expect(parseAgyEnvelope(`${JSON.stringify(SUCCESS_ENVELOPE)}\n`)).toEqual(SUCCESS_ENVELOPE);
+    expect(parseAgyEnvelope(JSON.stringify(SUCCESS_ENVELOPE, null, 2))).toEqual(SUCCESS_ENVELOPE);
   });
 
   it('finds the envelope behind a stray banner line', () => {
     // A banner would otherwise turn a completed, paid-for turn into "no result".
-    const stdout = `Fetching available models...\n${JSON.stringify(SUCCESS_ENVELOPE)}\n`;
+    const stdout = `Fetching available models...\n${RESULT_EVENT(SUCCESS_ENVELOPE)}\n`;
     expect(parseAgyEnvelope(stdout)?.response).toBe('ok-e1\n');
   });
 
@@ -871,9 +979,13 @@ describe('runAgyCliStep', () => {
     expect(seen.env.GEMINI_API_KEY).toBeUndefined();
     expect(JSON.stringify(seen.env)).not.toContain(TOKEN);
 
-    // The prompt is ONE argv value: this CLI has no --system-prompt flag and
-    // does not read stdin, so the system prompt is delimited inside it.
-    const prompt = seen.argv[seen.argv.indexOf('-p') + 1];
+    // The prompt is ONE NDJSON message on STDIN, not an argument: this CLI has
+    // no --system-prompt flag, so the system prompt is delimited inside the one
+    // turn, and putting that turn in argv is what used to cap it at 100 KB.
+    expect(seen.turn).toMatchObject({ event: 'user', message: { role: 'user' } });
+    expect(seen.stdin.endsWith('\n')).toBe(true);
+    expect(seen.argv.join('\u0000')).not.toContain('SYSTEM INSTRUCTIONS');
+    const prompt = seen.prompt;
     expect(prompt).toContain('=== SYSTEM INSTRUCTIONS ===');
     expect(prompt).toContain('NODE PREFIX');
     expect(prompt).toContain('be terse');
@@ -992,12 +1104,53 @@ describe('runAgyCliStep', () => {
     expect(result['data.out']).toEqual({ age: 36, name: 'Ada' });
   });
 
-  it('refuses a prompt that cannot fit in argv, before a turn is spent', async () => {
+  it('carries a 200 KB prompt through stdin, whole', async () => {
+    // The regression this path exists for. 200 KB is twice the argv ceiling the
+    // provider shipped with, and `MAX_ARG_STRLEN` would have refused it before a
+    // turn was spent. The fake reports the byte count and the LAST characters it
+    // received, so a truncated pipe fails the assertion rather than passing
+    // quietly on a prefix.
+    const filler = 'The Boulanger Institute ledger. '.repeat(6600); // ~211 KB
+    const userPrompt = `${filler}\nSECRET-NEEDLE-VALUE: 84317`;
+    expect(Buffer.byteLength(userPrompt, 'utf8')).toBeGreaterThan(200 * 1024);
+
+    process.env.AGY_CLI_BIN = writeFakeAgy(
+      'whenPrompt((turn) => { const p = turn.message.content; out(' +
+        `Object.assign({}, ${JSON.stringify(SUCCESS_ENVELOPE)}, ` +
+        '{response: "bytes=" + Buffer.byteLength(p, "utf8") + " tail=" + p.slice(-26)})); });',
+    );
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let answer: unknown;
+    let warnings = '';
+    try {
+      const { result } = await runStep({ userPrompt });
+      answer = result['data.out'];
+      // Read the calls BEFORE restoring: `mockRestore` clears them.
+      warnings = warn.mock.calls.flat().join(' ');
+    } finally {
+      warn.mockRestore();
+    }
+
+    // The system preamble is prepended, so the child sees MORE than was sent.
+    const bytes = Number(String(answer).match(/bytes=(\d+)/)?.[1]);
+    expect(bytes).toBeGreaterThan(Buffer.byteLength(userPrompt, 'utf8'));
+    // …and the tail survived, which is the half a truncating transport loses.
+    expect(String(answer)).toContain('tail=SECRET-NEEDLE-VALUE: 84317');
+
+    // Past the point where agy itself starts silently truncating, an operator
+    // gets told — the CLI reports SUCCESS either way.
+    expect(bytes).toBeGreaterThan(PROMPT_TRUNCATION_WARN_BYTES);
+    expect(warnings).toContain('silently');
+  }, 30_000);
+
+  it('refuses a prompt past the sanity bound, before a turn is spent', async () => {
+    // Not an argv limit any more — 4 MiB is past any context this CLI drives.
     process.env.AGY_CLI_BIN = writeFakeAgy(`out(${JSON.stringify(SUCCESS_ENVELOPE)});`);
-    await expect(
-      runStep({ userPrompt: 'x'.repeat(MAX_PROMPT_ARG_BYTES + 1) }),
-    ).rejects.toMatchObject({ code: 'agy_prompt_too_large' });
-  });
+    await expect(runStep({ userPrompt: 'x'.repeat(MAX_PROMPT_BYTES + 1) })).rejects.toMatchObject({
+      code: 'agy_prompt_too_large',
+    });
+  }, 30_000);
 
   it('refuses to run with no credential anywhere', async () => {
     process.env.AGY_CLI_BIN = writeFakeAgy(`out(${JSON.stringify(SUCCESS_ENVELOPE)});`);
