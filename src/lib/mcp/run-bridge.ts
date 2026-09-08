@@ -59,14 +59,20 @@
  *      the allowlist and the args check, so the two denial branches — the
  *      cheapest frames an attacker can send, and the ones that publish two
  *      run-archive writes each — are capped like everything else.
- *   8. Attacker-controlled bytes (a bogus tool name, an unvalidated args blob,
- *      a JSON-RPC `id`, a `protocolVersion`) are truncated on their way into an
- *      error message, a response echo or the archive.
+ *   8. Attacker-controlled bytes are truncated on their way into an error
+ *      message or the archive (a bogus tool name, an unvalidated args blob) —
+ *      and anything the server would ECHO VERBATIM is allowlisted instead of
+ *      truncated, because a bound that only covers one JSON type is not a
+ *      bound: a JSON-RPC `id` must be a finite number or a short string, and a
+ *      `protocolVersion` must be short and version-shaped, or the frame is an
+ *      invalid request answered at constant size.
  *   9. The peer cannot make the worker starve or swell. Reads are pumped in
  *      bounded batches so a pipelined burst cannot stall the event loop; writes
  *      apply backpressure and a peer that will not drain is dropped;
- *      `tools/call` is capped by budget and by concurrency; and every archive
- *      write the bridge awaits has a deadline. The one deliberate exception is
+ *      `tools/call` is capped by budget and by concurrency — DENIALS INCLUDED,
+ *      because a denial is two archive writes and the dispatcher is
+ *      fire-and-forget; and every archive write the bridge awaits has a
+ *      deadline. The one deliberate exception is
  *      `callTool` itself — a tool owns its own timeout and holds one of four
  *      inflight slots, not the session.
  *  10. The socket lives 0600 inside a 0700 directory and both are removed on
@@ -151,8 +157,15 @@ const MAX_WRITE_BACKLOG_BYTES = 8 * 1024 * 1024;
 /** Failed auth frames tolerated before the whole session is revoked. */
 const MAX_AUTH_FAILURES = 3;
 
-/** Concurrent `tools/call` dispatches allowed per session. */
-const MAX_INFLIGHT_CALLS = 4;
+/**
+ * Concurrent `tools/call` frames allowed per session — DENIALS INCLUDED.
+ *
+ * A denial is not free work: it publishes a `tool_start` and a `tool_error` to
+ * the run archive. `handleRequest` is fire-and-forget, so leaving denials
+ * outside this cap let a child hold `maxCalls` audit conversations open at
+ * once.
+ */
+export const MAX_INFLIGHT_CALLS = 4;
 
 /**
  * Peer sockets the listener will hold at once.
@@ -259,8 +272,23 @@ const DEFAULT_MAX_TOOL_ITERATIONS = 50;
  *   - `alert_desktop` and every `desktop_*` tool — see `FORBIDDEN_TOOL_PREFIXES`.
  *   - `workspace_checkout` / `workspace_checkin` / `workspace_release` — the
  *     worker owns workspace lifecycle; a run must not move its own fence.
- *   - `create_neuron` / `update_neuron` / `delete_neuron` — self-modification
- *     of the model layer that runs the next step.
+ *   - The AUTHORING pack — `create_neuron` / `update_neuron` / `delete_neuron`
+ *     / `fork_neuron`, `create_node` / `update_node` / `node_patch` /
+ *     `delete_node` / `fork_node`, and `create_graph` / `update_graph` /
+ *     `graph_patch` / `publish_graph` / `fork_graph` / `delete_graph`.
+ *
+ *     The neuron trio was already here for "self-modification of the model
+ *     layer that runs the next step", and the rest achieve exactly that by a
+ *     different door: a node IS the step, and a graph is the program the steps
+ *     run in. `graph_patch` on the running graph, or `update_node` on the next
+ *     node, rewrites the thing about to execute — with the run's own
+ *     credentials and no second pair of eyes. `publish_graph` is worse than
+ *     self-modification: `native-registry.ts` names `create_graph` +
+ *     `update_automation` + a CRON trigger as the boundary the model-driven
+ *     taint CANNOT cross, because a scheduled run starts with no model context
+ *     to taint. A coding child has no business authoring the platform it runs
+ *     on, so the whole pack is off. This is a bridge rule, not a capability
+ *     rule — an API neuron with the right profile still has these.
  *
  * The URL-fetching tools are excluded separately by `NETWORK_TOOLS` +
  * `CALLER_TRUST_FIX_PRESENT` below, because that exclusion lifts itself.
@@ -280,6 +308,18 @@ export const FORBIDDEN_TOOLS: ReadonlySet<string> = new Set([
   'create_neuron',
   'update_neuron',
   'delete_neuron',
+  'fork_neuron',
+  'create_node',
+  'update_node',
+  'node_patch',
+  'delete_node',
+  'fork_node',
+  'create_graph',
+  'update_graph',
+  'graph_patch',
+  'publish_graph',
+  'fork_graph',
+  'delete_graph',
 ]);
 
 /**
@@ -559,9 +599,18 @@ export function stripPrototypeKeys(raw: Record<string, unknown>): Record<string,
  * tool that deep-merges its options — or hands them to a library that does —
  * turns that into prototype pollution. Depth-bounded for the same reason
  * {@link scrubValueForPublish} is: the args came off a socket.
+ *
+ * The bound FAILS CLOSED, and that is the whole point of it. Returning the
+ * subtree unstripped — which is what this did — turned the recursion limit into
+ * the bypass: fourteen meaningless wrappers around
+ * `{"__proto__":{"POLLUTED":"yes"}}` walked straight past the bound and reached
+ * a tool handler with `__proto__` as an own property. Past the bound nothing
+ * that can CARRY a key survives, so the marker is a string, exactly as
+ * {@link scrubValueForPublish} does it. No native tool's schema describes an
+ * object twelve levels deep, so nothing legitimate is being truncated here.
  */
 function stripPrototypeKeysDeep(value: unknown, depth: number): unknown {
-  if (depth >= MAX_STRIP_DEPTH) return value;
+  if (depth >= MAX_STRIP_DEPTH) return isPlainObject(value) || Array.isArray(value) ? '[TRUNCATED]' : value;
   if (Array.isArray(value)) return value.map((item) => stripPrototypeKeysDeep(item, depth + 1));
   if (!isPlainObject(value)) return value;
   const out: Record<string, unknown> = {};
@@ -683,6 +732,21 @@ export function boundPublishedInput(raw: unknown, maxBytes: number): unknown {
     _bytes: bytes,
     preview: Buffer.from(json, 'utf8').subarray(0, maxBytes).toString('utf8'),
   };
+}
+
+/**
+ * True when a JSON-RPC `id` is one this server is willing to echo.
+ *
+ * An allowlist, not a blocklist: JSON-RPC 2.0 permits a string, a number or
+ * null, and every response repeats the id verbatim. A short string or a finite
+ * number costs a bounded number of bytes to repeat; an object, an array, or a
+ * 5000-character string is a peer choosing how many bytes leave the worker on
+ * every frame it sends. `null`/absent never reaches here — that is a
+ * notification, and notifications are not answered at all.
+ */
+export function isEchoableRpcId(id: unknown): id is string | number {
+  if (typeof id === 'number') return Number.isFinite(id);
+  return typeof id === 'string' && id.length <= MAX_RPC_ID_CHARS;
 }
 
 /** Bound an attacker-supplied name before it reaches a message or the archive. */
@@ -1096,12 +1160,22 @@ export async function startRunToolBridge(
     }
   }
 
+  /**
+   * Charge one `tools/call` frame against BOTH caps, then dispatch it.
+   *
+   * The budget and the concurrency limit are applied here, together, and both
+   * cover the denial path as well as the accepted one. Charging only the
+   * accepted path left a real hole: `handleRequest` is fire-and-forget, so a
+   * child that pipelines `maxCalls` bogus names had that many `auditDenial`
+   * calls — two `RunPublisher` writes and two 15 s timers each — in flight at
+   * once, because a denial returned before `inflight` was ever incremented.
+   * One counter, incremented before the first `await` and released in a
+   * `finally`, is what makes "at most four archive conversations at a time"
+   * true for every branch instead of just the happy one.
+   */
   async function handleToolsCall(
     params: AnyObject | undefined,
   ): Promise<CallToolResult | { rpcError: JsonRpcError }> {
-    const name = typeof params?.name === 'string' ? params.name : '';
-    const rawArgs = params?.arguments;
-
     // ── The caps come FIRST, before the allowlist and before the args check ──
     // Those two branches each publish a `tool_start` and a `tool_error` to the
     // run archive, and an unknown tool name with a multi-megabyte argument blob
@@ -1137,10 +1211,25 @@ export async function startRunToolBridge(
     }
 
     // Charged here, synchronously, before the first `await`: every frame that
-    // gets past the caps costs one unit of budget whether it is served or
-    // denied. (A frame the cap itself refused is not charged — otherwise a
-    // capped session could never report a stable `callsTotal`.)
+    // gets past the caps costs one unit of budget AND one concurrency slot,
+    // whether it is served or denied. (A frame the cap itself refused is not
+    // charged — otherwise a capped session could never report a stable
+    // `callsTotal`.)
     stats.callsTotal += 1;
+    inflight += 1;
+    try {
+      return await dispatchToolsCall(params);
+    } finally {
+      inflight -= 1;
+    }
+  }
+
+  /** The body of an accepted-into-the-caps `tools/call`. */
+  async function dispatchToolsCall(
+    params: AnyObject | undefined,
+  ): Promise<CallToolResult | { rpcError: JsonRpcError }> {
+    const name = typeof params?.name === 'string' ? params.name : '';
+    const rawArgs = params?.arguments;
 
     if (!name || !toolsByName.has(name)) {
       stats.denied += 1;
@@ -1182,7 +1271,6 @@ export async function startRunToolBridge(
       }
     }
 
-    inflight += 1;
     const toolId = generateBridgeToolId(name, ++seq);
 
     try {
@@ -1221,8 +1309,8 @@ export async function startRunToolBridge(
       assertUntrustedContext(context);
 
       // Deliberately NOT wrapped in a timeout. A tool owns its own deadline
-      // (`run_command` is given one above when the CLI omits it), it is handed
-      // the run's `abortSignal`, and a hung tool costs one of
+      // (`run_command` reads `RUN_COMMAND_DEFAULT_TIMEOUT_MS` for itself since
+      // PR #379), it is handed the run's `abortSignal`, and a hung tool costs one of
       // `MAX_INFLIGHT_CALLS` slots rather than the session. A blanket deadline
       // here would kill legitimate long work with no way for a node to opt out.
       const result = await getNativeRegistry().callTool(name, args, context);
@@ -1255,8 +1343,6 @@ export async function startRunToolBridge(
         );
       }
       return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
-    } finally {
-      inflight -= 1;
     }
   }
 
@@ -1268,14 +1354,20 @@ export async function startRunToolBridge(
 
     if (isNotification) return;
 
-    // The id is echoed on EVERY response, including the cheap error ones. A
+    // The id is echoed on EVERY response, including the cheap error ones, so a
     // peer that names itself with a megabyte gets that megabyte back on every
-    // frame, out of the worker's heap, for free. Ids are short by every
-    // convention; a long one is not a client.
-    if (typeof id === 'string' && id.length > MAX_RPC_ID_CHARS) {
+    // frame out of the worker's heap, for free — and `ping` is not charged
+    // against the call budget, so it can do it forever.
+    //
+    // JSON-RPC 2.0 says an id is a string, a number or null. Bounding only the
+    // STRING case left the hole open one type over: `{"id":{...5000 chars...}}`
+    // is not a string, skipped the check, and came back in full. So this is an
+    // allowlist — a short string or a finite number — and everything else is an
+    // invalid request answered with a constant-size frame.
+    if (!isEchoableRpcId(id)) {
       replyError(socket, 0, {
         code: -32600,
-        message: `Invalid Request: id exceeds ${MAX_RPC_ID_CHARS} characters`,
+        message: `Invalid Request: id must be a number or a string of at most ${MAX_RPC_ID_CHARS} characters`,
       });
       return;
     }

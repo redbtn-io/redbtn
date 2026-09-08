@@ -43,6 +43,7 @@ import {
   boundPublishedInput,
   echoName,
   isSecretKey,
+  isEchoableRpcId,
   cleanupOrphanedBridges,
   assertUntrustedContext,
   FORBIDDEN_TOOLS,
@@ -52,6 +53,7 @@ import {
   DEFAULT_PROTOCOL_VERSION,
   MAX_CONNECTIONS,
   MAX_PREAUTH_BYTES,
+  MAX_INFLIGHT_CALLS,
   MAX_CALLS_CEILING,
   type RunToolBridge,
   type RunBridgeToolRef,
@@ -500,7 +502,12 @@ describe('FORBIDDEN set', () => {
       'invoke_tool', 'list_available_tools', 'get_tool_schema', 'invoke_graph', 'ssh_shell',
       'ssh_copy', 'send_webhook', 'alert_desktop',
       'workspace_checkout', 'workspace_checkin', 'workspace_release',
-      'create_neuron', 'update_neuron', 'delete_neuron',
+      // The authoring pack. A node IS the step and a graph is the program the
+      // steps run in, so these reach the same self-modification the neuron trio
+      // is forbidden for — by a different door.
+      'create_neuron', 'update_neuron', 'delete_neuron', 'fork_neuron',
+      'create_node', 'update_node', 'node_patch', 'delete_node', 'fork_node',
+      'create_graph', 'update_graph', 'graph_patch', 'publish_graph', 'fork_graph', 'delete_graph',
     ]) {
       expect(FORBIDDEN_TOOLS.has(name)).toBe(true);
       expect(isForbiddenForBridge(name)).toBe(true);
@@ -1658,6 +1665,54 @@ describe('stripPrototypeKeys', () => {
     expect(() => stripPrototypeKeys(deep)).not.toThrow();
   });
 
+  it('fails CLOSED at the depth bound instead of returning the subtree whole', () => {
+    // The bound used to `return value` — which made the recursion limit the
+    // bypass. Meaningless wrappers are free to add, so a payload parked below
+    // the bound was handed to a tool completely unstripped.
+    const payload = JSON.parse('{"__proto__":{"POLLUTED":"yes"},"marker":1}');
+    let deep: any = payload;
+    for (let i = 0; i < 14; i++) deep = { wrap: deep };
+
+    const out: any = stripPrototypeKeys(deep);
+    // Walk to the bound: nothing that can CARRY a key survives past it.
+    let cursor: any = out;
+    let hops = 0;
+    while (cursor && typeof cursor === 'object' && 'wrap' in cursor) {
+      expect(Object.prototype.hasOwnProperty.call(cursor, '__proto__')).toBe(false);
+      cursor = cursor.wrap;
+      hops += 1;
+    }
+    expect(cursor).toBe('[TRUNCATED]');
+    expect(hops).toBeLessThan(14);
+    expect(JSON.stringify(out)).not.toContain('POLLUTED');
+  });
+
+  it('never lets a below-the-bound __proto__ reach a tool handler', async () => {
+    // The end-to-end version of the above, over a real socket — this is the
+    // path that was proven to reach a handler with `__proto__` as an own
+    // property.
+    const payload = JSON.parse('{"__proto__":{"POLLUTED":"yes"}}');
+    let nested: any = payload;
+    for (let i = 0; i < 14; i++) nested = { wrap: nested };
+
+    const { bridge: b } = await start();
+    const c = await client(b);
+    await c.send('tools/call', {
+      name: 'bridge_probe',
+      arguments: { note: 'deep', extra: nested },
+    });
+
+    await until(() => received.length > 0);
+    const seen = received[0].args;
+    let cursor: any = seen.extra;
+    while (cursor && typeof cursor === 'object') {
+      expect(Object.prototype.hasOwnProperty.call(cursor, '__proto__')).toBe(false);
+      cursor = cursor.wrap;
+    }
+    expect(JSON.stringify(seen)).not.toContain('POLLUTED');
+    expect(({} as any).POLLUTED).toBeUndefined();
+  });
+
   it('reaches a tool with the nested key already gone', async () => {
     const { bridge: b } = await start();
     const c = await client(b);
@@ -1714,6 +1769,51 @@ describe('flow control', () => {
   });
 });
 
+describe('denial concurrency', () => {
+  it('charges a DENIAL against the concurrency cap, not just an accepted call', async () => {
+    // `handleRequest` is fire-and-forget and a denial used to return before
+    // `inflight` was ever incremented, so a child that pipelined bogus names
+    // could hold `maxCalls` audit conversations open at once — two publisher
+    // writes and two 15 s timers each.
+    let release: () => void = () => {};
+    const parked = new Promise<void>((r) => {
+      release = r;
+    });
+    let starts = 0;
+    const slowPublisher = {
+      async toolStart() {
+        starts += 1;
+        await parked;
+      },
+      async toolComplete() {},
+      async toolError() {},
+    };
+
+    const { bridge: b } = await start({ publisher: slowPublisher, maxToolIterations: 50 });
+    const c = await client(b);
+
+    const parkedDenials = Array.from({ length: MAX_INFLIGHT_CALLS }, (_, i) =>
+      c.send('tools/call', { name: `nope${i}`, arguments: {} }),
+    );
+    await until(() => starts >= MAX_INFLIGHT_CALLS, 2000);
+    expect(starts).toBe(MAX_INFLIGHT_CALLS);
+
+    const overflow = await c.send('tools/call', { name: 'nope-overflow', arguments: {} });
+    expect(overflow.result.isError).toBe(true);
+    expect(overflow.result.content[0].text).toContain('too many concurrent tool calls');
+    // The refused frame never reached the archive at all.
+    expect(starts).toBe(MAX_INFLIGHT_CALLS);
+
+    release();
+    const settled = await Promise.all(parkedDenials);
+    for (const res of settled) expect(res.error.code).toBe(-32602);
+
+    // And a slot is released afterwards, so the session is not wedged.
+    const after = await c.send('tools/call', { name: 'nope-after', arguments: {} });
+    expect(after.error.code).toBe(-32602);
+  });
+});
+
 // =============================================================================
 // 18. Bounds on everything the bridge echoes back
 // =============================================================================
@@ -1730,6 +1830,47 @@ describe('echo bounds', () => {
     expect(msg.error.code).toBe(-32600);
     expect(msg.id).toBe(0);
     expect(JSON.stringify(msg).length).toBeLessThan(512);
+  });
+
+  it('refuses a non-STRING id it would have to echo unbounded', async () => {
+    // Bounding only the string case left the hole open one type over: an id
+    // that is an object skipped the check entirely and came back in full, and
+    // `ping` is not charged against the call budget, so it could do that
+    // forever. The rule is an allowlist now.
+    const { bridge: b } = await start();
+    const c = await client(b);
+    const fatId: Record<string, string> = {};
+    for (let i = 0; i < 200; i++) fatId[`k${i}`] = 'v'.repeat(25);
+
+    c.raw(JSON.stringify({ jsonrpc: '2.0', id: fatId, method: 'ping' }) + '\n');
+    await until(() => c.lines.length > 0, 2000);
+    const msg = JSON.parse(c.lines[c.lines.length - 1]);
+    expect(msg.error.code).toBe(-32600);
+    expect(msg.id).toBe(0);
+    // The whole response, not just the id, is constant-size.
+    expect(JSON.stringify(msg).length).toBeLessThan(512);
+  });
+
+  it('states the id rule directly', () => {
+    expect(isEchoableRpcId(1)).toBe(true);
+    expect(isEchoableRpcId(0)).toBe(true);
+    expect(isEchoableRpcId(-4)).toBe(true);
+    expect(isEchoableRpcId('abc')).toBe(true);
+    expect(isEchoableRpcId('x'.repeat(128))).toBe(true);
+    expect(isEchoableRpcId('x'.repeat(129))).toBe(false);
+    expect(isEchoableRpcId({ a: 1 })).toBe(false);
+    expect(isEchoableRpcId([1, 2, 3])).toBe(false);
+    expect(isEchoableRpcId(true)).toBe(false);
+    expect(isEchoableRpcId(Number.NaN)).toBe(false);
+    expect(isEchoableRpcId(Number.POSITIVE_INFINITY)).toBe(false);
+  });
+
+  it('still answers a normal numeric or string id', async () => {
+    const { bridge: b } = await start();
+    const c = await client(b);
+    c.raw(JSON.stringify({ jsonrpc: '2.0', id: 'client-42', method: 'ping' }) + '\n');
+    await until(() => c.lines.some((l) => l.includes('client-42')), 2000);
+    expect(JSON.parse(c.lines[c.lines.length - 1])).toEqual({ jsonrpc: '2.0', id: 'client-42', result: {} });
   });
 
   it('echoes a sane protocolVersion and substitutes the default for anything else', async () => {
