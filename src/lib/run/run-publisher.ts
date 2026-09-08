@@ -1123,6 +1123,26 @@ export class RunPublisher {
     }
   }
 
+  /**
+   * Replace the run's accumulated output text.
+   *
+   * The last-writer correction for a step that streamed its own text and then
+   * found the provider's final answer disagreeing with it. `functions/run.ts`
+   * reads `output.content` back off the cached state when it completes the
+   * run, so this lands in `run_complete`'s `finalContent` — the value the chat
+   * client treats as the final word on the bubble.
+   *
+   * A REPLACEMENT, not a chunk: appending a correction as another chunk puts a
+   * second writer on a stream that already has one, which is how a live turn
+   * came back with its text out of order. Nothing is re-published to the
+   * conversation stream here; the terminal event carries the truth.
+   */
+  async replaceOutputContent(content: string): Promise<void> {
+    this.ensureInitialized();
+    this.state!.output.content = content;
+    await this.saveState();
+  }
+
   async thinkingComplete(): Promise<void> {
     this.ensureInitialized();
     await this.saveState();
