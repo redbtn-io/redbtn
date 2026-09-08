@@ -3,13 +3,14 @@
  *
  * # Why this exists
  *
- * The platform default for real work is a `claude-code` neuron: a Claude Code
- * CLI child spending a flat-rate subscription. That is the right default and
- * the wrong single point of failure. The CLI is a *process* — it can fail to
- * spawn, fail its `system/init` guard, sit in the worker's concurrency queue
- * until the queue timeout, hit a subscription rate limit, or have its OAuth
- * token rejected — none of which says anything about the step's prompt. A
- * metered Gemini neuron would have answered the same question fine.
+ * The platform default for real work is a subscription-backed CLI neuron: a
+ * `claude-code` child spending a flat-rate Claude subscription, or an `agy-cli`
+ * child spending a flat-rate Antigravity one. That is the right default and the
+ * wrong single point of failure. A CLI is a *process* — it can fail to spawn,
+ * fail its startup guard, sit in the worker's concurrency queue until the queue
+ * timeout, or hit a subscription rate limit — none of which says anything about
+ * the step's prompt. A metered neuron would have answered the same question
+ * fine.
  *
  * So a neuron step may name a `fallbackNeuronId`. When the primary fails with
  * an error that a *different* neuron would plausibly survive, the executor
@@ -93,6 +94,50 @@ export const CLAUDE_CODE_FALLBACK_CODES: ReadonlySet<string> = new Set([
   'claude_code_error_result',
 ]);
 
+/**
+ * `agy-cli` executor error codes that justify trying a different neuron.
+ *
+ * The motivating case for this whole module now has a second provider: an
+ * `agy-cli` neuron running Gemini Flash on a flat-rate Antigravity
+ * subscription, with a metered `sonnet-5` behind it for when the subscription
+ * is capped. `agy_rate_limited` is the code that hop exists for.
+ *
+ * The same rule as the Claude set decides membership — is this a statement
+ * about the CLI child or its environment, or about the step? — but ONE
+ * classification differs from its Claude twin, deliberately:
+ *
+ *   - `claude_code_auth_401` IS a trigger; `agy_auth_required` is NOT.
+ *
+ * A rejected Claude subscription token is recoverable by the platform on its
+ * own schedule and the run may as well finish elsewhere. `agy_auth_required`
+ * means the Antigravity CLI is asking a HUMAN to complete a Google OAuth flow:
+ * nothing gets better until someone does, every subsequent step pays a fresh
+ * child spawn to rediscover it, and a silent fallback would keep the graphs
+ * green while the subscription this provider exists to spend quietly stops
+ * being used at all. It surfaces.
+ *
+ * Deliberately ABSENT, and why:
+ *
+ *   - `agy_auth_required`  — see above. A human has to log in again.
+ *   - `agy_tool_denied`    — the permission policy refused a tool and the turn
+ *                            produced nothing. A tripped security guard is the
+ *                            one thing that must never be routed around
+ *                            quietly, exactly like `claude_code_api_key_leak`.
+ *   - `agy_no_token`       — a broken neuron document; a fallback would hide it
+ *                            forever.
+ *   - `agy_bad_model`, `agy_prompt_too_large`, `agy_schema_too_large`,
+ *     `agy_bad_structured_output` — step/neuron config defects. The fallback
+ *                            neuron fails the same way, one model later.
+ */
+export const AGY_FALLBACK_CODES: ReadonlySet<string> = new Set([
+  'agy_spawn_failed',
+  'agy_rate_limited',
+  'agy_queue_timeout',
+  'agy_timeout',
+  'agy_failed',
+  'agy_error_result',
+]);
+
 /** Node / undici / provider-SDK connection error codes. */
 const NETWORK_ERROR_CODES: ReadonlySet<string> = new Set([
   'ECONNRESET',
@@ -170,8 +215,9 @@ function networkCodeOf(err: unknown): string | undefined {
  * The three hard NOs come first and are absolute:
  *   1. Run interrupt / abort — the user or the platform stopped this run. A
  *      fallback would restart work the run has already been told to abandon.
- *   2. Anything already classified as a `claude-code` code that is not in the
- *      trigger set (config defects, the API-key-leak guard, a missing token).
+ *   2. Anything already classified as a `claude-code` or `agy-cli` code that is
+ *      not in that provider's trigger set (config defects, a tripped security
+ *      guard, a missing token, an expired subscription login).
  *   3. Provider 4xx — a request defect. Includes 401/403: unlike the shared
  *      subscription token, a rejected API key is this neuron's own
  *      configuration being wrong, and quietly billing a second provider does
@@ -184,13 +230,20 @@ export function classifyFallbackTrigger(err: unknown): FallbackTriggerCode | nul
     if (typeof name === 'string' && ABORT_ERROR_NAMES.has(name)) return null;
   }
 
-  // (2) claude-code: a closed, enumerated set. A `claude_code_*` code that is
-  // not in the set is a decision, not an oversight — never fall through to the
-  // generic heuristics below for it.
+  // (2) The CLI providers: closed, enumerated sets. A `claude_code_*` or
+  // `agy_*` code that is not in its set is a decision, not an oversight —
+  // never fall through to the generic heuristics below for it. That matters
+  // most for the codes deliberately excluded: `agy_auth_required`'s message
+  // mentions a login and `agy_rate_limited`'s mentions a rate limit, so a
+  // text-matching fallthrough would classify BOTH as `http_429` and hop around
+  // the one that must not be hopped around.
   for (const node of errorChain(err)) {
     const code = (node as { code?: unknown })?.code;
     if (typeof code === 'string' && code.startsWith('claude_code_')) {
       return CLAUDE_CODE_FALLBACK_CODES.has(code) ? code : null;
+    }
+    if (typeof code === 'string' && code.startsWith('agy_')) {
+      return AGY_FALLBACK_CODES.has(code) ? code : null;
     }
   }
 

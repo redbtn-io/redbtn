@@ -515,6 +515,16 @@ export class NeuronRegistry {
         throw new NeuronProviderError(
           'claude-code neurons run via claudeCodeExecutor, not createModel',
         );
+      case 'agy-cli':
+        // Same story as claude-code: an `agy -p` child driven by
+        // agyCliExecutor, entered before `getModel()`. Throwing rather than
+        // quietly building a Gemini API model matters more here than anywhere
+        // else — a silent fallthrough to `google` would put a neuron that
+        // exists to spend a SUBSCRIPTION back on the metered API, which is the
+        // exact bill this provider was added to avoid.
+        throw new NeuronProviderError(
+          'agy-cli neurons run via agyCliExecutor, not createModel',
+        );
       default:
         throw new NeuronProviderError(`Unknown provider: ${(config as NeuronConfig).provider}`);
     }

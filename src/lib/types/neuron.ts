@@ -8,12 +8,19 @@
 /**
  * Supported LLM providers
  *
- * `'claude-code'` is not an HTTP model endpoint: it denotes a neuron backed by
- * a local Claude Code CLI process authenticated with a Claude subscription
- * token rather than a metered API key. It never reaches
- * `NeuronRegistry.createModel` — a dedicated executor drives it — but it is a
- * first-class provider value so the value is accepted by the Mongoose schema,
- * the neurons API and the capability matrices.
+ * Two of these are not HTTP model endpoints. They denote a neuron backed by a
+ * local CLI process authenticated with a SUBSCRIPTION rather than a metered API
+ * key, driven by a dedicated executor that is entered before
+ * `NeuronRegistry.createModel` is ever reached:
+ *
+ *   - `'claude-code'` — a Claude Code CLI child on a Claude subscription
+ *     (`claudeCodeExecutor`).
+ *   - `'agy-cli'`     — an Antigravity CLI (`agy`) child on a Google
+ *     Antigravity subscription (`agyCliExecutor`), so a graph can run Gemini
+ *     Flash without paying the Gemini API per token.
+ *
+ * Both are first-class provider values so they are accepted by the Mongoose
+ * schema, the neurons API and the capability matrices.
  */
 export type NeuronProvider =
   | 'ollama'
@@ -21,7 +28,8 @@ export type NeuronProvider =
   | 'anthropic'
   | 'google'
   | 'custom'
-  | 'claude-code';
+  | 'claude-code'
+  | 'agy-cli';
 
 /**
  * Neuron role categorization (for UI organization)
@@ -85,6 +93,32 @@ export type ClaudeCodeEffort = (typeof CLAUDE_CODE_EFFORT_LEVELS)[number];
 export const DEFAULT_CLAUDE_CODE_EFFORT: ClaudeCodeEffort = 'xhigh';
 
 /**
+ * `--effort` levels the Antigravity CLI accepts.
+ *
+ * VERIFIED against agy 1.1.27 on 2026-09-08: `--effort xhigh` is refused with
+ * `invalid --effort "xhigh" (valid: low, medium, high)`. This is a strict
+ * SUBSET of `CLAUDE_CODE_EFFORT_LEVELS`, which is why the two providers cannot
+ * share one list: a neuron doc carrying `effort: 'xhigh'` is legal (the shared
+ * Mongoose enum is the union, so a doc can be re-pointed between providers
+ * without a migration) but is degraded to the default by `agyCliExecutor`
+ * rather than passed through to a run that would die at argument-parse time.
+ */
+export const AGY_EFFORT_LEVELS = ['low', 'medium', 'high'] as const;
+
+export type AgyEffort = (typeof AGY_EFFORT_LEVELS)[number];
+
+/**
+ * Effort used when an `agy-cli` neuron doc names none.
+ *
+ * `high` because these neurons exist to spend a flat-rate subscription; a step
+ * that wants it cheaper says so. Note that `--effort` is not merely optional on
+ * this CLI: the bare model ids (`gemini-3.8-flash`) REQUIRE one and the Claude
+ * and GPT-OSS models REFUSE one, so the executor consults a per-model table
+ * before deciding whether this value is used at all.
+ */
+export const DEFAULT_AGY_EFFORT: AgyEffort = 'high';
+
+/**
  * Provider-specific knobs carried on the neuron document.
  *
  * Deliberately a *closed* shape rather than a free-form bag: the Mongoose
@@ -93,7 +127,14 @@ export const DEFAULT_CLAUDE_CODE_EFFORT: ClaudeCodeEffort = 'xhigh';
  * line. Adding a knob is a schema change on purpose.
  */
 export interface NeuronParameters {
-  /** `claude-code` only — maps to the CLI's `--effort <level>`. */
+  /**
+   * CLI providers only — maps to the CLI's `--effort <level>`.
+   *
+   * Typed as the Claude Code list because that is the UNION of the two
+   * providers' levels. An `agy-cli` neuron may only use `low`/`medium`/`high`
+   * (`AGY_EFFORT_LEVELS`); `agyCliExecutor` degrades anything else to
+   * `DEFAULT_AGY_EFFORT` with a warning rather than failing the run.
+   */
   effort?: ClaudeCodeEffort;
 }
 
@@ -131,7 +172,7 @@ export interface NeuronConfig {
   capabilities?: NeuronCapabilities;
   /**
    * Provider-specific knobs from the neuron document. Today only
-   * `parameters.effort`, read by the `claude-code` executor.
+   * `parameters.effort`, read by the `claude-code` and `agy-cli` executors.
    */
   parameters?: NeuronParameters;
 }

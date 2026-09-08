@@ -96,6 +96,17 @@ CHROMA_URL=http://localhost:8000
 # Web Search (optional)
 GOOGLE_SEARCH_API_KEY=...
 GOOGLE_SEARCH_CX=...
+
+# Subscription CLI neurons (worker only; see "Subscription CLI neurons")
+CLAUDE_CODE_BIN=claude               # default: `claude` on PATH
+CLAUDE_CODE_MAX_CONCURRENT=1         # CLI children per worker
+AGY_CLI_BIN=agy                      # default: `agy` on PATH
+AGY_CLI_MAX_CONCURRENT=2
+AGY_CLI_QUEUE_WAIT_MS=               # default: the step's own timeout
+AGY_STATE_DIR=/var/lib/redbtn/agy    # 0700; caches the refreshed OAuth token
+AGY_OAUTH_TOKEN=                     # fallback when no neuron names a secret
+AGY_INSTALLATION_ID=                 # optional; the CLI generates one if unset
+REDBTN_RUN_DIR_ROOT=/tmp/redbtn-run  # per-step private dirs (0700)
 ```
 
 ---
@@ -127,6 +138,66 @@ const neuron = await engine.neuronRegistry.getNeuronForUser(userId, role);
 ```
 
 Tier-based access (levels 0–4) controls which models and graphs a user can access.
+
+#### Subscription CLI neurons (`claude-code`, `agy-cli`)
+
+Two providers are not HTTP model endpoints. They spawn a coding-agent CLI as a
+child of the neuron step and authenticate it with a flat-rate **subscription**
+instead of a metered API key, so a graph can spend a seat rather than a token
+budget:
+
+| provider | binary | executor | models |
+|---|---|---|---|
+| `claude-code` | `claude` | `claudeCodeExecutor.ts` | `opus`, `fable`, `sonnet`, `claude-opus-5`, … |
+| `agy-cli` | `agy` (Antigravity) | `agyCliExecutor.ts` | `gemini-3.8-flash` (and `-3.7-`/`-3.6-`), optionally suffixed `-low`/`-medium`/`-high`; `gemini-3.1-pro`; `claude-sonnet-4-6`; `claude-opus-4-6-thinking`; `gpt-oss-120b-medium` |
+
+Both are dispatched before `NeuronRegistry.getModel()` — `createModel` throws
+for them on purpose — and both are handed the run's tools over the same per-run
+Unix-socket MCP bridge (`lib/mcp/run-bridge.ts`) rather than through
+`bindTools()`, because each CLI runs its own agent loop.
+
+```ts
+// A neuron document for the Antigravity CLI.
+{
+  neuronId: 'agy-flash-3-8',
+  provider: 'agy-cli',
+  endpoint: 'agy-cli://worker',
+  model: 'gemini-3.8-flash',
+  secretName: 'agy-oauth-token',   // resolved from redsecrets into `apiKey`
+  parameters: { effort: 'high' },  // agy: low | medium | high
+}
+```
+
+**Credentials.** `secretName` resolves through redsecrets into `apiKey`, as for
+every other provider. `claude-code` passes it to the child as
+`CLAUDE_CODE_OAUTH_TOKEN`; `agy-cli` cannot, because that CLI reads its
+credential from a FILE and rewrites it on refresh, so the executor materialises
+it into a per-run private `HOME` and copies a refreshed token back into a
+per-worker cache (`AGY_STATE_DIR`, default `/var/lib/redbtn/agy`).
+
+**The tool surface is the whole security model.** Both executors build the
+child's environment as an allowlist from nothing — the worker's `MONGODB_URI`,
+`REDIS_URL` and `INTERNAL_SERVICE_KEY` never reach a process the model can read
+`/proc/self/environ` from, and `agy-cli` additionally excludes `GEMINI_API_KEY`
+and `GOOGLE_API_KEY` so a subscription neuron cannot silently answer on the
+metered API. Both run with an empty placeholder cwd so no `CLAUDE.md`,
+`AGENTS.md` or `.agents/rules/*.md` from an untrusted tree becomes instructions.
+`agy-cli` relies on the Antigravity CLI's headless deny-by-default — in print
+mode every tool needing a permission nobody granted is auto-denied and the turn
+ends — and grants exactly one thing, `mcp(redbtn/*)`. A turn that produced no
+text because a tool was denied fails the step with `agy_tool_denied` rather than
+writing `""` into graph state.
+
+**Falling back.** A step may name `fallbackNeuronId` to re-run once against a
+metered neuron when the CLI itself could not run. See `neuronFallback.ts`:
+`agy_rate_limited` (subscription capped), `agy_timeout`, `agy_spawn_failed`,
+`agy_queue_timeout`, `agy_failed` and `agy_error_result` hop;
+`agy_auth_required` (a human must redo the Google login) and `agy_tool_denied`
+(a tripped security guard) deliberately do not.
+
+```ts
+{ neuronId: 'agy-flash-3-8', fallbackNeuronId: 'sonnet-5' }
+```
 
 ### MCP Tools
 

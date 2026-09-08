@@ -5,10 +5,10 @@
  *
  * A neuron step may name a `fallbackNeuronId`. When the primary fails in a way
  * a DIFFERENT neuron would plausibly survive, the same step is re-run once
- * against that neuron. The motivating case is a `claude-code` primary: a CLI
- * child that can fail to spawn, fail its init guard, sit out the worker's slot
- * queue, hit a subscription rate limit or have its token rejected — none of
- * which is a statement about the prompt.
+ * against that neuron. The motivating case is a subscription-backed CLI
+ * primary — `claude-code` or `agy-cli` — a child process that can fail to
+ * spawn, fail its startup guard, sit out the worker's slot queue or hit a
+ * subscription rate limit, none of which is a statement about the prompt.
  *
  * The tests below pin the three things that make this safe rather than merely
  * convenient:
@@ -26,6 +26,7 @@ import {
   classifyFallbackTrigger,
   resolveFallbackNeuronId,
   CLAUDE_CODE_FALLBACK_CODES,
+  AGY_FALLBACK_CODES,
 } from '../../src/lib/nodes/universal/executors/neuronFallback';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -36,6 +37,14 @@ function codedError(code: string, message = `failure: ${code}`): Error {
   const err = new Error(message);
   (err as Any).code = code;
   (err as Any).name = 'ClaudeCodeError';
+  return err;
+}
+
+/** The same, shaped like an AgyCliError. */
+function agyError(code: string, message = `failure: ${code}`): Error {
+  const err = new Error(message);
+  (err as Any).code = code;
+  (err as Any).name = 'AgyCliError';
   return err;
 }
 
@@ -161,6 +170,78 @@ describe('classifyFallbackTrigger — claude-code codes', () => {
     const wrapped = new Error(`Neuron step failed: ${inner.message}`);
     (wrapped as Any).cause = inner;
     expect(classifyFallbackTrigger(wrapped)).toBe('claude_code_rate_limited');
+  });
+});
+
+describe('classifyFallbackTrigger — agy-cli codes', () => {
+  const triggering = [
+    'agy_spawn_failed',
+    'agy_rate_limited',
+    'agy_queue_timeout',
+    'agy_timeout',
+    'agy_failed',
+    'agy_error_result',
+  ];
+  const notTriggering = [
+    'agy_auth_required',
+    'agy_tool_denied',
+    'agy_no_token',
+    'agy_bad_model',
+    'agy_prompt_too_large',
+    'agy_schema_too_large',
+    'agy_bad_structured_output',
+  ];
+
+  it('exports exactly the documented trigger set', () => {
+    expect([...AGY_FALLBACK_CODES].sort()).toEqual([...triggering].sort());
+  });
+
+  it.each(triggering)('falls back on %s', (code) => {
+    expect(classifyFallbackTrigger(agyError(code))).toBe(code);
+  });
+
+  it.each(notTriggering)('does NOT fall back on %s', (code) => {
+    expect(classifyFallbackTrigger(agyError(code))).toBeNull();
+  });
+
+  it('refuses agy_auth_required even though its MESSAGE mentions a login', () => {
+    // The code decides, not the text. A human has to redo a Google OAuth flow;
+    // hopping around that keeps every graph green while the subscription this
+    // provider exists to spend quietly stops being used at all.
+    expect(
+      classifyFallbackTrigger(
+        agyError(
+          'agy_auth_required',
+          'the Antigravity subscription needs an interactive Google login — rotate the secret',
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  it('refuses agy_tool_denied even though its MESSAGE mentions a denied action', () => {
+    // A tripped security guard is the one thing that must never be routed
+    // around quietly.
+    expect(
+      classifyFallbackTrigger(
+        agyError('agy_tool_denied', 'the CLI reached for RunCommand and the turn ended'),
+      ),
+    ).toBeNull();
+  });
+
+  it('does not let a text heuristic rescue an excluded agy code', () => {
+    // `agy_bad_model`'s message quotes the CLI, which lists "Gemini 3.1 Pro"
+    // and other prose; nothing in the generic ladder below may claim it.
+    expect(
+      classifyFallbackTrigger(
+        agyError('agy_bad_model', 'model gemini-9 is not recognized. Available models: ...'),
+      ),
+    ).toBeNull();
+  });
+
+  it('sees an agy code through the executor cause chain', () => {
+    const wrapped = new Error('step failed');
+    (wrapped as Any).cause = agyError('agy_rate_limited');
+    expect(classifyFallbackTrigger(wrapped)).toBe('agy_rate_limited');
   });
 });
 
@@ -336,6 +417,71 @@ describe('executeNeuron — fallback dispatch', () => {
 
     expect(called).toEqual(['sonnet-5', 'red-neuron']);
     expect(result['data.out']).toBe('from gemini');
+  });
+
+  it.each([
+    'agy_spawn_failed',
+    'agy_rate_limited',
+    'agy_queue_timeout',
+    'agy_timeout',
+    'agy_failed',
+    'agy_error_result',
+  ])('re-runs the step on the fallback neuron after %s', async (code) => {
+    // The shape George actually ships: an `agy-cli` primary on the flat-rate
+    // Antigravity subscription, with a metered `sonnet-5` behind it.
+    //
+    // The registry stub keeps the harness's default provider on purpose. What
+    // is under test is the CLASSIFIER's reading of the error code; giving the
+    // stub `provider: 'agy-cli'` would route it into the real executor, which
+    // would then fail on a missing credential and prove nothing about fallback.
+    const { state, called } = makeState({
+      'agy-flash-3-8': { model: 'gemini-3.8-flash', fail: agyError(code) },
+      'sonnet-5': { answer: 'from sonnet' },
+    });
+
+    const result = await executeNeuron(
+      { ...baseConfig, neuronId: 'agy-flash-3-8', fallbackNeuronId: 'sonnet-5' } as Any,
+      state,
+    );
+
+    expect(called).toEqual(['agy-flash-3-8', 'sonnet-5']);
+    expect(result['data.out']).toBe('from sonnet');
+  });
+
+  it('does NOT fall back when the agy subscription needs a human to log in', async () => {
+    const { state, called } = makeState({
+      'agy-flash-3-8': {
+        fail: agyError('agy_auth_required', 'rotate the agy-oauth-token secret'),
+      },
+      'sonnet-5': { answer: 'from sonnet' },
+    });
+
+    await expect(
+      executeNeuron(
+        { ...baseConfig, neuronId: 'agy-flash-3-8', fallbackNeuronId: 'sonnet-5' } as Any,
+        state,
+      ),
+    ).rejects.toThrow(/rotate the agy-oauth-token secret/);
+
+    expect(called).toEqual(['agy-flash-3-8']);
+  });
+
+  it('does NOT fall back when the agy permission policy blocked the turn', async () => {
+    const { state, called } = makeState({
+      'agy-flash-3-8': {
+        fail: agyError('agy_tool_denied', 'the CLI reached for RunCommand'),
+      },
+      'sonnet-5': { answer: 'from sonnet' },
+    });
+
+    await expect(
+      executeNeuron(
+        { ...baseConfig, neuronId: 'agy-flash-3-8', fallbackNeuronId: 'sonnet-5' } as Any,
+        state,
+      ),
+    ).rejects.toThrow(/RunCommand/);
+
+    expect(called).toEqual(['agy-flash-3-8']);
   });
 
   it('re-runs the step after a provider 429', async () => {
