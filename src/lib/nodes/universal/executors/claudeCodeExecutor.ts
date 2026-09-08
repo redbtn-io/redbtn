@@ -1044,37 +1044,62 @@ export function assertInitEvent(
 }
 
 /**
- * Map a `result` event's usage onto the metering shape.
+ * The metering shape the CLI's usage is mapped onto.
  *
- * There is no `total_tokens` anywhere in the payload (VERIFIED,
- * 16-phase0-smoke.md §2) — it is computed. Cache creation and cache reads are
- * folded into `input_tokens` because on a subscription they are input the
- * account paid for: a plain no-tool turn already burns ~3 146 cache-creation
- * tokens of system prompt.
+ * `input_tokens` is the TOTAL input — uncached + cache creation + cache read —
+ * which is both what the account paid for on a subscription and exactly the
+ * convention `@langchain/anthropic` uses for every API neuron
+ * (`buildUsageMetadata` sums the three). Keeping the two paths identical is
+ * what lets redToken price them with one rule.
+ *
+ * The cache split is no longer *lost* in that sum, though: it is reported
+ * beside it, in the same `input_token_details` shape LangChain emits, so
+ * `extractCacheUsage()` reads the CLI and the API identically and a later rate
+ * card can charge a cache read at its own (≈0.1x) rate. `uncached_input_tokens`
+ * is the fresh-input residue, spelled out so nobody has to re-derive it.
+ *
+ * There is no `total_tokens` anywhere in the CLI payload (VERIFIED,
+ * 16-phase0-smoke.md §2) — it is computed, and its meaning is unchanged.
  */
-export function mapResultUsage(usage: AnyObject | undefined): {
+export interface ClaudeCodeUsage {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
-} {
+  uncached_input_tokens: number;
+  input_token_details: { cache_creation: number; cache_read: number };
+}
+
+function buildUsage(uncached: number, cacheCreation: number, cacheRead: number, output: number): ClaudeCodeUsage {
+  const input = uncached + cacheCreation + cacheRead;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: input + output,
+    uncached_input_tokens: uncached,
+    input_token_details: { cache_creation: cacheCreation, cache_read: cacheRead },
+  };
+}
+
+/** Map a `result` event's usage onto the metering shape. */
+export function mapResultUsage(usage: AnyObject | undefined): ClaudeCodeUsage {
   const u = usage || {};
-  const input =
-    num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens);
-  const output = num(u.output_tokens);
-  return { input_tokens: input, output_tokens: output, total_tokens: input + output };
+  return buildUsage(
+    num(u.input_tokens),
+    num(u.cache_creation_input_tokens),
+    num(u.cache_read_input_tokens),
+    num(u.output_tokens),
+  );
 }
 
 /** Map one `modelUsage` entry (camelCase on the wire) onto the same shape. */
-export function mapModelUsageEntry(entry: AnyObject | undefined): {
-  input_tokens: number;
-  output_tokens: number;
-  total_tokens: number;
-} {
+export function mapModelUsageEntry(entry: AnyObject | undefined): ClaudeCodeUsage {
   const e = entry || {};
-  const input =
-    num(e.inputTokens) + num(e.cacheCreationInputTokens) + num(e.cacheReadInputTokens);
-  const output = num(e.outputTokens);
-  return { input_tokens: input, output_tokens: output, total_tokens: input + output };
+  return buildUsage(
+    num(e.inputTokens),
+    num(e.cacheCreationInputTokens),
+    num(e.cacheReadInputTokens),
+    num(e.outputTokens),
+  );
 }
 
 function num(value: unknown): number {
@@ -1930,9 +1955,12 @@ function ensureCwd(tree: string, dir: string): string {
  * into `data.workspaceInstructions` by a setup step — auto-discovery is
  * deliberately impossible here, because the cwd is an empty placeholder).
  *
- * Keep this byte-stable across the steps of a run: an identical system prompt
- * was 19× cheaper on the second call (3 146 cached tokens, 16-phase0-smoke.md
- * §2), and interpolating a timestamp or a run id would throw that away.
+ * Keep this byte-stable across the steps of a run AND across runs: an
+ * identical system prompt was 19× cheaper on the second call (3 146 cached
+ * tokens, 16-phase0-smoke.md §2), and interpolating a timestamp or a run id
+ * throws that away. `state.systemPrefix` used to break exactly that rule — it
+ * carried the clock to the minute, so the prefix changed every 60 seconds; it
+ * is day-precision now (`getNodeSystemPrefix`, and prompt-cache.ts for why).
  */
 function buildSystemPrompt(config: NeuronStepConfig, state: AnyObject, preamble: string): string {
   const parts: string[] = [];

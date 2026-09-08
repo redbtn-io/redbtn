@@ -62,6 +62,7 @@ import {
   __claudeCodeSlotsInUse,
   type ClaudeInitEvent,
 } from '../../src/lib/nodes/universal/executors/claudeCodeExecutor';
+import { extractCacheUsage } from '../../src/lib/neurons/prompt-cache';
 import { DEFAULT_CLAUDE_CODE_EFFORT } from '../../src/lib/types/neuron';
 import { runControlRegistry } from '../../src/lib/run/RunControlRegistry';
 
@@ -583,12 +584,18 @@ describe('buildSpawnArgs', () => {
 // =============================================================================
 
 describe('usage mapping', () => {
-  it('folds cache tokens into input and computes the missing total', () => {
+  it('reports the cache split beside the total input, and computes the missing total', () => {
     // The CLI sends no `total_tokens` anywhere (16-phase0-smoke.md §2).
+    // `input_tokens` stays the TOTAL input (uncached + creation + read) — the
+    // same convention `@langchain/anthropic` uses for API neurons — and the
+    // split rides alongside it so a rate card can price a cache read at its
+    // own rate instead of at full input price.
     expect(mapResultUsage(RESULT_EVENT.usage)).toEqual({
       input_tokens: 3148,
       output_tokens: 4,
       total_tokens: 3152,
+      uncached_input_tokens: 2,
+      input_token_details: { cache_creation: 3146, cache_read: 0 },
     });
   });
 
@@ -597,6 +604,8 @@ describe('usage mapping', () => {
       input_tokens: 0,
       output_tokens: 0,
       total_tokens: 0,
+      uncached_input_tokens: 0,
+      input_token_details: { cache_creation: 0, cache_read: 0 },
     });
   });
 
@@ -605,6 +614,15 @@ describe('usage mapping', () => {
       input_tokens: 3148,
       output_tokens: 4,
       total_tokens: 3152,
+      uncached_input_tokens: 2,
+      input_token_details: { cache_creation: 3146, cache_read: 0 },
+    });
+  });
+
+  it('is readable by the shared cache-usage extractor (one reader, both paths)', () => {
+    expect(extractCacheUsage({ usage_metadata: mapResultUsage(RESULT_EVENT.usage) })).toEqual({
+      cacheCreationInputTokens: 3146,
+      cacheReadInputTokens: 0,
     });
   });
 });
@@ -821,7 +839,13 @@ describe('runClaudeCodeStep', () => {
     expect(cli.terminalReason).toBe('completed');
     expect(cli.permissionDenials).toBe(0);
     expect(cli.rateLimit.fiveHourUtilization).toBe(0.43);
-    expect(cli.usage).toEqual({ input_tokens: 3148, output_tokens: 4, total_tokens: 3152 });
+    expect(cli.usage).toEqual({
+      input_tokens: 3148,
+      output_tokens: 4,
+      total_tokens: 3152,
+      uncached_input_tokens: 2,
+      input_token_details: { cache_creation: 3146, cache_read: 0 },
+    });
 
     expect(usage).toHaveLength(1);
     expect(usage[0].hint).toBe('claude-code/claude-opus-5');
@@ -1167,6 +1191,8 @@ describe('runClaudeCodeStep', () => {
       input_tokens: 15,
       output_tokens: 20,
       total_tokens: 35,
+      uncached_input_tokens: 10,
+      input_token_details: { cache_creation: 0, cache_read: 5 },
     });
   });
 
