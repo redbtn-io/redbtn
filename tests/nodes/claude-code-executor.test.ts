@@ -793,20 +793,23 @@ describe('runClaudeCodeStep', () => {
 
   it('runs a turn, streams the text, meters the usage and cleans up', async () => {
     const dump = path.join(tmpRoot, 'dump.json');
+    // The `result` text is the final assistant message, so it MUST agree with
+    // the deltas — the executor now reconciles the two and publishes anything
+    // the stream never carried (see the streaming-parity tests).
     process.env.CLAUDE_CODE_BIN = writeFakeCli(
       `${dumpLine(dump)}
        ${EMIT_INIT}
        emit(${JSON.stringify(textDelta('Hello, '))});
        emit(${JSON.stringify(textDelta('world'))});
        emit(${JSON.stringify(RATE_LIMIT_EVENT)});
-       emit(${JSON.stringify(RESULT_EVENT)});
+       emit(${JSON.stringify({ ...RESULT_EVENT, result: 'Hello, world' })});
        process.exit(0);`,
     );
 
     const { promise, usage, publisher } = run();
     const out = await promise;
 
-    expect(out['data.coderSummary']).toBe('ok');
+    expect(out['data.coderSummary']).toBe('Hello, world');
     expect(publisher.chunks).toEqual(['Hello, ', 'world']);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1167,14 +1170,33 @@ describe('runClaudeCodeStep', () => {
     });
   });
 
-  it('does not stream from a node named respond (run.ts already forwards it)', async () => {
+  // Regression, report 39 defect D1. The executor used to skip its own
+  // publishing for nodes named `respond`/`responder`, deferring to the
+  // `on_llm_stream` forwarder in `functions/run.ts`. That forwarder only ever
+  // fires for a LangChain model, and a claude-code neuron never builds one —
+  // so the stock chat graphs (whose node IS named `responder`) streamed
+  // nothing at all.
+  it('streams from a node named responder — run.ts never forwards this provider', async () => {
     process.env.CLAUDE_CODE_BIN = writeFakeCli(
       `${EMIT_INIT}
-       emit(${JSON.stringify(textDelta('should not double-publish'))});
-       emit(${JSON.stringify(RESULT_EVENT)});
+       emit(${JSON.stringify(textDelta('live '))});
+       emit(${JSON.stringify(textDelta('text'))});
+       emit(${JSON.stringify({ ...RESULT_EVENT, result: 'live text' })});
        process.exit(0);`,
     );
-    const { promise, publisher } = run({}, { nodeConfig: { graphNodeId: 'respond' } });
+    const { promise, publisher } = run({}, { nodeConfig: { graphNodeId: 'responder' } });
+    await promise;
+    expect(publisher.chunks.join('')).toBe('live text');
+  });
+
+  it('publishes nothing when the step did not ask to stream', async () => {
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT}
+       emit(${JSON.stringify(textDelta('quiet'))});
+       emit(${JSON.stringify({ ...RESULT_EVENT, result: 'quiet' })});
+       process.exit(0);`,
+    );
+    const { promise, publisher } = run({ stream: false }, { nodeConfig: { graphNodeId: 'responder' } });
     await promise;
     expect(publisher.chunks).toEqual([]);
   });
