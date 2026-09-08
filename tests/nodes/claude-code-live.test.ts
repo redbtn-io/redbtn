@@ -150,10 +150,12 @@ function makePublisher() {
   const chunks: string[] = [];
   const thinking: string[] = [];
   const tools: CapturedTool[] = [];
+  const replaced: string[] = [];
   return {
     chunks,
     thinking,
     tools,
+    replaced,
     async chunk(text: string) {
       chunks.push(text);
     },
@@ -168,6 +170,9 @@ function makePublisher() {
     },
     async toolError(toolId: string, error: string) {
       tools.push({ kind: 'error', toolId, name: error });
+    },
+    async replaceOutputContent(text: string) {
+      replaced.push(text);
     },
     async getState() {
       return { status: 'running' };
@@ -356,6 +361,18 @@ describe.skipIf(!LIVE)(`claude-code executor, live against the real CLI (${CLI_V
       expect(streamed.endsWith(text as string)).toBe(true);
       // Incremental, not one blob replayed after the fact.
       expect(publisher.chunks.length).toBeGreaterThan(1);
+      // ── 7. IN ORDER ─────────────────────────────────────────────────────
+      // A live turn on 0.0.241 came back as an exact permutation of the right
+      // answer because the step fired its publishes off in parallel. Every
+      // chunk must land where the running total says it should.
+      let offset = 0;
+      for (const chunk of publisher.chunks) {
+        expect(streamed.slice(offset, offset + chunk.length)).toBe(chunk);
+        offset += chunk.length;
+      }
+      expect(offset).toBe(streamed.length);
+      // The stream agreed with the answer, so no replacement was needed.
+      expect(publisher.replaced).toEqual([]);
     },
     300_000,
   );

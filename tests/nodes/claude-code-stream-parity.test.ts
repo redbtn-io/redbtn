@@ -42,7 +42,6 @@ import {
   runClaudeCodeStep,
   createStreamHandler,
   assistantMessageText,
-  overlapLength,
 } from '../../src/lib/nodes/universal/executors/claudeCodeExecutor';
 
 // =============================================================================
@@ -165,17 +164,20 @@ describe('createStreamHandler — assistant envelopes (defect D1)', () => {
     expect(state.text).toBe('Hello, world');
   });
 
-  it('publishes only the tail when the deltas stopped mid-message', () => {
+  // Superseded by the ordering fix: a message that streamed deltas has ONE
+  // source, and topping it up from the envelope put a second writer on the
+  // stream (which reordered a live turn). The shortfall is corrected once, via
+  // the run's final content — see `claude-code-stream-order.test.ts`.
+  it('does not top up a message whose deltas stopped mid-message', () => {
     const { chunks, state } = collect([
       INIT_EVENT,
       messageStart('msg_01'),
       textDelta('This is actually the '),
-      // The CLI stopped emitting partials here; the envelope is the authority.
       assistantEvent('msg_01', [textBlock('This is actually the very start of our conversation.')]),
       resultEvent('This is actually the very start of our conversation.'),
     ]);
-    expect(chunks).toEqual(['This is actually the ', 'very start of our conversation.']);
-    expect(state.text).toBe('This is actually the very start of our conversation.');
+    expect(chunks).toEqual(['This is actually the ']);
+    expect(state.text).toBe('This is actually the ');
   });
 
   it('handles several messages across a tool turn without losing or repeating any', () => {
@@ -238,7 +240,7 @@ describe('createStreamHandler — assistant envelopes (defect D1)', () => {
   });
 });
 
-describe('assistantMessageText / overlapLength', () => {
+describe('assistantMessageText', () => {
   it('concatenates text blocks and skips everything else', () => {
     expect(
       assistantMessageText({ content: [textBlock('a'), toolUseBlock('t', 'now'), textBlock('b')] }),
@@ -246,13 +248,6 @@ describe('assistantMessageText / overlapLength', () => {
     expect(assistantMessageText({ content: 'plain string' })).toBe('plain string');
     expect(assistantMessageText(undefined)).toBe('');
     expect(assistantMessageText({ content: [] })).toBe('');
-  });
-
-  it('finds the splice point between what was streamed and the final answer', () => {
-    expect(overlapLength('', 'full answer')).toBe(0);
-    expect(overlapLength('This is the ', 'This is the whole answer')).toBe(12);
-    expect(overlapLength('preamble. The answer.', 'The answer.')).toBe(11);
-    expect(overlapLength('abc', 'xyz')).toBe(0);
   });
 });
 
@@ -266,7 +261,9 @@ let savedBin: string | undefined;
 
 interface FakePublisher {
   chunks: string[];
+  replaced: string[];
   chunk(text: string): Promise<void>;
+  replaceOutputContent(text: string): Promise<void>;
   thinkingChunk(text: string): Promise<void>;
   toolStart(): Promise<void>;
   toolComplete(): Promise<void>;
@@ -276,10 +273,15 @@ interface FakePublisher {
 
 function makePublisher(): FakePublisher {
   const chunks: string[] = [];
+  const replaced: string[] = [];
   return {
     chunks,
+    replaced,
     async chunk(text: string) {
       chunks.push(text);
+    },
+    async replaceOutputContent(text: string) {
+      replaced.push(text);
     },
     async thinkingChunk() {},
     async toolStart() {},
@@ -413,8 +415,10 @@ describe('runClaudeCodeStep — the redChat event sequence (defect D1)', () => {
     expect(out['data.response']).toBe(ANSWER);
   });
 
-  it('completes a stream the CLI truncated, rather than leaving a prefix', async () => {
+  it('leaves a truncated stream alone and corrects the run\'s final content', async () => {
     // The c1t4 shape: one character reached the stream, 152 were persisted.
+    // The correction is a replacement, not another chunk — see
+    // `claude-code-stream-order.test.ts` for why.
     const { promise, publisher } = runStep([
       INIT_EVENT,
       messageStart('msg_01'),
@@ -423,7 +427,8 @@ describe('runClaudeCodeStep — the redChat event sequence (defect D1)', () => {
       resultEvent(ANSWER),
     ]);
     const out = await promise;
-    expect(publisher.chunks.join('')).toBe(ANSWER);
+    expect(publisher.chunks).toEqual(['I']);
+    expect(publisher.replaced).toEqual([ANSWER]);
     expect(out['data.response']).toBe(ANSWER);
   });
 
