@@ -247,6 +247,11 @@ describe.skipIf(!LIVE)(`claude-code executor, live against the real CLI (${CLI_V
           runId,
           userId: 'user_live_test',
           runPublisher: publisher,
+          // `responder` on purpose: it is the node name every stock chat graph
+          // uses, and it is the name the executor used to refuse to stream
+          // from (report 39, defect D1). A live turn on that node is the only
+          // proof that the real CLI's event stream reaches the publisher.
+          nodeConfig: { graphNodeId: 'responder' },
           data: { runId, userId: 'user_live_test' },
         },
         neuronCfg: {
@@ -340,10 +345,17 @@ describe.skipIf(!LIVE)(`claude-code executor, live against the real CLI (${CLI_V
         }, null, 2));
       }
 
-      // Streaming reached the run publisher (the node is not named
-      // respond/responder, so the executor publishes rather than deferring to
-      // `functions/run.ts`).
-      expect(publisher.chunks.join('')).not.toBe('');
+      // ── 6. the stream carried the answer, not a fragment of it ──────────
+      // `run_complete.finalContent` on the redChat dispatch stream is derived
+      // from the forwarded chunks, so "what was streamed" must equal "what was
+      // answered". Report 39 measured 8 of 10 turns failing this: zero chunks,
+      // or a prefix (worst case a single character `T` against a 152-character
+      // persisted message).
+      const streamed = publisher.chunks.join('');
+      expect(streamed).not.toBe('');
+      expect(streamed.endsWith(text as string)).toBe(true);
+      // Incremental, not one blob replayed after the fact.
+      expect(publisher.chunks.length).toBeGreaterThan(1);
     },
     300_000,
   );
