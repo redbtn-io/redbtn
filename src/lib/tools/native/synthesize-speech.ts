@@ -41,7 +41,20 @@ interface SynthesizeArgs {
 
 const DEFAULT_KOKORO_BASE = 'http://192.168.1.6:8880';
 const DEFAULT_GEMINI_VOICE = 'Kore';
-const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash-preview-tts';
+const DEFAULT_GEMINI_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
+
+/**
+ * Gemini's TTS models started (2026-09) answering a bare transcript as if it
+ * were a prompt and failing with 400 "Model tried to generate text, but it
+ * should only be used for TTS". A leading read-aloud instruction makes them
+ * speak the text verbatim again. Kept as a plain prefix so the spoken
+ * output is unchanged.
+ */
+export const GEMINI_TTS_READ_ALOUD_PREFIX = 'Read the following aloud exactly as written, adding nothing: ';
+export function geminiTtsPrompt(text: string): string {
+  const t = String(text ?? '');
+  return t.startsWith(GEMINI_TTS_READ_ALOUD_PREFIX) ? t : GEMINI_TTS_READ_ALOUD_PREFIX + t;
+}
 
 // Gemini TTS always emits PCM 24 kHz mono 16-bit LE — this matches the
 // existing `tts-synthesize.ts` behaviour and what `session-manager.ts`
@@ -237,7 +250,7 @@ async function synthesizeWithGemini(args: {
 
   const response = await ai.models.generateContent({
     model: DEFAULT_GEMINI_MODEL,
-    contents: [{ parts: [{ text }] }],
+    contents: [{ parts: [{ text: geminiTtsPrompt(text) }] }],
     config: {
       responseModalities: ['AUDIO'],
       speechConfig: {
