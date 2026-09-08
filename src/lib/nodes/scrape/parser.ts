@@ -86,11 +86,62 @@ export async function fetchAndParse(
 /**
  * Parse HTML string and convert main content to clean Markdown
  */
+/**
+ * happy-dom settings for parsing untrusted HTML we only want to READ.
+ *
+ * Without these, `<link rel="preload">` / `<link rel="modulepreload">` in the
+ * parsed page make happy-dom kick off resource loads in the background — and
+ * with no document URL a relative `href` throws `TypeError: Invalid URL` from
+ * a detached promise AFTER parseHtml has returned. That surfaced in prod on
+ * 2026-09-08 as an unhandled rejection that the worker treats as fatal: every
+ * fetch_url of a page with a relative preload link restarted the worker and
+ * re-queued the run (a crash loop). Nothing here needs scripts, styles,
+ * images or iframes — this is text extraction — so file loading is off.
+ */
+const PARSE_ONLY_SETTINGS = {
+  disableJavaScriptEvaluation: true,
+  disableJavaScriptFileLoading: true,
+  disableCSSFileLoading: true,
+  disableIframePageLoading: true,
+  disableComputedStyleRendering: true,
+} as const;
+
+/** `<link>` relations that trigger background fetches in happy-dom. */
+const RESOURCE_HINT_RE =
+  /<link\b(?=[^>]*\brel\s*=\s*["']?\s*(?:module)?preload|[^>]*\brel\s*=\s*["']?\s*(?:dns-)?prefetch|[^>]*\brel\s*=\s*["']?\s*preconnect|[^>]*\brel\s*=\s*["']?\s*prerender)[^>]*>/gi;
+
+/**
+ * Strip resource-hint `<link>` tags before the HTML reaches happy-dom. Belt
+ * and braces with PARSE_ONLY_SETTINGS: `as="fetch"` preloads have no settings
+ * gate in happy-dom 20, so the only way to guarantee no background load (and
+ * no background throw) is for the tag never to be parsed.
+ */
+export function stripResourceHints(html: string): string {
+  return html.replace(RESOURCE_HINT_RE, '');
+}
+
+/**
+ * A happy-dom Window suited to read-only parsing of a fetched page. `baseUrl`
+ * gives relative hrefs something to resolve against instead of `about:blank`.
+ */
+export function createParseWindow(baseUrl?: string): Window {
+  let url: string | undefined;
+  if (baseUrl) {
+    try {
+      const u = new URL(baseUrl);
+      if (u.protocol === 'http:' || u.protocol === 'https:') url = u.toString();
+    } catch {
+      /* fall back to happy-dom's default */
+    }
+  }
+  return new Window({ ...(url ? { url } : {}), settings: PARSE_ONLY_SETTINGS });
+}
+
 export function parseHtml(html: string, baseUrl?: string): ParsedContent {
   try {
-    const window = new Window();
+    const window = createParseWindow(baseUrl);
     const doc = window.document;
-    doc.body.innerHTML = html;
+    doc.body.innerHTML = stripResourceHints(html);
 
     // Extract title
     const titleEl = doc.querySelector('title');
