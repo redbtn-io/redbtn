@@ -96,6 +96,12 @@ const MATRIX: Record<NeuronProvider, MatrixEntry[]> = {
   'claude-code': [
     { patterns: ['*'], hasVision: false },
   ],
+  // Antigravity CLI (subscription) — the prompt is a single argv string and the
+  // reply is a JSON envelope; there is no image content-part channel into it,
+  // whatever the underlying Gemini model can do through the API.
+  'agy-cli': [
+    { patterns: ['*'], hasVision: false },
+  ],
 };
 
 const PROVIDER_DEFAULTS: Record<NeuronProvider, boolean> = {
@@ -105,6 +111,7 @@ const PROVIDER_DEFAULTS: Record<NeuronProvider, boolean> = {
   ollama: false,
   custom: false,
   'claude-code': false,
+  'agy-cli': false,
 };
 
 /**

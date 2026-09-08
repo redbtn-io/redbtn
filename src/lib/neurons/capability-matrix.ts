@@ -114,6 +114,14 @@ const MATRIX: Record<NeuronProvider, MatrixEntry[]> = {
   'claude-code': [
     { patterns: ['*'], strategy: 'none' },
   ],
+  // Antigravity CLI (subscription) — same shape as claude-code and for the
+  // same reason: the CLI runs its own loop, and its tools arrive over the run
+  // bridge rather than through `bindTools()`. It does not even expose them as
+  // named functions (there is one `call_mcp_tool` meta-tool), so there is
+  // nothing a binding could name.
+  'agy-cli': [
+    { patterns: ['*'], strategy: 'none' },
+  ],
 };
 
 /**
@@ -132,6 +140,7 @@ const PROVIDER_DEFAULTS: Record<NeuronProvider, ToolStrategy> = {
   custom: 'native',
   // See the MATRIX comment: tools are offered over the run bridge, never bound.
   'claude-code': 'none',
+  'agy-cli': 'none',
 };
 
 /**
@@ -259,9 +268,10 @@ const HOSTED_MATRIX: Record<NeuronProvider, HostedMatrixEntry[]> = {
   // No hosted tools exist for self-hosted / OpenAI-compatible endpoints.
   ollama: [],
   custom: [],
-  // Claude Code exposes its own server-side tools through CLI flags, not
+  // Both CLI providers expose their own server-side tools through the CLI, not
   // through `bindTools()`. Nothing to map here.
   'claude-code': [],
+  'agy-cli': [],
 };
 
 /**

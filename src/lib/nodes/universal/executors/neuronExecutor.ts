@@ -33,6 +33,7 @@ import {
 import { resolveTools, toBindToolsPayload, partitionToolRefs, type ResolvedTool } from '../../../tools/tool-resolver';
 import { coerceArgsToSchema } from '../../../tools/coerce-args';
 import { runClaudeCodeStep } from './claudeCodeExecutor';
+import { runAgyCliStep } from './agyCliExecutor';
 import {
   classifyFallbackTrigger,
   resolveFallbackNeuronId,
@@ -479,6 +480,17 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     const early = await neuronRegistry.getConfig(neuronId, userId).catch(() => null);
     if (early?.provider === 'claude-code') {
       return runClaudeCodeStep({
+        config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
+      });
+    }
+
+    // ── `agy-cli`: an Antigravity CLI child, not a chat model ────────────────
+    // Same branch, same reasons, a different binary. It must sit before
+    // getModel() too: `NeuronRegistry.createModel` throws for this provider on
+    // purpose, and `toolStrategy` resolves to 'none', which would discard
+    // `config.tools` before the CLI could be offered them over the run bridge.
+    if (early?.provider === 'agy-cli') {
+      return runAgyCliStep({
         config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
       });
     }
