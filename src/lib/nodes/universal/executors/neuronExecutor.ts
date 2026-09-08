@@ -33,6 +33,12 @@ import {
 import { resolveTools, toBindToolsPayload, partitionToolRefs, type ResolvedTool } from '../../../tools/tool-resolver';
 import { coerceArgsToSchema } from '../../../tools/coerce-args';
 import { runClaudeCodeStep } from './claudeCodeExecutor';
+import {
+  classifyFallbackTrigger,
+  resolveFallbackNeuronId,
+  truncateReason,
+  type FallbackRecord,
+} from './neuronFallback';
 
 /**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
@@ -185,7 +191,10 @@ export async function executeNeuron(config: NeuronStepConfig, state: any): Promi
   // If error handling configured, wrap execution
   if (config.errorHandling) {
     const result = await executeWithErrorHandling(
-      () => executeNeuronInternal(config, state),
+      // The fallback neuron sits INSIDE the error-handling wrapper on purpose:
+      // `retry` / `onError` / `fallbackValue` must only see a failure once the
+      // primary AND its fallback have both failed. See neuronFallback.ts.
+      () => executeNeuronWithFallback(config, state),
       config.errorHandling,
       {
         type: 'neuron',
@@ -216,7 +225,147 @@ export async function executeNeuron(config: NeuronStepConfig, state: any): Promi
   }
 
   // Otherwise execute directly
-  return executeNeuronInternal(config, state);
+  return executeNeuronWithFallback(config, state);
+}
+
+/**
+ * Resolve the neuron id a step will actually run against.
+ *
+ * Shared by the executor and the fallback dispatcher so both agree on which
+ * neuron is "the primary" — the dispatcher needs it to reject a fallback that
+ * points at the primary, and to record an honest `from` on the run.
+ *
+ * A template that cannot be resolved comes back from `resolveConfigValue` as
+ * its own raw source, so an unresolved `{{...}}` is treated as absent: using it
+ * as an id would just guarantee a registry miss.
+ */
+function resolveEffectiveNeuronId(config: NeuronStepConfig, state: any): string | undefined {
+  const resolved = resolveConfigValue(config.neuronId, state);
+  const usable =
+    typeof resolved === 'string' && resolved.includes('{{') ? undefined : resolved;
+  const id = usable || state?.defaultNeuronId || state?.data?.defaultNeuronId;
+  return typeof id === 'string' && id ? id : undefined;
+}
+
+/**
+ * Run the step, and if the primary neuron fails in a way a different neuron
+ * would plausibly survive, run the SAME step once more against the configured
+ * fallback neuron.
+ *
+ * Everything about the step is preserved across the hop — messages, tools,
+ * temperature/maxTokens, structured output, streaming — because the fallback
+ * attempt is the same `executeNeuronInternal` call with one field swapped.
+ *
+ * Four things this is careful about:
+ *
+ *  1. **Validation is a precondition, not a rescue.** If the fallback id does
+ *     not resolve for this caller, or points back at the primary, the PRIMARY's
+ *     error is rethrown untouched. A misconfigured fallback must never
+ *     replace the real failure with a confusing one about itself.
+ *  2. **The primary's partial stream must not leak.** A `claude-code` primary
+ *     publishes chunks live, so a step that streamed a preamble and then died
+ *     has already put text on the run. `replaceOutputContent('')` resets it
+ *     (a REPLACEMENT, not a chunk — see run-publisher.ts) so the fallback's
+ *     answer is the whole answer, not a splice onto a corpse.
+ *  3. **Metering stays honest.** The fallback attempt carries the fallback's
+ *     `neuronId`, so `emitNeuronUsage` resolves and reports the model that
+ *     actually answered. The primary's own partial usage (tokens it really
+ *     did burn) is left exactly as it was emitted — no re-emit, no double count.
+ *  4. **Depth 1.** The retry runs with `fallbackNeuronId: null`, so the
+ *     fallback's own fallback is never followed.
+ */
+async function executeNeuronWithFallback(
+  config: NeuronStepConfig,
+  state: any,
+): Promise<Partial<any>> {
+  try {
+    return await executeNeuronInternal(config, state);
+  } catch (primaryError) {
+    const code = classifyFallbackTrigger(primaryError);
+    if (!code) throw primaryError;
+
+    const fallbackId = resolveFallbackNeuronId(config, state, resolveConfigValue);
+    if (!fallbackId) throw primaryError;
+
+    const primaryId = resolveEffectiveNeuronId(config, state);
+    if (fallbackId === primaryId) {
+      console.warn(
+        `[NeuronExecutor] fallbackNeuronId '${fallbackId}' is the primary neuron for step ` +
+          `'${config.outputField}' — ignoring it and failing with the original error.`,
+      );
+      throw primaryError;
+    }
+
+    // The fallback must be a neuron THIS caller can resolve. Checking up front
+    // keeps a typo'd id from turning a rate-limit into a "neuron not found".
+    const neuronRegistry = getNeuronRegistry(state);
+    const userId = state?.userId || state?.data?.userId;
+    try {
+      const fallbackCfg = await neuronRegistry?.getConfig?.(fallbackId, userId);
+      if (!fallbackCfg) throw new Error('registry returned no config');
+    } catch (lookupError) {
+      console.warn(
+        `[NeuronExecutor] fallbackNeuronId '${fallbackId}' does not resolve for this caller ` +
+          `(${lookupError instanceof Error ? lookupError.message : String(lookupError)}) — ` +
+          `failing step '${config.outputField}' with the original error.`,
+      );
+      throw primaryError;
+    }
+
+    const reason = truncateReason(
+      primaryError instanceof Error ? primaryError.message : String(primaryError),
+    );
+    console.warn(
+      `[NeuronExecutor] FALLBACK: step '${config.outputField}' failed on neuron ` +
+        `'${primaryId ?? 'unknown'}' (${code}); re-running once on '${fallbackId}'. Reason: ${reason}`,
+    );
+
+    // Reset any text the primary already streamed onto the run before the
+    // fallback starts writing its own.
+    try {
+      await getRunPublisher(state)?.replaceOutputContent?.('');
+    } catch (resetError) {
+      console.warn(
+        '[NeuronExecutor] could not reset streamed output before fallback:',
+        resetError instanceof Error ? resetError.message : resetError,
+      );
+    }
+
+    const fallbackConfig: NeuronStepConfig = {
+      ...config,
+      neuronId: fallbackId,
+      // Depth 1 — the fallback gets no fallback of its own.
+      fallbackNeuronId: null,
+    };
+
+    const result = await executeNeuronInternal(fallbackConfig, state);
+
+    const record: FallbackRecord = {
+      from: primaryId ?? 'unknown',
+      to: fallbackId,
+      reason,
+      code,
+    };
+    // `stepId` matches the metering convention (`emitNeuronUsage` keys on
+    // `config.outputField`), so a usage event and its fallback record line up.
+    const stepId = config.outputField;
+    const existing =
+      state?.data?._fallback && typeof state.data._fallback === 'object'
+        ? state.data._fallback
+        : {};
+    const merged = { ...existing, [stepId]: record };
+
+    // Mutate the live state too, so a later step in this same node sees it
+    // even before the flat update is folded back in by universalNode.
+    if (state && typeof state === 'object') {
+      state.data = state.data || {};
+      state.data._fallback = merged;
+    }
+
+    // Dotted key — universalNode's convertFlatToNested folds this into
+    // `state.data._fallback` and deep-merges it onto the run state.
+    return { ...result, 'data._fallback': merged };
+  }
 }
 
 /**
@@ -266,7 +415,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // Run identifier — needed by callNeuron for direct cancellation.
     const callRunId: string | undefined = state?.runId || state?.data?.runId;
 
-    // Determine which neuron ID to use.
+    // Determine which neuron ID to use — see `resolveEffectiveNeuronId`.
     //
     // `neuronId` goes through resolveConfigValue like every other templated
     // config field. It previously did NOT: a config authored as
@@ -274,19 +423,9 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // as that literal string, the lookup missed, and the step threw — so a
     // node that parameterised its model (the obvious way to make a node
     // reusable) failed at runtime, and any step with an onError fallback
-    // swallowed it silently. A template that resolves to nothing falls back to
-    // the state defaults rather than being used as a garbage id.
-    // A template that cannot be resolved comes back as its own raw source
-    // (resolveConfigValue's documented "return as-is"), so an unresolved
-    // `{{...}}` must be treated as absent — using it as an id would just
-    // guarantee a registry miss.
-    const resolvedNeuronId = resolveConfigValue(config.neuronId, state);
-    const usableNeuronId =
-      typeof resolvedNeuronId === 'string' && resolvedNeuronId.includes('{{')
-        ? undefined
-        : resolvedNeuronId;
-    const neuronId = usableNeuronId || state.defaultNeuronId || state.data?.defaultNeuronId;
-    if (!neuronId || typeof neuronId !== 'string') {
+    // swallowed it silently.
+    const neuronId = resolveEffectiveNeuronId(config, state);
+    if (!neuronId) {
       throw new Error('No neuron available: config.neuronId not set and no default neuron in state');
     }
 
@@ -1132,9 +1271,29 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       outputField: config.outputField,
       error: error instanceof Error ? error.message : String(error)
     });
-    throw new Error(
+
+    // Cancellation is not a step failure. `universalNode` and the outer run
+    // wrapper both route on `error.name`, so re-wrapping an interrupt/abort
+    // turned a clean cancellation into a reported run failure — and would now
+    // also hide the one signal the fallback dispatcher uses to refuse to
+    // re-run an abandoned step. `loopExecutor` already preserves these for the
+    // same reason; this brings the neuron step in line.
+    const name = (error as { name?: unknown } | null)?.name;
+    if (name === 'RunInterruptedError' || name === 'AbortError') {
+      throw error;
+    }
+
+    const wrapped = new Error(
       `Neuron step failed: ${error instanceof Error ? error.message : String(error)}`
     );
+    // Keep the original reachable. The message alone is lossy: a
+    // `ClaudeCodeError`'s `code`, a provider SDK's `status`, and a socket
+    // error's `ECONNRESET` all live on the object, and callers that route on
+    // them (fallback dispatch) can only see them through the cause chain.
+    // Assigned rather than passed to the constructor because the project
+    // targets ES2016, which has no `Error(message, { cause })` overload.
+    (wrapped as { cause?: unknown }).cause = error;
+    throw wrapped;
   }
 }
 

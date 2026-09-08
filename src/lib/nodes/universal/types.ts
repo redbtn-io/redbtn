@@ -57,6 +57,35 @@ export interface ErrorHandlingConfig {
 export interface NeuronStepConfig {
     /** Which neuron (model) to use. If not specified, uses defaultNeuronId from state */
     neuronId?: string;
+    /**
+     * Neuron to re-run this step against when the primary fails in a way a
+     * DIFFERENT neuron would plausibly survive.
+     *
+     * The motivating case: `neuronId` names a `claude-code` subscription neuron
+     * (a Claude Code CLI child). The CLI is a process, so it can fail to spawn,
+     * fail its init guard, time out in the worker's slot queue, hit a
+     * subscription rate limit, or have its token rejected — none of which says
+     * anything about the prompt. `fallbackNeuronId: 'red-neuron'` re-runs the
+     * same step, once, against a metered API neuron instead of failing the run.
+     *
+     * Trigger set (see `neuronFallback.ts` for the full rationale):
+     *   - `claude-code`: spawn_failed, init_failed, rate_limited, queue_timeout,
+     *     auth_401, timeout, failed (non-zero exit), error_result.
+     *   - API providers: 429, 5xx, network errors, timeouts.
+     *   - NEVER: run interrupt/abort, provider 4xx, bad schemas, content
+     *     refusals, or the `claude-code` config/security codes.
+     *
+     * Resolution precedence: this field as a literal id > this field as a
+     * template (`"{{parameters.fallbackNeuronId}}"`) > the node parameter
+     * `parameters.fallbackNeuronId` (which a graph sets via the graph node's
+     * `config.parameters`). `null` disables the fallback outright and is NOT
+     * overridable by the node parameter.
+     *
+     * Validated at run time: the id must resolve for the same caller and must
+     * not be the primary. Exactly ONE hop — the fallback attempt runs with its
+     * own fallback forced off, so chains and loops are impossible.
+     */
+    fallbackNeuronId?: string | null;
     /** System message to guide LLM behavior (optional) */
     systemPrompt?: string;
     /** User prompt - REQUIRED. Supports template variables like {{state.field}} */
