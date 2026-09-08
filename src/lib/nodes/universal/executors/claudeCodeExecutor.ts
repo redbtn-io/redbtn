@@ -746,25 +746,6 @@ export function assistantMessageText(message: unknown): string {
     .join('');
 }
 
-/** Upper bound on the overlap scan below (characters). */
-export const MAX_OVERLAP_SCAN = 65536;
-
-/**
- * The longest suffix of `published` that is also a prefix of `next`.
- *
- * Used to splice a late authority (an `assistant` envelope, the final
- * `result`) onto what has already been streamed without either duplicating the
- * overlap or dropping the tail. Bounded so a huge answer cannot turn this into
- * a quadratic scan.
- */
-export function overlapLength(published: string, next: string): number {
-  const max = Math.min(published.length, next.length, MAX_OVERLAP_SCAN);
-  for (let k = max; k > 0; k -= 1) {
-    if (published.endsWith(next.slice(0, k))) return k;
-  }
-  return 0;
-}
-
 /**
  * The stream-json reader. One JSON object per line.
  *
@@ -802,9 +783,17 @@ export function createStreamHandler(hooks: StreamHandlerHooks = {}): {
     unparsedLines: 0,
   };
 
-  /** Text emitted from deltas for the message currently being assembled. */
+  /**
+   * Text already emitted for the message currently being assembled, and the
+   * same per message id so a repeated envelope is a no-op.
+   *
+   * `sawDelta` is the source-of-truth switch: once a message has produced a
+   * single `content_block_delta`, the deltas ARE that message's stream and its
+   * `assistant` envelope contributes nothing. Mixing the two is what let a
+   * second writer interleave text into an already-ordered stream.
+   */
   let pendingDeltaText = '';
-  /** Text emitted per completed message id, so a repeated envelope is a no-op. */
+  let sawDelta = false;
   const emittedByMessage = new Map<string, string>();
 
   function emit(text: string): void {
@@ -844,9 +833,12 @@ export function createStreamHandler(hooks: StreamHandlerHooks = {}): {
         const inner = event.event;
         if (!inner) return;
         if (inner.type === 'message_start') {
-          // A new assistant message begins: the delta ledger for the previous
-          // one is closed (its `assistant` envelope has been reconciled).
-          if (event.parent_tool_use_id == null) pendingDeltaText = '';
+          // A new assistant message begins: close the previous message's
+          // ledger and start it again from nothing.
+          if (event.parent_tool_use_id == null) {
+            pendingDeltaText = '';
+            sawDelta = false;
+          }
           return;
         }
         if (inner.type !== 'content_block_delta') return;
@@ -856,6 +848,7 @@ export function createStreamHandler(hooks: StreamHandlerHooks = {}): {
         if (delta.type === 'text_delta' && typeof delta.text === 'string') {
           if (fromSubagent) return;
           pendingDeltaText += delta.text;
+          sawDelta = true;
           emit(delta.text);
         } else if (
           (delta.type === 'thinking_delta' || delta.type === 'signature_delta') &&
@@ -871,16 +864,32 @@ export function createStreamHandler(hooks: StreamHandlerHooks = {}): {
       case 'assistant': {
         // `request_id` is what Anthropic support asks for. Tool events come
         // from the bridge with real tool ids, so `tool_use` blocks are ignored
-        // here — but the envelope's TEXT is authoritative for the message.
+        // here.
         if (typeof event.request_id === 'string' && state.requestIds.length < 64) {
           state.requestIds.push(event.request_id);
         }
         if (event.parent_tool_use_id != null) return; // a subagent's turn
         const message = event.message;
         const messageId = typeof message?.id === 'string' ? message.id : null;
-        const priorForId = messageId ? (emittedByMessage.get(messageId) ?? '') : '';
-        const prior = priorForId.length >= pendingDeltaText.length ? priorForId : pendingDeltaText;
+        const hadDeltas = sawDelta;
+        const priorFromDeltas = pendingDeltaText;
         pendingDeltaText = '';
+        sawDelta = false;
+        // ONE source per message. When the message streamed deltas, they are
+        // the whole of it — a real capture shows the envelope's text equal to
+        // the deltas character for character — and re-deriving anything from
+        // the envelope only risks a second writer racing the first.
+        if (hadDeltas) {
+          if (messageId) {
+            if (emittedByMessage.size >= 256) emittedByMessage.clear();
+            emittedByMessage.set(messageId, priorFromDeltas);
+          }
+          return;
+        }
+        // No deltas for this message: the envelope IS the stream. Emit exactly
+        // the suffix beyond what this message id has already contributed, so a
+        // repeated or grown envelope never republishes what was shown.
+        const prior = messageId ? (emittedByMessage.get(messageId) ?? '') : '';
         const full = assistantMessageText(message);
         let tail = '';
         if (!prior) {
@@ -888,11 +897,9 @@ export function createStreamHandler(hooks: StreamHandlerHooks = {}): {
         } else if (full.startsWith(prior)) {
           tail = full.slice(prior.length);
         } else if (full) {
-          // The envelope is not an extension of what was streamed. Publishing
-          // it would show the turn twice; the persisted answer still comes
-          // from `result`, so drop it here and say so.
           console.warn(
-            '[ClaudeCode] assistant envelope diverged from the streamed deltas; not republishing',
+            '[ClaudeCode] assistant envelope diverged from what was already emitted; ' +
+              'not republishing (run_complete carries the authoritative text)',
           );
         }
         emit(tail);
@@ -1515,20 +1522,41 @@ export async function runClaudeCodeStep(
 
     // ── stdout / stderr ────────────────────────────────────────────────────
     const expectedTools = bridge.toolNames;
+
+    // ── ORDERING ───────────────────────────────────────────────────────────
+    // `RunPublisher.chunk` awaits a Redis publish (and, on the first chunk of
+    // a segment, a `startMessage` round trip) BEFORE it forwards the
+    // `content_chunk` to the conversation channel. Firing those calls off in
+    // parallel — one per stream-json line, which is what this used to do —
+    // makes the conversation's event order the order those awaits happen to
+    // resolve in, not the order the model produced the text. Under real Redis
+    // latency that reorders adjacent chunks: a live redChat turn came back as
+    // an exact PERMUTATION of the right answer ("…standoffish soundal kingdom
+    // cr in the animest nossed with the polit…") — same characters, right
+    // count, wrong order.
+    //
+    // So every publish this step makes goes through one serial chain: the next
+    // call is not even made until the previous one has resolved. Text and
+    // thinking share the chain so their interleaving is preserved too. The
+    // chain is awaited before the step finalises, so nothing is still in
+    // flight when the run completes.
+    let publishChain: Promise<void> = Promise.resolve();
+    const enqueuePublish = (publish: () => unknown, label: string): void => {
+      publishChain = publishChain.then(async () => {
+        try {
+          await publish();
+        } catch (err) {
+          console.warn(`[ClaudeCode] ${label} publish failed:`, err);
+        }
+      });
+    };
+
     const handler = createStreamHandler({
       onText: streamToUser && publisher?.chunk
-        ? (text) => {
-            void Promise.resolve(publisher.chunk(text)).catch((err: unknown) =>
-              console.warn('[ClaudeCode] chunk publish failed:', err),
-            );
-          }
+        ? (text) => enqueuePublish(() => publisher.chunk(text), 'chunk')
         : undefined,
       onThinking: streamToUser && publisher?.thinkingChunk
-        ? (text) => {
-            void Promise.resolve(publisher.thinkingChunk(text)).catch((err: unknown) =>
-              console.warn('[ClaudeCode] thinkingChunk publish failed:', err),
-            );
-          }
+        ? (text) => enqueuePublish(() => publisher.thinkingChunk(text), 'thinkingChunk')
         : undefined,
       onInit: (init) => {
         const failure = assertInitEvent(init, expectedTools);
@@ -1651,31 +1679,38 @@ export async function runClaudeCodeStep(
     const finalText = typeof result.result === 'string' ? result.result : handler.state.text;
     const softMaxTurns = result.subtype === 'error_max_turns';
 
+    // Everything this step queued has been published, in order, before the
+    // run is allowed to finish.
+    await publishChain;
+
     // ── the answer and the stream must agree ───────────────────────────────
-    // `result.result` is the authority on the final answer; the stream is the
-    // authority on what the user has already seen. Publish exactly the part of
-    // the answer that never reached the conversation — spliced on the longest
-    // overlap so a stream that ended mid-sentence is completed rather than
-    // repeated, and a stream that already carried the whole answer adds
-    // nothing. Without this, `run_complete`'s finalContent (derived from the
-    // forwarded chunks) could be a truncated prefix of the persisted message.
-    if (streamToUser && publisher?.chunk && typeof finalText === 'string' && finalText) {
+    // `result.result` is the authority on the final answer; the stream is what
+    // the user has already seen. They normally agree exactly — a real CLI
+    // capture has deltas, envelope and `result.result` identical character for
+    // character — and when they do, nothing happens here.
+    //
+    // When they do NOT, the correction is a REPLACEMENT, never a splice. An
+    // earlier version spliced the missing tail in as another chunk, which put
+    // a second writer on a stream that already had one. `run_complete` carries
+    // the run's output content as `finalContent`, and the chat client treats
+    // that as the final word on the bubble, so setting it is the whole fix:
+    // one event, no interleaving, no partial text competing with the answer.
+    //
+    // `published.endsWith(finalText)` is the agreement test rather than
+    // equality because a tool turn legitimately streams a preamble before the
+    // final message ("Let me check the time. " + the answer), and that whole
+    // transcript is the correct content for the turn.
+    if (streamToUser && typeof finalText === 'string' && finalText) {
       const published = handler.state.text;
-      const missing = published.endsWith(finalText)
-        ? ''
-        : finalText.slice(overlapLength(published, finalText));
-      if (missing) {
-        if (published) {
-          console.warn(
-            `[ClaudeCode] step '${stepId}': ${missing.length} char(s) of the answer never ` +
-              `reached the stream; publishing the remainder`,
-          );
-        }
+      if (!published.endsWith(finalText)) {
+        console.warn(
+          `[ClaudeCode] step '${stepId}': the stream (${published.length} chars) does not end ` +
+            `with the answer (${finalText.length} chars); replacing the run's final content`,
+        );
         try {
-          await publisher.chunk(missing);
-          handler.state.text = published + missing;
+          await publisher?.replaceOutputContent?.(finalText);
         } catch (err) {
-          console.warn('[ClaudeCode] final chunk publish failed:', err);
+          console.warn('[ClaudeCode] final content replacement failed:', err);
         }
       }
     }
