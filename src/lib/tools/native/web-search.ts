@@ -12,8 +12,7 @@
  */
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
-import { Window } from 'happy-dom';
-import { fetchAndParse, DEFAULT_BROWSER_HEADERS } from '../../nodes/scrape/parser';
+import { fetchAndParse, DEFAULT_BROWSER_HEADERS, createParseWindow, stripResourceHints } from '../../nodes/scrape/parser';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -123,9 +122,9 @@ async function duckduckgoSearch(
   }
 
   const html = await response.text();
-  const window = new Window();
+  const window = createParseWindow(url);
   const doc = window.document;
-  doc.body.innerHTML = html;
+  doc.body.innerHTML = stripResourceHints(html);
 
   const results: NormalisedResult[] = [];
   const resultBlocks = doc.querySelectorAll('.result__body, .web-result, .result');
