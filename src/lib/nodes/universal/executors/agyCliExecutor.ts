@@ -1063,7 +1063,8 @@ export async function runAgyCliStep(
     throw new AgyCliError(
       'agy_no_token',
       `Neuron '${neuronId}' is provider 'agy-cli' but no subscription token resolved. ` +
-        `Set secretName (e.g. 'agy-oauth-token') on the neuron and store the contents of ` +
+        `Set secretName (the fleet convention is 'AGY_OAUTH_TOKEN', matching ` +
+        `'CLAUDE_CODE_OAUTH') on the neuron and store the contents of ` +
         `~/.gemini/antigravity-cli/antigravity-oauth-token in the vault, or set ` +
         `AGY_OAUTH_TOKEN on the worker.`,
     );
@@ -1413,7 +1414,7 @@ export async function runAgyCliStep(
       throw new AgyCliError(
         'agy_auth_required',
         `the Antigravity subscription needs an interactive Google login — rotate the ` +
-          `'agy-oauth-token' secret from a machine where 'agy' is logged in ` +
+          `'AGY_OAUTH_TOKEN' secret from a machine where 'agy' is logged in ` +
           `(see RUNBOOK-agy.md). ${stderrClean || '(no stderr)'}`,
       );
     }
@@ -1439,7 +1440,7 @@ export async function runAgyCliStep(
         throw new AgyCliError(
           'agy_auth_required',
           `the Antigravity subscription needs an interactive Google login — rotate the ` +
-            `'agy-oauth-token' secret. ${stderrClean}`,
+            `'AGY_OAUTH_TOKEN' secret. ${stderrClean}`,
         );
       }
       if (looksLikeRateLimit(stderrClean)) {
@@ -1487,7 +1488,7 @@ export async function runAgyCliStep(
         throw new AgyCliError(
           'agy_auth_required',
           `the Antigravity subscription needs an interactive Google login — rotate the ` +
-            `'agy-oauth-token' secret. ${detail}`,
+            `'AGY_OAUTH_TOKEN' secret. ${detail}`,
         );
       }
       if (looksLikeRateLimit(detail)) {

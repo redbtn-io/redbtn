@@ -164,7 +164,7 @@ const NEURON_CFG = {
   endpoint: 'agy-cli://worker',
   model: 'gemini-3.8-flash',
   apiKey: TOKEN,
-  secretName: 'agy-oauth-token',
+  secretName: 'AGY_OAUTH_TOKEN',
   role: 'worker',
   tier: 1,
   parameters: { effort: 'high' },

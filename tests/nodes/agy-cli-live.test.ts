@@ -249,7 +249,7 @@ async function live(
       endpoint: 'agy-cli://worker',
       model: MODEL,
       apiKey: TOKEN,
-      secretName: 'agy-oauth-token',
+      secretName: 'AGY_OAUTH_TOKEN',
       role: 'worker',
       tier: 1,
       // 'low' keeps the live turn cheap; the executor's own default is 'high'.

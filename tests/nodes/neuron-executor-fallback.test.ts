@@ -451,7 +451,7 @@ describe('executeNeuron — fallback dispatch', () => {
   it('does NOT fall back when the agy subscription needs a human to log in', async () => {
     const { state, called } = makeState({
       'agy-flash-3-8': {
-        fail: agyError('agy_auth_required', 'rotate the agy-oauth-token secret'),
+        fail: agyError('agy_auth_required', 'rotate the AGY_OAUTH_TOKEN secret'),
       },
       'sonnet-5': { answer: 'from sonnet' },
     });
@@ -461,7 +461,7 @@ describe('executeNeuron — fallback dispatch', () => {
         { ...baseConfig, neuronId: 'agy-flash-3-8', fallbackNeuronId: 'sonnet-5' } as Any,
         state,
       ),
-    ).rejects.toThrow(/rotate the agy-oauth-token secret/);
+    ).rejects.toThrow(/rotate the AGY_OAUTH_TOKEN secret/);
 
     expect(called).toEqual(['agy-flash-3-8']);
   });

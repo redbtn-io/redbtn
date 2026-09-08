@@ -163,7 +163,7 @@ Unix-socket MCP bridge (`lib/mcp/run-bridge.ts`) rather than through
   provider: 'agy-cli',
   endpoint: 'agy-cli://worker',
   model: 'gemini-3.8-flash',
-  secretName: 'agy-oauth-token',   // resolved from redsecrets into `apiKey`
+  secretName: 'AGY_OAUTH_TOKEN',   // resolved from redsecrets into `apiKey`
   parameters: { effort: 'high' },  // agy: low | medium | high
 }
 ```
