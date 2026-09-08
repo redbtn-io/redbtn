@@ -28,7 +28,8 @@
  *   | MCP config     | `--mcp-config <path>`         | NO FLAG — read from `$HOME`    |
  *   | tool gate      | `--tools ""` + `--allowedTools`| the permission engine          |
  *   | tool names     | `mcp__redbtn__<tool>`         | one meta-tool `call_mcp_tool`  |
- *   | system prompt  | `--system-prompt` / stdin     | NO FLAG, NO STDIN — argv only  |
+ *   | system prompt  | `--system-prompt` / stdin     | NO FLAG — folded into the turn |
+ *   | prompt input   | argv or stdin                 | NDJSON on stdin, `stream-json` |
  *   | max turns      | `--max-turns`                 | none                           |
  *   | effort         | low…max                       | low/medium/high, model-dependent|
  *   | credential     | an env var                    | a FILE the CLI rewrites        |
@@ -84,6 +85,40 @@
  *    private `HOME`, the bridge socket, the MCP config and the materialised
  *    OAuth token — is removed in `finally`.
  *
+ * # How the prompt reaches the CLI
+ *
+ * On stdin, as ONE NDJSON message, never as an argument.
+ *
+ * `agy` has no `--system-prompt` flag, so the system prompt is delimited inside
+ * the single turn the CLI is given. The first cut of this provider then passed
+ * that turn as the `-p` argv value, which put it under Linux's
+ * `MAX_ARG_STRLEN` (128 KiB) and made every prompt over 100 KB a hard failure —
+ * a ceiling the Gemini API itself does not have.
+ *
+ * `--input-format stream-json` removes it. VERIFIED live against agy 1.1.27 on
+ * 2026-09-08:
+ *
+ *   - the CLI is put in print mode with an EMPTY prompt (`-p=`, one token —
+ *     `-p` followed by another flag makes it swallow that flag as the prompt,
+ *     and a bare `-p` is "flag needs an argument");
+ *   - it then reads one NDJSON message per line from stdin:
+ *     `{"event":"user","message":{"role":"user","content":"<the whole turn>"}}`
+ *     (the key is `event`, NOT `type` — `type` is rejected with
+ *     `stream input message is missing the "event" field`);
+ *   - one message runs one turn, and closing stdin ends the process;
+ *   - `--input-format stream-json` REQUIRES `--output-format stream-json`,
+ *     which emits `init`, then a `step_update` per step, then exactly one
+ *     `{"event":"result","result":{…}}` whose payload is byte-for-byte the
+ *     envelope `--output-format json` used to print — same `status`,
+ *     `response`, `error`, `usage`, `denied_actions`, `structured_output`.
+ *
+ * The remaining ceiling is the CLI's own, and it is NOT an error: past its
+ * prompt-token budget `agy` silently truncates the turn and still reports
+ * `status: SUCCESS`. VERIFIED: 190 081 bytes of prose arrives whole (the model
+ * answers a question buried at the end); 200 056 bytes comes back with "the
+ * document was truncated before the end". That is a warning here, not a
+ * refusal, because it is the model's budget rather than the transport's.
+ *
  * # The credential, and why there is a persistent state directory
  *
  * `claude` takes its subscription token as an environment variable. `agy` does
@@ -104,7 +139,7 @@
  */
 
 import { spawn, type ChildProcessByStdio } from 'child_process';
-import type { Readable } from 'stream';
+import type { Readable, Writable } from 'stream';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -146,23 +181,48 @@ export const SIGKILL_GRACE_MS = 10_000;
 export const RUN_POLL_INTERVAL_MS = 60_000;
 
 /**
- * Ceiling on the prompt, which is ONE argv value.
+ * Ceiling on the prompt.
  *
- * VERIFIED: `agy` has no `--system-prompt` flag and does not read a prompt from
- * stdin — `-p -` is taken as the literal prompt `-`, not as a stdin sentinel.
- * The whole prompt is therefore an argv token, under Linux's `MAX_ARG_STRLEN`
- * (128 KiB). There is nowhere to fold an oversized prompt into, so this is a
- * hard error rather than a fallback, and it is checked before a turn is spent.
+ * NOT an argv limit. The prompt is written to the child's stdin as one NDJSON
+ * message, so Linux's `MAX_ARG_STRLEN` does not apply to it and the 100 KiB cap
+ * this provider shipped with is gone — the API it fronts has no such limit.
+ *
+ * What remains is a sanity bound: a prompt no model could read should be
+ * refused before a turn is spent, rather than streamed into a pipe. 4 MiB is
+ * comfortably above the largest context any model this CLI drives accepts.
  */
-export const MAX_PROMPT_ARG_BYTES = 100 * 1024;
+export const MAX_PROMPT_BYTES = 4 * 1024 * 1024;
 
-/** `--json-schema` ceiling. Same `MAX_ARG_STRLEN` constraint, same reasoning. */
+/**
+ * Where `agy` starts SILENTLY truncating, so a large prompt gets a log line.
+ *
+ * VERIFIED live (gemini-3.8-flash, 2026-09-08): a 190 081 byte prompt is read
+ * whole — the model answers a question placed after the last byte of a long
+ * document. At 200 056 bytes the same prompt comes back "truncated before the
+ * end", with `status: SUCCESS` and no error anywhere. The cut is the CLI's own
+ * prompt-token budget (~69 k input tokens, including its ~14 k of built-in
+ * instructions), not the transport, so it is warned about rather than refused:
+ * a smaller model or a longer system prompt moves it.
+ */
+export const PROMPT_TRUNCATION_WARN_BYTES = 190 * 1024;
+
+/**
+ * `--json-schema` ceiling. This one IS still an argv value, so `MAX_ARG_STRLEN`
+ * still applies to it and the reasoning that produced 100 KiB still holds.
+ */
 export const MAX_JSON_SCHEMA_ARG_BYTES = 100 * 1024;
 
 /** Bytes of stderr kept for the error message on a failure. */
 export const STDERR_TAIL_BYTES = 2048;
 
-/** Cap on the JSON envelope read off stdout, so a wedged child cannot OOM us. */
+/**
+ * Cap on stdout, so a wedged child cannot OOM the worker.
+ *
+ * `stream-json` writes more than `json` did — an `init` line, then a
+ * `step_update` per step carrying that step's text delta — so this holds the
+ * whole NDJSON stream, not just one envelope. 32 MiB is still far past any turn
+ * a neuron step should produce.
+ */
 export const MAX_STDOUT_BYTES = 32 * 1024 * 1024;
 
 /**
@@ -292,7 +352,8 @@ const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
  *   - `agy_no_token`              — no credential resolved.            NO hop.
  *   - `agy_bad_model`             — the neuron names a model the CLI
  *                                   cannot run.                        NO hop.
- *   - `agy_prompt_too_large`      — the prompt cannot fit in argv.      NO hop.
+ *   - `agy_prompt_too_large`      — the prompt is past the sanity
+ *                                   bound; no transport would help.     NO hop.
  *   - `agy_schema_too_large`      — same, for `--json-schema`.          NO hop.
  *   - `agy_bad_structured_output` — the CLI returned non-JSON for a
  *                                   step that declared a schema.        NO hop.
@@ -798,7 +859,6 @@ function sha256(value: string): string {
 export interface AgySpawnArgsInput {
   model: string;
   effort?: string;
-  prompt: string;
   printTimeoutMs: number;
   jsonSchema?: string;
   conversationId?: string;
@@ -808,18 +868,28 @@ export interface AgySpawnArgsInput {
  * Build the exact argv. Kept pure so the security-relevant shape is asserted in
  * a unit test rather than in a code review.
  *
+ * There is no `prompt` here on purpose: the turn goes over stdin as one NDJSON
+ * message (`buildAgyStdinMessage`), which is what removes the `MAX_ARG_STRLEN`
+ * ceiling. See "How the prompt reaches the CLI" in the module comment.
+ *
  * Notes on the flags that are here on purpose:
  *
+ *   - `-p=` is ONE token: print mode with an empty inline prompt. `-p` followed
+ *     by another flag makes the CLI take that flag as the prompt ("`-p` took
+ *     `--input-format` as its prompt"), and a bare trailing `-p` is refused
+ *     with "flag needs an argument". The prompt itself arrives on stdin.
+ *   - `--input-format stream-json` is the whole point: one NDJSON message per
+ *     line on stdin, one turn each. It REQUIRES `--output-format stream-json`.
+ *   - `--output-format stream-json` emits `init`, a `step_update` per step, and
+ *     exactly one `result` event whose payload is the same envelope
+ *     `--output-format json` printed — response, usage, `denied_actions` and
+ *     (with a schema) `structured_output`. The per-step deltas are ignored
+ *     here; they are where live streaming would be added.
  *   - `--disable-slash-commands` strips the bundled slash-command and skill
  *     expansion. They cannot execute anything under the permission policy, but
  *     they are injectable instruction surface.
  *   - `--sandbox` turns on the CLI's own terminal restrictions. Belt on top of
  *     a `command` permission that is already denied by default.
- *   - `--output-format json` gives one envelope carrying the response, the
- *     usage, `denied_actions` and (with a schema) `structured_output`.
- *     `stream-json` exists and emits per-STEP deltas, not per-token ones, so it
- *     buys almost nothing over the run's existing completion path and doubles
- *     the parsing surface. It is where live streaming would be added.
  *   - `--print-timeout` is the CLI's own ceiling and is set INSIDE the step's
  *     wall clock, so the CLI reports a clean timeout envelope before the
  *     executor has to kill anything.
@@ -828,11 +898,13 @@ export interface AgySpawnArgsInput {
  * which would auto-approve every built-in tool. See §5 of the module comment.
  */
 export function buildAgySpawnArgs(input: AgySpawnArgsInput): string[] {
-  const args: string[] = ['-p', input.prompt, '--model', input.model];
+  const args: string[] = ['-p=', '--model', input.model];
   if (input.effort) args.push('--effort', input.effort);
   args.push(
+    '--input-format',
+    'stream-json',
     '--output-format',
-    'json',
+    'stream-json',
     '--disable-slash-commands',
     '--sandbox',
     '--print-timeout',
@@ -843,15 +915,31 @@ export function buildAgySpawnArgs(input: AgySpawnArgsInput): string[] {
   return args;
 }
 
+/**
+ * The single NDJSON line written to the child's stdin, newline-terminated.
+ *
+ * VERIFIED against agy 1.1.27: the discriminator is `event`, not `type` — a
+ * `{"type":"user",…}` message is rejected with `stream input message is missing
+ * the "event" field` — and `message.content` may be a string, which is what a
+ * single delimited turn wants. One line is one turn; the executor closes stdin
+ * straight afterwards, which is what makes the CLI exit rather than wait for a
+ * second turn.
+ */
+export function buildAgyStdinMessage(prompt: string): string {
+  return `${JSON.stringify({ event: 'user', message: { role: 'user', content: prompt } })}\n`;
+}
+
 // =============================================================================
 // The result envelope
 // =============================================================================
 
 /**
- * `--output-format json` writes exactly one JSON object to stdout.
+ * The result payload, identical under `--output-format json` (one bare object)
+ * and `--output-format stream-json` (the `result` event's `result` field).
  *
- * Recorded off the wire on 2026-09-08. `denied_actions` and `structured_output`
- * are present only when they apply; `error` only when `status` is `ERROR`.
+ * Recorded off the wire on 2026-09-08, on both output formats. `denied_actions`
+ * and `structured_output` are present only when they apply; `error` only when
+ * `status` is `ERROR`.
  */
 export interface AgyEnvelope {
   conversation_id?: string;
@@ -867,19 +955,45 @@ export interface AgyEnvelope {
 }
 
 /**
- * Find the envelope in whatever the CLI wrote to stdout.
+ * Pull the result payload out of one parsed stdout line, or `null` if that line
+ * is not the result.
  *
- * Normally stdout is exactly one JSON object. It is parsed defensively anyway:
- * a stray banner line ahead of the object would otherwise turn a completed,
- * paid-for turn into "no result", and the last JSON object on stdout is the
- * result by construction.
+ * Two shapes are accepted, because the executor is not the only caller of the
+ * CLI: `stream-json` wraps the payload as `{"event":"result","result":{…}}`,
+ * and the older `--output-format json` prints the payload bare. An `init` or
+ * `step_update` event is explicitly NOT a result — without that check the
+ * scan below would stop at the first well-formed object it met.
+ */
+function unwrapAgyResult(parsed: unknown): AgyEnvelope | null {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const obj = parsed as AnyObject;
+  if (typeof obj.event === 'string') {
+    if (obj.event !== 'result') return null;
+    const payload = obj.result;
+    return payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? (payload as AgyEnvelope)
+      : null;
+  }
+  return 'status' in obj ? (obj as AgyEnvelope) : null;
+}
+
+/**
+ * Find the result envelope in whatever the CLI wrote to stdout.
+ *
+ * Under `--output-format stream-json` stdout is NDJSON — one `init`, a
+ * `step_update` per step, then one `result` — so the scan runs backwards and
+ * takes the last line that unwraps to a result. It is parsed defensively
+ * anyway: a stray banner line, or a `step_update` carrying a huge text delta,
+ * would otherwise turn a completed, paid-for turn into "no result".
  */
 export function parseAgyEnvelope(stdout: string): AgyEnvelope | null {
   const trimmed = stdout.trim();
   if (!trimmed) return null;
+  // A single pretty-printed object (the legacy `--output-format json` shape)
+  // spans several lines, so it has to be tried whole before the line scan.
   try {
-    const whole = JSON.parse(trimmed);
-    if (whole && typeof whole === 'object' && !Array.isArray(whole)) return whole as AgyEnvelope;
+    const whole = unwrapAgyResult(JSON.parse(trimmed));
+    if (whole) return whole;
   } catch {
     /* fall through to the line scan */
   }
@@ -888,8 +1002,8 @@ export function parseAgyEnvelope(stdout: string): AgyEnvelope | null {
     const line = lines[i].trim();
     if (!line.startsWith('{')) continue;
     try {
-      const parsed = JSON.parse(line);
-      if (parsed && typeof parsed === 'object' && 'status' in parsed) return parsed as AgyEnvelope;
+      const found = unwrapAgyResult(JSON.parse(line));
+      if (found) return found;
     } catch {
       /* not this line */
     }
@@ -1092,12 +1206,13 @@ export async function runAgyCliStep(
   const cwd = ensureCwd(mount.tree, dir);
 
   let bridge: RunToolBridge | null = null;
-  // `stdio: ['ignore', 'pipe', 'pipe']`, so the type carries a null stdin.
-  // Ignoring stdin is deliberate rather than incidental: this CLI never reads a
-  // prompt from it, but its interactive login DOES read from it ("paste the
-  // authorization code here"), and a closed stdin is what stops that prompt
-  // from parking a worker slot waiting for a human who is not there.
-  let child: ChildProcessByStdio<null, Readable, Readable> | null = null;
+  // `stdio: ['pipe', 'pipe', 'pipe']`: the prompt is one NDJSON message written
+  // to stdin. It is written and stdin is CLOSED immediately, which matters for
+  // two separate reasons — one message plus EOF is what makes the CLI run
+  // exactly one turn and exit, and an EOF on stdin is what stops the CLI's
+  // interactive login ("paste the authorization code here") from parking a
+  // worker slot waiting for a human who is not there.
+  let child: ChildProcessByStdio<Writable, Readable, Readable> | null = null;
   let unregisterCancel: (() => void) | null = null;
   let onAbort: (() => void) | null = null;
   let wallTimer: NodeJS.Timeout | null = null;
@@ -1260,12 +1375,23 @@ export async function runAgyCliStep(
     const prompt = `=== SYSTEM INSTRUCTIONS ===\n${systemPrompt}\n=== END SYSTEM INSTRUCTIONS ===\n\n${userPrompt}`;
 
     const promptBytes = Buffer.byteLength(prompt, 'utf8');
-    if (promptBytes > MAX_PROMPT_ARG_BYTES) {
+    if (promptBytes > MAX_PROMPT_BYTES) {
       throw new AgyCliError(
         'agy_prompt_too_large',
-        `agy-cli step '${stepId}' built a ${promptBytes} byte prompt; the CLI takes it as a ` +
-          `single argv value, capped at ${MAX_PROMPT_ARG_BYTES} (it has no --system-prompt ` +
-          `flag and does not read stdin). Shorten the prompt or use a claude-code neuron.`,
+        `agy-cli step '${stepId}' built a ${promptBytes} byte prompt; the executor writes the ` +
+          `prompt to the CLI's stdin and so has no argv ceiling, but refuses anything over ` +
+          `${MAX_PROMPT_BYTES} bytes because no model this CLI drives could read it. ` +
+          `Shorten the prompt.`,
+      );
+    }
+    if (promptBytes > PROMPT_TRUNCATION_WARN_BYTES) {
+      // Not an error: past its own prompt-token budget the CLI truncates the
+      // turn and still reports `status: SUCCESS`, so the only honest thing the
+      // executor can do is say so where an operator will see it.
+      console.warn(
+        `[AgyCli] step '${stepId}' prompt is ${promptBytes} bytes, over the ` +
+          `~${PROMPT_TRUNCATION_WARN_BYTES} bytes at which agy has been observed silently ` +
+          `truncating a turn (and still reporting SUCCESS). The tail may not be read.`,
       );
     }
 
@@ -1291,7 +1417,6 @@ export async function runAgyCliStep(
     const args = buildAgySpawnArgs({
       model,
       effort,
-      prompt,
       printTimeoutMs,
       jsonSchema: jsonSchemaArg,
       conversationId: resolveResumeConversationId(config, state, stepId),
@@ -1308,12 +1433,29 @@ export async function runAgyCliStep(
       cwd,
       timeoutMs,
       tools: bridge.toolNames.length,
-      // The token is a file inside the private HOME and never an argument, but
-      // the prompt and the schema can be enormous, so they are elided.
+      promptBytes,
+      // The token is a file inside the private HOME and never an argument; the
+      // prompt is not an argument either any more, and the schema can be
+      // enormous, so it is elided.
       argv: redactArgvForLog(args),
     });
 
-    child = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    child = spawn(bin, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+
+    // ── the prompt, then EOF ───────────────────────────────────────────────
+    // Never awaited, and errors are swallowed: a child that dies before it
+    // drains the pipe (a bad credential, a refused model) gives EPIPE here,
+    // and that is a diagnosis the envelope and stderr make far better than an
+    // unhandled 'error' on a stream would. The turn's real outcome is decided
+    // below, off the CLI's own result.
+    child.stdin.on('error', () => {
+      /* EPIPE: the child exited before it read the turn */
+    });
+    try {
+      child.stdin.end(buildAgyStdinMessage(prompt));
+    } catch (err) {
+      console.warn(`[AgyCli] could not write the prompt to stdin: ${(err as Error)?.message}`);
+    }
 
     if (child.pid) {
       installExitHooks();
@@ -1783,14 +1925,15 @@ async function auditDenials(
 }
 
 /**
- * argv for a log line. The token is never an argument, but the prompt and the
- * JSON schema can be enormous, so they are elided rather than logged.
+ * argv for a log line. The token is never an argument and the prompt is not one
+ * either (it goes over stdin), but the JSON schema can be enormous, so it is
+ * elided rather than logged.
  */
 export function redactArgvForLog(args: string[]): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; i += 1) {
     out.push(args[i]);
-    if (args[i] === '-p' || args[i] === '--json-schema') {
+    if (args[i] === '--json-schema') {
       const value = args[i + 1] ?? '';
       out.push(`<${Buffer.byteLength(value, 'utf8')} bytes>`);
       i += 1;
