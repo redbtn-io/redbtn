@@ -731,10 +731,62 @@ export interface StreamHandlerHooks {
 }
 
 /**
+ * Concatenate the text blocks of an `assistant` event's message.
+ *
+ * The envelope carries the message's text CUMULATIVELY — everything the model
+ * has produced for that message, not a delta — alongside `tool_use` blocks
+ * that are not text and never belong in the conversation bubble.
+ */
+export function assistantMessageText(message: unknown): string {
+  const content = (message as AnyObject)?.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((block: AnyObject) => (block?.type === 'text' && typeof block.text === 'string' ? block.text : ''))
+    .join('');
+}
+
+/** Upper bound on the overlap scan below (characters). */
+export const MAX_OVERLAP_SCAN = 65536;
+
+/**
+ * The longest suffix of `published` that is also a prefix of `next`.
+ *
+ * Used to splice a late authority (an `assistant` envelope, the final
+ * `result`) onto what has already been streamed without either duplicating the
+ * overlap or dropping the tail. Bounded so a huge answer cannot turn this into
+ * a quadratic scan.
+ */
+export function overlapLength(published: string, next: string): number {
+  const max = Math.min(published.length, next.length, MAX_OVERLAP_SCAN);
+  for (let k = max; k > 0; k -= 1) {
+    if (published.endsWith(next.slice(0, k))) return k;
+  }
+  return 0;
+}
+
+/**
  * The stream-json reader. One JSON object per line.
  *
  * Only main-loop text reaches `onText`: `parent_tool_use_id` is non-null for a
  * subagent's stream, and a subagent's chatter is not this step's answer.
+ *
+ * TWO sources of assistant text, reconciled so neither is lost and nothing is
+ * emitted twice:
+ *
+ *   - `stream_event` / `content_block_delta` — token deltas, present only
+ *     while the CLI is emitting partial messages.
+ *   - `assistant` — the completed message envelope, whose text is CUMULATIVE
+ *     for that message. It is the only source when partial messages are
+ *     absent (a resumed turn, a build that stops emitting them, the message
+ *     that follows a tool result), which is why the conversation stream used
+ *     to lose whole turns while the persisted message was complete
+ *     (report 39, defect D1).
+ *
+ * Per message id: whatever the deltas already emitted is treated as a prefix
+ * of the envelope's text and only the remainder is published. A divergent
+ * envelope (not an extension of what was streamed) publishes nothing rather
+ * than duplicating the turn.
  */
 export function createStreamHandler(hooks: StreamHandlerHooks = {}): {
   handle: (line: string) => void;
@@ -749,6 +801,17 @@ export function createStreamHandler(hooks: StreamHandlerHooks = {}): {
     requestIds: [],
     unparsedLines: 0,
   };
+
+  /** Text emitted from deltas for the message currently being assembled. */
+  let pendingDeltaText = '';
+  /** Text emitted per completed message id, so a repeated envelope is a no-op. */
+  const emittedByMessage = new Map<string, string>();
+
+  function emit(text: string): void {
+    if (!text) return;
+    state.text += text;
+    hooks.onText?.(text);
+  }
 
   function handle(line: string): void {
     const trimmed = line.trim();
@@ -779,14 +842,21 @@ export function createStreamHandler(hooks: StreamHandlerHooks = {}): {
 
       case 'stream_event': {
         const inner = event.event;
-        if (!inner || inner.type !== 'content_block_delta') return;
+        if (!inner) return;
+        if (inner.type === 'message_start') {
+          // A new assistant message begins: the delta ledger for the previous
+          // one is closed (its `assistant` envelope has been reconciled).
+          if (event.parent_tool_use_id == null) pendingDeltaText = '';
+          return;
+        }
+        if (inner.type !== 'content_block_delta') return;
         const delta = inner.delta;
         if (!delta) return;
         const fromSubagent = event.parent_tool_use_id != null;
         if (delta.type === 'text_delta' && typeof delta.text === 'string') {
           if (fromSubagent) return;
-          state.text += delta.text;
-          if (delta.text) hooks.onText?.(delta.text);
+          pendingDeltaText += delta.text;
+          emit(delta.text);
         } else if (
           (delta.type === 'thinking_delta' || delta.type === 'signature_delta') &&
           typeof delta.thinking === 'string'
@@ -798,14 +868,40 @@ export function createStreamHandler(hooks: StreamHandlerHooks = {}): {
         return;
       }
 
-      case 'assistant':
-        // Tool events come from the bridge with real tool ids; the assistant
-        // envelope is only worth its `request_id`, which is what Anthropic
-        // support asks for.
+      case 'assistant': {
+        // `request_id` is what Anthropic support asks for. Tool events come
+        // from the bridge with real tool ids, so `tool_use` blocks are ignored
+        // here — but the envelope's TEXT is authoritative for the message.
         if (typeof event.request_id === 'string' && state.requestIds.length < 64) {
           state.requestIds.push(event.request_id);
         }
+        if (event.parent_tool_use_id != null) return; // a subagent's turn
+        const message = event.message;
+        const messageId = typeof message?.id === 'string' ? message.id : null;
+        const priorForId = messageId ? (emittedByMessage.get(messageId) ?? '') : '';
+        const prior = priorForId.length >= pendingDeltaText.length ? priorForId : pendingDeltaText;
+        pendingDeltaText = '';
+        const full = assistantMessageText(message);
+        let tail = '';
+        if (!prior) {
+          tail = full;
+        } else if (full.startsWith(prior)) {
+          tail = full.slice(prior.length);
+        } else if (full) {
+          // The envelope is not an extension of what was streamed. Publishing
+          // it would show the turn twice; the persisted answer still comes
+          // from `result`, so drop it here and say so.
+          console.warn(
+            '[ClaudeCode] assistant envelope diverged from the streamed deltas; not republishing',
+          );
+        }
+        emit(tail);
+        if (messageId) {
+          if (emittedByMessage.size >= 256) emittedByMessage.clear();
+          emittedByMessage.set(messageId, prior + tail);
+        }
         return;
+      }
 
       case 'rate_limit_event':
         if (event.rate_limit_info) state.rateLimit = event.rate_limit_info;
@@ -1103,13 +1199,19 @@ export async function runClaudeCodeStep(
       ? (config as AnyObject).timeoutMs
       : DEFAULT_TIMEOUT_MS;
 
-  // The CLI is the whole node's turn: stream only when the node asked for it,
-  // and never from a node named respond/responder — `functions/run.ts:1005`
-  // forwards `on_llm_stream` for exactly those two names, so publishing here
-  // as well would double up in the conversation.
-  const nodeName = resolveNodeName(state);
-  const streamToUser =
-    config.stream === true && nodeName !== 'respond' && nodeName !== 'responder';
+  // The CLI is the whole node's turn: stream whenever the node asked for it.
+  //
+  // This used to skip nodes named `respond`/`responder`, on the theory that
+  // `functions/run.ts` already forwards `on_llm_stream` for those two names.
+  // It does — but ONLY for a LangChain model, and a `claude-code` neuron never
+  // builds one (this executor is dispatched before `getModel()`). So every
+  // claude-code chat node — and `responder` is the name the stock chat graphs
+  // use — published nothing live, and the run's `on_chain_end` backstop then
+  // replayed the finished answer ONE CHARACTER AT A TIME, seconds late and
+  // lossy: 1 of 152 characters in the worst observed turn (report 39, D1).
+  // Streaming here suppresses that backstop (it checks `output.content`) and
+  // makes the claude-code event sequence identical to every other provider's.
+  const streamToUser = config.stream === true;
 
   // ── the step's private directory ─────────────────────────────────────────
   const dir = path.join(
@@ -1548,6 +1650,35 @@ export async function runClaudeCodeStep(
 
     const finalText = typeof result.result === 'string' ? result.result : handler.state.text;
     const softMaxTurns = result.subtype === 'error_max_turns';
+
+    // ── the answer and the stream must agree ───────────────────────────────
+    // `result.result` is the authority on the final answer; the stream is the
+    // authority on what the user has already seen. Publish exactly the part of
+    // the answer that never reached the conversation — spliced on the longest
+    // overlap so a stream that ended mid-sentence is completed rather than
+    // repeated, and a stream that already carried the whole answer adds
+    // nothing. Without this, `run_complete`'s finalContent (derived from the
+    // forwarded chunks) could be a truncated prefix of the persisted message.
+    if (streamToUser && publisher?.chunk && typeof finalText === 'string' && finalText) {
+      const published = handler.state.text;
+      const missing = published.endsWith(finalText)
+        ? ''
+        : finalText.slice(overlapLength(published, finalText));
+      if (missing) {
+        if (published) {
+          console.warn(
+            `[ClaudeCode] step '${stepId}': ${missing.length} char(s) of the answer never ` +
+              `reached the stream; publishing the remainder`,
+          );
+        }
+        try {
+          await publisher.chunk(missing);
+          handler.state.text = published + missing;
+        } catch (err) {
+          console.warn('[ClaudeCode] final chunk publish failed:', err);
+        }
+      }
+    }
     const isError =
       result.is_error === true ||
       (typeof result.subtype === 'string' && result.subtype.startsWith('error_'));
@@ -1756,17 +1887,6 @@ function ensureCwd(tree: string, dir: string): string {
     fs.mkdirSync(fallback, { recursive: true });
     return fallback;
   }
-}
-
-/** The compiled graph node key, which is what `functions/run.ts` gates on. */
-function resolveNodeName(state: AnyObject): string {
-  return (
-    state?.nodeConfig?.graphNodeId ||
-    state?.nodeConfig?.nodeId ||
-    state?.nodeId ||
-    state?.data?.currentNodeId ||
-    ''
-  );
 }
 
 /**
