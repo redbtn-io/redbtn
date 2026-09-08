@@ -8,6 +8,10 @@
  * - State fields: {{state.query}}, {{state.user.name}}
  * - Parameters: {{parameters.temperature}}, {{parameters.model}}
  * - Global State: {{globalState.namespace.key}} (persisted across workflows)
+ * - Expressions: {{state.a || 'fallback'}}, {{state.n > 3 ? 'many' : 'few'}},
+ *   {{(() => state.items.length)()}} — evaluated through `resolveValue`, the
+ *   same evaluator a transform step uses, so a prompt and a transform reading
+ *   the same expression in the same run agree
  * - Multiple variables in same string
  * - Undefined variables are left as-is (not replaced)
  *
@@ -51,18 +55,136 @@ function getTemplateGlobalStateClient(state?: any) {
     });
 }
 
+/** A bare dotted path — the only form the two substitution passes below handle. */
+const SIMPLE_PATH_PATTERN = /^(state|parameters)(\.\w+)+$/;
+
+/** How many times a substituted value may itself be re-rendered. */
+const MAX_RENDER_PASSES = 4;
+
+/**
+ * Locate every balanced `{{ … }}` group in a string.
+ *
+ * A regex cannot do this: an IIFE (`{{(() => { … })()}}`) and an object
+ * literal both contain braces, and `/\{\{(.+?)\}\}/` stops at the first
+ * inner `}}`. This walks the string tracking brace depth instead, so the
+ * expression handed to the evaluator is the whole expression.
+ *
+ * An unbalanced `{{` (a stray mustache in prose) yields no match and is left
+ * exactly where it is.
+ */
+export function findTemplateExpressions(
+    template: string,
+): Array<{ start: number; end: number; expression: string }> {
+    const found: Array<{ start: number; end: number; expression: string }> = [];
+    let i = 0;
+    while (i < template.length - 1) {
+        if (template[i] !== '{' || template[i + 1] !== '{') {
+            i += 1;
+            continue;
+        }
+        let depth = 0;
+        let end = -1;
+        for (let j = i + 2; j < template.length; j += 1) {
+            const ch = template[j];
+            if (ch === '{') {
+                depth += 1;
+            } else if (ch === '}') {
+                if (depth > 0) {
+                    depth -= 1;
+                } else if (template[j + 1] === '}') {
+                    end = j + 2;
+                    break;
+                } else {
+                    break; // a lone `}` at depth 0 — not a template group
+                }
+            }
+        }
+        if (end < 0) {
+            i += 2;
+            continue;
+        }
+        found.push({ start: i, end, expression: template.slice(i + 2, end - 2).trim() });
+        i = end;
+    }
+    return found;
+}
+
+/**
+ * Evaluate the EXPRESSION forms of `{{ … }}` — `||` fallbacks, ternaries,
+ * IIFEs, bracket indexing, comparisons — through the same `resolveValue` a
+ * transform step uses, so a prompt and a transform reading the same expression
+ * in the same run resolve it the same way.
+ *
+ * Before this pass existed, `renderTemplate` recognised ONLY the bare dotted
+ * path `{{state.a.b}}`, and every other form was left in the string verbatim.
+ * A neuron step's `systemPrompt` / `userPrompt` is rendered with
+ * `renderTemplate`, so `{{state.data.x || '(none)'}}` reached the model as its
+ * own source text and the model reported the placeholder as empty — while two
+ * transform steps evaluating the same expression in the same run resolved it
+ * (report 39, defect D2). `red-coder-node-opus` uses that idiom three times.
+ *
+ * Deliberately NOT applied to substituted values (see `renderTemplate`'s
+ * `pass` argument): this pass can execute JavaScript, so it runs on the
+ * template a graph author wrote and never on a value — a chat message, a tool
+ * result, a fetched document — that merely happens to contain braces.
+ *
+ * Left untouched, so the passes below keep their existing behaviour:
+ *   - simple dotted paths (handled, and deliberately preserved when missing),
+ *   - `{{globalState.…}}` (belongs to `renderTemplateAsync`),
+ *   - anything that never mentions `state` or `parameters` (a mustache in
+ *     prose or a code sample is not ours to evaluate).
+ */
+function renderTemplateExpressions(template: string, state: any): string {
+    if (!template.includes('{{')) return template;
+    const groups = findTemplateExpressions(template);
+    if (groups.length === 0) return template;
+    let out = '';
+    let cursor = 0;
+    for (const { start, end, expression } of groups) {
+        out += template.slice(cursor, start);
+        cursor = end;
+        const literal = template.slice(start, end);
+        if (
+            !expression ||
+            SIMPLE_PATH_PATTERN.test(expression) ||
+            /\bglobalState\b/.test(expression) ||
+            !/\b(state|parameters)\b/.test(expression)
+        ) {
+            out += literal;
+            continue;
+        }
+        const value = resolveValue(`{{${expression}}}`, state);
+        if (value === undefined || (typeof value === 'string' && value === `{{${expression}}}`)) {
+            // `resolveValue` returns its own input when evaluation threw, and
+            // `undefined` when the expression legitimately produced nothing.
+            // Either way the author gets the source back plus a warning rather
+            // than a silently empty prompt.
+            console.warn(`[TemplateRenderer] Expression did not resolve: ${expression}`);
+            out += literal;
+            continue;
+        }
+        out += typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value);
+    }
+    return out + template.slice(cursor);
+}
+
 /**
  * Render a template string by replacing {{state.field}} and {{parameters.field}} variables
  *
- * Supports nested property access via dot notation.
+ * Supports nested property access via dot notation, plus the expression forms
+ * (`||` fallback, ternary, IIFE, indexing) that `resolveValue` supports.
  *
  * @param template - Template string with {{state.field}} or {{parameters.field}} placeholders
  * @param state - State object containing values to substitute (includes parameters)
+ * @param pass - Internal. 0 for the author's template; >0 for a re-render of a
+ *               substituted value, where expression evaluation is OFF.
  * @returns Rendered string with variables replaced
  */
-export function renderTemplate(template: string, state: any): string {
+export function renderTemplate(template: string, state: any, pass = 0): string {
+    // Expressions first, and only on the author's own template.
+    const seed = pass === 0 ? renderTemplateExpressions(template, state) : template;
     // First, replace {{parameters.xxx}} patterns
-    let result = template.replace(/\{\{parameters\.(\w+(?:\.\w+)*)\}\}/g, (match, path) => {
+    let result = seed.replace(/\{\{parameters\.(\w+(?:\.\w+)*)\}\}/g, (match, path) => {
         // Get value from state.parameters
         const value = getNestedProperty(state.parameters || {}, path);
         if (value !== undefined) {
@@ -100,9 +222,16 @@ export function renderTemplate(template: string, state: any): string {
         }
     });
     // Multi-pass: if result still contains unresolved templates after first pass,
-    // do one more pass (handles {{parameters.X}} resolving to {{state.Y}})
-    if (result !== template && (result.includes('{{state.') || result.includes('{{parameters.'))) {
-        result = renderTemplate(result, state);
+    // do one more pass (handles {{parameters.X}} resolving to {{state.Y}}).
+    // PATH SUBSTITUTION ONLY — `pass > 0` turns expression evaluation off, so a
+    // value that was substituted into the template can never be executed as
+    // source. Bounded so a value that resolves to another template cannot spin.
+    if (
+        result !== seed &&
+        pass + 1 < MAX_RENDER_PASSES &&
+        (result.includes('{{state.') || result.includes('{{parameters.'))
+    ) {
+        result = renderTemplate(result, state, pass + 1);
     }
     return result;
 }
@@ -254,11 +383,16 @@ export function resolveValue(value: any, state: any, options: ResolveValueOption
             }
         }
 
-        // Complex expression (or simple path that returned undefined) — evaluate via new Function
+        // Complex expression (or simple path that returned undefined) — evaluate via new Function.
+        //
+        // `parameters` is bound alongside `state` so `{{parameters.x || 'y'}}`
+        // evaluates instead of throwing a ReferenceError and falling back to
+        // the raw source. Strictly additive: every expression that already
+        // worked still does.
         try {
             // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-            const evalFunc = new Function('state', `return (${expression})`);
-            return evalFunc(state);
+            const evalFunc = new Function('state', 'parameters', `return (${expression})`);
+            return evalFunc(state, state?.parameters ?? {});
         } catch (error) {
             console.error('[TemplateRenderer] resolveValue: failed to evaluate expression:', expression, error);
             if (options.throwOnError) {
@@ -289,7 +423,13 @@ export function resolveValue(value: any, state: any, options: ResolveValueOption
  * @returns True if string contains template patterns
  */
 export function hasTemplateVariables(str: string): boolean {
-    return /\{\{(state|parameters|globalState)\.\w+(?:\.\w+)*\}\}/.test(str);
+    if (/\{\{(state|parameters|globalState)\.\w+(?:\.\w+)*\}\}/.test(str)) return true;
+    // Expression forms (`{{state.a || 'b'}}`, ternaries, IIFEs) are templates
+    // too — a check that only recognised bare paths made callers that gate on
+    // it skip rendering and pass the source through verbatim.
+    return findTemplateExpressions(str).some(({ expression }) =>
+        /\b(state|parameters|globalState)\b/.test(expression),
+    );
 }
 
 /**
