@@ -32,6 +32,7 @@ import {
 } from '../../../neurons/capability-matrix';
 import { resolveTools, toBindToolsPayload, partitionToolRefs, type ResolvedTool } from '../../../tools/tool-resolver';
 import { coerceArgsToSchema } from '../../../tools/coerce-args';
+import { runClaudeCodeStep } from './claudeCodeExecutor';
 
 /**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
@@ -318,6 +319,22 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
         state, neuronRegistry, config, neuronId, userId, callRunId,
         providerResponse, modelHint, stepIdOverride,
       });
+
+    // ── `claude-code`: a CLI child, not a chat model ─────────────────────────
+    // This branch MUST sit before getModel(). A `claude-code` neuron has no
+    // LangChain model to build (`NeuronRegistry.createModel` throws for it on
+    // purpose), it runs its own agent loop so `bindTools` can never be
+    // honoured, and `toolStrategy` resolves to 'none' for the provider, which
+    // would discard `config.tools` before the CLI ever saw them. The executor
+    // below reads the tool allowlist itself and serves it over the per-run MCP
+    // bridge. `getConfig` is LRU-cached for 5 minutes and is called again a few
+    // lines down by the tool paths, so this lookup is free.
+    const early = await neuronRegistry.getConfig(neuronId, userId).catch(() => null);
+    if (early?.provider === 'claude-code') {
+      return runClaudeCodeStep({
+        config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
+      });
+    }
 
     let model: any = await neuronRegistry.getModel(
       neuronId,

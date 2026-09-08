@@ -49,6 +49,20 @@ function isSystemNeuron(doc: { userId?: string; isSystem?: boolean }): boolean {
   );
 }
 
+/**
+ * Turn an optional Mongoose subdocument into a plain object.
+ *
+ * `capabilities` and `parameters` end up in an LRU-cached `NeuronConfig` that
+ * executors read, and one of those executors puts `parameters.effort` on a
+ * child process's command line. A live subdocument would drag the whole
+ * Mongoose document surface into that cache; a plain snapshot cannot.
+ */
+function plainSubdoc<T extends object>(value: T | undefined | null): T | undefined {
+  if (!value) return undefined;
+  const asDoc = value as { toObject?: () => T };
+  return { ...(typeof asDoc.toObject === 'function' ? asDoc.toObject() : value) };
+}
+
 export { NeuronConfig, NeuronDocument } from '../types/neuron';
 
 const log = createLogger('NeuronRegistry');
@@ -390,6 +404,12 @@ export class NeuronRegistry {
       tier: doc.tier,
       userId: doc.userId,
       audioOptimized: (doc as any).audioOptimized ?? false,
+      // Both are optional subdocuments. `toObject` strips the Mongoose
+      // document wrapper so the cached config is a plain value — it is handed
+      // to executors that pass pieces of it to a child process, and a live
+      // subdocument would carry the whole model surface with it.
+      capabilities: plainSubdoc(doc.capabilities),
+      parameters: plainSubdoc(doc.parameters),
     };
     this.configCache.set(cacheKey, config);
     return config;

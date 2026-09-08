@@ -27,6 +27,7 @@ import {
   desktopPing,
 } from '../../src/lib/tools/native/desktop-computer';
 import alertDesktopTool from '../../src/lib/tools/native/alert-desktop';
+import { RELAY_GRACE_MS } from '../../src/lib/environments/DesktopAgentSession';
 
 function makeContext(userId = 'user_a'): NativeToolContext {
   return {
@@ -239,14 +240,52 @@ describe('desktop exec/settings tools — strict target handling', () => {
       userId: 'user_a',
       installId: 'install_123',
       kind: 'exec',
-      timeoutMs: 7000,
+      // The RELAY wait, not the command budget: this used to be 7000 on both,
+      // so a command that hit its 7 s hard kill raced the engine's 7 s give-up
+      // and lost, surfacing as `No desktop responded within 7000ms` — a
+      // presence error for a connector that was present and replying.
+      timeoutMs: 7000 + RELAY_GRACE_MS,
       payload: {
         command: 'echo',
         args: ['hello'],
         cwd: '/tmp',
+        // The CONNECTOR's hard-kill budget, unchanged and verbatim.
         timeoutMs: 7000,
       },
     });
+  });
+
+  test('desktop_exec never sends the relay wait and the command budget as one number', async () => {
+    await desktopExec.handler(
+      { environmentId: 'env_desktop', command: 'sleep', args: ['999'], timeoutMs: 120_000 },
+      makeContext(),
+    );
+    const call = requestDesktopRawMock.mock.calls.at(-1)?.[0];
+    expect(call.payload.timeoutMs).toBe(120_000);
+    expect(call.timeoutMs).toBeGreaterThan(call.payload.timeoutMs);
+  });
+
+  test('desktop_exec with no timeoutMs sets neither clock', async () => {
+    // No hard kill was requested, so there is no second clock to clear and the
+    // relay keeps desktop-request's own presence-detector default.
+    await desktopExec.handler(
+      { environmentId: 'env_desktop', command: 'echo', args: ['hi'] },
+      makeContext(),
+    );
+    const call = requestDesktopRawMock.mock.calls.at(-1)?.[0];
+    expect(call.timeoutMs).toBeUndefined();
+    expect(call.payload.timeoutMs).toBeUndefined();
+  });
+
+  test('desktop_exec ignores an unusable timeoutMs on both clocks', async () => {
+    await desktopExec.handler(
+      { environmentId: 'env_desktop', command: 'echo', timeoutMs: -1 },
+      makeContext(),
+    );
+    const call = requestDesktopRawMock.mock.calls.at(-1)?.[0];
+    // A negative relay wait would fire on the next tick; resolveTimeoutMs
+    // rejects it, and the grace must not resurrect it as 29999.
+    expect(call.timeoutMs).toBeUndefined();
   });
 
   test('desktop_settings resolves target and passes installId to requestDesktopRaw', async () => {

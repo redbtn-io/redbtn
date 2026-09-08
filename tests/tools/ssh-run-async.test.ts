@@ -365,6 +365,65 @@ describe('ssh_run_async — execution', () => {
     expect(body.error).toMatch(/connection lost/);
   });
 
+  test('the outer subshell closes the SSH channel fds (> /dev/null 2>&1 before the &)', async () => {
+    // Regression guard. Without the outer redirect the backgrounded subshell
+    // inherits the exec channel's stdout/stderr and holds them open for the
+    // life of the user command, so the channel never EOFs and this "instant"
+    // launch blocked for the full 30 s wrapper timeout (3011 ms measured, vs
+    // 4 ms with the redirect).
+    vi.mocked(loadAndResolveEnvironment).mockResolvedValue({ env: FAKE_ENV, sshKey: 'k' });
+    let captured = '';
+    vi.mocked(environmentManager.acquire).mockResolvedValue({
+      exec: vi.fn(async (cmd: string) => {
+        captured = cmd;
+        return { stdout: '4242\n', stderr: '', exitCode: 0, durationMs: 4, truncated: false };
+      }),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+
+    const r = await sshRunAsyncTool.handler(
+      { environmentId: 'env_proc', command: 'sleep 300' },
+      makeMockContext(),
+    );
+    const body = JSON.parse(r.content[0].text);
+    expect(body.success).toBe(true);
+
+    // The redirect is on the OUTER subshell and comes BEFORE the `&`, so the
+    // subshell is what gets /dev/null; `echo $!` runs after it and still writes
+    // the PID to the channel.
+    expect(captured).toContain(') > /dev/null 2>&1 & echo $!');
+    // and never after the ampersand, which would redirect the echo instead.
+    expect(captured).not.toContain('& > /dev/null');
+  });
+
+  test('the exit-file contract ssh_tail/ssh_kill/ssh_jobs read is unchanged', async () => {
+    vi.mocked(loadAndResolveEnvironment).mockResolvedValue({ env: FAKE_ENV, sshKey: 'k' });
+    let captured = '';
+    vi.mocked(environmentManager.acquire).mockResolvedValue({
+      exec: vi.fn(async (cmd: string) => {
+        captured = cmd;
+        return { stdout: '77\n', stderr: '', exitCode: 0, durationMs: 4, truncated: false };
+      }),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+
+    const r = await sshRunAsyncTool.handler(
+      { environmentId: 'env_proc', command: 'make build' },
+      makeMockContext(),
+    );
+    const { jobId } = JSON.parse(r.content[0].text);
+
+    // Inner redirections are applied INSIDE the subshell, so they still win over
+    // the outer /dev/null: output and exit code land in the same three files.
+    expect(captured).toContain(`> /tmp/${jobId}_out 2> /tmp/${jobId}_err`);
+    expect(captured).toContain(`echo $? > /tmp/${jobId}_exit`);
+    // /dev/null must not have replaced any of them.
+    expect(captured).not.toContain(`/tmp/${jobId}_out > /dev/null`);
+    // The user command still runs under nohup inside its own bash -c.
+    expect(captured).toContain('nohup bash -c');
+    expect(captured).toContain('make build');
+  });
+
   test('jobIds are unique across calls', async () => {
     vi.mocked(loadAndResolveEnvironment).mockResolvedValue({ env: FAKE_ENV, sshKey: 'k' });
     vi.mocked(environmentManager.acquire).mockResolvedValue({

@@ -5,7 +5,12 @@
  */
 import * as mongoose from 'mongoose';
 import { Model } from 'mongoose';
-import { NeuronDocument } from '../types/neuron';
+import {
+  CLAUDE_CODE_EFFORT_LEVELS,
+  type NeuronCapabilities,
+  type NeuronDocument,
+  type NeuronParameters,
+} from '../types/neuron';
 
 /**
  * Neuron schema
@@ -91,6 +96,52 @@ const neuronSchema = new mongoose.Schema<NeuronDocument>({
   secretName: {
     type: String,
     trim: true,
+  },
+  /**
+   * Explicit per-modality capability overrides.
+   *
+   * Declared here because Mongoose strict mode (the default) drops any path
+   * the schema does not name — both on write and on hydration — so a doc
+   * written with `capabilities` was previously invisible to the engine even
+   * though `NeuronDocument` had always declared it.
+   *
+   * `_id: false`: a flags object, not a subdocument with an identity.
+   */
+  capabilities: {
+    type: new mongoose.Schema<NeuronCapabilities>(
+      {
+        vision: { type: Boolean },
+        audio: { type: Boolean },
+        tools: { type: Boolean },
+        streaming: { type: Boolean },
+      },
+      { _id: false },
+    ),
+    required: false,
+  },
+  /**
+   * Provider-specific knobs.
+   *
+   * A closed shape, not a `Mixed` bag: `parameters.effort` becomes an argv
+   * value on a `claude-code` child's command line, so the set of keys that can
+   * get there is fixed at the schema and the set of values `effort` can take
+   * is the CLI's own list. Anything else a caller writes is dropped by strict
+   * mode rather than forwarded.
+   */
+  parameters: {
+    type: new mongoose.Schema<NeuronParameters>(
+      {
+        effort: {
+          type: String,
+          // Keep in sync with `--effort` in `claude --help`; the executor
+          // re-validates on read, so a doc written before a level was retired
+          // degrades to "no --effort" instead of failing the run.
+          enum: CLAUDE_CODE_EFFORT_LEVELS as unknown as string[],
+        },
+      },
+      { _id: false },
+    ),
+    required: false,
   },
   temperature: {
     type: Number,
