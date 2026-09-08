@@ -9,7 +9,7 @@
  *   - output: { neuronId, createdAt }
  *
  * NeuronConfig: { name, provider (ollama|openai|anthropic|google|custom|
- * claude-code),
+ * claude-code, agy-cli),
  * model, endpoint?, apiKey?, temperature?, maxTokens?, topP?,
  * audioOptimized?, role?, description?, tags? }.
  *
@@ -55,7 +55,7 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
 
 const createNeuronTool: NativeToolDefinition = {
   description:
-    'Create a new neuron (LLM endpoint config). Wraps an LLM provider (Ollama/OpenAI/Anthropic/Google/custom, or claude-code for a Claude subscription CLI worker) with model selection and inference parameters. Used by graph nodes via neuron step type.',
+    'Create a new neuron (LLM endpoint config). Wraps an LLM provider (Ollama/OpenAI/Anthropic/Google/custom, or a subscription CLI worker: claude-code for Claude, agy-cli for Antigravity/Gemini) with model selection and inference parameters. Used by graph nodes via neuron step type.',
   server: 'platform',
   inputSchema: {
     type: 'object',
@@ -68,7 +68,7 @@ const createNeuronTool: NativeToolDefinition = {
       config: {
         type: 'object',
         description:
-          'NeuronConfig: { name (required), provider (required: ollama|openai|anthropic|google|custom|claude-code), model (required), endpoint? (use claude-code://worker for claude-code), apiKey?, secretName?, temperature? (default 0.7), maxTokens? (default 4096), topP?, audioOptimized?, role? (chat|worker|specialist), description?, tags? }.',
+          'NeuronConfig: { name (required), provider (required: ollama|openai|anthropic|google|custom|claude-code|agy-cli), model (required; for agy-cli one of gemini-3.8-flash / gemini-3.7-flash / gemini-3.6-flash / gemini-3.1-pro, optionally suffixed -low|-medium|-high, or claude-sonnet-4-6 / claude-opus-4-6-thinking / gpt-oss-120b-medium), endpoint? (use claude-code://worker for claude-code, agy-cli://worker for agy-cli), apiKey?, secretName?, temperature? (default 0.7), maxTokens? (default 4096), topP?, audioOptimized?, parameters? ({ effort } — claude-code low|medium|high|xhigh|max, agy-cli low|medium|high), role? (chat|worker|specialist), description?, tags? }.',
       },
     },
     required: ['config'],

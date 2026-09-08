@@ -61,19 +61,24 @@ export interface NeuronStepConfig {
      * Neuron to re-run this step against when the primary fails in a way a
      * DIFFERENT neuron would plausibly survive.
      *
-     * The motivating case: `neuronId` names a `claude-code` subscription neuron
-     * (a Claude Code CLI child). The CLI is a process, so it can fail to spawn,
-     * fail its init guard, time out in the worker's slot queue, hit a
-     * subscription rate limit, or have its token rejected — none of which says
-     * anything about the prompt. `fallbackNeuronId: 'red-neuron'` re-runs the
-     * same step, once, against a metered API neuron instead of failing the run.
+     * The motivating case: `neuronId` names a subscription-backed CLI neuron —
+     * `claude-code` (a Claude Code child) or `agy-cli` (an Antigravity child
+     * running Gemini Flash on George's subscription). A CLI is a process, so it
+     * can fail to spawn, fail its startup guard, time out in the worker's slot
+     * queue, or hit a subscription rate limit — none of which says anything
+     * about the prompt. `fallbackNeuronId: 'sonnet-5'` re-runs the same step,
+     * once, against a metered API neuron instead of failing the run.
      *
      * Trigger set (see `neuronFallback.ts` for the full rationale):
      *   - `claude-code`: spawn_failed, init_failed, rate_limited, queue_timeout,
      *     auth_401, timeout, failed (non-zero exit), error_result.
+     *   - `agy-cli`: spawn_failed, rate_limited, queue_timeout, timeout, failed,
+     *     error_result. NOT `agy_auth_required` — that one means a human has to
+     *     redo a Google login, and hiding it behind a fallback would keep the
+     *     graphs green while the subscription stopped being used at all.
      *   - API providers: 429, 5xx, network errors, timeouts.
      *   - NEVER: run interrupt/abort, provider 4xx, bad schemas, content
-     *     refusals, or the `claude-code` config/security codes.
+     *     refusals, or either CLI provider's config/security codes.
      *
      * Resolution precedence: this field as a literal id > this field as a
      * template (`"{{parameters.fallbackNeuronId}}"`) > the node parameter

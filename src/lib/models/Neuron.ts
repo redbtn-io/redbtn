@@ -80,7 +80,7 @@ const neuronSchema = new mongoose.Schema<NeuronDocument>({
     // Keep in sync with `NeuronProvider` in lib/types/neuron.ts. `create_neuron`
     // saves through this schema, so a provider missing here is rejected at
     // validation time no matter what the TypeScript union says.
-    enum: ['ollama', 'openai', 'anthropic', 'google', 'custom', 'claude-code'],
+    enum: ['ollama', 'openai', 'anthropic', 'google', 'custom', 'claude-code', 'agy-cli'],
   },
   endpoint: {
     type: String,
@@ -123,19 +123,27 @@ const neuronSchema = new mongoose.Schema<NeuronDocument>({
    * Provider-specific knobs.
    *
    * A closed shape, not a `Mixed` bag: `parameters.effort` becomes an argv
-   * value on a `claude-code` child's command line, so the set of keys that can
-   * get there is fixed at the schema and the set of values `effort` can take
-   * is the CLI's own list. Anything else a caller writes is dropped by strict
-   * mode rather than forwarded.
+   * value on a `claude-code` or `agy-cli` child's command line, so the set of
+   * keys that can get there is fixed at the schema and the set of values
+   * `effort` can take is the CLIs' own lists. Anything else a caller writes is
+   * dropped by strict mode rather than forwarded.
+   *
+   * The enum below is the UNION of the two providers' levels (agy accepts only
+   * low/medium/high). Validating the union here rather than per-provider is
+   * deliberate: a neuron can be re-pointed from `claude-code` to `agy-cli`
+   * without a data migration, and each executor re-validates on read — the agy
+   * one degrades an inapplicable level to its own default instead of failing
+   * the run.
    */
   parameters: {
     type: new mongoose.Schema<NeuronParameters>(
       {
         effort: {
           type: String,
-          // Keep in sync with `--effort` in `claude --help`; the executor
-          // re-validates on read, so a doc written before a level was retired
-          // degrades to "no --effort" instead of failing the run.
+          // Keep in sync with `--effort` in `claude --help` (the wider of the
+          // two lists); each executor re-validates on read, so a doc written
+          // before a level was retired — or one naming a level the agy CLI
+          // does not know — degrades instead of failing the run.
           enum: CLAUDE_CODE_EFFORT_LEVELS as unknown as string[],
         },
       },
