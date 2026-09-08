@@ -86,17 +86,37 @@ const MODEL = process.env.CLAUDE_CODE_TEST_MODEL || 'claude-fable-5-1';
  * dies on spawn, and the init guard rejects the session with
  * "the 'redbtn' MCP server reported status 'failed'".
  *
- * So compile the real shim to exactly the path the bridge will name, run
- * against it, and remove it afterwards. This transpiles the actual source —
- * it is not a stand-in.
+ * Compiling the real shim to a TEMP directory would be tidier, and is what a
+ * review asked for, but `resolveShimPath()` takes no override — it is
+ * `__dirname` plus a fixed name — and that function lives in `run-bridge.ts`,
+ * which this branch must not modify (it belongs to #381). So the file has to
+ * land at exactly that path. Two things make that safe rather than grubby:
+ * cleanup runs on `afterAll` AND on process exit, so an interrupted run does
+ * not leave it behind; and the path is git-ignored, so it can never be
+ * committed by accident.
  *
- * (Worth knowing for its own sake: because `resolveShimPath` never checks that
- * the file is there, a packaging slip that omitted the shim from `dist` would
- * present as the same opaque init failure rather than as a missing file.)
+ * The fix that makes the temp dir possible is one line in `run-bridge.ts` —
+ * either an env override or an existence check with a `.ts` fallback — and it
+ * is worth having for its own sake: `resolveShimPath()` never checks the file
+ * exists, so a packaging slip that dropped the shim from `dist` would present
+ * as this same opaque init failure rather than as a missing file. Flagged for
+ * #381.
+ *
+ * What is compiled here is the real shim source, not a stand-in.
  */
 const SHIM_TS = path.join(__dirname, '..', '..', 'src', 'lib', 'mcp', 'run-bridge-shim.ts');
 const SHIM_JS = SHIM_TS.replace(/\.ts$/, '.js');
 let shimWasBuiltHere = false;
+
+function removeBuiltShim(): void {
+  if (!shimWasBuiltHere) return;
+  shimWasBuiltHere = false;
+  try {
+    fs.rmSync(SHIM_JS, { force: true });
+  } catch {
+    /* best effort — the afterAll hook is the primary path */
+  }
+}
 
 async function buildShim(): Promise<void> {
   if (fs.existsSync(SHIM_JS)) return; // a real build already put one here
@@ -110,6 +130,8 @@ async function buildShim(): Promise<void> {
   });
   fs.writeFileSync(SHIM_JS, outputText, { mode: 0o644 });
   shimWasBuiltHere = true;
+  // Belt for a vitest run that is killed rather than finished.
+  process.once('exit', removeBuiltShim);
 }
 
 // =============================================================================
@@ -160,9 +182,7 @@ beforeAll(async () => {
   if (LIVE) await buildShim();
 });
 
-afterAll(() => {
-  if (shimWasBuiltHere) fs.rmSync(SHIM_JS, { force: true });
-});
+afterAll(removeBuiltShim);
 
 beforeEach(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cce-live-'));

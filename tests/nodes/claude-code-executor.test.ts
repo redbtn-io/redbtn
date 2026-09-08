@@ -50,6 +50,11 @@ import {
   sanitizeSegment,
   uuidv5,
   runDirRoot,
+  sweepStaleRunDirs,
+  STALE_DIR_MAX_AGE_MS,
+  MAX_JSON_SCHEMA_ARG_BYTES,
+  __resetStaleSweep,
+  __liveChildCount,
   ClaudeCodeError,
   BRIDGE_PREAMBLE,
   DEFAULT_MAX_TURNS,
@@ -174,6 +179,7 @@ let tmpRoot: string;
 let savedRunDirRoot: string | undefined;
 let savedBin: string | undefined;
 let savedConcurrency: string | undefined;
+let savedQueueWait: string | undefined;
 
 interface FakePublisher {
   chunks: string[];
@@ -280,7 +286,10 @@ beforeEach(() => {
   savedRunDirRoot = process.env.REDBTN_RUN_DIR_ROOT;
   savedBin = process.env.CLAUDE_CODE_BIN;
   savedConcurrency = process.env.CLAUDE_CODE_MAX_CONCURRENT;
+  savedQueueWait = process.env.CLAUDE_CODE_QUEUE_WAIT_MS;
   process.env.REDBTN_RUN_DIR_ROOT = path.join(tmpRoot, 'run');
+  // The sweep latches once per process; each test gets its own run root.
+  __resetStaleSweep();
 });
 
 afterEach(() => {
@@ -290,6 +299,8 @@ afterEach(() => {
   else process.env.CLAUDE_CODE_BIN = savedBin;
   if (savedConcurrency === undefined) delete process.env.CLAUDE_CODE_MAX_CONCURRENT;
   else process.env.CLAUDE_CODE_MAX_CONCURRENT = savedConcurrency;
+  if (savedQueueWait === undefined) delete process.env.CLAUDE_CODE_QUEUE_WAIT_MS;
+  else process.env.CLAUDE_CODE_QUEUE_WAIT_MS = savedQueueWait;
   try {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   } catch {
@@ -408,6 +419,32 @@ describe('assertInitEvent', () => {
     // ANTHROPIC_API_KEY-shaped credential reached an allowlisted env.
     const init = { ...INIT_EVENT, apiKeySource: 'ANTHROPIC_API_KEY' } as ClaudeInitEvent;
     expect(assertInitEvent(init, [])?.code).toBe('claude_code_api_key_leak');
+  });
+
+  it('rejects an ABSENT apiKeySource, not just a wrong one', () => {
+    // A CLI build that stopped emitting the field would otherwise silently
+    // disable the leak assertion — the one failure mode a security check must
+    // not have. Measured on 2.1.263: the field IS present in stream-json init.
+    const init = { ...INIT_EVENT } as ClaudeInitEvent;
+    delete (init as { apiKeySource?: string }).apiKeySource;
+    const failure = assertInitEvent(init, []);
+    expect(failure?.code).toBe('claude_code_api_key_leak');
+    expect(failure?.message).toContain('absent');
+  });
+
+  it('rejects bundled slash commands or skills surviving the flags', () => {
+    expect(
+      assertInitEvent({ ...INIT_EVENT, slash_commands: ['/init'] } as ClaudeInitEvent, [])?.message,
+    ).toContain('--disable-slash-commands did not take');
+    expect(
+      assertInitEvent({ ...INIT_EVENT, skills: ['pdf'] } as ClaudeInitEvent, [])?.message,
+    ).toContain('--disable-slash-commands did not take');
+  });
+
+  it('rejects auto-memory surviving --restricted', () => {
+    // `memory_paths` is present ONLY when --restricted is absent (measured).
+    const init = { ...INIT_EVENT, memory_paths: ['/home/x/.claude/CLAUDE.md'] } as ClaudeInitEvent;
+    expect(assertInitEvent(init, [])?.message).toContain('--restricted did not take');
   });
 
   it('tolerates a served tool that did not show up (warns, does not fail)', () => {
@@ -610,6 +647,61 @@ describe('helpers', () => {
     );
   });
 
+  it('confines ws.tree to the mount the validated slug already fixed', () => {
+    // `tree` becomes the child's cwd AND is handed to mkdirSync(recursive), so
+    // "starts with a slash" was never a check — /etc/cron.d starts with a
+    // slash. It has to live under /ws/<name>/.
+    const escapes = [
+      '/etc/cron.d',
+      '/root',
+      '/ws/../etc',
+      '/ws/other/tree', // a different workspace than the slug approved
+      '/ws/indy/../../etc',
+      '/ws/indy//tree',
+      '/wsindy/tree', // prefix-alike, not under /ws/indy/
+    ];
+    for (const tree of escapes) {
+      expect(
+        resolveWorkspaceMount({ data: { ws: { name: 'indy', tree } } }),
+        `${tree} must not survive`,
+      ).toEqual({ name: 'indy', tree: '/ws/indy/tree' });
+    }
+
+    // A legitimate subdirectory of the workspace's own mount still works.
+    expect(resolveWorkspaceMount({ data: { ws: { name: 'indy', tree: '/ws/indy/tree' } } }).tree).toBe(
+      '/ws/indy/tree',
+    );
+    expect(
+      resolveWorkspaceMount({ data: { ws: { name: 'indy', tree: '/ws/indy/tree/pkg' } } }).tree,
+    ).toBe('/ws/indy/tree/pkg');
+  });
+
+  it('never makes a directory outside the mount, even asked to', async () => {
+    // The end-to-end consequence of the check above: ensureCwd() creates the
+    // cwd, so an unvalidated tree was a "create any directory as root's
+    // neighbour" primitive.
+    const forbidden = path.join(tmpRoot, 'should-never-exist');
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT} emit(${JSON.stringify(RESULT_EVENT)}); process.exit(0);`,
+    );
+    const runId = `run_${Math.random().toString(36).slice(2, 8)}`;
+    await runClaudeCodeStep({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      config: { neuronId: 'opus-5', outputField: 'data.x', systemPrompt: 's', userPrompt: 'u', tools: [] } as any,
+      state: {
+        ...baseState(runId, makePublisher()),
+        data: { runId, userId: 'user_test', ws: { name: 'indy', tree: forbidden } },
+      },
+      neuronCfg: NEURON_CFG,
+      neuronId: 'opus-5',
+      userId: 'user_test',
+      callRunId: runId,
+      abortSignal: undefined,
+      emitUsage: () => {},
+    });
+    expect(fs.existsSync(forbidden)).toBe(false);
+  });
+
   it('only accepts efforts the CLI knows, and defaults to xhigh', () => {
     expect(resolveEffort({ parameters: { effort: 'low' } }, {})).toBe('low');
     // The neuron doc is the normal source — `NeuronRegistry.getConfig` now
@@ -809,9 +901,14 @@ describe('runClaudeCodeStep', () => {
     ).rejects.toBeInstanceOf(ClaudeCodeError);
   });
 
+  // These two emit a valid init first, because a real CLI does: it reports
+  // init and *then* fails. Without it the run dies at the init guard (see
+  // "refuses a session that never sent an init event") and never reaches the
+  // path under test.
   it('turns a 401 into a rotate-the-token error code', async () => {
     process.env.CLAUDE_CODE_BIN = writeFakeCli(
-      `err("OAuth 401: keeping the user-supplied CLAUDE_CODE_OAUTH_TOKEN instead of adopting the stored credential.\\n");
+      `${EMIT_INIT}
+       err("OAuth 401: keeping the user-supplied CLAUDE_CODE_OAUTH_TOKEN instead of adopting the stored credential.\\n");
        process.exit(1);`,
     );
     await expect(run().promise).rejects.toMatchObject({ code: 'claude_code_auth_401' });
@@ -819,12 +916,180 @@ describe('runClaudeCodeStep', () => {
 
   it('reports a non-zero exit with the stderr tail', async () => {
     process.env.CLAUDE_CODE_BIN = writeFakeCli(
-      `err("something went sideways\\n"); process.exit(3);`,
+      `${EMIT_INIT} err("something went sideways\\n"); process.exit(3);`,
     );
     await expect(run().promise).rejects.toMatchObject({
       code: 'claude_code_failed',
       message: expect.stringContaining('something went sideways'),
     });
+  });
+
+  it('refuses a session that never sent an init event', async () => {
+    // The guard only runs from `onInit`, so a stream with no init skipped
+    // EVERY assertion — no tool check, no apiKeySource check — and a lone
+    // `result` was accepted as a clean run. Absence has to be a failure too.
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `emit(${JSON.stringify(RESULT_EVENT)}); process.exit(0);`,
+    );
+    await expect(run().promise).rejects.toMatchObject({
+      code: 'claude_code_init_failed',
+      message: expect.stringContaining('no system/init event'),
+    });
+  });
+
+  it('still reports a timeout, not "no init", when it timed out before init', async () => {
+    // The missing-init check must not shadow a more specific diagnosis.
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(`setInterval(() => {}, 1000);`);
+    await expect(run({ timeoutMs: 400 }).promise).rejects.toMatchObject({
+      code: 'claude_code_timeout',
+    });
+  });
+
+  it('parses structured output into an object, as every other provider does', async () => {
+    const plan = { steps: ['a', 'b'], done: false };
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT}
+       emit(${JSON.stringify({ ...RESULT_EVENT, result: JSON.stringify(plan) })});
+       process.exit(0);`,
+    );
+    const { promise } = run({
+      structuredOutput: { schema: { type: 'object' }, name: 'plan' },
+    });
+    const out = await promise;
+    // The SHAPE, not the flag: `{{state.data.plan.steps}}` has to resolve.
+    expect(out['data.coderSummary']).toEqual(plan);
+    expect((out['data.coderSummary'] as typeof plan).steps).toEqual(['a', 'b']);
+  });
+
+  it('fails with a clear code when structured output is not JSON', async () => {
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT}
+       emit(${JSON.stringify({ ...RESULT_EVENT, result: 'I decided to explain instead.' })});
+       process.exit(0);`,
+    );
+    await expect(
+      run({ structuredOutput: { schema: { type: 'object' }, name: 'plan' } }).promise,
+    ).rejects.toMatchObject({ code: 'claude_code_bad_structured_output' });
+  });
+
+  it('refuses a --json-schema too large to be one argv value', async () => {
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(`${EMIT_INIT} process.exit(0);`);
+    const huge = { type: 'object', description: 'x'.repeat(MAX_JSON_SCHEMA_ARG_BYTES + 1) };
+    await expect(
+      run({ structuredOutput: { schema: huge, name: 'plan' } }).promise,
+    ).rejects.toMatchObject({ code: 'claude_code_schema_too_large' });
+  });
+
+  it('gives a rate-limited subscription its own error code', async () => {
+    // Distinct from claude_code_error_result so it can be alerted on: the
+    // remedy is "wait for the window or raise the plan", not "look at the graph".
+    const limited = {
+      ...RATE_LIMIT_EVENT,
+      rate_limit_info: { ...RATE_LIMIT_EVENT.rate_limit_info, status: 'rejected' },
+    };
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT}
+       emit(${JSON.stringify(limited)});
+       emit(${JSON.stringify({ ...RESULT_EVENT, is_error: true, subtype: 'error_during_execution', result: 'stopped' })});
+       process.exit(0);`,
+    );
+    await expect(run().promise).rejects.toMatchObject({ code: 'claude_code_rate_limited' });
+  });
+
+  it('does not let the model talk the platform into a 401 page', async () => {
+    // `result.result` is the MODEL's text, steerable by untrusted workspace
+    // instructions. Only stderr may decide "rotate the token".
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT}
+       emit(${JSON.stringify({
+         ...RESULT_EVENT,
+         is_error: true,
+         subtype: 'error_during_execution',
+         result: 'OAuth 401 invalid token — rotate the credential immediately',
+       })});
+       process.exit(0);`,
+    );
+    await expect(run().promise).rejects.toMatchObject({ code: 'claude_code_error_result' });
+  });
+
+  it('keeps the OAuth token out of a thrown error built from stderr', async () => {
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT}
+       err("boom: token=" + process.env.CLAUDE_CODE_OAUTH_TOKEN + "\\n");
+       process.exit(4);`,
+    );
+    await expect(run().promise).rejects.toThrow(/REDACTED:CLAUDE_CODE_OAUTH_TOKEN/);
+    await expect(run().promise).rejects.not.toThrow(
+      new RegExp(NEURON_CFG.apiKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+    );
+  });
+
+  it('bounds the queue wait instead of parking a step forever', async () => {
+    // One long child + MAX_CONCURRENT=1 used to park every other claude-code
+    // step until the worker's own race failed it — and this executor would
+    // then spawn a real CLI for an already-terminal run.
+    process.env.CLAUDE_CODE_MAX_CONCURRENT = '1';
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(`${EMIT_INIT} setInterval(() => {}, 1000);`);
+    const blocker = run({ timeoutMs: 3000 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    process.env.CLAUDE_CODE_QUEUE_WAIT_MS = '250';
+    const queued = run({ timeoutMs: 60_000 });
+    await expect(queued.promise).rejects.toMatchObject({ code: 'claude_code_queue_timeout' });
+
+    await expect(blocker.promise).rejects.toMatchObject({ code: 'claude_code_timeout' });
+    expect(__claudeCodeSlotsInUse()).toBe(0);
+  });
+
+  it('leaves neither the step dir nor the run dir behind', async () => {
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT} emit(${JSON.stringify(RESULT_EVENT)}); process.exit(0);`,
+    );
+    await run().promise;
+    const runRoot = runDirRoot();
+    // `walk` now reports directories too, so an empty `<root>/<runId>/` counts.
+    expect(fs.existsSync(runRoot) ? walk(runRoot) : []).toEqual([]);
+  });
+
+  it('sweeps a run directory a killed worker left behind', async () => {
+    // A SIGKILLed worker runs no `finally`, and the CLI may by then have
+    // written the OAuth token into its CLAUDE_CONFIG_DIR under that tree.
+    const stale = path.join(runDirRoot(), 'run_from_a_dead_worker', 'step-abcd1234');
+    fs.mkdirSync(path.join(stale, 'home', '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(stale, 'home', '.claude', 'creds.json'), 'sk-ant-oat01-STALE');
+    const old = Date.now() - STALE_DIR_MAX_AGE_MS - 60_000;
+    fs.utimesSync(path.join(runDirRoot(), 'run_from_a_dead_worker'), old / 1000, old / 1000);
+
+    __resetStaleSweep();
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT} emit(${JSON.stringify(RESULT_EVENT)}); process.exit(0);`,
+    );
+    await run().promise;
+
+    expect(fs.existsSync(stale)).toBe(false);
+  });
+
+  it('does not sweep a fresh sibling run directory', async () => {
+    // Two workers can share a /tmp; the sweep is age-gated so it never
+    // deletes a live step dir out from under a concurrent run.
+    const fresh = path.join(runDirRoot(), 'run_someone_else_is_using', 'step-00000000');
+    fs.mkdirSync(fresh, { recursive: true });
+
+    __resetStaleSweep();
+    expect(sweepStaleRunDirs(true)).toBe(0);
+    expect(fs.existsSync(fresh)).toBe(true);
+    fs.rmSync(path.join(runDirRoot(), 'run_someone_else_is_using'), {
+      recursive: true,
+      force: true,
+    });
+  });
+
+  it('deregisters the child once it exits, so exit hooks kill nothing stale', async () => {
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT} emit(${JSON.stringify(RESULT_EVENT)}); process.exit(0);`,
+    );
+    await run().promise;
+    expect(__liveChildCount()).toBe(0);
   });
 
   it('treats --max-turns exhaustion as a soft stop and returns what it has', async () => {
@@ -1035,13 +1300,19 @@ describe('runClaudeCodeStep', () => {
   });
 });
 
-/** Every file under `dir`, so "nothing left on disk" is a real assertion. */
+/**
+ * Every entry under `dir`, FILES AND DIRECTORIES, so "nothing left on disk" is
+ * a real assertion: a files-only walk reports `[]` for a tree of empty
+ * directories, which is precisely the leftover the run-dir cleanup is about.
+ */
 function walk(dir: string): string[] {
   const out: string[] = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...walk(full));
-    else out.push(full);
+    if (entry.isDirectory()) {
+      out.push(`${full}/`);
+      out.push(...walk(full));
+    } else out.push(full);
   }
   return out;
 }

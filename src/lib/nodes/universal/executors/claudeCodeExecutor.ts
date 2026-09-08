@@ -113,6 +113,14 @@ export const DEFAULT_MAX_TURNS = 50;
  */
 export const MAX_SYSTEM_PROMPT_ARG_BYTES = 100 * 1024;
 
+/**
+ * `--json-schema` ceiling.
+ *
+ * Same MAX_ARG_STRLEN constraint as the system prompt, but with no stdin
+ * fallback to fold an oversized value into, so this one is a hard error.
+ */
+export const MAX_JSON_SCHEMA_ARG_BYTES = 100 * 1024;
+
 /** Bytes of stderr kept for the error message on a non-zero exit. */
 export const STDERR_TAIL_BYTES = 2048;
 
@@ -262,7 +270,30 @@ function maxConcurrent(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 1;
 }
 
-async function acquireSlot(abortSignal?: AbortSignal): Promise<void> {
+/**
+ * How long a step may wait for a slot, before being capped by its own timeout.
+ *
+ * Defaults to the step's whole budget (wait as long as you were going to live
+ * anyway); `CLAUDE_CODE_QUEUE_WAIT_MS` tightens it for an operator who would
+ * rather a queued step failed fast than burned its deadline waiting.
+ */
+export function queueWaitMs(timeoutMs: number): number {
+  const raw = Number.parseInt(process.env.CLAUDE_CODE_QUEUE_WAIT_MS || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : timeoutMs;
+}
+
+/**
+ * Wait for a slot, but never past `maxWaitMs`.
+ *
+ * An unbounded wait is not "patient", it is a queue with no failure mode: with
+ * `CLAUDE_CODE_MAX_CONCURRENT=1` (the default) one two-hour child parks every
+ * other `claude-code` step behind it until the WORKER's own job race fails
+ * them while they are still queued — and this executor would then acquire the
+ * slot and spawn a real CLI child, spending subscription quota, for a run that
+ * is already terminal. Failing fast with a distinct code is the honest answer:
+ * the step could not get a worker, which is an operational fact worth seeing.
+ */
+async function acquireSlot(abortSignal: AbortSignal | undefined, maxWaitMs: number): Promise<void> {
   if (abortSignal?.aborted) throw abortError('Run aborted before claude-code slot acquired');
   if (activeChildren < maxConcurrent()) {
     activeChildren += 1;
@@ -270,20 +301,40 @@ async function acquireSlot(abortSignal?: AbortSignal): Promise<void> {
   }
   await new Promise<void>((resolve, reject) => {
     let settled = false;
+    let timer: NodeJS.Timeout | null = null;
+    const unqueue = () => {
+      const idx = waiters.indexOf(admit);
+      if (idx >= 0) waiters.splice(idx, 1);
+      if (timer) clearTimeout(timer);
+    };
     const onAbort = () => {
       if (settled) return;
       settled = true;
-      const idx = waiters.indexOf(admit);
-      if (idx >= 0) waiters.splice(idx, 1);
+      unqueue();
       reject(abortError('Run aborted while queued for a claude-code slot'));
     };
     function admit(): void {
       if (settled) return;
       settled = true;
+      if (timer) clearTimeout(timer);
       abortSignal?.removeEventListener('abort', onAbort);
       activeChildren += 1;
       resolve();
     }
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      unqueue();
+      abortSignal?.removeEventListener('abort', onAbort);
+      reject(
+        new ClaudeCodeError(
+          'claude_code_queue_timeout',
+          `waited ${maxWaitMs} ms for one of ${maxConcurrent()} claude-code slot(s) on this ` +
+            `worker and never got one; raise CLAUDE_CODE_MAX_CONCURRENT or add workers`,
+        ),
+      );
+    }, maxWaitMs);
+    timer.unref?.();
     waiters.push(admit);
     abortSignal?.addEventListener('abort', onAbort, { once: true });
   });
@@ -293,6 +344,127 @@ function releaseSlot(): void {
   activeChildren = Math.max(0, activeChildren - 1);
   const next = waiters.shift();
   if (next) next();
+}
+
+// =============================================================================
+// Live children: surviving the worker's own death
+// =============================================================================
+
+/**
+ * Process-group ids of CLI children this process started and has not reaped.
+ *
+ * `detached: true` is what makes the group kill possible, but it also means
+ * the CLI is NOT killed when the worker dies — it is reparented to init, still
+ * holding `CLAUDE_CODE_OAUTH_TOKEN` in its environment and still spending
+ * subscription quota on a run nobody is listening to any more. A worker deploy
+ * severs in-flight runs routinely, so this is the common case, not the
+ * exotic one.
+ */
+const livePgids = new Set<number>();
+
+let exitHooksInstalled = false;
+
+/** Group-kill everything still running. Best effort by construction. */
+function killAllLiveChildren(signal: NodeJS.Signals = 'SIGTERM'): void {
+  for (const pgid of livePgids) {
+    try {
+      process.kill(-pgid, signal);
+    } catch {
+      /* already gone */
+    }
+  }
+  livePgids.clear();
+}
+
+/**
+ * Install the worker-death hooks once.
+ *
+ * `exit` cannot await anything, so the SIGTERM it sends is all the child gets;
+ * that is enough, because the CLI exits on a closed stdin anyway and the
+ * point here is to not leave a *detached* process holding a token. The signal
+ * handlers re-raise so normal shutdown is not swallowed — installing a
+ * listener for SIGTERM/SIGINT otherwise silently disables the default
+ * terminate behaviour, which would hang the worker on deploy.
+ */
+function installExitHooks(): void {
+  if (exitHooksInstalled) return;
+  exitHooksInstalled = true;
+
+  process.on('exit', () => killAllLiveChildren('SIGKILL'));
+
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(signal, () => {
+      killAllLiveChildren('SIGTERM');
+      // Restore the default and re-raise, so this hook observes the shutdown
+      // without becoming the thing that decides it.
+      process.removeAllListeners(signal);
+      process.kill(process.pid, signal);
+    });
+  }
+}
+
+/**
+ * Age past which a directory under `runDirRoot()` is considered abandoned.
+ *
+ * Only ever applied to directories this executor's own naming scheme created.
+ */
+export const STALE_DIR_MAX_AGE_MS = 60 * 60 * 1000;
+
+let sweptStaleDirs = false;
+
+/**
+ * Remove step directories left behind by a previous worker process.
+ *
+ * The `finally` block deletes the step dir on every path this process
+ * controls, but a SIGKILLed worker (OOM, `docker kill`, a node reboot)
+ * controls nothing — and the CLI may by then have persisted the OAuth token
+ * into its `CLAUDE_CONFIG_DIR`, which lives inside that directory. Those
+ * survive the worker, so sweep them at first use.
+ *
+ * Age-gated rather than "delete everything": two workers sharing a `/tmp` (a
+ * dev box, two vitest workers) must not delete each other's live step dirs,
+ * and nothing legitimate under here is an hour old.
+ */
+export function sweepStaleRunDirs(force = false): number {
+  if (sweptStaleDirs && !force) return 0;
+  sweptStaleDirs = true;
+  const root = runDirRoot();
+  let removed = 0;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return 0; // no root yet: nothing to sweep
+  }
+  const cutoff = Date.now() - STALE_DIR_MAX_AGE_MS;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const full = path.join(root, entry.name);
+    try {
+      if (fs.statSync(full).mtimeMs > cutoff) continue;
+      fs.rmSync(full, { recursive: true, force: true });
+      removed++;
+    } catch {
+      /* a directory we cannot stat or remove is not ours to worry about */
+    }
+  }
+  if (removed > 0) {
+    console.warn(
+      `[ClaudeCode] swept ${removed} abandoned run director${removed === 1 ? 'y' : 'ies'} ` +
+        `under ${root} (a previous worker died without cleaning up)`,
+    );
+  }
+  return removed;
+}
+
+/** Test-only: reset the once-per-process sweep latch. */
+export function __resetStaleSweep(): void {
+  sweptStaleDirs = false;
+}
+
+/** Test-only: pgids currently registered as live. */
+export function __liveChildCount(): number {
+  return livePgids.size;
 }
 
 /** Test-only: current occupancy of the worker-wide semaphore. */
@@ -357,11 +529,33 @@ export function resolveWorkspaceMount(state: AnyObject): { name: string; tree: s
     (typeof state?.data?.workspaceName === 'string' && state.data.workspaceName) ||
     '';
   const name = rawName && /^[a-z0-9][a-z0-9-]{1,62}$/.test(rawName) ? rawName : DEFAULT_WS_NAME;
-  const tree =
-    typeof ws?.tree === 'string' && ws.tree.startsWith('/')
-      ? ws.tree
-      : `${WS_ROOT}/${name}/tree`;
-  return { name, tree };
+
+  // The default, and the only shape a supplied `tree` may take.
+  const canonical = `${WS_ROOT}/${name}/tree`;
+
+  // `tree` becomes the child's cwd and is passed to `mkdirSync(recursive)`,
+  // so "starts with a slash" is nowhere near enough: `/etc/cron.d` starts with
+  // a slash. It must live under the mount point the validated slug already
+  // fixed, which also means a `tree` cannot smuggle in a different workspace
+  // than the `name` the slug check approved. `..` is refused outright rather
+  // than normalised, because a path that needs normalising is not one this
+  // ever meant to accept.
+  const supplied = typeof ws?.tree === 'string' ? ws.tree : '';
+  const prefix = `${WS_ROOT}/${name}/`;
+  const acceptable =
+    supplied === canonical ||
+    (supplied.startsWith(prefix) &&
+      !supplied.includes('..') &&
+      !supplied.includes('\0') &&
+      !supplied.includes('//'));
+
+  if (supplied && !acceptable) {
+    console.warn(
+      `[ClaudeCode] ignoring workspace tree ${JSON.stringify(supplied)}: ` +
+        `it is not under ${prefix}`,
+    );
+  }
+  return { name, tree: acceptable ? supplied : canonical };
 }
 
 /**
@@ -509,6 +703,12 @@ export interface ClaudeInitEvent {
   apiKeySource?: string;
   permissionMode?: string;
   claude_code_version?: string;
+  /** Empty under `--disable-slash-commands`; 42 entries without it. */
+  slash_commands?: string[];
+  /** Empty under `--disable-slash-commands`; 16 entries without it. */
+  skills?: string[];
+  /** Present ONLY when `--restricted` is absent (auto-memory is on). */
+  memory_paths?: string[];
 }
 
 export interface StreamHandlerState {
@@ -671,13 +871,56 @@ export function assertInitEvent(
   }
 
   // `apiKeySource` is `"none"` for OAuth/subscription auth of any kind
-  // (VERIFIED, 16-phase0-smoke.md §4). Anything else means an
-  // `ANTHROPIC_API_KEY`-shaped credential reached a child whose env is
-  // supposed to be an allowlist — a leak, not a preference.
-  if (typeof init.apiKeySource === 'string' && init.apiKeySource !== 'none') {
+  // (VERIFIED live on 2.1.263, 2026-09-07: the field is PRESENT in the
+  // stream-json init event under a subscription token — it is only the
+  // `--output-format json` *result* envelope that omits it). Anything else
+  // means an `ANTHROPIC_API_KEY`-shaped credential reached a child whose env
+  // is supposed to be an allowlist — a leak, not a preference.
+  //
+  // Presence is required, not just the value: tolerating an absent field would
+  // mean a CLI build that stopped emitting it silently disabled this
+  // assertion, which is exactly the failure mode a security check must not
+  // have. If a future CLI drops the field this fails loudly and gets looked at.
+  if (init.apiKeySource !== 'none') {
     return {
       code: 'claude_code_api_key_leak',
-      message: `apiKeySource is '${init.apiKeySource}', expected 'none' — an API key reached the child env`,
+      message:
+        `apiKeySource is ${init.apiKeySource === undefined ? 'absent' : `'${init.apiKeySource}'`}, ` +
+        `expected 'none' — an API key reached the child env, or this CLI no longer reports the source`,
+    };
+  }
+
+  // `--restricted` and `--disable-slash-commands` are load-bearing, so verify
+  // them off the wire rather than trusting that the flags were accepted.
+  // Measured on 2.1.263: with both flags, `slash_commands` and `skills` are
+  // `[]` and `memory_paths` is absent entirely; without `--restricted`,
+  // `memory_paths` appears (auto-memory reads files the worker never vetted).
+  // Bundled commands and skills cannot execute anything while `tools` is
+  // empty, but they are injectable instruction surface.
+  const slashCommands = Array.isArray(init.slash_commands) ? init.slash_commands : [];
+  if (slashCommands.length > 0) {
+    return {
+      code: 'claude_code_init_failed',
+      message:
+        `--disable-slash-commands did not take: ${slashCommands.length} slash command(s) are loaded ` +
+        `(${slashCommands.slice(0, 5).join(', ')})`,
+    };
+  }
+  const skills = Array.isArray(init.skills) ? init.skills : [];
+  if (skills.length > 0) {
+    return {
+      code: 'claude_code_init_failed',
+      message:
+        `--disable-slash-commands did not take: ${skills.length} skill(s) are loaded ` +
+        `(${skills.slice(0, 5).join(', ')})`,
+    };
+  }
+  if (init.memory_paths !== undefined) {
+    return {
+      code: 'claude_code_init_failed',
+      message:
+        '--restricted did not take: the init event reports memory_paths, so auto-memory is on ' +
+        'and the CLI will read files outside the step directory',
     };
   }
 
@@ -736,11 +979,62 @@ function num(value: unknown): number {
 }
 
 /**
+ * Remove the OAuth token from text bound for a log, an error or the archive.
+ *
+ * Cheap insurance on the one value whose whole security model is "it never
+ * leaves the child's environment".
+ */
+export function redactToken(text: string, token: string): string {
+  if (!text || !token || token.length < 8) return text;
+  return text.split(token).join('[REDACTED:CLAUDE_CODE_OAUTH_TOKEN]');
+}
+
+/** Is this `rate_limit_info` telling us the subscription is capped out? */
+export function isRateLimited(rateLimit: AnyObject | null | undefined): boolean {
+  if (!rateLimit) return false;
+  const status = typeof rateLimit.status === 'string' ? rateLimit.status : '';
+  // `allowed` is the healthy value; anything else (`rejected`,
+  // `allowed_warning` escalating, …) means the window is closing or closed.
+  if (status && status !== 'allowed' && status !== 'allowed_warning') return true;
+  // Overage explicitly refused with the primary window exhausted.
+  const util = num(rateLimit.unifiedWindows?.five_hour?.utilization);
+  return rateLimit.overageStatus === 'rejected' && util >= 1;
+}
+
+/** Does this text look like Anthropic refusing on quota rather than auth? */
+export function looksLikeRateLimit(text: string): boolean {
+  if (!text) return false;
+  return (
+    /\b429\b/.test(text) ||
+    /rate[ _-]?limit/i.test(text) ||
+    /usage limit reached/i.test(text) ||
+    /\bquota\b[^\n]{0,40}\b(exceeded|exhausted)\b/i.test(text)
+  );
+}
+
+/** One-line description of the rate-limit window for an operator. */
+export function describeRateLimit(rateLimit: AnyObject | null | undefined): string {
+  if (!rateLimit) return 'no rate_limit_event was received';
+  const parts = [`status=${rateLimit.status ?? 'unknown'}`];
+  const five = rateLimit.unifiedWindows?.five_hour?.utilization;
+  const seven = rateLimit.unifiedWindows?.seven_day?.utilization;
+  if (five !== undefined) parts.push(`5h=${five}`);
+  if (seven !== undefined) parts.push(`7d=${seven}`);
+  if (rateLimit.resetsAt) parts.push(`resetsAt=${rateLimit.resetsAt}`);
+  if (rateLimit.overageStatus) parts.push(`overage=${rateLimit.overageStatus}`);
+  return parts.join(' ');
+}
+
+/**
  * Does this text look like Anthropic rejecting the token?
  *
  * `apiKeySource` cannot answer this — it reads `"none"` on a perfectly healthy
  * subscription run (16-phase0-smoke.md §8.1), so the detector keys on the CLI's
  * own 401 text and on a bare 401 status instead.
+ *
+ * Only ever run over STDERR. The model's own text is steerable by untrusted
+ * workspace instructions, and a model that can choose the platform's error
+ * code can manufacture "rotate the token" pages on demand.
  */
 export function looksLikeAuthFailure(text: string): boolean {
   if (!text) return false;
@@ -823,6 +1117,10 @@ export async function runClaudeCodeStep(
     sanitizeSegment(runId, 'norun'),
     `${sanitizeSegment(stepId, 'step')}-${crypto.randomBytes(4).toString('hex')}`,
   );
+  // Before creating ours, clear out anything a previously-killed worker left
+  // behind — those directories can contain a CLAUDE_CONFIG_DIR the CLI wrote
+  // the OAuth token into. Once per process, age-gated.
+  sweepStaleRunDirs();
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.chmodSync(dir, 0o700);
   fs.mkdirSync(path.join(dir, 'home', '.claude'), { recursive: true, mode: 0o700 });
@@ -843,6 +1141,7 @@ export async function runClaudeCodeStep(
   let killTimer: NodeJS.Timeout | null = null;
   let pollTimer: NodeJS.Timeout | null = null;
   let slotHeld = false;
+  let spawnedPgid: number | null = null;
 
   /**
    * Mutable outcome flags.
@@ -901,8 +1200,57 @@ export async function runClaudeCodeStep(
   };
 
   try {
-    await acquireSlot(abortSignal);
+    // The queue wait comes out of the step's own budget: a step cannot
+    // usefully wait longer than its own deadline, and time spent queued is
+    // time the caller has already granted. `CLAUDE_CODE_QUEUE_WAIT_MS` can cap
+    // it tighter (fail fast and let the graph retry elsewhere) but never
+    // looser.
+    const queueBudgetMs = Math.min(timeoutMs, queueWaitMs(timeoutMs));
+    const queueStartedAt = Date.now();
+    await acquireSlot(abortSignal, queueBudgetMs);
     slotHeld = true;
+    const queuedMs = Date.now() - queueStartedAt;
+
+    // Whatever is left of the wall clock after queueing. A step that spent its
+    // whole budget waiting must not now spawn a real CLI child.
+    const runTimeoutMs = timeoutMs - queuedMs;
+    if (runTimeoutMs <= 0) {
+      throw new ClaudeCodeError(
+        'claude_code_queue_timeout',
+        `claude-code step '${stepId}' spent its entire ${timeoutMs} ms budget queued for a slot`,
+      );
+    }
+    if (queuedMs > 1000) {
+      console.warn(`[ClaudeCode] step '${stepId}' waited ${queuedMs} ms for a slot`);
+    }
+
+    // Re-check liveness AFTER queueing. The run may have been cancelled, timed
+    // out at the worker, or otherwise gone terminal while this step sat in the
+    // queue — and the whole point of the check is to not spend subscription
+    // quota on an answer nobody will read.
+    if (abortSignal?.aborted) {
+      throw abortError(`claude-code step '${stepId}' aborted while queued for a slot`);
+    }
+    // `wasCancelled` consults the tombstone, so it still answers correctly
+    // after the run context has been unregistered — which is exactly the state
+    // a step that queued through its run's own death finds itself in.
+    if (runControlRegistry.wasCancelled(runId)) {
+      throw abortError(`claude-code step '${stepId}' was cancelled while queued for a slot`);
+    }
+    if (queuedMs > 0 && publisher?.getState) {
+      try {
+        const queuedRunState = await publisher.getState();
+        const queuedStatus = queuedRunState?.status;
+        if (typeof queuedStatus === 'string' && TERMINAL_RUN_STATUSES.has(queuedStatus)) {
+          throw abortError(
+            `claude-code step '${stepId}' not started: run went ${queuedStatus} while queued`,
+          );
+        }
+      } catch (err) {
+        // A terminal-status abort must propagate; a Redis hiccup must not.
+        if ((err as AnyObject)?.name === 'AbortError') throw err;
+      }
+    }
 
     // ── tools → bridge ─────────────────────────────────────────────────────
     const attached = Array.isArray(config.tools) ? config.tools : [];
@@ -965,6 +1313,23 @@ export async function runClaudeCodeStep(
       );
     }
 
+    // `--json-schema` is an argv value like `--system-prompt`, so it is under
+    // the same MAX_ARG_STRLEN ceiling. Unlike the system prompt there is no
+    // stdin fallback to fold it into, so an oversized schema is a
+    // configuration error rather than something to work around silently.
+    let jsonSchemaArg: string | undefined;
+    if (config.structuredOutput) {
+      jsonSchemaArg = JSON.stringify(config.structuredOutput.schema);
+      const schemaBytes = Buffer.byteLength(jsonSchemaArg, 'utf8');
+      if (schemaBytes > MAX_JSON_SCHEMA_ARG_BYTES) {
+        throw new ClaudeCodeError(
+          'claude_code_schema_too_large',
+          `structuredOutput schema is ${schemaBytes} bytes; the CLI takes it as a single ` +
+            `argv value, capped at ${MAX_JSON_SCHEMA_ARG_BYTES}`,
+        );
+      }
+    }
+
     const args = buildSpawnArgs({
       model,
       effort: resolveEffort(state, neuronCfg),
@@ -973,9 +1338,7 @@ export async function runClaudeCodeStep(
       resumeSessionId: resolveResumeSessionId(config, state, stepId),
       maxTurns,
       systemPrompt: systemFitsInArgv ? systemPrompt : undefined,
-      jsonSchema: config.structuredOutput
-        ? JSON.stringify(config.structuredOutput.schema)
-        : undefined,
+      jsonSchema: jsonSchemaArg,
     });
 
     const env = buildChildEnv({ dir, oauthToken });
@@ -998,6 +1361,16 @@ export async function runClaudeCodeStep(
     // there — the two are a pair.
     child = spawn(bin, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
 
+    // Track the group so a dying worker takes the CLI with it. `detached`
+    // otherwise reparents the child to init with the OAuth token still in its
+    // environment; a worker deploy severs in-flight runs as a matter of
+    // routine, so this path is ordinary, not exotic.
+    if (child.pid) {
+      installExitHooks();
+      livePgids.add(child.pid);
+      spawnedPgid = child.pid;
+    }
+
     // ── cancellation, abort, wall clock, run-record poll ───────────────────
     unregisterCancel = runControlRegistry.registerOnCancel(runId, () =>
       requestKill('run cancelled'),
@@ -1012,8 +1385,8 @@ export async function runClaudeCodeStep(
     }
     wallTimer = setTimeout(() => {
       ctl.timedOut = true;
-      requestKill(`wall-clock timeout after ${timeoutMs} ms`);
-    }, timeoutMs);
+      requestKill(`wall-clock timeout after ${runTimeoutMs} ms`);
+    }, runTimeoutMs);
     wallTimer.unref?.();
     if (publisher?.getState) {
       pollTimer = setInterval(() => {
@@ -1083,10 +1456,14 @@ export async function runClaudeCodeStep(
       }
     });
 
+    // stderr is quoted verbatim into thrown errors, which reach the run
+    // record, the archive and an ops DM. The CLI has no business echoing its
+    // own token, but "no business" is not a guarantee, and this is the one
+    // place a token could ride out of an env allowlist into a log.
     let stderrTail = '';
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
-      stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_BYTES);
+      stderrTail = redactToken(stderrTail + chunk, oauthToken).slice(-STDERR_TAIL_BYTES);
     });
 
     const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
@@ -1118,16 +1495,44 @@ export async function runClaudeCodeStep(
     if (ctl.timedOut) {
       throw new ClaudeCodeError(
         'claude_code_timeout',
-        `claude-code step '${stepId}' exceeded ${timeoutMs} ms and was killed`,
+        `claude-code step '${stepId}' exceeded ${runTimeoutMs} ms of run time ` +
+          `(of a ${timeoutMs} ms budget) and was killed`,
       );
     }
     if (ctl.killReason && !handler.state.result) {
       throw abortError(`claude-code step '${stepId}' stopped: ${ctl.killReason}`);
     }
 
+    // No init event at all.
+    //
+    // `onInit` only runs if one actually arrived, so a stream that never emits
+    // one skips every assertion above — no tool check, no `apiKeySource`
+    // check — and a lone `result` would otherwise be accepted as a clean run.
+    // A guard is only a guard if its ABSENCE is a failure too.
+    //
+    // Checked after the timeout and cancel branches on purpose: those are more
+    // specific diagnoses of the same missing stream, and reporting "no init
+    // event" for a run the operator cancelled would send them looking in the
+    // wrong place.
+    if (!handler.state.init) {
+      const failure = assertInitEvent(null, expectedTools);
+      throw new ClaudeCodeError(
+        failure!.code,
+        `claude-code init guard rejected the session: ${failure!.message} ` +
+          `(exit ${exit.code ?? 'null'}${exit.signal ? `, ${exit.signal}` : ''})`,
+      );
+    }
+
     const result = handler.state.result;
     if (!result) {
       const tail = stderrTail.trim();
+      if (isRateLimited(handler.state.rateLimit) || looksLikeRateLimit(tail)) {
+        throw new ClaudeCodeError(
+          'claude_code_rate_limited',
+          `the shared Claude subscription is rate limited ` +
+            `(${describeRateLimit(handler.state.rateLimit)}); the CLI exited without a result`,
+        );
+      }
       if (looksLikeAuthFailure(tail)) {
         throw new ClaudeCodeError(
           'claude_code_auth_401',
@@ -1221,10 +1626,26 @@ export async function runClaudeCodeStep(
     if (isError && !softMaxTurns) {
       const detail =
         (typeof result.result === 'string' && result.result) || stderrTail.trim() || '(no detail)';
-      if (looksLikeAuthFailure(detail)) {
+      // Match ONLY against stderr, never `result.result`. That field is the
+      // model's own text, and the model is steerable by workspace
+      // instructions and tool output the platform did not write — so letting
+      // it decide the error code lets an untrusted tree fabricate
+      // "rotate the token" ops pages at will. stderr comes from the CLI.
+      if (looksLikeAuthFailure(stderrTail)) {
         throw new ClaudeCodeError(
           'claude_code_auth_401',
-          `Anthropic rejected the subscription token — rotate the 'claude-code-oauth' secret. ${detail}`,
+          `Anthropic rejected the subscription token — rotate the 'claude-code-oauth' secret. ` +
+            `${stderrTail.trim() || '(no stderr)'}`,
+        );
+      }
+      // A capped-out subscription is an operational condition with its own
+      // remedy (wait for the window, or raise the plan) and deserves its own
+      // code rather than being buried in the generic failure.
+      if (isRateLimited(handler.state.rateLimit) || looksLikeRateLimit(stderrTail)) {
+        throw new ClaudeCodeError(
+          'claude_code_rate_limited',
+          `the shared Claude subscription is rate limited (${describeRateLimit(handler.state.rateLimit)}); ` +
+            `claude-code step '${stepId}' could not complete`,
         );
       }
       throw new ClaudeCodeError(
@@ -1238,12 +1659,32 @@ export async function runClaudeCodeStep(
       );
     }
 
+    // Structured output is a PARSED OBJECT for every other provider —
+    // `withStructuredOutput` returns one, and the Ollama path JSON.parses the
+    // content itself (`neuronExecutor.ts:533`, `:749`). Returning the raw
+    // string here would make `{{state.data.plan.steps}}` silently resolve to
+    // nothing for `claude-code` alone, which is the kind of difference that
+    // only shows up in a graph someone already shipped.
+    let output: unknown = finalText;
+    if (config.structuredOutput && typeof finalText === 'string') {
+      try {
+        output = JSON.parse(finalText);
+      } catch (err) {
+        throw new ClaudeCodeError(
+          'claude_code_bad_structured_output',
+          `step '${stepId}' declares structuredOutput but the CLI returned text that is not ` +
+            `JSON (${err instanceof Error ? err.message : String(err)}): ` +
+            `${finalText.slice(0, 200)}`,
+        );
+      }
+    }
+
     // Write in place so later steps of the SAME node can read it, and return
     // the flat key so the value survives the LangGraph reducer.
     const cliBag: AnyObject = { ...(state?.data?._cli ?? {}), [stepId]: cli };
     if (state?.data && typeof state.data === 'object') state.data._cli = cliBag;
 
-    return { [stepId]: finalText, 'data._cli': cliBag };
+    return { [stepId]: output, 'data._cli': cliBag };
   } finally {
     if (reader) {
       try {
@@ -1277,6 +1718,16 @@ export async function runClaudeCodeStep(
     } catch (err) {
       console.warn(`[ClaudeCode] failed to remove step dir ${dir}:`, err);
     }
+    // And the run's own directory, which is this step's parent. `rmdir`
+    // (not `rm -rf`) on purpose: it succeeds only when the directory is
+    // empty, so the LAST step of a run tidies up and a concurrent sibling
+    // step's directory is never taken out from under it.
+    try {
+      fs.rmdirSync(path.dirname(dir));
+    } catch {
+      /* not empty (a sibling step is still running), or already gone */
+    }
+    if (spawnedPgid !== null) livePgids.delete(spawnedPgid);
     if (slotHeld) releaseSlot();
   }
 }
