@@ -37,6 +37,7 @@ export { extractThinking, logThinking, extractAndLogThinking } from "./lib/utils
 // Export RAG (Retrieval-Augmented Generation) components
 export {
   VectorStoreManager,
+  DEFAULT_SIMILARITY_THRESHOLD,
   DocumentChunk,
   SearchResult,
   ChunkingConfig,

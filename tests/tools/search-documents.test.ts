@@ -130,7 +130,7 @@ describe('search_documents', () => {
     expect(result.isError).toBeFalsy();
     // Formatted markdown contains the match and pending note
     expect(result.content[0].text).toContain('match-1');
-    expect(result.content[0].text).toContain('85.0% relevant');
+    expect(result.content[0].text).toContain('[similarity: 0.850]');
     expect(result.content[0].text).toContain('1 document(s) currently pending indexing');
 
     // Structured JSON content block

@@ -10,6 +10,7 @@
 
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 import mongoose from 'mongoose';
+import { DEFAULT_SIMILARITY_THRESHOLD } from '../../memory/vectors';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -182,8 +183,8 @@ const searchDocuments: NativeToolDefinition = {
       },
       threshold: {
         type: 'number',
-        description: 'Minimum similarity threshold 0-1 (default: 0.7)',
-        default: 0.7,
+        description: `Minimum similarity threshold 0-1 (default: ${DEFAULT_SIMILARITY_THRESHOLD})`,
+        default: DEFAULT_SIMILARITY_THRESHOLD,
       },
       filter: {
         type: 'object',
@@ -205,7 +206,7 @@ const searchDocuments: NativeToolDefinition = {
       query,
       collection,
       topK = 5,
-      threshold = 0.7,
+      threshold = DEFAULT_SIMILARITY_THRESHOLD,
       filter,
       mergeChunks = true,
     } = args;
@@ -313,12 +314,12 @@ const searchDocuments: NativeToolDefinition = {
 
       for (let i = 0; i < processedResults.length; i++) {
         const result = processedResults[i];
-        const relevance = (result.score * 100).toFixed(1);
+        const scoreStr = result.score.toFixed(3);
         const source = result.metadata?.source || 'unknown';
         const mergedCount = result.metadata?.mergedChunks;
         const mergeInfo = mergedCount > 1 ? ` (${mergedCount} chunks merged)` : '';
 
-        resultText += `## Result ${i + 1} - ${relevance}% relevant${mergeInfo}\n`;
+        resultText += `## Result ${i + 1} [similarity: ${scoreStr}]${mergeInfo}\n`;
         resultText += `**Source:** ${source}\n\n`;
         resultText += `${result.text}\n\n`;
         resultText += `---\n\n`;
