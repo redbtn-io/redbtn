@@ -145,6 +145,12 @@ export interface IEnvironment {
   /** Default working directory for `exec`. Optional — falls back to home. */
   workingDir?: string;
 
+  // --- Workspace integration ---
+  /** Optional Workspace ID if this environment was spawned for a workspace checkout. */
+  workspaceId?: string;
+  /** Optional Checkout ID if this environment was spawned for a workspace checkout. */
+  checkoutId?: string;
+
   // --- Lifecycle ---
   /** Idle timeout in ms after last op. Default 300000 (5 min). */
   idleTimeoutMs: number;

@@ -510,8 +510,8 @@ export interface StartRunToolBridgeOptions {
    * capability profile is still what decides which environment is reachable.
    */
   environmentId: string;
-  /** Default `cwd` / `workingDir` for calls whose schema declares one. */
-  workingDir: string;
+  /** Default `cwd` / `workingDir` for calls whose schema declares one. Defaults to '/workspace'. */
+  workingDir?: string;
   /** Run-level abort signal. Aborting revokes and closes the bridge. */
   abortSignal: AbortSignal | null;
   /** Owning neuron step id, stamped on every published tool event. */
@@ -942,7 +942,7 @@ export async function startRunToolBridge(
     publisher,
     resolvedTools,
     environmentId,
-    workingDir,
+    workingDir = '/workspace',
     abortSignal,
     neuronStepId,
     dir,
@@ -1264,10 +1264,11 @@ export async function startRunToolBridge(
     }
 
     const schemaProps = (served.inputSchema as AnyObject)?.properties as AnyObject | undefined;
-    if (workingDir) {
-      if (schemaProps?.cwd && (args.cwd === undefined || args.cwd === '')) args.cwd = workingDir;
+    const effectiveWorkingDir = workingDir || '/workspace';
+    if (effectiveWorkingDir) {
+      if (schemaProps?.cwd && (args.cwd === undefined || args.cwd === '')) args.cwd = effectiveWorkingDir;
       if (schemaProps?.workingDir && (args.workingDir === undefined || args.workingDir === '')) {
-        args.workingDir = workingDir;
+        args.workingDir = effectiveWorkingDir;
       }
     }
 

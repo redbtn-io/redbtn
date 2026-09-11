@@ -726,6 +726,14 @@ describe('environmentId pin', () => {
     expect(received[0].args.workingDir).toBe(WORKING_DIR);
   });
 
+  it('defaults workingDir to /workspace when omitted from start options', async () => {
+    const { bridge: b } = await start({ workingDir: undefined });
+    const c = await client(b);
+    await c.send('tools/call', { name: 'bridge_probe', arguments: { note: 'hi' } });
+    expect(received[0].args.cwd).toBe('/workspace');
+    expect(received[0].args.workingDir).toBe('/workspace');
+  });
+
   it('defaults cwd to the session workingDir and leaves an explicit cwd alone', async () => {
     const { bridge: b } = await start();
     const c = await client(b);

@@ -609,20 +609,40 @@ export function resolveWorkspaceMount(state: AnyObject): { name: string; tree: s
     '';
   const name = rawName && /^[a-z0-9][a-z0-9-]{1,62}$/.test(rawName) ? rawName : DEFAULT_WS_NAME;
   const canonical = `${WS_ROOT}/${name}/tree`;
-  const supplied = typeof ws?.tree === 'string' ? ws.tree : '';
+
+  // Check if this is a dedicated workspace execution (PR 5)
+  const isDedicatedWorkspace = Boolean(
+    state?.data?.workspaceId ||
+    state?.parameters?.workspaceId ||
+    ws?.workspaceId ||
+    (typeof ws?.tree === 'string' && (ws.tree === '/workspace' || ws.tree.startsWith('/workspace/'))) ||
+    (typeof state?.data?.workingDir === 'string' && (state.data.workingDir === '/workspace' || state.data.workingDir.startsWith('/workspace/')))
+  );
+
+  const defaultTree = isDedicatedWorkspace ? '/workspace' : canonical;
+
+  const supplied = typeof ws?.tree === 'string'
+    ? ws.tree
+    : (isDedicatedWorkspace && typeof state?.data?.workingDir === 'string' && (state.data.workingDir === '/workspace' || state.data.workingDir.startsWith('/workspace/'))
+        ? state.data.workingDir
+        : '');
+
   const prefix = `${WS_ROOT}/${name}/`;
   const acceptable =
+    supplied === '/workspace' ||
+    (typeof supplied === 'string' && supplied.startsWith('/workspace/') && !supplied.includes('..') && !supplied.includes('\0') && !supplied.includes('//')) ||
     supplied === canonical ||
     (supplied.startsWith(prefix) &&
       !supplied.includes('..') &&
       !supplied.includes('\0') &&
       !supplied.includes('//'));
+
   if (supplied && !acceptable) {
     console.warn(
       `[AgyCli] ignoring workspace tree ${JSON.stringify(supplied)}: it is not under ${prefix}`,
     );
   }
-  return { name, tree: acceptable ? supplied : canonical };
+  return { name, tree: acceptable ? supplied : defaultTree };
 }
 
 /**

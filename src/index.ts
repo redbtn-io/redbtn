@@ -271,6 +271,9 @@ export type {
   LoadEnvironmentDeps,
 } from './lib/environments';
 
+// Workspaces subsystem (containerized execution substrates + CAS checkouts)
+export * from './lib/workspaces/index.js';
+
 // --- Type Definitions ---
 
 /**
