@@ -23,3 +23,7 @@ export {
   RED_MEMORY_WRITER_CAPABILITY_PROFILE,
   RED_MEMORY_WRITER_GRAPH_IDS,
 } from './red-memory-writer-profile';
+export {
+  RED_CODER_CAPABILITY_PROFILE,
+  RED_CODER_GRAPH_IDS,
+} from './red-coder-profile';
