@@ -245,7 +245,6 @@ describe('enforceToolCapability — knowledge', () => {
       ['list_stream_sessions', { streamId: 'stream-1' }],
       ['get_stream_session', { sessionId: 'sess-1' }],
       ['send_email', { to: 'victim@example.com' }],
-      ['send_webhook', { url: 'https://example.com/webhook' }],
       ['fetch_url', { url: 'https://example.com' }],
       ['scrape_url', { url: 'https://example.com' }],
       ['task_create', { subject: 'new task' }],

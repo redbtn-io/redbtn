@@ -57,7 +57,7 @@ export type CapabilityResource =
   | 'run'          // run queries (get_recent_runs, get_run, get_run_logs)
   | 'conversation' // conversation queries (get_messages, get_context_history, get_conversation)
   | 'stream'       // stream session queries (list_stream_sessions, get_stream_session)
-  | 'communication'// outbound notifications (send_email, send_webhook)
+  | 'communication'// outbound notifications (send_email; send_webhook stays UNMAPPED: the run bridge forbids it unconditionally)
   | 'web'          // outbound web queries (fetch_url, scrape_url)
   | 'task';        // agent task tracking (task_create, task_list, task_get, task_update, task_complete)
 

@@ -347,7 +347,6 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
 
   // ── Communication / Outbound notifications ────────────────────────────────
   send_email: { resource: 'communication', action: 'write', extract: emailRecipient },
-  send_webhook: { resource: 'communication', action: 'write', extract: urlAddress },
 
   // ── Web / Network ─────────────────────────────────────────────────────────
   fetch_url: { resource: 'web', action: 'read', extract: urlAddress },
