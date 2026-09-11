@@ -1,0 +1,156 @@
+{
+  "graphId": "autonomous-workspace-agent",
+  "userId": "system",
+  "isDefault": true,
+  "isSystem": true,
+  "name": "Autonomous Workspace Agent",
+  "description": "Dedicated workspace runner agent. Manages two-tiered context via Global State (Workspace_<workspaceId>), injects scratchpad, runs CLI neuron with fallback, and safely sanitizes and persists scratchpad.",
+  "graphType": "workflow",
+  "tier": 4,
+  "version": "1.0.0",
+  "nodes": [
+    {
+      "id": "workspace-init",
+      "config": {
+        "nodeId": "command",
+        "steps": [
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.workspaceId",
+              "value": "{{state.data.input?.workspaceId || state.data.workspaceId || 'default'}}"
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.workspaceNamespace",
+              "value": "{{'Workspace_' + (state.data.workspaceId).replace(/[^A-Za-z0-9_]/g, '_')}}"
+            }
+          },
+          {
+            "type": "tool",
+            "config": {
+              "toolName": "get_global_state",
+              "parameters": {
+                "namespace": "{{state.data.workspaceNamespace}}",
+                "key": "scratchpad"
+              },
+              "outputField": "data.rawScratchpadResult",
+              "errorHandling": {
+                "onError": "continue"
+              }
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.rawScratchpad",
+              "value": "{{state.data.rawScratchpadResult?.value || state.data.rawScratchpadResult || ''}}"
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.workingDir",
+              "value": "/workspace"
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.fullPrompt",
+              "value": "{{(function(){ var p = state.data.input?.prompt || state.data.prompt || ''; var sp = state.data.rawScratchpad; if (sp && sp.trim()) { return '=== PERSISTED WORKSPACE SCRATCHPAD ===\\n' + sp.trim() + '\\n=== END SCRATCHPAD ===\\n\\n' + p; } return p; })()}}"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "workspace-execute",
+      "config": {
+        "nodeId": "command",
+        "steps": [
+          {
+            "type": "neuron",
+            "config": {
+              "neuronId": "{{state.data.input?.neuronId || state.data.neuronId || 'claude-code-opus'}}",
+              "fallbackNeuronId": "{{state.data.input?.fallbackNeuronId || state.data.fallbackNeuronId || 'gemini-2-5-flash-chat'}}",
+              "systemPrompt": "You are an autonomous engineering agent working in a persistent workspace mounted at /workspace. Maintain the project context. If you make architectural decisions or plan follow-up tasks, update the scratchpad block enclosed in === SCRATCHPAD === ... === END SCRATCHPAD ===.",
+              "userPrompt": "{{state.data.fullPrompt}}",
+              "outputField": "data.agentOutput",
+              "tools": ["run_command", "read_file", "write_to_file", "edit_file", "list_dir"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "workspace-persist",
+      "config": {
+        "nodeId": "command",
+        "steps": [
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.sanitizedScratchpad",
+              "value": "{{(function(){ var raw = ''; if (typeof state.data.agentOutput === 'string') { var match = state.data.agentOutput.match(/=== (?:UPDATED )?SCRATCHPAD ===([\\s\\S]*?)=== END SCRATCHPAD ===/i); if (match) raw = match[1].trim(); } if (!raw && state.data.agentOutput && typeof state.data.agentOutput === 'object' && state.data.agentOutput.scratchpad) { raw = String(state.data.agentOutput.scratchpad).trim(); } if (!raw) raw = state.data.rawScratchpad || ''; var sanitized = String(raw).replace(/\\{\\{/g, '').replace(/\\}\\}/g, ''); if (sanitized.length > 8192) { sanitized = sanitized.slice(0, 8192); } return sanitized; })()}}"
+            }
+          },
+          {
+            "type": "tool",
+            "config": {
+              "toolName": "set_global_state",
+              "parameters": {
+                "namespace": "{{state.data.workspaceNamespace}}",
+                "key": "scratchpad",
+                "value": "{{state.data.sanitizedScratchpad}}"
+              },
+              "outputField": "data.setGlobalStateResult",
+              "errorHandling": {
+                "onError": "continue"
+              }
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.response",
+              "value": "{{state.data.agentOutput}}"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    { "from": "__start__", "to": "workspace-init" },
+    { "from": "workspace-init", "to": "workspace-execute" },
+    { "from": "workspace-execute", "to": "workspace-persist" },
+    { "from": "workspace-persist", "to": "__end__" }
+  ],
+  "config": {
+    "maxReplans": 0,
+    "maxSearchIterations": 0,
+    "timeout": 7200,
+    "enableFastpath": false
+  },
+  "isPublic": true,
+  "isImmutable": false,
+  "usageCount": 0,
+  "inputSchema": [
+    { "key": "workspaceId", "label": "Workspace ID", "type": "text", "required": true, "placeholder": "ws_xxxxxx", "helpText": "ID of the workspace to bind to" },
+    { "key": "checkoutKey", "label": "Checkout Key", "type": "text", "required": false, "default": "trunk", "placeholder": "trunk or card-101", "helpText": "Checkout concurrency deduplication key" },
+    { "key": "mode", "label": "Checkout Mode", "type": "select", "required": false, "options": ["exclusive", "branch"], "default": "exclusive", "helpText": "Concurrency mode: exclusive (trunk) or branch (concurrent cards)" },
+    { "key": "prompt", "label": "Directive", "type": "textarea", "required": true, "placeholder": "Implement feature X...", "helpText": "The prompt / instruction for the agent" },
+    { "key": "neuronId", "label": "Primary Neuron", "type": "text", "required": false, "default": "claude-code-opus", "placeholder": "claude-code-opus" },
+    { "key": "fallbackNeuronId", "label": "Fallback Neuron", "type": "text", "required": false, "default": "gemini-2-5-flash-chat", "placeholder": "gemini-2-5-flash-chat" }
+  ]
+}

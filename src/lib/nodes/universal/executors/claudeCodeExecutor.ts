@@ -533,16 +533,27 @@ export function resolveWorkspaceMount(state: AnyObject): { name: string; tree: s
   // The default, and the only shape a supplied `tree` may take.
   const canonical = `${WS_ROOT}/${name}/tree`;
 
-  // `tree` becomes the child's cwd and is passed to `mkdirSync(recursive)`,
-  // so "starts with a slash" is nowhere near enough: `/etc/cron.d` starts with
-  // a slash. It must live under the mount point the validated slug already
-  // fixed, which also means a `tree` cannot smuggle in a different workspace
-  // than the `name` the slug check approved. `..` is refused outright rather
-  // than normalised, because a path that needs normalising is not one this
-  // ever meant to accept.
-  const supplied = typeof ws?.tree === 'string' ? ws.tree : '';
+  // Check if this is a dedicated workspace execution (PR 5)
+  const isDedicatedWorkspace = Boolean(
+    state?.data?.workspaceId ||
+    state?.parameters?.workspaceId ||
+    ws?.workspaceId ||
+    (typeof ws?.tree === 'string' && (ws.tree === '/workspace' || ws.tree.startsWith('/workspace/'))) ||
+    (typeof state?.data?.workingDir === 'string' && (state.data.workingDir === '/workspace' || state.data.workingDir.startsWith('/workspace/')))
+  );
+
+  const defaultTree = isDedicatedWorkspace ? '/workspace' : canonical;
+
+  const supplied = typeof ws?.tree === 'string'
+    ? ws.tree
+    : (isDedicatedWorkspace && typeof state?.data?.workingDir === 'string' && (state.data.workingDir === '/workspace' || state.data.workingDir.startsWith('/workspace/'))
+        ? state.data.workingDir
+        : '');
+
   const prefix = `${WS_ROOT}/${name}/`;
   const acceptable =
+    supplied === '/workspace' ||
+    (typeof supplied === 'string' && supplied.startsWith('/workspace/') && !supplied.includes('..') && !supplied.includes('\0') && !supplied.includes('//')) ||
     supplied === canonical ||
     (supplied.startsWith(prefix) &&
       !supplied.includes('..') &&
@@ -555,7 +566,7 @@ export function resolveWorkspaceMount(state: AnyObject): { name: string; tree: s
         `it is not under ${prefix}`,
     );
   }
-  return { name, tree: acceptable ? supplied : canonical };
+  return { name, tree: acceptable ? supplied : defaultTree };
 }
 
 /**

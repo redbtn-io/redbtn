@@ -48,6 +48,7 @@ import {
   historyCacheInvokeOptions,
   extractCacheUsage,
 } from '../../../neurons/prompt-cache';
+import { WorkspaceRepository } from '../../../workspaces/WorkspaceRepository';
 
 /**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
@@ -188,6 +189,106 @@ function resolveConfigValue(value: any, state: any): any {
 import { buildMultimodalMessage, type AttachmentRef } from './multimodalMessage';
 export { buildMultimodalMessage };
 export type { AttachmentRef };
+
+/**
+ * Resolves workspace context (environmentId and workingDir) for a run.
+ * Ensures the target environmentId and workingDir are bound to state
+ * prior to bridge initialization and tool execution.
+ *
+ * Precedence:
+ * 1. Explicit state.parameters.environmentId or state.data.environmentId
+ * 2. Embedded checkout info on state.data.ws / state.data.workspaceCheckout
+ * 3. Active checkout looked up from WorkspaceRepository via workspaceId
+ */
+export async function resolveWorkspaceEnvironment(state: any): Promise<string | undefined> {
+  if (!state || typeof state !== 'object') return undefined;
+
+  const workspaceId =
+    state.parameters?.workspaceId ||
+    state.data?.workspaceId ||
+    state.data?.ws?.workspaceId ||
+    state.data?.workspaceCheckout?.workspaceId;
+
+  // Whenever a workspace is present, ensure default workingDir is '/workspace'
+  if (workspaceId) {
+    if (!state.data) state.data = {};
+    if (!state.data.workingDir) state.data.workingDir = '/workspace';
+    if (state.parameters && !state.parameters.workingDir) state.parameters.workingDir = '/workspace';
+  }
+
+  // 1. Explicit environmentId already present
+  const explicitEnv = state.parameters?.environmentId || state.data?.environmentId;
+  if (explicitEnv) {
+    return explicitEnv;
+  }
+
+  // 2. Embedded checkout / ws context on state
+  const fromWs =
+    state.data?.ws?.environmentId ||
+    state.data?.workspaceCheckout?.environmentId ||
+    state.parameters?.workspaceCheckout?.environmentId;
+  if (fromWs) {
+    if (!state.data) state.data = {};
+    state.data.environmentId = fromWs;
+    if (state.parameters) state.parameters.environmentId = fromWs;
+    return fromWs;
+  }
+
+  // 3. Resolve active checkout from WorkspaceRepository if workspaceId is present
+  if (workspaceId) {
+    const runId = state.runId || state.data?.runId;
+    const checkoutId =
+      state.parameters?.checkoutId ||
+      state.data?.checkoutId ||
+      state.data?.ws?.checkoutId;
+
+    let repo = state.workspaceRepository;
+    if (!repo) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const mongoose = require('mongoose');
+        if (mongoose?.connection?.readyState === 1 && mongoose.connection.db) {
+          repo = new WorkspaceRepository(mongoose.connection.db);
+        }
+      } catch {
+        // Mongoose or DB unavailable in current environment
+      }
+    }
+
+    if (repo && typeof repo.getWorkspace === 'function') {
+      try {
+        const ws = await repo.getWorkspace(workspaceId);
+        if (ws && Array.isArray(ws.activeCheckouts) && ws.activeCheckouts.length > 0) {
+          let checkout = checkoutId
+            ? ws.activeCheckouts.find((c: any) => c.checkoutId === checkoutId)
+            : undefined;
+          if (!checkout && runId) {
+            checkout = ws.activeCheckouts.find((c: any) => c.runId === runId);
+          }
+          if (!checkout) {
+            checkout = ws.activeCheckouts[ws.activeCheckouts.length - 1];
+          }
+          if (checkout?.environmentId) {
+            if (!state.data) state.data = {};
+            state.data.environmentId = checkout.environmentId;
+            state.data.workspaceId = workspaceId;
+            state.data.checkoutId = checkout.checkoutId;
+            state.data.workingDir = state.data.workingDir || ws.config?.defaultCwd || '/workspace';
+            if (state.parameters) {
+              state.parameters.environmentId = checkout.environmentId;
+              state.parameters.workingDir = state.data.workingDir;
+            }
+            return checkout.environmentId;
+          }
+        }
+      } catch (err) {
+        console.warn('[NeuronExecutor] Failed to resolve workspace checkout from repository:', err);
+      }
+    }
+  }
+
+  return undefined;
+}
 
 /**
  * Execute a neuron step (with error handling wrapper)
@@ -405,6 +506,9 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
   });
 
   try {
+    // Resolve workspace environmentId and workingDir prior to bridge / tool initialization
+    await resolveWorkspaceEnvironment(state);
+
     // Get neuron registry from run-context registry (with state fallback for tests)
     const neuronRegistry = getNeuronRegistry(state);
 
