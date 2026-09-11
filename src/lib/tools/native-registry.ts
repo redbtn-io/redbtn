@@ -14,7 +14,7 @@ import { enforceToolCapability, isFailClosedResource } from '../permissions/enfo
 import { CapabilityDeniedError } from '../permissions/types';
 import { persistDenial } from '../permissions/persist-denial';
 import { isGuardedExecTool, runExecGuard, ExecBlockedError, auditAttempt } from '../permissions/exec-guard';
-import { getDataToolRule } from '../permissions/tool-map';
+import { getDataToolRule, isDataTool } from '../permissions/tool-map';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -177,6 +177,7 @@ export type NativeMcpContent =
 export interface NativeMcpResult {
   content: NativeMcpContent[];
   isError?: boolean;
+  [key: string]: any;
 }
 
 export interface NativeToolDefinition {
@@ -367,6 +368,26 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   'tts_synthesize',
 ]);
 
+const unmappedToolCalls: Map<string, number> = new Map();
+
+/** Increment and record an unmapped tool call metric. */
+export function recordUnmappedToolCall(name: string): number {
+  const current = unmappedToolCalls.get(name) ?? 0;
+  const next = current + 1;
+  unmappedToolCalls.set(name, next);
+  return next;
+}
+
+/** Get a snapshot of unmapped tool call metrics. */
+export function getUnmappedToolCallMetrics(): Record<string, number> {
+  return Object.fromEntries(unmappedToolCalls.entries());
+}
+
+/** Reset unmapped tool call metrics (for testing). */
+export function resetUnmappedToolCallMetrics(): void {
+  unmappedToolCalls.clear();
+}
+
 export class NativeToolRegistry {
   private tools: Map<string, NativeToolDefinition> = new Map();
 
@@ -446,6 +467,12 @@ export class NativeToolRegistry {
   async callTool(name: string, args: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
     const tool = this.tools.get(name);
     if (!tool) throw new Error(`Native tool not found: ${name}`);
+
+    // Surface a log/metric when a tool call reaches the registry unmapped in DATA_TOOL_RULES
+    if (!isDataTool(name)) {
+      recordUnmappedToolCall(name);
+      console.warn(`[NativeRegistry] tool call unmapped in DATA_TOOL_RULES: tool=${name}`);
+    }
 
     // Capability enforcement. Wrapped defensively: a failure to RESOLVE the
     // profile (lookup throws) must never crash an otherwise-valid call, but a

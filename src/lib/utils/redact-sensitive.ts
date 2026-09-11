@@ -16,7 +16,12 @@ function redactString(value: string): string {
     .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, REDACTED)
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`)
     .replace(/\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, REDACTED)
-    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi, `$1${REDACTED}@`);
+    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi, `$1${REDACTED}@`)
+    .replace(/\brpat_[A-Za-z0-9_-]+/g, REDACTED)
+    .replace(/\bsk-[A-Za-z0-9_-]+/g, REDACTED)
+    .replace(/\bghp_[A-Za-z0-9]+/g, REDACTED)
+    .replace(/\bAKIA[0-9A-Z]{12,}/g, REDACTED)
+    .replace(/(?:\b[A-Za-z0-9+/]{64,}={0,2}|\b[A-Za-z0-9+/]{40,}={1,2})(?=[^A-Za-z0-9+/=]|$)/g, REDACTED);
 }
 
 /** Return a JSON-compatible, non-mutating copy with credential values masked. */

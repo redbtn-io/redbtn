@@ -309,3 +309,59 @@ describe('get_stream_session — upstream error (fast path)', () => {
     expect(JSON.parse(r.content[0].text).error).toMatch(/ECONNRESET/);
   });
 });
+
+describe('get_stream_session — projection & redaction', () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalWebappUrl: string | undefined;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    originalWebappUrl = process.env.WEBAPP_URL;
+    process.env.WEBAPP_URL = 'http://test-webapp.example';
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    if (originalWebappUrl === undefined) delete process.env.WEBAPP_URL;
+    else process.env.WEBAPP_URL = originalWebappUrl;
+    vi.restoreAllMocks();
+  });
+
+  test('applies fields/projection to session doc and redacts secrets', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          session: {
+            sessionId: 'sess-proj',
+            streamId: 'stream-1',
+            status: 'active',
+            token: 'rpat_secret1234567890abcdef',
+            openaiKey: 'sk-projsecretkey987654321',
+            turnCount: 5,
+            nested: { secret: 'ghp_githubpersonalaccesstoken12345', normal: 'hello' },
+          },
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof globalThis.fetch;
+
+    const result = await getStreamSessionTool.handler(
+      {
+        sessionId: 'sess-proj',
+        streamId: 'stream-1',
+        fields: ['sessionId', 'status', 'token', 'nested.secret'],
+      },
+      makeMockContext(),
+    );
+
+    expect(result.isError).toBeFalsy();
+    const body = JSON.parse(result.content[0].text);
+    expect(body.session.sessionId).toBe('sess-proj');
+    expect(body.session.status).toBe('active');
+    expect(body.session.turnCount).toBeUndefined(); // Projected out
+    expect(body.session.openaiKey).toBeUndefined(); // Projected out
+    expect(body.session.token).toBe('[REDACTED]'); // Redacted
+    expect(body.session.nested.secret).toBe('[REDACTED]'); // Redacted
+  });
+});
+

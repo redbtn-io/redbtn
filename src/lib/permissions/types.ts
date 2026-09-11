@@ -50,7 +50,16 @@ export type CapabilityResource =
   | 'knowledge'
   | 'exec'         // run commands / file I/O via an env session (run_command, ssh_shell, read_file, ssh_copy, desktop_exec)
   | 'computer'     // screen/mouse/keyboard (desktop_* computer-use tools)
-  | 'environment'; // reserved: managing env configs (not gated yet)
+  | 'environment'  // reserved: managing env configs (not gated yet)
+  | 'graph'        // graph tools (invoke_graph)
+  | 'tool'         // tool-of-tools meta dispatch (invoke_tool)
+  | 'automation'   // automation tools (trigger_automation)
+  | 'run'          // run queries (get_recent_runs, get_run, get_run_logs)
+  | 'conversation' // conversation queries (get_messages, get_context_history, get_conversation)
+  | 'stream'       // stream session queries (list_stream_sessions, get_stream_session)
+  | 'communication'// outbound notifications (send_email, send_webhook)
+  | 'web'          // outbound web queries (fetch_url, scrape_url)
+  | 'task';        // agent task tracking (task_create, task_list, task_get, task_update, task_complete)
 
 /** Verbs. Every mapped tool declares exactly one. */
 export type CapabilityAction =

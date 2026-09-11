@@ -253,7 +253,10 @@ const searchDocuments: NativeToolDefinition = {
       }
 
       const body = (await response.json()) as AnyObject;
-      const results = Array.isArray(body?.results) ? body.results as AnyObject[] : [];
+      const results = Array.isArray(body?.results) ? (body.results as AnyObject[]) : [];
+      const pendingDocuments = Array.isArray(body?.pendingDocuments)
+        ? (body.pendingDocuments as AnyObject[])
+        : [];
 
       // Merge chunks if requested
       let processedResults = results as AnyObject[];
@@ -281,13 +284,26 @@ const searchDocuments: NativeToolDefinition = {
       }
 
       if (processedResults.length === 0) {
+        let emptyText = `No relevant documents found in library "${libraryId}" for query: "${query}"`;
+        if (pendingDocuments.length > 0) {
+          emptyText += ` (${pendingDocuments.length} document(s) pending indexing)`;
+        }
         return {
           content: [
             {
               type: 'text',
-              text: `No relevant documents found in library "${libraryId}" for query: "${query}"`,
+              text: emptyText,
+            },
+            {
+              type: 'text',
+              text: JSON.stringify({
+                results: [],
+                pendingDocuments,
+              }),
             },
           ],
+          results: [],
+          pendingDocuments,
         };
       }
 
@@ -308,8 +324,23 @@ const searchDocuments: NativeToolDefinition = {
         resultText += `---\n\n`;
       }
 
+      if (pendingDocuments.length > 0) {
+        resultText += `Note: ${pendingDocuments.length} document(s) currently pending indexing in library "${libraryId}".\n\n`;
+      }
+
       return {
-        content: [{ type: 'text', text: resultText }],
+        content: [
+          { type: 'text', text: resultText },
+          {
+            type: 'text',
+            text: JSON.stringify({
+              results: processedResults,
+              pendingDocuments,
+            }),
+          },
+        ],
+        results: processedResults,
+        pendingDocuments,
       };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
