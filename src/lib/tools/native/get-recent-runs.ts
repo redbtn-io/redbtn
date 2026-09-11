@@ -36,6 +36,7 @@
 import mongoose from 'mongoose';
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 import { isSystemResource } from '../../system-resource';
+import { redactSensitive } from '../../utils/redact-sensitive';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -45,12 +46,14 @@ interface GetRecentRunsArgs {
   streamId?: string;
   limit?: number;
   includeOutput?: boolean;
+  maxBytes?: number;
   status?: 'completed' | 'error' | 'interrupted' | 'running';
   since?: string;
 }
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
+const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024; // 64KB cap per run output to prevent worker OOM
 
 // `interrupted` is the public-facing status for a non-terminal exit; the
 // archiver writes `unknown` to the DB for that case. Translate here so
@@ -144,6 +147,10 @@ const getRecentRuns: NativeToolDefinition = {
         format: 'date-time',
         description: 'Only return runs started after this ISO timestamp.',
       },
+      maxBytes: {
+        type: 'integer',
+        description: 'Maximum bytes per run output before truncation (default 65536). Bounds memory to prevent worker OOM.',
+      },
     },
   },
 
@@ -155,6 +162,10 @@ const getRecentRuns: NativeToolDefinition = {
       typeof args.limit === 'number' && Number.isFinite(args.limit) && args.limit > 0
         ? Math.min(Math.floor(args.limit), MAX_LIMIT)
         : DEFAULT_LIMIT;
+    const maxOutputBytes =
+      typeof args.maxBytes === 'number' && Number.isFinite(args.maxBytes) && args.maxBytes > 0
+        ? Math.floor(args.maxBytes)
+        : DEFAULT_MAX_OUTPUT_BYTES;
 
     // ── Validate: exactly one of graphId or streamId ───────────────────
     const hasGraphId = typeof graphId === 'string' && graphId.length > 0;
@@ -333,7 +344,22 @@ const getRecentRuns: NativeToolDefinition = {
           trigger: d.trigger ?? null,
         };
         if (includeOutput) {
-          base.output = extractOutput(d.events as AnyObject[] | undefined);
+          const rawOutput = extractOutput(d.events as AnyObject[] | undefined);
+          if (rawOutput !== null && rawOutput !== undefined) {
+            try {
+              const strOutput = typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput);
+              if (strOutput && strOutput.length > maxOutputBytes) {
+                base.output = `${strOutput.slice(0, maxOutputBytes)}… [clipped, ${strOutput.length} chars total, byte cap: ${maxOutputBytes}]`;
+                base.outputTruncated = true;
+              } else {
+                base.output = rawOutput;
+              }
+            } catch {
+              base.output = rawOutput;
+            }
+          } else {
+            base.output = null;
+          }
         }
         return base;
       });
@@ -377,7 +403,7 @@ const getRecentRuns: NativeToolDefinition = {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(responseBody),
+            text: JSON.stringify(redactSensitive(responseBody)),
           },
         ],
       };

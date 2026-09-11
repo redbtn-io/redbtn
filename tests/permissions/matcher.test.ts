@@ -195,6 +195,71 @@ describe('enforceToolCapability — knowledge', () => {
       enforceToolCapability(libJail, 'create_library', { name: 'coder/scratch' }),
     ).not.toThrow();
   });
+
+  // Acceptance test from card 6aa1d97608971669b4a25d0a:
+  // "A profile of [{knowledge,[read,write],'red-memory'}] provably denies restore_document on another library"
+  const redMemoryJail: CapabilityProfile = {
+    name: 'red-memory-jail',
+    capabilities: [
+      { resource: 'knowledge', actions: ['read', 'write'], selector: 'red-memory' },
+    ],
+  };
+
+  it('ALLOWS in-jail restore_document on red-memory', () => {
+    expect(() =>
+      enforceToolCapability(redMemoryJail, 'restore_document', {
+        libraryId: 'red-memory',
+        documentId: 'doc-123',
+      }),
+    ).not.toThrow();
+  });
+
+  it('DENIES cross-library restore_document on another library (acceptance)', () => {
+    expect(() =>
+      enforceToolCapability(redMemoryJail, 'restore_document', {
+        libraryId: 'finance-secrets',
+        documentId: 'doc-123',
+      }),
+    ).toThrow(CapabilityDeniedError);
+  });
+
+  it('DENIES restore_library on another library', () => {
+    expect(() =>
+      enforceToolCapability(redMemoryJail, 'restore_library', {
+        libraryId: 'finance-secrets',
+      }),
+    ).toThrow(CapabilityDeniedError);
+  });
+
+  it('DENIES unmapped tools that previously bypassed the capability check', () => {
+    for (const [tool, args] of [
+      ['invoke_graph', { graphId: 'graph-1' }],
+      ['invoke_tool', { toolName: 'web_search' }],
+      ['trigger_automation', { automationId: 'auto-1' }],
+      ['get_recent_runs', { graphId: 'graph-1' }],
+      ['get_run', { runId: 'run-1' }],
+      ['get_run_logs', { runId: 'run-1' }],
+      ['get_messages', { conversationId: 'conv-1' }],
+      ['get_context_history', { conversationId: 'conv-1' }],
+      ['get_conversation', { conversationId: 'conv-1' }],
+      ['list_stream_sessions', { streamId: 'stream-1' }],
+      ['get_stream_session', { sessionId: 'sess-1' }],
+      ['send_email', { to: 'victim@example.com' }],
+      ['fetch_url', { url: 'https://example.com' }],
+      ['scrape_url', { url: 'https://example.com' }],
+      ['task_create', { subject: 'new task' }],
+      ['task_list', {}],
+      ['task_get', { taskId: 'task-1' }],
+      ['task_update', { taskId: 'task-1' }],
+      ['task_complete', { taskId: 'task-1' }],
+      ['parse_document', { fileBase64: 'abc' }],
+    ] as const) {
+      expect(
+        () => enforceToolCapability(redMemoryJail, tool, args),
+        `${tool} must be denied under red-memory knowledge jail`,
+      ).toThrow(CapabilityDeniedError);
+    }
+  });
 });
 
 describe('normalizeProfile', () => {

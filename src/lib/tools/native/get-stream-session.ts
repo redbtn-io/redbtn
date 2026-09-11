@@ -31,6 +31,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { redactSensitive } from '../../utils/redact-sensitive';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -42,6 +43,54 @@ interface GetStreamSessionArgs {
    * by hitting the per-stream session route directly.
    */
   streamId?: string;
+  /**
+   * Optional projection: list of field names or dot-separated paths to include.
+   */
+  fields?: string[] | string;
+  /**
+   * Alias for fields.
+   */
+  projection?: string[] | string;
+}
+
+function parseFieldList(val: unknown): string[] | null {
+  if (Array.isArray(val)) {
+    return val.map((x) => String(x).trim()).filter(Boolean);
+  }
+  if (typeof val === 'string') {
+    return val.split(',').map((x) => x.trim()).filter(Boolean);
+  }
+  return null;
+}
+
+function applyProjection(doc: AnyObject, fields: string[]): AnyObject {
+  if (!fields.length) return doc;
+  const projected: AnyObject = {};
+  for (const field of fields) {
+    if (field.includes('.')) {
+      const parts = field.split('.');
+      let cur: any = doc;
+      for (const p of parts) {
+        if (cur && typeof cur === 'object' && p in cur) {
+          cur = cur[p];
+        } else {
+          cur = undefined;
+          break;
+        }
+      }
+      if (cur !== undefined) {
+        let dest: any = projected;
+        for (let i = 0; i < parts.length - 1; i++) {
+          dest[parts[i]] = dest[parts[i]] || {};
+          dest = dest[parts[i]];
+        }
+        dest[parts[parts.length - 1]] = cur;
+      }
+    } else if (field in doc) {
+      projected[field] = doc[field];
+    }
+  }
+  return projected;
 }
 
 function getBaseUrl(): string {
@@ -162,6 +211,18 @@ const getStreamSessionTool: NativeToolDefinition = {
         description:
           'Optional fast-path hint — the streamId that owns this session. When provided, skips the streams-list discovery walk entirely.',
       },
+      fields: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'Optional projection: list of field names or dot-separated paths to include in the returned session object.',
+      },
+      projection: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'Alias for fields. Optional list of field names or dot-separated paths to include.',
+      },
     },
     required: ['sessionId'],
   },
@@ -218,11 +279,19 @@ const getStreamSessionTool: NativeToolDefinition = {
         };
       }
 
+      const requestedFields =
+        parseFieldList(args.fields) ?? parseFieldList(args.projection);
+      let sessionResult: AnyObject = session;
+      if (requestedFields && requestedFields.length > 0) {
+        sessionResult = applyProjection(session, requestedFields);
+      }
+      sessionResult = redactSensitive(sessionResult);
+
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ session }),
+            text: JSON.stringify({ session: sessionResult }),
           },
         ],
       };
