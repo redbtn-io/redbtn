@@ -88,4 +88,40 @@ describe('redactSensitive — extended credential patterns', () => {
     const circResult = redactSensitive(circular);
     expect(circResult.self).toBe('[Circular]');
   });
+
+  it('redacts operational bearer tokens and credential suffixes in objects', () => {
+    const config = {
+      enabled: true,
+      mode: 'always',
+      atlasToken: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJhZ2VudCJ9.sig1',
+      coordinatorToken: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.sig2',
+      workerToken: 'raw_worker_token_string',
+      reviewerToken: 'raw_reviewer_token_string',
+      clientSecret: 'shhh-secret',
+      masterPassword: 'super-password',
+      dbCredentials: { host: '10.100.0.10' },
+      workerHosts: [{ host: 'server.georgeanthony.net', port: 2222 }],
+    };
+
+    const redacted = redactSensitive(config);
+    expect(redacted.enabled).toBe(true);
+    expect(redacted.mode).toBe('always');
+    expect(redacted.atlasToken).toBe(REDACTED);
+    expect(redacted.coordinatorToken).toBe(REDACTED);
+    expect(redacted.workerToken).toBe(REDACTED);
+    expect(redacted.reviewerToken).toBe(REDACTED);
+    expect(redacted.clientSecret).toBe(REDACTED);
+    expect(redacted.masterPassword).toBe(REDACTED);
+    expect(redacted.dbCredentials).toBe(REDACTED);
+    expect(redacted.workerHosts[0].host).toBe('server.georgeanthony.net');
+  });
+
+  it('redacts root value when rootKey is sensitive', () => {
+    const rawToken = 'plain-token-that-has-no-special-prefix';
+    const result = redactSensitive(rawToken, 'atlasToken');
+    expect(result).toBe(REDACTED);
+
+    const nonSensitive = redactSensitive('my-regular-mode', 'mode');
+    expect(nonSensitive).toBe('my-regular-mode');
+  });
 });

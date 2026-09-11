@@ -51,6 +51,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { redactSensitive } from '../../utils/redact-sensitive';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -292,7 +293,8 @@ const listGlobalStateTool: NativeToolDefinition = {
         });
       } else {
         const data = (await response.json()) as AnyObject;
-        all = data?.values && typeof data.values === 'object' ? data.values : {};
+        const rawAll = data?.values && typeof data.values === 'object' ? data.values : {};
+        all = redactSensitive(rawAll);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
