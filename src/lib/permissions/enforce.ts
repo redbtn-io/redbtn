@@ -169,7 +169,22 @@ export function normalizeProfile(raw: unknown): CapabilityProfile | null {
     capabilities: [],
   };
 
-  const VALID_RESOURCES = new Set(['state', 'knowledge', 'exec', 'computer', 'environment']);
+  const VALID_RESOURCES = new Set([
+    'state',
+    'knowledge',
+    'exec',
+    'computer',
+    'environment',
+    'graph',
+    'tool',
+    'automation',
+    'run',
+    'conversation',
+    'stream',
+    'communication',
+    'web',
+    'task',
+  ]);
   const VALID_ACTIONS = new Set(['read', 'write', 'create', 'delete', 'execute', 'control']);
   for (const c of caps) {
     if (!c || typeof c !== 'object') continue;

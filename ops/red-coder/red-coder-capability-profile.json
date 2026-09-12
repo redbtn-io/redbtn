@@ -1,0 +1,13 @@
+{
+  "name": "red-coder-ws-jail",
+  "description": "Red Coder (Workspace) capability profile. Strictly read-only on state, knowledge, and memory; execution is scoped to managed workspace environments. All memory and state writes are handled by deterministic graph lifecycle nodes, eliminating unreachable write theatre.",
+  "capabilities": [
+    { "resource": "exec", "actions": ["execute"], "selector": "*" },
+    { "resource": "state", "actions": ["read"], "selector": "*" },
+    { "resource": "knowledge", "actions": ["read"], "selector": "*" },
+    { "resource": "state", "actions": ["write", "create"], "selector": "coder*" },
+    { "resource": "state", "actions": ["write", "create"], "selector": "redcoder*" },
+    { "resource": "knowledge", "actions": ["write", "create"], "selector": "coder*" },
+    { "resource": "knowledge", "actions": ["write", "create"], "selector": "redcoder*" }
+  ]
+}

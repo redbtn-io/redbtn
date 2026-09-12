@@ -681,6 +681,37 @@ async function loadPreviousRunSnapshot(
 // Initial State Builder
 // =============================================================================
 
+/**
+ * Extracts a prompt message or task from diverse input formats.
+ * Supports explicit message, task, content, or RedBoard dispatch payloads
+ * (title, body, acceptance criteria, comments).
+ */
+export function extractTaskOrMessage(input: Record<string, unknown>): string {
+  if (!input || typeof input !== 'object') return '';
+  if (typeof input.message === 'string' && input.message.trim()) return input.message.trim();
+  if (typeof input.task === 'string' && input.task.trim()) return input.task.trim();
+  if (typeof input.content === 'string' && input.content.trim()) return input.content.trim();
+  if (input.source === 'redboard' || (input.cardId && (input.title || input.body))) {
+    const parts: string[] = [];
+    if (input.title) parts.push(`# ${input.title}`);
+    if (input.body) parts.push(String(input.body));
+    if (Array.isArray(input.acceptance) && input.acceptance.length > 0) {
+      parts.push('\n## Acceptance Criteria:');
+      for (const item of input.acceptance as any[]) {
+        parts.push(`- [${item.done ? 'x' : ' '}] (${item.id || ''}) ${item.text || ''}`);
+      }
+    }
+    if (Array.isArray(input.comments) && input.comments.length > 0) {
+      parts.push('\n## Card Discussion:');
+      for (const c of input.comments as any[]) {
+        parts.push(`**${c.author || 'User'}**: ${c.body}`);
+      }
+    }
+    return parts.join('\n\n');
+  }
+  return '';
+}
+
 function buildInitialState(
   _red: Red,
   input: Record<string, unknown>,
@@ -691,7 +722,8 @@ function buildInitialState(
   abortController: AbortController,
   previousRun: PreviousRunSnapshot | null,
 ) {
-  const message = (input.message as string) || '';
+  const message = extractTaskOrMessage(input);
+  const task = (input.task as string) || message;
   const systemPrompt =
     process.env.SYSTEM_PROMPT ||
     `You are Red, an AI assistant developed by redbtn.io.
@@ -754,7 +786,13 @@ CRITICAL RULES:
       options: { ...options, runId },
       runId,
       conversationId: options.conversationId,
-      messages: message ? [{ role: 'user', content: message }] : [],
+      task,
+      messages:
+        Array.isArray(input.messages) && input.messages.length > 0
+          ? (input.messages as any[])
+          : message
+            ? [{ role: 'user', content: message }]
+            : [],
       userId: options.userId,
       // Mirror of the top-level callerUserId (same rationale as userId/runId).
       ...(options.connectionIdentityUserId

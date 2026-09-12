@@ -107,4 +107,74 @@ describe('search_documents', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('libraryId is required');
   });
+
+  test('passes through pendingDocuments and returns structured results alongside markdown', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          results: [
+            { id: 'r1', text: 'match-1', score: 0.85, metadata: { source: 'doc.md' } },
+          ],
+          pendingDocuments: [{ documentId: 'doc-pending-1', name: 'pending.pdf' }],
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof globalThis.fetch;
+
+    const tool = (await import('../../src/lib/tools/native/search-documents')).default;
+    const result = await tool.handler(
+      { libraryId: 'lib-1', query: 'hello' },
+      makeContext(),
+    );
+
+    expect(result.isError).toBeFalsy();
+    // Formatted markdown contains the match and pending note
+    expect(result.content[0].text).toContain('match-1');
+    expect(result.content[0].text).toContain('[similarity: 0.850]');
+    expect(result.content[0].text).toContain('1 document(s) currently pending indexing');
+
+    // Structured JSON content block
+    expect(result.content[1]).toBeDefined();
+    const structured = JSON.parse(result.content[1].text);
+    expect(structured.results).toHaveLength(1);
+    expect(structured.results[0].score).toBe(0.85);
+    expect(structured.pendingDocuments).toEqual([
+      { documentId: 'doc-pending-1', name: 'pending.pdf' },
+    ]);
+
+    // Top-level envelope fields
+    expect(result.results).toHaveLength(1);
+    expect(result.pendingDocuments).toEqual([
+      { documentId: 'doc-pending-1', name: 'pending.pdf' },
+    ]);
+  });
+
+  test('surfaces pendingDocuments when no documents matched query', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          results: [],
+          pendingDocuments: [{ documentId: 'doc-pending-2', name: 'indexing.pdf' }],
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof globalThis.fetch;
+
+    const tool = (await import('../../src/lib/tools/native/search-documents')).default;
+    const result = await tool.handler(
+      { libraryId: 'lib-1', query: 'miss' },
+      makeContext(),
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('No relevant documents found');
+    expect(result.content[0].text).toContain('1 document(s) pending indexing');
+
+    const structured = JSON.parse(result.content[1].text);
+    expect(structured.results).toEqual([]);
+    expect(structured.pendingDocuments).toEqual([
+      { documentId: 'doc-pending-2', name: 'indexing.pdf' },
+    ]);
+  });
 });
+

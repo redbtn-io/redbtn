@@ -7,8 +7,29 @@ const SENSITIVE_KEYS = new Set([
   'clientsecret', 'internalkey', 'credentials',
 ]);
 
-function sensitiveKey(key: string): boolean {
-  return SENSITIVE_KEYS.has(key.toLowerCase().replace(/[^a-z0-9]/g, ''));
+export function sensitiveKey(key: string): boolean {
+  const norm = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (SENSITIVE_KEYS.has(norm)) return true;
+  if (
+    norm.endsWith('token') ||
+    norm.endsWith('tokens') ||
+    norm.endsWith('secret') ||
+    norm.endsWith('secrets') ||
+    norm.endsWith('password') ||
+    norm.endsWith('passwd') ||
+    norm.endsWith('credential') ||
+    norm.endsWith('credentials') ||
+    norm.endsWith('apikey') ||
+    norm.endsWith('privatekey') ||
+    norm.endsWith('sshkey') ||
+    norm.endsWith('secretkey') ||
+    norm.endsWith('authkey') ||
+    norm.endsWith('accesskey') ||
+    norm.includes('bearer')
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function redactString(value: string): string {
@@ -16,15 +37,20 @@ function redactString(value: string): string {
     .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, REDACTED)
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`)
     .replace(/\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, REDACTED)
-    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi, `$1${REDACTED}@`);
+    .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi, `$1${REDACTED}@`)
+    .replace(/\brpat_[A-Za-z0-9_-]+/g, REDACTED)
+    .replace(/\bsk-[A-Za-z0-9_-]+/g, REDACTED)
+    .replace(/\bghp_[A-Za-z0-9]+/g, REDACTED)
+    .replace(/\bAKIA[0-9A-Z]{12,}/g, REDACTED)
+    .replace(/(?:\b[A-Za-z0-9+/]{64,}={0,2}|\b[A-Za-z0-9+/]{40,}={1,2})(?=[^A-Za-z0-9+/=]|$)/g, REDACTED);
 }
 
 /** Return a JSON-compatible, non-mutating copy with credential values masked. */
-export function redactSensitive<T>(value: T): T {
+export function redactSensitive<T>(value: T, rootKey = ''): T {
   const seen = new WeakSet<object>();
 
   const visit = (input: unknown, key = ''): unknown => {
-    if (sensitiveKey(key)) return REDACTED;
+    if (key && sensitiveKey(key)) return REDACTED;
     if (typeof input === 'string') return redactString(input);
     if (input === null || typeof input !== 'object') return input;
     if (input instanceof Date) return input;
@@ -36,7 +62,7 @@ export function redactSensitive<T>(value: T): T {
     );
   };
 
-  return visit(value) as T;
+  return visit(value, rootKey) as T;
 }
 
 export { REDACTED };

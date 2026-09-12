@@ -2,6 +2,7 @@
  * Vitest for native tool: create_library
  *
  * Per TOOL-HANDOFF.md §6.1 — happy path + validation + upstream error.
+ * Card 6aa38e4acc654a03514c624d: chunkSize & chunkOverlap forwarding.
  */
 
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -21,11 +22,13 @@ function makeMockContext(overrides?: Partial<NativeToolContext>): NativeToolCont
 }
 
 describe('create_library — schema', () => {
-  test('exposes name (required) + description + metadata', () => {
+  test('exposes name (required) + description + chunkSize + chunkOverlap + metadata', () => {
     expect(createLibraryTool.description.toLowerCase()).toContain('library');
     expect(createLibraryTool.inputSchema.required).toEqual(['name']);
     expect(createLibraryTool.inputSchema.properties.name).toBeDefined();
     expect(createLibraryTool.inputSchema.properties.description).toBeDefined();
+    expect(createLibraryTool.inputSchema.properties.chunkSize).toBeDefined();
+    expect(createLibraryTool.inputSchema.properties.chunkOverlap).toBeDefined();
     expect(createLibraryTool.inputSchema.properties.metadata).toBeDefined();
   });
 });
@@ -43,7 +46,7 @@ describe('create_library — happy path', () => {
     vi.restoreAllMocks();
   });
 
-  test('returns { libraryId } on 201', async () => {
+  test('returns { libraryId } on 201 with chunkSize and chunkOverlap forwarded', async () => {
     let captured: any = null;
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const u = typeof input === 'string' ? input : (input as URL).toString();
@@ -60,13 +63,21 @@ describe('create_library — happy path', () => {
     }) as unknown as typeof globalThis.fetch;
 
     const result = await createLibraryTool.handler(
-      { name: 'My Lib', description: 'desc', metadata: { source: 'agent' } },
+      {
+        name: 'My Lib',
+        description: 'desc',
+        chunkSize: 100000,
+        chunkOverlap: 0,
+        metadata: { source: 'agent' },
+      },
       makeMockContext(),
     );
     expect(result.isError).toBeFalsy();
     expect(JSON.parse(result.content[0].text)).toEqual({ libraryId: 'lib-new' });
     expect(captured.name).toBe('My Lib');
     expect(captured.description).toBe('desc');
+    expect(captured.chunkSize).toBe(100000);
+    expect(captured.chunkOverlap).toBe(0);
     expect(captured.metadata).toEqual({ source: 'agent' });
   });
 
@@ -82,6 +93,8 @@ describe('create_library — happy path', () => {
 
     await createLibraryTool.handler({ name: 'Just Name' }, makeMockContext());
     expect(captured).toEqual({ name: 'Just Name' });
+    expect(captured.chunkSize).toBeUndefined();
+    expect(captured.chunkOverlap).toBeUndefined();
   });
 });
 
@@ -95,6 +108,24 @@ describe('create_library — validation errors', () => {
   test('name longer than 100 chars returns VALIDATION', async () => {
     const r = await createLibraryTool.handler(
       { name: 'x'.repeat(101) },
+      makeMockContext(),
+    );
+    expect(r.isError).toBe(true);
+    expect(JSON.parse(r.content[0].text).code).toBe('VALIDATION');
+  });
+
+  test('invalid chunkSize returns VALIDATION', async () => {
+    const r = await createLibraryTool.handler(
+      { name: 'Lib', chunkSize: -1 },
+      makeMockContext(),
+    );
+    expect(r.isError).toBe(true);
+    expect(JSON.parse(r.content[0].text).code).toBe('VALIDATION');
+  });
+
+  test('invalid chunkOverlap returns VALIDATION', async () => {
+    const r = await createLibraryTool.handler(
+      { name: 'Lib', chunkOverlap: -10 },
       makeMockContext(),
     );
     expect(r.isError).toBe(true);

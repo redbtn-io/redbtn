@@ -117,6 +117,78 @@ function envId(args: Record<string, unknown>): ExtractedAddress {
   return { addresses: [id] };
 }
 
+function parseDocumentAddress(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.libraryId);
+  if (id) return { addresses: [id] };
+  return { addresses: [], unscoped: true };
+}
+
+function graphId(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.graphId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
+function toolNameAddress(args: Record<string, unknown>): ExtractedAddress {
+  const name = str(args.toolName);
+  if (!name) return { addresses: [], unscoped: true };
+  return { addresses: [name] };
+}
+
+function automationId(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.automationId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
+function runAddress(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.runId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
+function recentRunsAddress(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.graphId || args.streamId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
+function conversationId(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.conversationId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
+function streamSessionAddress(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.sessionId || args.streamId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
+function streamId(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.streamId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
+function emailRecipient(args: Record<string, unknown>): ExtractedAddress {
+  const to = strArray(Array.isArray(args.to) ? args.to : [args.to]);
+  if (to.length === 0) return { addresses: [], unscoped: true };
+  return { addresses: to };
+}
+
+function urlAddress(args: Record<string, unknown>): ExtractedAddress {
+  const u = str(args.url);
+  if (!u) return { addresses: [], unscoped: true };
+  return { addresses: [u] };
+}
+
+function taskAddress(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.taskId || args.scope || args.parentTaskId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
 /**
  * The data-tool table. EXHAUSTIVE for State + Knowledge mutation AND read
  * paths in `native/`. Read tools are included so a jail can also prevent
@@ -179,6 +251,11 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
     action: 'read',
     extract: libraryIdsFilter,
   },
+  parse_document: {
+    resource: 'knowledge',
+    action: 'read',
+    extract: parseDocumentAddress,
+  },
 
   // ── Knowledge: create ─────────────────────────────────────────────────────
   create_library: { resource: 'knowledge', action: 'create', extract: libraryName },
@@ -189,6 +266,8 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   update_library: { resource: 'knowledge', action: 'write', extract: libraryId },
   update_document: { resource: 'knowledge', action: 'write', extract: libraryId },
   reprocess_document: { resource: 'knowledge', action: 'write', extract: libraryId },
+  restore_library: { resource: 'knowledge', action: 'write', extract: libraryId },
+  restore_document: { resource: 'knowledge', action: 'write', extract: libraryId },
 
   // ── Knowledge: deletes ────────────────────────────────────────────────────
   delete_library: { resource: 'knowledge', action: 'delete', extract: libraryId },
@@ -242,6 +321,43 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   desktop_type: { resource: 'computer', action: 'control', extract: envId },
   desktop_key: { resource: 'computer', action: 'control', extract: envId },
   desktop_scroll: { resource: 'computer', action: 'control', extract: envId },
+
+  // ── Graph tools ───────────────────────────────────────────────────────────
+  invoke_graph: { resource: 'graph', action: 'execute', extract: graphId },
+
+  // ── Meta tools ("tool tools") ─────────────────────────────────────────────
+  invoke_tool: { resource: 'tool', action: 'execute', extract: toolNameAddress },
+
+  // ── Automations ───────────────────────────────────────────────────────────
+  trigger_automation: { resource: 'automation', action: 'execute', extract: automationId },
+
+  // ── Runs ──────────────────────────────────────────────────────────────────
+  get_recent_runs: { resource: 'run', action: 'read', extract: recentRunsAddress },
+  get_run: { resource: 'run', action: 'read', extract: runAddress },
+  get_run_logs: { resource: 'run', action: 'read', extract: runAddress },
+
+  // ── Conversations / Context ───────────────────────────────────────────────
+  get_messages: { resource: 'conversation', action: 'read', extract: conversationId },
+  get_context_history: { resource: 'conversation', action: 'read', extract: conversationId },
+  get_conversation: { resource: 'conversation', action: 'read', extract: conversationId },
+
+  // ── Streams ───────────────────────────────────────────────────────────────
+  list_stream_sessions: { resource: 'stream', action: 'read', extract: streamId },
+  get_stream_session: { resource: 'stream', action: 'read', extract: streamSessionAddress },
+
+  // ── Communication / Outbound notifications ────────────────────────────────
+  send_email: { resource: 'communication', action: 'write', extract: emailRecipient },
+
+  // ── Web / Network ─────────────────────────────────────────────────────────
+  fetch_url: { resource: 'web', action: 'read', extract: urlAddress },
+  scrape_url: { resource: 'web', action: 'read', extract: urlAddress },
+
+  // ── Tasks ─────────────────────────────────────────────────────────────────
+  task_create: { resource: 'task', action: 'create', extract: taskAddress },
+  task_list: { resource: 'task', action: 'read', extract: taskAddress },
+  task_get: { resource: 'task', action: 'read', extract: taskAddress },
+  task_update: { resource: 'task', action: 'write', extract: taskAddress },
+  task_complete: { resource: 'task', action: 'write', extract: taskAddress },
 };
 
 /** Is this tool name a gated data tool? */
