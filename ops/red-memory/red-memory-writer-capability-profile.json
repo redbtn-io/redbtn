@@ -1,0 +1,24 @@
+{
+  "name": "red-memory-writer-jailed",
+  "description": "Jailed memory extraction profile for red-memory-writer-subgraph. Strictly limits state and knowledge access to Red_Memory* and red-memory*. Omits all delete actions, exec, computer, and invoke_tool.",
+  "capabilities": [
+    {
+      "resource": "state",
+      "actions": [
+        "read",
+        "write",
+        "create"
+      ],
+      "selector": "Red_Memory*"
+    },
+    {
+      "resource": "knowledge",
+      "actions": [
+        "read",
+        "write",
+        "create"
+      ],
+      "selector": "red-memory*"
+    }
+  ]
+}
