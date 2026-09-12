@@ -46,7 +46,13 @@ const DEFAULT_OLLAMA_URL = 'http://localhost:11434';
  * Default similarity threshold (0-1 scale, where 1 is most similar)
  * ChromaDB uses cosine similarity by default
  */
-const DEFAULT_SIMILARITY_THRESHOLD = 0.7;
+/**
+ * Default similarity threshold (0-1 scale, where 1 is most similar)
+ * ChromaDB uses cosine similarity by default.
+ * Recalibrated from 0.7 (under old 1 - dist/2) to 0.55 (under true cosine score = 1 - distance)
+ * per Card 6aa223ea08971669b4a25e5b / report 46.
+ */
+export const DEFAULT_SIMILARITY_THRESHOLD = 0.55;
 
 /**
  * Maximum tokens for embedding model (nomic-embed-text limit)
@@ -155,6 +161,12 @@ export class VectorStoreManager {
    * @param chromaUrl ChromaDB server URL (default: http://localhost:8024)
    * @param ollamaUrl Ollama server URL for embeddings (default: http://localhost:11434)
    * @param embeddingModel Model name for embeddings (default: nomic-embed-text)
+   *
+   * Note on `library.embeddingModel`:
+   * Although library documents in MongoDB may define an `embeddingModel` property,
+   * all VectorStoreManager construction sites currently use the default parameter
+   * (`DEFAULT_EMBEDDING_MODEL` = 'nomic-embed-text'). This configuration is documented
+   * as inert config per Card 6aa223ea08971669b4a25e5b until multi-model routing is enabled.
    */
   constructor(
     chromaUrl: string = process.env.CHROMA_URL || process.env.VECTOR_DB_URL || 'http://localhost:8024',
@@ -685,11 +697,12 @@ export class VectorStoreManager {
         for (let i = 0; i < results.ids[0].length; i++) {
           const distance = results.distances?.[0]?.[i] ?? 999;
           
-          // With cosine similarity, ChromaDB returns distance in range [0, 2]
-          // where 0 = identical, 1 = orthogonal, 2 = opposite
-          // Convert to similarity score: 1 - (distance / 2)
-          // This gives scores from 0 to 1, where 1 is most similar
-          const score = 1 - (distance / 2);
+          // ChromaDB with cosine distance metric returns: distance = 1 - cosine_similarity.
+          // Distance range is [0, 2] where 0 = identical, 1 = orthogonal, 2 = opposite.
+          // Converted directly to true similarity score: score = 1 - distance (Card 6aa223ea08971669b4a25e5b).
+          // Note: Previously used 1 - (distance / 2), which compressed distance into [0.65, 0.95],
+          // rendering thresholds meaningless and letting irrelevant queries clear 0.70.
+          const score = 1 - distance;
 
           // Filter by threshold
           if (score >= threshold) {
