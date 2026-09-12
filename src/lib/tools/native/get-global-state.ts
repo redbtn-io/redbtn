@@ -79,6 +79,7 @@ import type {
 } from '../native-registry';
 import type { Segment } from './_json-path';
 import { parseJsonPath, resolveJsonPath, joinJsonPath } from './_json-path';
+import { redactSensitive } from '../../utils/redact-sensitive';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -577,6 +578,9 @@ const getGlobalStateTool: NativeToolDefinition = {
 
       const data = (await response.json()) as AnyObject;
       stored = data?.value ?? null;
+      if (stored !== null && stored !== undefined) {
+        stored = redactSensitive(stored, key);
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return errorResult({ error: message });

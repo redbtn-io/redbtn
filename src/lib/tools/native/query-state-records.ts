@@ -26,6 +26,7 @@ import {
   toolError,
   toolOk,
 } from '../state-records-http';
+import { redactSensitive } from '../../utils/redact-sensitive';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -109,8 +110,11 @@ const queryStateRecordsTool: NativeToolDefinition = {
 
     if (!result.ok) return result.result;
 
+    const rawRecords = result.data?.records ?? [];
+    const records = Array.isArray(rawRecords) ? rawRecords.map((r: unknown) => redactSensitive(r)) : [];
+
     return toolOk({
-      records: result.data?.records ?? [],
+      records,
       count: result.data?.count ?? 0,
       hasMore: result.data?.hasMore ?? false,
       ...(result.data?.total !== undefined ? { total: result.data.total } : {}),
