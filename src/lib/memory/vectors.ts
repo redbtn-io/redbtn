@@ -349,13 +349,15 @@ export class VectorStoreManager {
 
     // Fallback: split by fixed size with overlap
     let startIndex = 0;
+    const safeOverlap = Math.min(Math.max(0, chunkOverlap), Math.max(0, chunkSize - 1));
+    const step = Math.max(1, chunkSize - safeOverlap);
     while (startIndex < text.length) {
       const endIndex = Math.min(startIndex + chunkSize, text.length);
       const chunk = text.slice(startIndex, endIndex);
       chunks.push(chunk);
       
-      // Move forward by (chunkSize - overlap) to create overlap
-      startIndex += chunkSize - chunkOverlap;
+      // Move forward by step to guarantee advancement and prevent OOM loops
+      startIndex += step;
       
       // Break if we've reached the end
       if (endIndex >= text.length) {

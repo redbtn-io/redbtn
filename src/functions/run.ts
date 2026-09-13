@@ -789,7 +789,9 @@ CRITICAL RULES:
       task,
       messages:
         Array.isArray(input.messages) && input.messages.length > 0
-          ? (input.messages as any[])
+          ? (input.messages
+              .filter((m: any) => m && typeof m === 'object' && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+              .map((m: any) => ({ role: m.role, content: m.content })))
           : message
             ? [{ role: 'user', content: message }]
             : [],

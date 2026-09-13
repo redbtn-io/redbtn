@@ -166,6 +166,26 @@ const createLibraryTool: NativeToolDefinition = {
     const metadata =
       args.metadata && typeof args.metadata === 'object' ? args.metadata : undefined;
 
+    // Cross-field validation: chunkOverlap must be strictly less than chunkSize
+    const effectiveCs = chunkSize !== undefined ? chunkSize : 2000;
+    const effectiveCo = chunkOverlap !== undefined ? chunkOverlap : 200;
+    if (chunkSize !== undefined || chunkOverlap !== undefined) {
+      if (effectiveCo >= effectiveCs) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'chunkOverlap must be strictly less than chunkSize',
+                code: 'VALIDATION',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     const body: AnyObject = { name };
     if (description !== undefined) body.description = description;
     if (chunkSize !== undefined) body.chunkSize = chunkSize;

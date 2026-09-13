@@ -131,6 +131,17 @@ describe('create_library — validation errors', () => {
     expect(r.isError).toBe(true);
     expect(JSON.parse(r.content[0].text).code).toBe('VALIDATION');
   });
+
+  test('chunkOverlap >= chunkSize returns VALIDATION error', async () => {
+    const r = await createLibraryTool.handler(
+      { name: 'Lib', chunkSize: 1000, chunkOverlap: 1000 },
+      makeMockContext(),
+    );
+    expect(r.isError).toBe(true);
+    const err = JSON.parse(r.content[0].text);
+    expect(err.code).toBe('VALIDATION');
+    expect(err.error).toContain('strictly less than');
+  });
 });
 
 describe('create_library — upstream error', () => {
