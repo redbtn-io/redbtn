@@ -34,4 +34,4 @@ export REDBTN_TOKEN="${RREG_TOKEN}"
 export REDBTN_API_URL="${REDBTN_API_URL:-https://app.redbtn.io}"
 
 echo "[workspace-runner] Starting redbtn connect for installId=${REDBTN_INSTALL_ID}..."
-exec redbtn connect --allow-exec --api-url "${REDBTN_API_URL}"
+exec redbtn connect --allow-exec
