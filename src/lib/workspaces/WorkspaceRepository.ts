@@ -37,7 +37,7 @@ export function generateEnvironmentId(): string {
 }
 
 export class WorkspaceRepository {
-  private collectionName = 'workspaces';
+  private collectionName = 'agentWorkspaces';
 
   constructor(private db: Db) {}
 
