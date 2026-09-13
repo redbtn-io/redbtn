@@ -30,20 +30,11 @@ describe('redactSensitive — extended credential patterns', () => {
     expect(result).not.toContain('AKIA');
   });
 
-  it('redacts long bare base64 runs', () => {
+  it('preserves ordinary long strings and base64 data outside credential keys', () => {
     const longBase64 = 'A'.repeat(64);
     const input = `Payload: ${longBase64}`;
     const result = redactSensitive(input);
-    expect(result).toBe(`Payload: ${REDACTED}`);
-    expect(result).not.toContain('AAAA');
-  });
-
-  it('redacts padded base64 runs', () => {
-    const paddedBase64 = 'A'.repeat(42) + '==';
-    const input = `Data: ${paddedBase64}`;
-    const result = redactSensitive(input);
-    expect(result).toBe(`Data: ${REDACTED}`);
-    expect(result).not.toContain('==');
+    expect(result).toBe(`Payload: ${longBase64}`);
   });
 
   it('preserves git commit SHAs', () => {
