@@ -104,9 +104,9 @@ export const SCRIPTED_TEST_CASES: TestCase[] = [
   {
     id: 'pos-14',
     type: 'positive',
-    question: 'What flight is booked for Denver and on what date?',
+    question: 'What flight is booked for Seattle and on what date?',
     targetMemoryIds: ['mem-14'],
-    expectedKeywords: ['AC842', 'September 14'],
+    expectedKeywords: ['ACME-1', 'September 14'],
   },
   {
     id: 'pos-15',
