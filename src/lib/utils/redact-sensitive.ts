@@ -42,7 +42,6 @@ function redactString(value: string): string {
     .replace(/\bsk-[A-Za-z0-9_-]+/g, REDACTED)
     .replace(/\bghp_[A-Za-z0-9]+/g, REDACTED)
     .replace(/\bAKIA[0-9A-Z]{12,}/g, REDACTED)
-    .replace(/(?:\b[A-Za-z0-9+/]{64,}={0,2}|\b[A-Za-z0-9+/]{40,}={1,2})(?=[^A-Za-z0-9+/=]|$)/g, REDACTED);
 }
 
 /** Return a JSON-compatible, non-mutating copy with credential values masked. */
