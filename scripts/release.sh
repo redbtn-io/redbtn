@@ -112,7 +112,16 @@ else
   fi
   (
     cd "$package_dir"
-    npm "${publish_args[@]}"
+    if ! output="$(npm "${publish_args[@]}" 2>&1)"; then
+      if echo "$output" | grep -qE "E409|cannot publish over the previously published versions|already exists"; then
+        log "$package_name@$package_version already exists on registry (E409); skipping npm publish"
+      else
+        printf '%s\n' "$output" >&2
+        exit 1
+      fi
+    else
+      printf '%s\n' "$output"
+    fi
   )
 fi
 

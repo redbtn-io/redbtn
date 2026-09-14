@@ -1,4 +1,10 @@
-export { StreamEventPublisher, createStreamEventPublisher } from './stream-publisher';
+export {
+  StreamEventPublisher,
+  createStreamEventPublisher,
+  sanitizeStreamEvent,
+  MAX_STREAM_EVENT_TEXT_CHARS,
+  MAX_REPLAY_EVENTS_PER_SESSION,
+} from './stream-publisher';
 export type { StreamEventPublisherOptions, StreamSessionState } from './stream-publisher';
 export { StreamSessionKeys, StreamSessionConfig } from './types';
 export type {

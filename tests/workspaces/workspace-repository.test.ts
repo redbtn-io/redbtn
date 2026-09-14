@@ -58,7 +58,7 @@ class MockWorkspaceCollection {
   ): Promise<IWorkspace | null> {
     for (const [id, doc] of this.docs.entries()) {
       if (this.matches(doc, filter)) {
-        this.applyUpdate(doc, update);
+        this.applyUpdate(doc, update, filter);
         const returned = JSON.parse(JSON.stringify(doc), (k, v) => (k.endsWith('At') ? new Date(v) : v));
         return returned;
       }
@@ -69,7 +69,7 @@ class MockWorkspaceCollection {
   async updateOne(filter: Filter<IWorkspace>, update: Record<string, any>): Promise<{ matchedCount: number; modifiedCount: number }> {
     for (const doc of this.docs.values()) {
       if (this.matches(doc, filter)) {
-        this.applyUpdate(doc, update);
+        this.applyUpdate(doc, update, filter);
         return { matchedCount: 1, modifiedCount: 1 };
       }
     }
@@ -121,7 +121,7 @@ class MockWorkspaceCollection {
     return true;
   }
 
-  private applyUpdate(doc: IWorkspace, update: Record<string, any>): void {
+  private applyUpdate(doc: IWorkspace, update: Record<string, any>, filter?: Record<string, any>): void {
     if (update.$push) {
       for (const [k, v] of Object.entries(update.$push)) {
         if (k === 'activeCheckouts') {
@@ -158,8 +158,16 @@ class MockWorkspaceCollection {
         if (k === 'updatedAt') {
           doc.updatedAt = new Date(v);
         } else if (k === 'activeCheckouts.$.leaseExpiresAt') {
-          // Update matching checkout
-          if (doc.activeCheckouts.length > 0) {
+          const targetCheckoutId = filter?.['activeCheckouts.checkoutId'];
+          const targetRunId = filter?.['activeCheckouts.runId'];
+          const target = doc.activeCheckouts.find((c) => {
+            if (targetCheckoutId && c.checkoutId !== targetCheckoutId) return false;
+            if (targetRunId && c.runId !== targetRunId) return false;
+            return true;
+          });
+          if (target) {
+            target.leaseExpiresAt = new Date(v);
+          } else if (doc.activeCheckouts.length > 0) {
             doc.activeCheckouts[0].leaseExpiresAt = new Date(v);
           }
         } else if (k === 'currentSnapshotId') {
@@ -413,6 +421,43 @@ describe('WorkspaceRepository (PR 1 CAS & Concurrency Engine)', () => {
       await expect(
         repo.renewWorkspaceLease(ws.workspaceId, checkout.checkoutId, 'run_wrong_runid')
       ).rejects.toThrow(WorkspaceLeaseLostError);
+    });
+
+    it('renews the exact targeted checkout in multi-checkout scenarios without mutating sibling checkouts', async () => {
+      const ws = await repo.createWorkspace({
+        userId: 'user_123',
+        name: 'Multi-Checkout Heartbeat',
+        maxConcurrentCheckouts: 5,
+      });
+
+      const { checkout: c1 } = await repo.checkoutWorkspace({
+        workspaceId: ws.workspaceId,
+        runId: 'run_c1',
+        workerId: 'worker_1',
+        mode: 'branch',
+        checkoutKey: 'task-1',
+      });
+
+      const { checkout: c2 } = await repo.checkoutWorkspace({
+        workspaceId: ws.workspaceId,
+        runId: 'run_c2',
+        workerId: 'worker_2',
+        mode: 'branch',
+        checkoutKey: 'task-2',
+      });
+
+      const c1OriginalExpiry = c1.leaseExpiresAt.getTime();
+      const c2OriginalExpiry = c2.leaseExpiresAt.getTime();
+
+      // Extend lease of c2 ONLY by 45 minutes
+      await repo.renewWorkspaceLease(ws.workspaceId, c2.checkoutId, 'run_c2', 45 * 60 * 1000);
+
+      const latest = await repo.getWorkspace(ws.workspaceId);
+      const afterC1 = latest?.activeCheckouts.find((c) => c.checkoutId === c1.checkoutId);
+      const afterC2 = latest?.activeCheckouts.find((c) => c.checkoutId === c2.checkoutId);
+
+      expect(afterC2?.leaseExpiresAt.getTime()).toBeGreaterThan(c2OriginalExpiry);
+      expect(afterC1?.leaseExpiresAt.getTime()).toBe(c1OriginalExpiry);
     });
   });
 

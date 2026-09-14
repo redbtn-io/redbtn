@@ -6,6 +6,7 @@ describe('StreamEventPublisher - transcription events', () => {
     return {
       publish: vi.fn().mockResolvedValue(1),
       rpush: vi.fn().mockResolvedValue(1),
+      ltrim: vi.fn().mockResolvedValue('OK'),
       expire: vi.fn().mockResolvedValue(1),
       get: vi.fn().mockResolvedValue(null),
       set: vi.fn().mockResolvedValue('OK'),
@@ -60,5 +61,36 @@ describe('StreamEventPublisher - transcription events', () => {
     await publisher.outputTranscription('blind output', { suppressed: true });
     const eventSuppressed = JSON.parse(redis.publish.mock.calls[1][1]);
     expect(eventSuppressed.suppressed).toBe(true);
+  });
+
+  it('redacts sensitive API keys and tokens from published transcripts', async () => {
+    const redis = makeFakeRedis();
+    const publisher = new StreamEventPublisher({
+      redis,
+      sessionId: 'sess-sensitive',
+    });
+
+    await publisher.inputTranscription('My API key is sk-abcdef1234567890abcdef and token Bearer xyz123');
+    const event = JSON.parse(redis.publish.mock.calls[0][1]);
+    expect(event.text).not.toContain('sk-abcdef1234567890abcdef');
+    expect(event.text).toContain('[REDACTED]');
+  });
+
+  it('caps oversized transcript text and trims the replay list on Redis', async () => {
+    const redis = makeFakeRedis();
+    const publisher = new StreamEventPublisher({
+      redis,
+      sessionId: 'sess-large',
+    });
+
+    const oversized = 'A'.repeat(25000);
+    await publisher.outputTranscription(oversized);
+
+    const event = JSON.parse(redis.publish.mock.calls[0][1]);
+    expect(event.text.length).toBeLessThan(20000);
+    expect(event.text).toContain('...[truncated]');
+
+    expect(redis.rpush).toHaveBeenCalledWith('stream:events:sess-large', expect.any(String));
+    expect(redis.ltrim).toHaveBeenCalledWith('stream:events:sess-large', -1000, -1);
   });
 });
