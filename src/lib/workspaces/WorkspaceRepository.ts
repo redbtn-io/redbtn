@@ -239,6 +239,14 @@ export class WorkspaceRepository {
     }
   }
 
+  /** Record the node whose docker daemon holds this workspace's named volume. */
+  async setWorkspaceNode(workspaceId: string, nodeId: string): Promise<void> {
+    await this.collection.updateOne(
+      { workspaceId } as Filter<IWorkspace>,
+      { $set: { nodeId, updatedAt: new Date() } as any }
+    );
+  }
+
   async renewWorkspaceLease(
     workspaceId: string,
     checkoutId: string,

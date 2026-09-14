@@ -113,6 +113,12 @@ export interface IWorkspace {
   stats: IWorkspaceStats;
 
   // --- Concurrency & Checkouts ---
+  /**
+   * The node whose docker daemon holds this workspace's named volume, recorded
+   * after each successful spawn. The next checkout prefers it so the working
+   * copy is reused rather than restored from object storage.
+   */
+  nodeId?: string;
   /** Optimistic concurrency version counter (incremented on checkout/release). */
   version: number;
   /** Maximum number of parallel checkouts allowed (default: 8). */

@@ -132,6 +132,14 @@ export interface AcquireOptions {
   mode?: CheckoutMode;
   leaseDurationMs?: number;
   apiUrl?: string;
+  /**
+   * Pin the spawn to one node's queue. Defaults to the node that last spawned
+   * this workspace (recorded on the document): the named volume lives there, so
+   * going back to it reuses the working copy instead of restoring the whole
+   * repository from object storage. Falls back to the global queue, where any
+   * provisioned node may take the job.
+   */
+  nodeId?: string;
 }
 
 export interface AcquiredWorkspace {
@@ -283,8 +291,10 @@ export async function acquireWorkspace(
   });
 
   try {
+    const targetNode = options.nodeId || (workspace as any).nodeId;
+    const spawnQueue = targetNode ? workspaceNodeQueue(targetNode) : WORKSPACE_QUEUE;
     const spawn = await queue.runJob(
-      WORKSPACE_QUEUE,
+      spawnQueue,
       'spawn',
       {
         action: 'spawn',
@@ -336,6 +346,8 @@ export async function acquireWorkspace(
       containerName: spawn.containerName,
       volumeName: spawn.volumeName,
     });
+    // Remember where the volume lives, so the next checkout goes back to it.
+    await repo.setWorkspaceNode(workspace.workspaceId, spawn.nodeId).catch(() => {});
 
     const acquired: AcquiredWorkspace = {
       workspace,
