@@ -438,17 +438,49 @@ export const MAX_STREAM_EVENT_TEXT_CHARS = 16384;
 export const MAX_REPLAY_EVENTS_PER_SESSION = 1000;
 
 /**
- * Redact sensitive credentials/tokens and cap maximum text length on stream events.
+ * Cap every oversized payload on a stream event, BEFORE it is redacted.
+ *
+ * The previous version capped only `text`, and did it *after* redaction, so a
+ * `tool_result` carrying a 1.5 MB `result` went through the full regex battery
+ * uncapped on the hub's event loop. Capping first bounds the redactor's input
+ * and is safe: redaction still runs over the surviving prefix afterwards.
+ *
+ * Exported for tests.
  */
-export function sanitizeStreamEvent(event: StreamEvent): StreamEvent {
-  const sanitized = redactSensitive(event);
-  if ('text' in sanitized && typeof (sanitized as any).text === 'string') {
-    const text = (sanitized as any).text;
-    if (text.length > MAX_STREAM_EVENT_TEXT_CHARS) {
-      (sanitized as any).text = text.slice(0, MAX_STREAM_EVENT_TEXT_CHARS) + '...[truncated]';
+export function capStreamEventPayload(event: StreamEvent): StreamEvent {
+  let copy: Record<string, unknown> | null = null;
+  const source = event as unknown as Record<string, unknown>;
+  for (const [k, v] of Object.entries(source)) {
+    if (typeof v === 'string') {
+      if (v.length > MAX_STREAM_EVENT_TEXT_CHARS) {
+        copy ??= { ...source };
+        copy[k] = v.slice(0, MAX_STREAM_EVENT_TEXT_CHARS) + '...[truncated]';
+      }
+      continue;
+    }
+    if (v === null || typeof v !== 'object') continue;
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(v) ?? '';
+    } catch {
+      serialized = '';
+    }
+    if (serialized.length > MAX_STREAM_EVENT_TEXT_CHARS) {
+      copy ??= { ...source };
+      copy[k] = {
+        _truncated: true,
+        preview: serialized.slice(0, MAX_STREAM_EVENT_TEXT_CHARS) + '...[truncated]',
+      };
     }
   }
-  return sanitized;
+  return (copy ?? event) as unknown as StreamEvent;
+}
+
+/**
+ * Cap maximum payload size and redact sensitive credentials/tokens on stream events.
+ */
+export function sanitizeStreamEvent(event: StreamEvent): StreamEvent {
+  return redactSensitive(capStreamEventPayload(event));
 }
 
 /**
