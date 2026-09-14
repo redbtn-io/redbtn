@@ -185,14 +185,18 @@ export class WorkspaceRepository {
     const res = await this.collection.updateOne(
       {
         workspaceId,
-        'activeCheckouts.checkoutId': checkoutId,
-        'activeCheckouts.runId': runId,
+        activeCheckouts: {
+          $elemMatch: { checkoutId, runId },
+        },
       } as Filter<IWorkspace>,
       {
         $set: {
-          'activeCheckouts.$.leaseExpiresAt': leaseExpiresAt,
+          'activeCheckouts.$[elem].leaseExpiresAt': leaseExpiresAt,
           updatedAt: now,
         },
+      },
+      {
+        arrayFilters: [{ 'elem.checkoutId': checkoutId, 'elem.runId': runId }],
       }
     );
 
