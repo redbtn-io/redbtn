@@ -787,14 +787,24 @@ CRITICAL RULES:
       runId,
       conversationId: options.conversationId,
       task,
-      messages:
-        Array.isArray(input.messages) && input.messages.length > 0
-          ? (input.messages
-              .filter((m: any) => m && typeof m === 'object' && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
-              .map((m: any) => ({ role: m.role, content: m.content })))
+      messages: (() => {
+        const filtered = Array.isArray(input.messages)
+          ? input.messages
+              .filter(
+                (m: any) =>
+                  m &&
+                  typeof m === 'object' &&
+                  (m.role === 'user' || m.role === 'assistant' || m.role === 'system') &&
+                  typeof m.content === 'string'
+              )
+              .map((m: any) => ({ role: m.role, content: m.content }))
+          : [];
+        return filtered.length > 0
+          ? filtered
           : message
             ? [{ role: 'user', content: message }]
-            : [],
+            : [];
+      })(),
       userId: options.userId,
       // Mirror of the top-level callerUserId (same rationale as userId/runId).
       ...(options.connectionIdentityUserId
