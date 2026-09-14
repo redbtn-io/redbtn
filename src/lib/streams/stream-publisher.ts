@@ -16,6 +16,7 @@
  */
 
 import type Redis from 'ioredis';
+import { redactSensitive } from '../utils/redact-sensitive';
 import {
   StreamSessionKeys,
   StreamSessionConfig,
@@ -360,16 +361,18 @@ export class StreamEventPublisher {
   // ── Internal helpers ───────────────────────────────────────────────────────
 
   private async publish(event: StreamEvent): Promise<void> {
-    const json = JSON.stringify(event);
+    const safeEvent = sanitizeStreamEvent(event);
+    const json = JSON.stringify(safeEvent);
     // Publish to pub/sub for live listeners
     await this.redis.publish(this.channel, json);
     // Store in list for replay on reconnection (strip audio payloads to keep small)
-    const archivable = stripAudio(event);
-    const archiveJson = archivable === event ? json : JSON.stringify(archivable);
+    const archivable = stripAudio(safeEvent);
+    const archiveJson = archivable === safeEvent ? json : JSON.stringify(archivable);
     await this.redis.rpush(this.eventsKey, archiveJson);
+    await this.redis.ltrim(this.eventsKey, -MAX_REPLAY_EVENTS_PER_SESSION, -1);
     await this.redis.expire(this.eventsKey, this.eventsTtl);
     // Fire-and-forget archive job
-    this._enqueueArchive(event).catch(() => {});
+    this._enqueueArchive(safeEvent).catch(() => {});
   }
 
   private async saveState(state: StreamSessionState): Promise<void> {
@@ -430,6 +433,23 @@ export class StreamEventPublisher {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+export const MAX_STREAM_EVENT_TEXT_CHARS = 16384;
+export const MAX_REPLAY_EVENTS_PER_SESSION = 1000;
+
+/**
+ * Redact sensitive credentials/tokens and cap maximum text length on stream events.
+ */
+export function sanitizeStreamEvent(event: StreamEvent): StreamEvent {
+  const sanitized = redactSensitive(event);
+  if ('text' in sanitized && typeof (sanitized as any).text === 'string') {
+    const text = (sanitized as any).text;
+    if (text.length > MAX_STREAM_EVENT_TEXT_CHARS) {
+      (sanitized as any).text = text.slice(0, MAX_STREAM_EVENT_TEXT_CHARS) + '...[truncated]';
+    }
+  }
+  return sanitized;
+}
 
 /**
  * Strip base64 audio payload from audio events before writing to the replay

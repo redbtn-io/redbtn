@@ -206,7 +206,16 @@ export { ConversationPublisher, createConversationPublisher, ConversationKeys } 
 export type { ConversationEvent, ConversationAttachmentEvent } from './lib/conversation';
 
 // Export stream session pub/sub
-export { StreamEventPublisher, createStreamEventPublisher, StreamSessionKeys, StreamSessionConfig } from './lib/streams';
+export {
+  StreamEventPublisher,
+  createStreamEventPublisher,
+  sanitizeStreamEvent,
+  MAX_STREAM_EVENT_TEXT_CHARS,
+  MAX_REPLAY_EVENTS_PER_SESSION,
+  StreamSessionKeys,
+  StreamSessionConfig,
+} from './lib/streams';
+export { redactSensitive } from './lib/utils/redact-sensitive';
 export type {
   StreamEvent,
   StreamEventType,
