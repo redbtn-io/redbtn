@@ -1,687 +1,232 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+/**
+ * WorkspaceRepository against a REAL MongoDB.
+ *
+ * The previous version of this file reimplemented `$expr`, `$ne`, `$push`,
+ * `$pull`, `$inc` and the positional `$` by hand — and got them wrong in exactly
+ * the way production was wrong, so `renewWorkspaceLease`'s cross-element bug
+ * passed for the wrong reason (48a P1-8), and when the mock was later "fixed" it
+ * modelled `$elemMatch` semantics real Mongo does not give a bare `$` (50a 1c).
+ * A CAS engine can only be tested against the engine that runs it.
+ *
+ * Skipped (not failed) when no Mongo is reachable, so CI without a database
+ * still goes green; point WORKSPACE_TEST_MONGODB_URI at any throwaway server.
+ */
+import { describe, it, expect, afterAll, beforeEach } from 'vitest';
+import { MongoClient, Db } from 'mongodb';
 import {
   WorkspaceRepository,
-  WorkspaceNotFoundError,
   WorkspaceLockedError,
   WorkspaceLeaseLostError,
   WorkspaceVersionConflictError,
-  IWorkspace,
-  IWorkspaceCheckout,
-} from '../../src/lib/workspaces/index.js';
-import type { Db, Collection, Filter } from 'mongodb';
+  DEFAULT_LEASE_DURATION_MS,
+} from '../../src/lib/workspaces';
 
-/**
- * In-memory Mock Collection simulating MongoDB atomic operators:
- * $set, $inc, $push, $pull, $ne, $size, $expr
- */
-class MockWorkspaceCollection {
-  private docs: Map<string, IWorkspace> = new Map();
+const URI = process.env.WORKSPACE_TEST_MONGODB_URI || 'mongodb://127.0.0.1:27017';
+const DB_NAME = `workspace_repo_test_${Date.now()}`;
 
-  async createIndex(): Promise<string> {
-    return 'index_created';
-  }
+let client: MongoClient | null = null;
+let db: Db | null = null;
+let available = false;
 
-  async insertOne(doc: IWorkspace): Promise<{ insertedId: string }> {
-    const clone = JSON.parse(JSON.stringify(doc));
-    // Restore Dates
-    clone.createdAt = new Date(doc.createdAt);
-    clone.updatedAt = new Date(doc.updatedAt);
-    this.docs.set(doc.workspaceId, clone);
-    return { insertedId: doc.workspaceId };
-  }
-
-  async findOne(filter: Filter<IWorkspace>): Promise<IWorkspace | null> {
-    for (const doc of this.docs.values()) {
-      if (this.matches(doc, filter)) {
-        return JSON.parse(JSON.stringify(doc), (k, v) => (k.endsWith('At') ? new Date(v) : v));
-      }
-    }
-    return null;
-  }
-
-  find(filter: Record<string, any>): { toArray: () => Promise<IWorkspace[]> } {
-    const results: IWorkspace[] = [];
-    for (const doc of this.docs.values()) {
-      if (this.matches(doc, filter)) {
-        results.push(JSON.parse(JSON.stringify(doc), (k, v) => (k.endsWith('At') ? new Date(v) : v)));
-      }
-    }
-    return {
-      toArray: async () => results,
-    };
-  }
-
-  async findOneAndUpdate(
-    filter: Filter<IWorkspace>,
-    update: Record<string, any>,
-    options?: { returnDocument?: string }
-  ): Promise<IWorkspace | null> {
-    for (const [id, doc] of this.docs.entries()) {
-      if (this.matches(doc, filter)) {
-        this.applyUpdate(doc, update, filter);
-        const returned = JSON.parse(JSON.stringify(doc), (k, v) => (k.endsWith('At') ? new Date(v) : v));
-        return returned;
-      }
-    }
-    return null;
-  }
-
-  async updateOne(
-    filter: Filter<IWorkspace>,
-    update: Record<string, any>,
-    options?: { arrayFilters?: any[] }
-  ): Promise<{ matchedCount: number; modifiedCount: number }> {
-    for (const doc of this.docs.values()) {
-      if (this.matches(doc, filter)) {
-        this.applyUpdate(doc, update, filter, options);
-        return { matchedCount: 1, modifiedCount: 1 };
-      }
-    }
-    return { matchedCount: 0, modifiedCount: 0 };
-  }
-
-  async deleteOne(filter: { workspaceId: string }): Promise<{ deletedCount: number }> {
-    const deleted = this.docs.delete(filter.workspaceId);
-    return { deletedCount: deleted ? 1 : 0 };
-  }
-
-  private matches(doc: IWorkspace, filter: Record<string, any>): boolean {
-    for (const [key, value] of Object.entries(filter)) {
-      if (key === '$expr') {
-        // Evaluate $lt: [{ $size: '$activeCheckouts' }, '$maxConcurrentCheckouts']
-        const lt = value['$lt'];
-        if (lt) {
-          const currentSize = doc.activeCheckouts.length;
-          const limit = doc.maxConcurrentCheckouts;
-          if (!(currentSize < limit)) return false;
-        }
-      } else if (key === 'workspaceId') {
-        if (doc.workspaceId !== value) return false;
-      } else if (key === 'version') {
-        if (doc.version !== value) return false;
-      } else if (key === 'activeCheckouts') {
-        if (value && typeof value === 'object' && '$elemMatch' in value) {
-          const match = doc.activeCheckouts.some((c) => {
-            for (const [subKey, subVal] of Object.entries(value.$elemMatch)) {
-              if ((c as any)[subKey] !== subVal) return false;
-            }
-            return true;
-          });
-          if (!match) return false;
-        }
-      } else if (key === 'activeCheckouts.checkoutKey') {
-        if (value && typeof value === 'object' && '$ne' in value) {
-          const hasKey = doc.activeCheckouts.some((c) => c.checkoutKey === value.$ne);
-          if (hasKey) return false;
-        }
-      } else if (key === 'activeCheckouts.mode') {
-        if (value && typeof value === 'object' && '$ne' in value) {
-          const hasMode = doc.activeCheckouts.some((c) => c.mode === value.$ne);
-          if (hasMode) return false;
-        }
-      } else if (key === 'activeCheckouts.checkoutId') {
-        const hasCheckout = doc.activeCheckouts.some((c) => c.checkoutId === value);
-        if (!hasCheckout) return false;
-      } else if (key === 'activeCheckouts.runId') {
-        const hasRun = doc.activeCheckouts.some((c) => c.runId === value);
-        if (!hasRun) return false;
-      } else if (key === 'activeCheckouts.leaseExpiresAt') {
-        if (value && typeof value === 'object' && '$lt' in value) {
-          const hasExpired = doc.activeCheckouts.some((c) => c.leaseExpiresAt < value.$lt);
-          if (!hasExpired) return false;
-        }
-      }
-    }
-    return true;
-  }
-
-  private applyUpdate(
-    doc: IWorkspace,
-    update: Record<string, any>,
-    filter?: Record<string, any>,
-    options?: { arrayFilters?: any[] }
-  ): void {
-    if (update.$push) {
-      for (const [k, v] of Object.entries(update.$push)) {
-        if (k === 'activeCheckouts') {
-          doc.activeCheckouts.push(JSON.parse(JSON.stringify(v), (key, val) => (key.endsWith('At') ? new Date(val) : val)));
-        }
-      }
-    }
-    if (update.$pull) {
-      for (const [k, v] of Object.entries(update.$pull)) {
-        if (k === 'activeCheckouts') {
-          const pullCriteria = v as any;
-          if (pullCriteria.checkoutId && pullCriteria.checkoutId.$in) {
-            const set = new Set(pullCriteria.checkoutId.$in);
-            doc.activeCheckouts = doc.activeCheckouts.filter((c) => !set.has(c.checkoutId));
-          } else if (pullCriteria.checkoutId) {
-            doc.activeCheckouts = doc.activeCheckouts.filter((c) => c.checkoutId !== pullCriteria.checkoutId);
-          }
-        }
-      }
-    }
-    if (update.$inc) {
-      for (const [k, v] of Object.entries(update.$inc)) {
-        if (k === 'version') {
-          doc.version += v as number;
-        } else if (k === 'stats.totalRunCount') {
-          doc.stats.totalRunCount += v as number;
-        } else if (k === 'stats.totalComputeSeconds') {
-          doc.stats.totalComputeSeconds += v as number;
-        }
-      }
-    }
-    if (update.$set) {
-      for (const [k, v] of Object.entries(update.$set)) {
-        if (k === 'updatedAt') {
-          doc.updatedAt = new Date(v);
-        } else if (k === 'activeCheckouts.$[elem].leaseExpiresAt') {
-          // `$[elem]` semantics: update EVERY element that satisfies every
-          // condition of the matching array filter. Real Mongo errors out when
-          // the identifier has no array filter, so the mock does too — a test
-          // can never accidentally pass by falling back to "some element".
-          const elemFilter = options?.arrayFilters?.find((af: Record<string, unknown>) =>
-            Object.keys(af).some((k2) => k2.startsWith('elem.')),
-          );
-          if (!elemFilter) {
-            throw new Error(
-              "No array filter found for identifier 'elem' in path 'activeCheckouts.$[elem].leaseExpiresAt'",
-            );
-          }
-          const conditions = Object.entries(elemFilter).map(
-            ([k2, v2]) => [k2.slice('elem.'.length), v2] as const,
-          );
-          for (const c of doc.activeCheckouts) {
-            if (conditions.every(([field, want]) => (c as Record<string, unknown>)[field] === want)) {
-              c.leaseExpiresAt = new Date(v);
-            }
-          }
-        } else if (k === 'activeCheckouts.$.leaseExpiresAt') {
-          // Positional `$` semantics, faithfully: it is a placeholder for the
-          // FIRST array element matched by the query — resolved from the first
-          // array condition alone, NOT from the conjunction of every dotted
-          // condition. Modelling it as "the element matching all conditions"
-          // is exactly what hid the cross-element lease bug (48a P1-8): with
-          // `{'activeCheckouts.checkoutId': X, 'activeCheckouts.runId': Y}`
-          // Mongo matches the document when X and Y live in *different*
-          // elements, and then renews the wrong one.
-          const positionalKey = Object.keys(filter ?? {}).find(
-            (fk) => fk.startsWith('activeCheckouts.') && fk !== 'activeCheckouts',
-          );
-          const field = positionalKey?.slice('activeCheckouts.'.length);
-          const want = positionalKey ? (filter as Record<string, unknown>)[positionalKey] : undefined;
-          const target = field
-            ? doc.activeCheckouts.find((c) => (c as Record<string, unknown>)[field] === want)
-            : doc.activeCheckouts[0];
-          if (target) {
-            target.leaseExpiresAt = new Date(v);
-          }
-        } else if (k === 'currentSnapshotId') {
-          doc.currentSnapshotId = v;
-        } else if (k === 'stats.snapshotSizeBytes') {
-          doc.stats.snapshotSizeBytes = v;
-        } else if (k === 'stats.fileCount') {
-          doc.stats.fileCount = v;
-        } else if (k === 'stats.lastSnapshotAt') {
-          doc.stats.lastSnapshotAt = new Date(v);
-        }
-      }
-    }
-  }
+// Probed at module load, not in beforeAll: vitest evaluates `skipIf` during
+// collection, so a beforeAll probe would skip every case unconditionally.
+try {
+  client = new MongoClient(URI, { serverSelectionTimeoutMS: 1500, connectTimeoutMS: 1500 });
+  await client.connect();
+  await client.db(DB_NAME).command({ ping: 1 });
+  db = client.db(DB_NAME);
+  available = true;
+} catch {
+  available = false;
+  await client?.close().catch(() => {});
+  client = null;
 }
 
-describe('WorkspaceRepository (PR 1 CAS & Concurrency Engine)', () => {
-  let mockCollection: MockWorkspaceCollection;
-  let mockDb: Db;
+afterAll(async () => {
+  if (db) await db.dropDatabase().catch(() => {});
+  await client?.close().catch(() => {});
+});
+
+describe('WorkspaceRepository (real MongoDB CAS engine)', () => {
   let repo: WorkspaceRepository;
 
-  beforeEach(() => {
-    mockCollection = new MockWorkspaceCollection();
-    mockDb = {
-      collection: () => mockCollection as unknown as Collection<IWorkspace>,
-    } as unknown as Db;
-    repo = new WorkspaceRepository(mockDb);
+  beforeEach(async () => {
+    if (!available) return;
+    await db!.collection('agentWorkspaces').deleteMany({});
+    repo = new WorkspaceRepository(db!);
   });
 
-  it('creates a workspace with default baseline configuration and initial version', async () => {
-    const ws = await repo.createWorkspace({
-      userId: 'user_123',
-      name: 'Become Project',
-      config: {
-        gitRepoUrl: 'https://github.com/redbtn-io/become.git',
-      },
-    });
+  const mkWorkspace = (over: Partial<Parameters<WorkspaceRepository['createWorkspace']>[0]> = {}) =>
+    repo.createWorkspace({ userId: 'user-1', name: `ws-${Math.random().toString(36).slice(2)}`, ...over } as any);
 
-    expect(ws.workspaceId).toMatch(/^ws_[A-Za-z0-9_-]{12}$/);
-    expect(ws.name).toBe('Become Project');
-    expect(ws.userId).toBe('user_123');
-    expect(ws.version).toBe(1);
-    expect(ws.config.defaultCwd).toBe('/workspace');
-    expect(ws.config.gitBranch).toBe('main');
-    expect(ws.activeCheckouts).toEqual([]);
-    expect(ws.currentSnapshotId).toBeNull();
+  it.skipIf(!available)('serialises exclusive checkouts: the second is refused, not queued', async () => {
+    const ws = await mkWorkspace();
+    const first = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'run-a', workerId: 'w1' });
+    expect(first.checkout.checkoutId).toMatch(/^chk_/);
+
+    await expect(
+      repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'run-b', workerId: 'w2', checkoutKey: 'other' })
+    ).rejects.toThrow(WorkspaceLockedError);
+
+    const after = await repo.getWorkspace(ws.workspaceId);
+    expect(after!.activeCheckouts).toHaveLength(1);
+    expect(after!.activeCheckouts[0].runId).toBe('run-a');
   });
 
-  it('retrieves an existing workspace by workspaceId', async () => {
-    const created = await repo.createWorkspace({
-      userId: 'user_123',
-      name: 'Test Project',
-    });
-
-    const retrieved = await repo.getWorkspace(created.workspaceId);
-    expect(retrieved).not.toBeNull();
-    expect(retrieved?.workspaceId).toBe(created.workspaceId);
-
-    const nonExistent = await repo.getWorkspace('ws_nonexistent');
-    expect(nonExistent).toBeNull();
+  it.skipIf(!available)('refuses a second checkout with the same key (idempotency), even in branch mode', async () => {
+    const ws = await mkWorkspace();
+    await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'run-a', workerId: 'w1', mode: 'branch', checkoutKey: 'card-1' });
+    await expect(
+      repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'run-b', workerId: 'w2', mode: 'branch', checkoutKey: 'card-1' })
+    ).rejects.toThrow(WorkspaceLockedError);
   });
 
-  describe('Exclusive Checkout (Trunk / Discord Bot)', () => {
-    it('successfully checks out an exclusive lease on trunk', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Trunk Repo',
-      });
-
-      const { workspace: updated, checkout } = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_trunk_01',
-        workerId: 'worker_delta_1',
-        mode: 'exclusive',
-        checkoutKey: 'trunk',
-        branch: 'main',
-      });
-
-      expect(updated.version).toBe(2);
-      expect(checkout.checkoutId).toMatch(/^chk_[A-Za-z0-9_-]{10}$/);
-      expect(checkout.mode).toBe('exclusive');
-      expect(checkout.checkoutKey).toBe('trunk');
-      expect(checkout.branch).toBe('main');
-      expect(checkout.environmentId).toMatch(/^env_[A-Za-z0-9_-]{12}$/);
-      expect(checkout.installId).toBe(`ws_${ws.workspaceId}_${checkout.checkoutId}`);
-      expect(checkout.volumeName).toBe(`ws_${ws.workspaceId}_${checkout.checkoutId}_data`);
-      expect(updated.activeCheckouts).toHaveLength(1);
-    });
-
-    it('rejects a second exclusive checkout while one is active', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Exclusive Repo',
-      });
-
-      await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_1',
-        workerId: 'worker_1',
-        mode: 'exclusive',
-        checkoutKey: 'trunk',
-      });
-
-      // Second checkout in exclusive mode must be rejected
-      await expect(
-        repo.checkoutWorkspace({
-          workspaceId: ws.workspaceId,
-          runId: 'run_2',
-          workerId: 'worker_2',
-          mode: 'exclusive',
-          checkoutKey: 'trunk_secondary',
-        })
-      ).rejects.toThrow(WorkspaceLockedError);
-    });
+  it.skipIf(!available)('allows parallel branch checkouts up to maxConcurrentCheckouts', async () => {
+    const ws = await mkWorkspace({ maxConcurrentCheckouts: 2 } as any);
+    await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'r1', workerId: 'w', mode: 'branch', checkoutKey: 'c1' });
+    await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'r2', workerId: 'w', mode: 'branch', checkoutKey: 'c2' });
+    await expect(
+      repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'r3', workerId: 'w', mode: 'branch', checkoutKey: 'c3' })
+    ).rejects.toThrow(WorkspaceLockedError);
   });
 
-  describe('Branch Checkout (Redboard Multi-Card Concurrency)', () => {
-    it('allows multiple branch checkouts to run concurrently on different cards', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Become Board',
-      });
+  it.skipIf(!available)('an EXPIRED checkout no longer blocks the workspace forever', async () => {
+    const ws = await mkWorkspace();
+    await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'dead-run', workerId: 'w', leaseDurationMs: 1 });
+    await new Promise((r) => setTimeout(r, 25));
 
-      // Card 101 checks out
-      const res1 = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_card_101',
-        workerId: 'worker_1',
-        mode: 'branch',
-        checkoutKey: 'card-101',
-        branch: 'task/card-101',
-      });
-
-      // Card 102 checks out concurrently
-      const res2 = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_card_102',
-        workerId: 'worker_2',
-        mode: 'branch',
-        checkoutKey: 'card-102',
-        branch: 'task/card-102',
-      });
-
-      expect(res1.checkout.checkoutKey).toBe('card-101');
-      expect(res2.checkout.checkoutKey).toBe('card-102');
-      expect(res1.checkout.checkoutId).not.toBe(res2.checkout.checkoutId);
-      expect(res1.checkout.volumeName).not.toBe(res2.checkout.volumeName);
-
-      const latest = await repo.getWorkspace(ws.workspaceId);
-      expect(latest?.activeCheckouts).toHaveLength(2);
-      expect(latest?.version).toBe(3); // Initial 1 + 2 checkouts
-    });
-
-    it('rejects duplicate checkouts for the exact same card (key deduplication)', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Become Board',
-      });
-
-      await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_card_101_attempt_1',
-        workerId: 'worker_1',
-        mode: 'branch',
-        checkoutKey: 'card-101',
-      });
-
-      // Same card-101 cannot check out twice simultaneously
-      await expect(
-        repo.checkoutWorkspace({
-          workspaceId: ws.workspaceId,
-          runId: 'run_card_101_attempt_2',
-          workerId: 'worker_2',
-          mode: 'branch',
-          checkoutKey: 'card-101',
-        })
-      ).rejects.toThrow(WorkspaceLockedError);
-    });
-
-    it('enforces maxConcurrentCheckouts ceiling', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Capped Workspace',
-        maxConcurrentCheckouts: 2,
-      });
-
-      await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_1',
-        workerId: 'w_1',
-        mode: 'branch',
-        checkoutKey: 'task-1',
-      });
-
-      await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_2',
-        workerId: 'w_2',
-        mode: 'branch',
-        checkoutKey: 'task-2',
-      });
-
-      // 3rd checkout must fail limit
-      await expect(
-        repo.checkoutWorkspace({
-          workspaceId: ws.workspaceId,
-          runId: 'run_3',
-          workerId: 'w_3',
-          mode: 'branch',
-          checkoutKey: 'task-3',
-        })
-      ).rejects.toThrow(WorkspaceLockedError);
-    });
+    // Before the fix the CAS filter ignored expiry despite a comment claiming
+    // otherwise: a worker that died mid-run wedged the workspace permanently.
+    const second = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'new-run', workerId: 'w', checkoutKey: 'fresh' });
+    expect(second.checkout.runId).toBe('new-run');
   });
 
-  describe('Heartbeat Lease Renewal', () => {
-    it('renews lease expiration timestamp for an active checkout', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Heartbeat Workspace',
-      });
+  it.skipIf(!available)('renews EXACTLY the targeted checkout when runIds and checkoutIds cross elements', async () => {
+    const ws = await mkWorkspace({ maxConcurrentCheckouts: 4 } as any);
+    const a = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R1', workerId: 'w', mode: 'branch', checkoutKey: 'A' });
+    const b = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R2', workerId: 'w', mode: 'branch', checkoutKey: 'B' });
 
-      const { checkout } = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_long_01',
-        workerId: 'worker_1',
-      });
+    const before = await repo.getWorkspace(ws.workspaceId);
+    const aBefore = before!.activeCheckouts.find((c) => c.checkoutId === a.checkout.checkoutId)!.leaseExpiresAt;
 
-      const initialExpiry = checkout.leaseExpiresAt.getTime();
+    // (checkout B, run R1) satisfies each dotted predicate on a DIFFERENT
+    // element. Two independent dotted predicates would match and the positional
+    // `$` would then renew element 0 — extending A's lease on B's authority.
+    await expect(
+      repo.renewWorkspaceLease(ws.workspaceId, b.checkout.checkoutId, 'R1')
+    ).rejects.toThrow(WorkspaceLeaseLostError);
 
-      // Extend lease by 30 minutes
-      await repo.renewWorkspaceLease(ws.workspaceId, checkout.checkoutId, 'run_long_01', 30 * 60 * 1000);
-
-      const latest = await repo.getWorkspace(ws.workspaceId);
-      const active = latest?.activeCheckouts.find((c) => c.checkoutId === checkout.checkoutId);
-      expect(active?.leaseExpiresAt.getTime()).toBeGreaterThan(initialExpiry);
-    });
-
-    it('fails to renew lease if checkout was already released or runId mismatch', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Heartbeat Workspace',
-      });
-
-      const { checkout } = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_valid',
-        workerId: 'worker_1',
-      });
-
-      await expect(
-        repo.renewWorkspaceLease(ws.workspaceId, checkout.checkoutId, 'run_wrong_runid')
-      ).rejects.toThrow(WorkspaceLeaseLostError);
-    });
-
-    it('refuses a renew whose runId belongs to a DIFFERENT checkout (cross-element match)', async () => {
-      // 48a P1-8. The pre-#442 filter used two independent dotted conditions
-      // (`activeCheckouts.checkoutId` + `activeCheckouts.runId`), which Mongo
-      // evaluates across the whole array: a caller holding run_c1 could name
-      // c2's checkoutId, the document still matched, and the positional `$`
-      // renewed c2's lease. `$elemMatch` requires both to be in the SAME
-      // element, so this now fails closed.
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Cross-Element Heartbeat',
-        maxConcurrentCheckouts: 5,
-      });
-
-      const { checkout: c1 } = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_c1',
-        workerId: 'worker_1',
-        mode: 'branch',
-        checkoutKey: 'task-1',
-      });
-      const { checkout: c2 } = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_c2',
-        workerId: 'worker_2',
-        mode: 'branch',
-        checkoutKey: 'task-2',
-      });
-
-      const c1Expiry = c1.leaseExpiresAt.getTime();
-      const c2Expiry = c2.leaseExpiresAt.getTime();
-
-      await expect(
-        repo.renewWorkspaceLease(ws.workspaceId, c2.checkoutId, 'run_c1', 45 * 60 * 1000),
-      ).rejects.toThrow(WorkspaceLeaseLostError);
-
-      const latest = await repo.getWorkspace(ws.workspaceId);
-      expect(
-        latest?.activeCheckouts.find((c) => c.checkoutId === c1.checkoutId)?.leaseExpiresAt.getTime(),
-      ).toBe(c1Expiry);
-      expect(
-        latest?.activeCheckouts.find((c) => c.checkoutId === c2.checkoutId)?.leaseExpiresAt.getTime(),
-      ).toBe(c2Expiry);
-    });
-
-    it('renews the exact targeted checkout in multi-checkout scenarios without mutating sibling checkouts', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Multi-Checkout Heartbeat',
-        maxConcurrentCheckouts: 5,
-      });
-
-      const { checkout: c1 } = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_c1',
-        workerId: 'worker_1',
-        mode: 'branch',
-        checkoutKey: 'task-1',
-      });
-
-      const { checkout: c2 } = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_c2',
-        workerId: 'worker_2',
-        mode: 'branch',
-        checkoutKey: 'task-2',
-      });
-
-      const c1OriginalExpiry = c1.leaseExpiresAt.getTime();
-      const c2OriginalExpiry = c2.leaseExpiresAt.getTime();
-
-      // Extend lease of c2 ONLY by 45 minutes
-      await repo.renewWorkspaceLease(ws.workspaceId, c2.checkoutId, 'run_c2', 45 * 60 * 1000);
-
-      const latest = await repo.getWorkspace(ws.workspaceId);
-      const afterC1 = latest?.activeCheckouts.find((c) => c.checkoutId === c1.checkoutId);
-      const afterC2 = latest?.activeCheckouts.find((c) => c.checkoutId === c2.checkoutId);
-
-      expect(afterC2?.leaseExpiresAt.getTime()).toBeGreaterThan(c2OriginalExpiry);
-      expect(afterC1?.leaseExpiresAt.getTime()).toBe(c1OriginalExpiry);
-    });
+    const after = await repo.getWorkspace(ws.workspaceId);
+    expect(after!.activeCheckouts.find((c) => c.checkoutId === a.checkout.checkoutId)!.leaseExpiresAt.getTime())
+      .toBe(aBefore.getTime());
   });
 
-  describe('Checkin & Release Mechanics', () => {
-    it('releases a branch checkout without touching parent snapshot state', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Branch Release',
-      });
+  it.skipIf(!available)('renews the right element when the pair does match', async () => {
+    const ws = await mkWorkspace({ maxConcurrentCheckouts: 4 } as any);
+    const a = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R1', workerId: 'w', mode: 'branch', checkoutKey: 'A', leaseDurationMs: 60_000 });
+    const b = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R2', workerId: 'w', mode: 'branch', checkoutKey: 'B', leaseDurationMs: 60_000 });
 
-      const { workspace: checkedOut, checkout } = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_branch_01',
-        workerId: 'worker_1',
-        mode: 'branch',
-        checkoutKey: 'card-200',
-      });
+    const before = await repo.getWorkspace(ws.workspaceId);
+    const aBefore = before!.activeCheckouts.find((c) => c.checkoutId === a.checkout.checkoutId)!.leaseExpiresAt.getTime();
 
-      await repo.releaseWorkspace({
-        workspaceId: ws.workspaceId,
-        checkoutId: checkout.checkoutId,
-        runId: 'run_branch_01',
-        expectedVersion: checkedOut.version,
-        commitTrunkSnapshot: false,
-        snapshotMeta: {
-          snapshotId: 'snap_branch_only',
-          snapshotSizeBytes: 5000,
-          fileCount: 20,
-          computeSeconds: 45,
-        },
-      });
+    await repo.renewWorkspaceLease(ws.workspaceId, b.checkout.checkoutId, 'R2', 10 * 60 * 1000);
 
-      const finalWs = await repo.getWorkspace(ws.workspaceId);
-      expect(finalWs?.activeCheckouts).toHaveLength(0);
-      expect(finalWs?.currentSnapshotId).toBeNull(); // Untouched
-      expect(finalWs?.stats.totalRunCount).toBe(1);
-      expect(finalWs?.stats.totalComputeSeconds).toBe(45);
-      expect(finalWs?.version).toBe(3); // 1 (create) + 1 (checkout) + 1 (release)
-    });
-
-    it('releases an exclusive checkout and updates parent snapshot on trunk commit', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Trunk Release',
-      });
-
-      const { workspace: checkedOut, checkout } = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_trunk_01',
-        workerId: 'worker_1',
-        mode: 'exclusive',
-      });
-
-      await repo.releaseWorkspace({
-        workspaceId: ws.workspaceId,
-        checkoutId: checkout.checkoutId,
-        runId: 'run_trunk_01',
-        expectedVersion: checkedOut.version,
-        commitTrunkSnapshot: true,
-        snapshotMeta: {
-          snapshotId: 'snap_trunk_hash_abc',
-          snapshotSizeBytes: 1048576,
-          fileCount: 142,
-          computeSeconds: 120,
-        },
-      });
-
-      const finalWs = await repo.getWorkspace(ws.workspaceId);
-      expect(finalWs?.activeCheckouts).toHaveLength(0);
-      expect(finalWs?.currentSnapshotId).toBe('snap_trunk_hash_abc');
-      expect(finalWs?.stats.snapshotSizeBytes).toBe(1048576);
-      expect(finalWs?.stats.fileCount).toBe(142);
-      expect(finalWs?.stats.lastSnapshotAt).not.toBeNull();
-      expect(finalWs?.stats.totalRunCount).toBe(1);
-    });
-
-    it('throws WorkspaceVersionConflictError on optimistic CAS version mismatch', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'CAS Conflict Workspace',
-      });
-
-      const { checkout } = await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_conflict',
-        workerId: 'worker_1',
-      });
-
-      // Expected version is wrong (e.g. outdated cached version)
-      await expect(
-        repo.releaseWorkspace({
-          workspaceId: ws.workspaceId,
-          checkoutId: checkout.checkoutId,
-          runId: 'run_conflict',
-          expectedVersion: 999,
-        })
-      ).rejects.toThrow(WorkspaceVersionConflictError);
-    });
+    const after = await repo.getWorkspace(ws.workspaceId);
+    const bAfter = after!.activeCheckouts.find((c) => c.checkoutId === b.checkout.checkoutId)!.leaseExpiresAt.getTime();
+    const aAfter = after!.activeCheckouts.find((c) => c.checkoutId === a.checkout.checkoutId)!.leaseExpiresAt.getTime();
+    expect(bAfter).toBeGreaterThan(Date.now() + 9 * 60 * 1000);
+    expect(aAfter).toBe(aBefore);
   });
 
-  describe('Stale Checkout Reaping', () => {
-    it('reaps expired checkouts while preserving active ones', async () => {
-      const ws = await repo.createWorkspace({
-        userId: 'user_123',
-        name: 'Reaper Workspace',
-      });
+  it.skipIf(!available)('releases a checkout even after other checkouts bumped the document version', async () => {
+    const ws = await mkWorkspace({ maxConcurrentCheckouts: 4 } as any);
+    const mine = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R1', workerId: 'w', mode: 'branch', checkoutKey: 'A' });
+    // Two more checkouts land between my checkout and my release.
+    await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R2', workerId: 'w', mode: 'branch', checkoutKey: 'B' });
+    await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R3', workerId: 'w', mode: 'branch', checkoutKey: 'C' });
 
-      // Checkout with negative lease duration (already expired)
-      await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_expired',
-        workerId: 'w_1',
-        mode: 'branch',
-        checkoutKey: 'expired-card',
-        leaseDurationMs: -1000,
-      });
-
-      // Checkout with active future lease
-      await repo.checkoutWorkspace({
-        workspaceId: ws.workspaceId,
-        runId: 'run_active',
-        workerId: 'w_2',
-        mode: 'branch',
-        checkoutKey: 'active-card',
-        leaseDurationMs: 60000,
-      });
-
-      const { reapedCount } = await repo.reapStaleCheckouts(ws.workspaceId);
-      expect(reapedCount).toBe(1);
-
-      const remaining = await repo.getWorkspace(ws.workspaceId);
-      expect(remaining?.activeCheckouts).toHaveLength(1);
-      expect(remaining?.activeCheckouts[0].checkoutKey).toBe('active-card');
+    // The old whole-document version CAS made this a guaranteed conflict, so the
+    // checkout leaked and the workspace filled its slots (48a P1-9).
+    await repo.releaseWorkspace({
+      workspaceId: ws.workspaceId,
+      checkoutId: mine.checkout.checkoutId,
+      runId: 'R1',
+      expectedVersion: mine.workspace.version,
     });
+
+    const after = await repo.getWorkspace(ws.workspaceId);
+    expect(after!.activeCheckouts.map((c) => c.checkoutId)).not.toContain(mine.checkout.checkoutId);
+    expect(after!.activeCheckouts).toHaveLength(2);
+    expect(after!.stats.totalRunCount).toBe(1);
+  });
+
+  it.skipIf(!available)('refuses to release a checkout that belongs to another run', async () => {
+    const ws = await mkWorkspace();
+    const mine = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R1', workerId: 'w' });
+    await expect(
+      repo.releaseWorkspace({ workspaceId: ws.workspaceId, checkoutId: mine.checkout.checkoutId, runId: 'SOMEONE-ELSE' })
+    ).rejects.toThrow(WorkspaceVersionConflictError);
+  });
+
+  it.skipIf(!available)('writes absolute snapshot stats and increments only the counters', async () => {
+    const ws = await mkWorkspace();
+    const c = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R1', workerId: 'w' });
+    await repo.releaseWorkspace({
+      workspaceId: ws.workspaceId,
+      checkoutId: c.checkout.checkoutId,
+      runId: 'R1',
+      commitTrunkSnapshot: true,
+      snapshotMeta: { snapshotId: 'snap-1', snapshotSizeBytes: 4096, fileCount: 12, computeSeconds: 30 },
+    });
+    const after = await repo.getWorkspace(ws.workspaceId);
+    expect(after!.currentSnapshotId).toBe('snap-1');
+    expect(after!.stats.snapshotSizeBytes).toBe(4096);
+    expect(after!.stats.fileCount).toBe(12);
+    expect(after!.stats.totalComputeSeconds).toBe(30);
+    expect((after as any).snapshotSizeBytes).toBeUndefined();
+  });
+
+  it.skipIf(!available)('binds the gateway-assigned environmentId and node to the right checkout', async () => {
+    const ws = await mkWorkspace({ maxConcurrentCheckouts: 4 } as any);
+    const a = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R1', workerId: 'w', mode: 'branch', checkoutKey: 'A' });
+    const b = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R2', workerId: 'w', mode: 'branch', checkoutKey: 'B' });
+
+    await repo.bindCheckoutRuntime(ws.workspaceId, b.checkout.checkoutId, 'R2', {
+      environmentId: 'env_fromGateway',
+      nodeId: '10.100.0.5',
+      containerName: 'ws_x_chk',
+    });
+
+    const after = await repo.getWorkspace(ws.workspaceId);
+    const bDoc = after!.activeCheckouts.find((c) => c.checkoutId === b.checkout.checkoutId)!;
+    const aDoc = after!.activeCheckouts.find((c) => c.checkoutId === a.checkout.checkoutId)!;
+    expect(bDoc.environmentId).toBe('env_fromGateway');
+    expect(bDoc.nodeId).toBe('10.100.0.5');
+    expect(aDoc.environmentId).not.toBe('env_fromGateway');
+    expect(aDoc.nodeId).toBeUndefined();
+
+    await expect(
+      repo.bindCheckoutRuntime(ws.workspaceId, b.checkout.checkoutId, 'WRONG-RUN', { environmentId: 'env_x', nodeId: 'n' })
+    ).rejects.toThrow(WorkspaceLeaseLostError);
+  });
+
+  it.skipIf(!available)('reaps only expired checkouts', async () => {
+    const ws = await mkWorkspace({ maxConcurrentCheckouts: 4 } as any);
+    await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'dead', workerId: 'w', mode: 'branch', checkoutKey: 'dead', leaseDurationMs: 1 });
+    const live = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'live', workerId: 'w', mode: 'branch', checkoutKey: 'live', leaseDurationMs: 600_000 });
+    await new Promise((r) => setTimeout(r, 25));
+
+    const { reapedCount } = await repo.reapStaleCheckouts(ws.workspaceId);
+    expect(reapedCount).toBe(1);
+    const after = await repo.getWorkspace(ws.workspaceId);
+    expect(after!.activeCheckouts.map((c) => c.checkoutId)).toEqual([live.checkout.checkoutId]);
+  });
+
+  it.skipIf(!available)('defaults the lease to 30 minutes, longer than a real CLI step', async () => {
+    const ws = await mkWorkspace();
+    const c = await repo.checkoutWorkspace({ workspaceId: ws.workspaceId, runId: 'R1', workerId: 'w' });
+    const ms = c.checkout.leaseExpiresAt.getTime() - Date.now();
+    expect(DEFAULT_LEASE_DURATION_MS).toBe(30 * 60 * 1000);
+    expect(ms).toBeGreaterThan(29 * 60 * 1000);
   });
 });

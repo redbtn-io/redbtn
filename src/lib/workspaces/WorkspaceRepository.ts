@@ -32,6 +32,13 @@ export function generateCheckoutId(): string {
   return `chk_${generateRandomString(10)}`;
 }
 
+/**
+ * 30 minutes, renewed every 60 s by the holder. The old 15-minute default was
+ * shorter than real runs (Red Coder allows 50 tool iterations), so a second run
+ * could check the same workspace out while the first was still writing.
+ */
+export const DEFAULT_LEASE_DURATION_MS = 30 * 60 * 1000;
+
 export function generateEnvironmentId(): string {
   return `env_${generateRandomString(12)}`;
 }
@@ -57,9 +64,12 @@ export class WorkspaceRepository {
   async createWorkspace(input: CreateWorkspaceInput): Promise<IWorkspace> {
     const now = new Date();
     const workspaceId = input.workspaceId || generateWorkspaceId();
+    // The node's redrun worker derives the real repository from its own
+    // WORKSPACE_S3_* env; this field is informational. It carries no IP literal:
+    // the endpoint is node configuration, not code (48a P2-6).
     const resticRepo =
       input.resticRepository ||
-      `s3:http://192.168.1.10:9000/workspaces/${workspaceId}`;
+      `s3:${(process.env.WORKSPACE_S3_ENDPOINT || 's3-endpoint-unset').replace(/\/$/, '')}/${process.env.WORKSPACE_S3_BUCKET || 'workspaces'}/${workspaceId}`;
 
     const doc: IWorkspace = {
       workspaceId,
@@ -108,7 +118,7 @@ export class WorkspaceRepository {
       checkoutKey = 'trunk',
       mode = 'exclusive',
       branch = mode === 'branch' ? `task/${checkoutKey}` : 'main',
-      leaseDurationMs = 15 * 60 * 1000,
+      leaseDurationMs = DEFAULT_LEASE_DURATION_MS,
     } = options;
 
     const existing = await this.getWorkspace(workspaceId);
@@ -142,16 +152,39 @@ export class WorkspaceRepository {
     // 2. No active non-expired checkout has the SAME checkoutKey (idempotency)
     // 3. If requesting 'exclusive', no active non-expired checkout is 'exclusive'
     // 4. Total active checkouts is below maxConcurrentCheckouts
+    // The comments used to claim "non-expired" filtering the filter did not
+    // implement, so a single expired checkout blocked the workspace forever and
+    // only a hand edit could free it (48a). These now genuinely ignore expired
+    // checkouts: an expired lease holds nothing.
     const filter: Record<string, any> = {
       workspaceId,
-      'activeCheckouts.checkoutKey': { $ne: checkoutKey },
+      activeCheckouts: {
+        $not: { $elemMatch: { checkoutKey, leaseExpiresAt: { $gt: now } } },
+      },
       $expr: {
-        $lt: [{ $size: '$activeCheckouts' }, '$maxConcurrentCheckouts'],
+        $lt: [
+          {
+            $size: {
+              $filter: {
+                input: '$activeCheckouts',
+                as: 'c',
+                cond: { $gt: ['$$c.leaseExpiresAt', now] },
+              },
+            },
+          },
+          '$maxConcurrentCheckouts',
+        ],
       },
     };
 
     if (mode === 'exclusive') {
-      filter['activeCheckouts.mode'] = { $ne: 'exclusive' };
+      filter.$and = [
+        {
+          activeCheckouts: {
+            $not: { $elemMatch: { mode: 'exclusive', leaseExpiresAt: { $gt: now } } },
+          },
+        },
+      ];
     }
 
     const doc = await this.collection.findOneAndUpdate(
@@ -171,6 +204,47 @@ export class WorkspaceRepository {
     }
 
     return { workspace: doc, checkout: newCheckout };
+  }
+
+  /**
+   * Record what the spawn produced: the environmentId the GATEWAY assigned (not
+   * the one minted at checkout — see WorkspaceLifecycle), and the node that
+   * holds the container and volume, so snapshot/reap can be routed back to it.
+   */
+  async bindCheckoutRuntime(
+    workspaceId: string,
+    checkoutId: string,
+    runId: string,
+    runtime: { environmentId: string; nodeId: string; containerName?: string; volumeName?: string }
+  ): Promise<void> {
+    const now = new Date();
+    const set: Record<string, any> = {
+      'activeCheckouts.$[elem].environmentId': runtime.environmentId,
+      'activeCheckouts.$[elem].nodeId': runtime.nodeId,
+      updatedAt: now,
+    };
+    if (runtime.containerName) set['activeCheckouts.$[elem].containerName'] = runtime.containerName;
+    if (runtime.volumeName) set['activeCheckouts.$[elem].volumeName'] = runtime.volumeName;
+
+    const res = await this.collection.updateOne(
+      { workspaceId, activeCheckouts: { $elemMatch: { checkoutId, runId } } } as Filter<IWorkspace>,
+      { $set: set },
+      { arrayFilters: [{ 'elem.checkoutId': checkoutId, 'elem.runId': runId }] }
+    );
+
+    if (res.matchedCount === 0) {
+      throw new WorkspaceLeaseLostError(
+        `Cannot bind runtime to checkout "${checkoutId}" on workspace "${workspaceId}": the checkout is gone`
+      );
+    }
+  }
+
+  /** Record the node whose docker daemon holds this workspace's named volume. */
+  async setWorkspaceNode(workspaceId: string, nodeId: string): Promise<void> {
+    await this.collection.updateOne(
+      { workspaceId } as Filter<IWorkspace>,
+      { $set: { nodeId, updatedAt: new Date() } as any }
+    );
   }
 
   async renewWorkspaceLease(
@@ -237,18 +311,25 @@ export class WorkspaceRepository {
       update.$set['stats.lastSnapshotAt'] = now;
     }
 
-    const res = await this.collection.updateOne(
-      {
-        workspaceId,
-        version: expectedVersion,
-        'activeCheckouts.checkoutId': checkoutId,
-      } as Filter<IWorkspace>,
-      update
-    );
+    // Guarded on the CHECKOUT, not on the document version. `version` is $inc'd
+    // by every other checkout, by the reaper and by the UI's PATCH, so with
+    // parallel branch checkouts a whole-document CAS was guaranteed to conflict
+    // and the checkout then leaked forever, filling the workspace's slots
+    // (48a P1-9). `expectedVersion` is accepted for callers that genuinely want
+    // the stricter guard, but it is no longer required.
+    const filter: Record<string, any> = {
+      workspaceId,
+      activeCheckouts: { $elemMatch: { checkoutId, runId } },
+    };
+    if (typeof expectedVersion === 'number' && options.enforceVersion) {
+      filter.version = expectedVersion;
+    }
+
+    const res = await this.collection.updateOne(filter as Filter<IWorkspace>, update);
 
     if (res.matchedCount === 0) {
       throw new WorkspaceVersionConflictError(
-        `Failed to release checkout "${checkoutId}" on workspace "${workspaceId}": concurrent version conflict or invalid checkout`
+        `Failed to release checkout "${checkoutId}" on workspace "${workspaceId}": no matching active checkout for this run`
       );
     }
   }
@@ -264,7 +345,11 @@ export class WorkspaceRepository {
       query.workspaceId = workspaceId;
     }
 
-    const workspacesWithExpired = await this.collection.find(query).toArray();
+    const workspacesWithExpired = await this.collection
+      .find(query)
+      .limit(200)
+      .maxTimeMS(5000)
+      .toArray();
     let reapedCount = 0;
 
     for (const ws of workspacesWithExpired) {

@@ -49,6 +49,7 @@ import {
   extractCacheUsage,
 } from '../../../neurons/prompt-cache';
 import { WorkspaceRepository } from '../../../workspaces/WorkspaceRepository';
+import { acquireWorkspace, WorkspaceSession } from '../../../workspaces/WorkspaceLifecycle';
 
 /**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
@@ -190,10 +191,24 @@ import { buildMultimodalMessage, type AttachmentRef } from './multimodalMessage'
 export { buildMultimodalMessage };
 export type { AttachmentRef };
 
+export class WorkspaceEnvironmentUnavailableError extends Error {
+  constructor(workspaceId: string, detail: string) {
+    super(
+      `Workspace "${workspaceId}" has no usable environment for this run: ${detail}. ` +
+        `Refusing to run the step on the ambient environment.`
+    );
+    this.name = 'WorkspaceEnvironmentUnavailableError';
+  }
+}
+
 /**
  * Resolves workspace context (environmentId and workingDir) for a run.
- * Ensures the target environmentId and workingDir are bound to state
- * prior to bridge initialization and tool execution.
+ *
+ * FAILS CLOSED. Previously this returned `undefined` when no checkout resolved,
+ * having ALREADY set `workingDir = '/workspace'` — so the step ran on whatever
+ * environment the run happened to carry (the user's desktop agent, an SSH node,
+ * or the engine worker itself) while the model was told its tree was
+ * /workspace, and the executors then mkdir'd that tree on the host (48a P0-7).
  *
  * Precedence:
  * 1. Explicit state.parameters.environmentId or state.data.environmentId
@@ -209,16 +224,13 @@ export async function resolveWorkspaceEnvironment(state: any): Promise<string | 
     state.data?.ws?.workspaceId ||
     state.data?.workspaceCheckout?.workspaceId;
 
-  // Whenever a workspace is present, ensure default workingDir is '/workspace'
-  if (workspaceId) {
-    if (!state.data) state.data = {};
-    if (!state.data.workingDir) state.data.workingDir = '/workspace';
-    if (state.parameters && !state.parameters.workingDir) state.parameters.workingDir = '/workspace';
-  }
-
-  // 1. Explicit environmentId already present
+  // 1. Explicit environmentId already present. Checked BEFORE workingDir is
+  //    rewritten: an explicit environment is the caller pinning the target, and
+  //    mutating workingDir for a workspace that then fails to resolve is what
+  //    made the fail-open silent.
   const explicitEnv = state.parameters?.environmentId || state.data?.environmentId;
   if (explicitEnv) {
+    if (workspaceId) setWorkspaceWorkingDir(state);
     return explicitEnv;
   }
 
@@ -231,6 +243,7 @@ export async function resolveWorkspaceEnvironment(state: any): Promise<string | 
     if (!state.data) state.data = {};
     state.data.environmentId = fromWs;
     if (state.parameters) state.parameters.environmentId = fromWs;
+    setWorkspaceWorkingDir(state);
     return fromWs;
   }
 
@@ -265,9 +278,10 @@ export async function resolveWorkspaceEnvironment(state: any): Promise<string | 
           if (!checkout && runId) {
             checkout = ws.activeCheckouts.find((c: any) => c.runId === runId);
           }
-          if (!checkout) {
-            checkout = ws.activeCheckouts[ws.activeCheckouts.length - 1];
-          }
+          // NO "last element" fallback. With maxConcurrentCheckouts defaulting
+          // to 8 and branch mode designed for parallel cards, guessing bound the
+          // run's tools to ANOTHER run's container, on another card's branch,
+          // writing into another run's volume (48a P0-6).
           if (checkout?.environmentId) {
             if (!state.data) state.data = {};
             state.data.environmentId = checkout.environmentId;
@@ -282,12 +296,123 @@ export async function resolveWorkspaceEnvironment(state: any): Promise<string | 
           }
         }
       } catch (err) {
+        if (err instanceof WorkspaceEnvironmentUnavailableError) throw err;
         console.warn('[NeuronExecutor] Failed to resolve workspace checkout from repository:', err);
+        throw new WorkspaceEnvironmentUnavailableError(
+          workspaceId,
+          `checkout lookup failed (${err instanceof Error ? err.message : String(err)})`
+        );
       }
     }
+
+    // A workspaceId was requested and nothing resolved. Fail closed.
+    throw new WorkspaceEnvironmentUnavailableError(
+      workspaceId,
+      'no active checkout with a registered environment was found'
+    );
   }
 
   return undefined;
+}
+
+/**
+ * THE PRODUCER.
+ *
+ * If the step names a `workspaceId` and nothing has checked it out yet, check it
+ * out and bring the container up before the step runs; release (snapshot +
+ * unlock) when the step finishes. Before this, `checkoutWorkspace` had zero
+ * non-test callers and nothing in any repo ever enqueued a `workspace-lifecycle`
+ * job, so the redrun worker listened on a queue with no producer (48a).
+ *
+ * Ownership:
+ *   - An explicit `environmentId` on state wins; the caller is pinning a target
+ *     and owns its lifecycle. No session, nothing to release.
+ *   - An existing checkout for this run (state.data.ws / an active checkout in
+ *     Mongo) means an OUTER owner holds it — bind to it, do not release it.
+ *   - Otherwise this step owns the checkout for its duration.
+ */
+export async function acquireWorkspaceForStep(state: any): Promise<WorkspaceSession | null> {
+  if (!state || typeof state !== 'object') return null;
+
+  const workspaceId =
+    state.parameters?.workspaceId ||
+    state.data?.workspaceId ||
+    state.data?.ws?.workspaceId ||
+    state.data?.workspaceCheckout?.workspaceId;
+  if (!workspaceId) return null;
+
+  // Someone already pinned an environment, or an outer owner holds a checkout.
+  if (state.parameters?.environmentId || state.data?.environmentId) return null;
+  if (state.data?.ws?.environmentId || state.data?.workspaceCheckout?.environmentId) return null;
+
+  const db = getWorkspaceDb(state);
+  if (!db) return null;
+
+  const runId = state.runId || state.data?.runId;
+  if (!runId) {
+    throw new WorkspaceEnvironmentUnavailableError(workspaceId, 'the run has no runId to hold a checkout with');
+  }
+
+  // An active checkout for this run already exists (a retry, or a sibling step
+  // in the same run) — bind to it rather than spawning a second container.
+  try {
+    const existing = await new WorkspaceRepository(db).getWorkspace(workspaceId);
+    const mine = existing?.activeCheckouts?.find(
+      (c: any) => c.runId === runId && c.environmentId && new Date(c.leaseExpiresAt).getTime() > Date.now()
+    );
+    if (mine) return null;
+  } catch {
+    /* fall through to acquire; acquire's own errors are surfaced */
+  }
+
+  const session = await acquireWorkspace(db, {
+    workspaceId,
+    runId,
+    workerId: process.env.HOSTNAME || process.env.WORKER_NODE_IP || 'engine',
+    checkoutKey: state.parameters?.checkoutKey || state.data?.checkoutKey,
+    mode: state.parameters?.workspaceMode || state.data?.workspaceMode,
+  });
+
+  if (!state.data) state.data = {};
+  state.data.environmentId = session.environmentId;
+  state.data.workspaceId = workspaceId;
+  state.data.checkoutId = session.acquired.checkout.checkoutId;
+  state.data.ws = {
+    workspaceId,
+    checkoutId: session.acquired.checkout.checkoutId,
+    environmentId: session.environmentId,
+    nodeId: session.acquired.nodeId,
+    containerName: session.acquired.containerName,
+  };
+  setWorkspaceWorkingDir(state, session.acquired.workspace.config?.defaultCwd || '/workspace');
+  if (state.parameters) {
+    state.parameters.environmentId = session.environmentId;
+    state.parameters.workingDir = state.data.workingDir;
+  }
+
+  session.startRenewing();
+  return session;
+}
+
+function getWorkspaceDb(state: any): any {
+  if (state?.workspaceDb) return state.workspaceDb;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mongoose = require('mongoose');
+    if (mongoose?.connection?.readyState === 1 && mongoose.connection.db) {
+      return mongoose.connection.db;
+    }
+  } catch {
+    /* Mongoose unavailable (tests, non-server hosts) */
+  }
+  return null;
+}
+
+/** Pin the working tree to the container's mount. Only ever called once an environment really resolved. */
+function setWorkspaceWorkingDir(state: any, defaultCwd = '/workspace'): void {
+  if (!state.data) state.data = {};
+  if (!state.data.workingDir) state.data.workingDir = defaultCwd;
+  if (state.parameters && !state.parameters.workingDir) state.parameters.workingDir = defaultCwd;
 }
 
 /**
@@ -505,8 +630,16 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     maxTokens: config.maxTokens
   });
 
+  // Owned by this step only when this step is the one that checked the
+  // workspace out; released in the `finally` below.
+  let workspaceSession: WorkspaceSession | null = null;
+  const workspaceStartedAt = Date.now();
+
   try {
-    // Resolve workspace environmentId and workingDir prior to bridge / tool initialization
+    // Bring a workspace container up if this step names one and nobody holds it,
+    // then resolve the environmentId + workingDir before the bridge and tools
+    // are initialised.
+    workspaceSession = await acquireWorkspaceForStep(state);
     await resolveWorkspaceEnvironment(state);
 
     // Get neuron registry from run-context registry (with state fallback for tests)
@@ -1445,6 +1578,18 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // targets ES2016, which has no `Error(message, { cause })` overload.
     (wrapped as { cause?: unknown }).cause = error;
     throw wrapped;
+  } finally {
+    if (workspaceSession) {
+      try {
+        await workspaceSession.release({
+          computeSeconds: Math.max(1, Math.round((Date.now() - workspaceStartedAt) / 1000)),
+        });
+      } catch (releaseErr) {
+        // A failed release must not mask the step's own outcome, but it must be
+        // loud: an unreleased checkout blocks the workspace until the reaper.
+        console.error('[NeuronExecutor] Failed to release workspace checkout:', releaseErr);
+      }
+    }
   }
 }
 

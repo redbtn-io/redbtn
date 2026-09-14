@@ -282,6 +282,70 @@ describe('PR 5: MCP Run-Bridge & Neuron Workspace Binding', () => {
   });
 
   describe('Neuron Fallback with Workspace Binding', () => {
+    it('THROWS instead of binding to another run\'s checkout when this run has none', async () => {
+      // With maxConcurrentCheckouts defaulting to 8 and branch mode built for
+      // parallel cards, the old `activeCheckouts[length-1]` fallback executed a
+      // run's tools inside ANOTHER run's container (48a P0-6).
+      const other: Partial<IWorkspaceCheckout> = {
+        checkoutId: 'chk_someone_else',
+        runId: 'run-belonging-to-someone-else',
+        environmentId: 'env_someoneElse',
+        checkoutKey: 'card-7',
+        mode: 'branch',
+      };
+      const state: any = {
+        runId: 'my-run',
+        data: { workspaceId: 'ws_x' },
+        workspaceRepository: {
+          getWorkspace: async () => ({ workspaceId: 'ws_x', activeCheckouts: [other], config: {} }),
+        },
+      };
+
+      await expect(resolveWorkspaceEnvironment(state)).rejects.toThrow(
+        /no active checkout with a registered environment/
+      );
+      expect(state.data.environmentId).toBeUndefined();
+    });
+
+    it('THROWS rather than falling open onto the ambient environment when no checkout exists', async () => {
+      const state: any = {
+        runId: 'my-run',
+        data: { workspaceId: 'ws_x' },
+        workspaceRepository: { getWorkspace: async () => ({ workspaceId: 'ws_x', activeCheckouts: [], config: {} }) },
+      };
+      await expect(resolveWorkspaceEnvironment(state)).rejects.toThrow(
+        /Refusing to run the step on the ambient environment/
+      );
+    });
+
+    it('does NOT rewrite workingDir to /workspace when the workspace fails to resolve', async () => {
+      // The fail-open was silent precisely because workingDir was pinned to
+      // /workspace BEFORE anything resolved, so the model was told its tree was
+      // /workspace while running somewhere else entirely (48a P0-7, P3-2).
+      const state: any = {
+        runId: 'my-run',
+        data: { workspaceId: 'ws_x' },
+        parameters: {},
+        workspaceRepository: { getWorkspace: async () => null },
+      };
+      await expect(resolveWorkspaceEnvironment(state)).rejects.toThrow();
+      expect(state.data.workingDir).toBeUndefined();
+      expect(state.parameters.workingDir).toBeUndefined();
+    });
+
+    it('surfaces a repository failure as a refusal, not a silent pass-through', async () => {
+      const state: any = {
+        runId: 'my-run',
+        data: { workspaceId: 'ws_x' },
+        workspaceRepository: {
+          getWorkspace: async () => {
+            throw new Error('mongo is down');
+          },
+        },
+      };
+      await expect(resolveWorkspaceEnvironment(state)).rejects.toThrow(/checkout lookup failed.*mongo is down/);
+    });
+
     it('preserves the exact resolved environmentId and /workspace across primary failure and fallback', async () => {
       let callCount = 0;
 
