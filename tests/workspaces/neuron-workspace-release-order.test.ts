@@ -22,6 +22,8 @@ const h = vi.hoisted(() => {
         acquiredInMs: 1,
       },
       release,
+      startRenewing: vi.fn(),
+      stopRenewing: vi.fn(),
     },
   };
 });
