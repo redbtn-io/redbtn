@@ -48,6 +48,15 @@ export interface IWorkspaceCheckout {
    * Evaluates to ws_${workspaceId}_${checkoutId}_data.
    */
   volumeName: string;
+  /**
+   * The fleet node whose redrun worker holds this checkout's container and named
+   * volume. Snapshot and reap jobs MUST be routed back to it: a snapshot taken
+   * elsewhere finds nothing and silently loses the working copy.
+   * Written by `bindCheckoutRuntime` after the spawn returns.
+   */
+  nodeId?: string;
+  /** Container name on `nodeId`, for operator diagnostics. */
+  containerName?: string;
   /** Expiration time of the current checkout lease, heartbeated periodically. */
   leaseExpiresAt: Date;
   /** When the checkout was acquired. */
@@ -104,6 +113,12 @@ export interface IWorkspace {
   stats: IWorkspaceStats;
 
   // --- Concurrency & Checkouts ---
+  /**
+   * The node whose docker daemon holds this workspace's named volume, recorded
+   * after each successful spawn. The next checkout prefers it so the working
+   * copy is reused rather than restored from object storage.
+   */
+  nodeId?: string;
   /** Optimistic concurrency version counter (incremented on checkout/release). */
   version: number;
   /** Maximum number of parallel checkouts allowed (default: 8). */
@@ -125,7 +140,7 @@ export interface ICheckoutOptions {
   mode?: CheckoutMode;
   /** Git branch to checkout. Defaults to "main" or "task/<checkoutKey>". */
   branch?: string;
-  /** Lease duration in milliseconds. Defaults to 15 minutes (900,000 ms). */
+  /** Lease duration in milliseconds. Defaults to DEFAULT_LEASE_DURATION_MS (30 min). */
   leaseDurationMs?: number;
 }
 
@@ -133,7 +148,14 @@ export interface IReleaseOptions {
   workspaceId: string;
   checkoutId: string;
   runId: string;
-  expectedVersion: number;
+  /**
+   * Only consulted when `enforceVersion` is set. The release is guarded on the
+   * checkout itself (checkoutId + runId), because `version` is bumped by every
+   * concurrent checkout — see WorkspaceRepository.releaseWorkspace.
+   */
+  expectedVersion?: number;
+  /** Opt in to the stricter whole-document version CAS. */
+  enforceVersion?: boolean;
   /** Whether changes should update the parent workspace trunk snapshot. */
   commitTrunkSnapshot?: boolean;
   /** Snapshot metadata if a new snapshot was taken. */
