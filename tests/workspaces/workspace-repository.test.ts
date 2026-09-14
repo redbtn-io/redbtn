@@ -66,10 +66,14 @@ class MockWorkspaceCollection {
     return null;
   }
 
-  async updateOne(filter: Filter<IWorkspace>, update: Record<string, any>): Promise<{ matchedCount: number; modifiedCount: number }> {
+  async updateOne(
+    filter: Filter<IWorkspace>,
+    update: Record<string, any>,
+    options?: { arrayFilters?: any[] }
+  ): Promise<{ matchedCount: number; modifiedCount: number }> {
     for (const doc of this.docs.values()) {
       if (this.matches(doc, filter)) {
-        this.applyUpdate(doc, update, filter);
+        this.applyUpdate(doc, update, filter, options);
         return { matchedCount: 1, modifiedCount: 1 };
       }
     }
@@ -95,6 +99,16 @@ class MockWorkspaceCollection {
         if (doc.workspaceId !== value) return false;
       } else if (key === 'version') {
         if (doc.version !== value) return false;
+      } else if (key === 'activeCheckouts') {
+        if (value && typeof value === 'object' && '$elemMatch' in value) {
+          const match = doc.activeCheckouts.some((c) => {
+            for (const [subKey, subVal] of Object.entries(value.$elemMatch)) {
+              if ((c as any)[subKey] !== subVal) return false;
+            }
+            return true;
+          });
+          if (!match) return false;
+        }
       } else if (key === 'activeCheckouts.checkoutKey') {
         if (value && typeof value === 'object' && '$ne' in value) {
           const hasKey = doc.activeCheckouts.some((c) => c.checkoutKey === value.$ne);
@@ -121,7 +135,12 @@ class MockWorkspaceCollection {
     return true;
   }
 
-  private applyUpdate(doc: IWorkspace, update: Record<string, any>, filter?: Record<string, any>): void {
+  private applyUpdate(
+    doc: IWorkspace,
+    update: Record<string, any>,
+    filter?: Record<string, any>,
+    options?: { arrayFilters?: any[] }
+  ): void {
     if (update.$push) {
       for (const [k, v] of Object.entries(update.$push)) {
         if (k === 'activeCheckouts') {
@@ -157,9 +176,21 @@ class MockWorkspaceCollection {
       for (const [k, v] of Object.entries(update.$set)) {
         if (k === 'updatedAt') {
           doc.updatedAt = new Date(v);
-        } else if (k === 'activeCheckouts.$.leaseExpiresAt') {
-          const targetCheckoutId = filter?.['activeCheckouts.checkoutId'];
-          const targetRunId = filter?.['activeCheckouts.runId'];
+        } else if (
+          k === 'activeCheckouts.$[elem].leaseExpiresAt' ||
+          k === 'activeCheckouts.$.leaseExpiresAt'
+        ) {
+          const elemFilter = options?.arrayFilters?.find(
+            (af: any) => af['elem.checkoutId'] !== undefined
+          );
+          const targetCheckoutId =
+            elemFilter?.['elem.checkoutId'] ??
+            filter?.['activeCheckouts.checkoutId'] ??
+            filter?.activeCheckouts?.$elemMatch?.checkoutId;
+          const targetRunId =
+            elemFilter?.['elem.runId'] ??
+            filter?.['activeCheckouts.runId'] ??
+            filter?.activeCheckouts?.$elemMatch?.runId;
           const target = doc.activeCheckouts.find((c) => {
             if (targetCheckoutId && c.checkoutId !== targetCheckoutId) return false;
             if (targetRunId && c.runId !== targetRunId) return false;
