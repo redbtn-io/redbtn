@@ -19,7 +19,7 @@
             "config": {
               "operation": "set",
               "outputField": "data.workspaceId",
-              "value": "{{state.data.input?.workspaceId || state.data.workspaceId || 'default'}}"
+              "value": "{{state.data.input?.workspaceId || state.data.workspaceId}}"
             }
           },
           {
@@ -27,7 +27,7 @@
             "config": {
               "operation": "set",
               "outputField": "data.workspaceNamespace",
-              "value": "{{'Workspace_' + (state.data.workspaceId).replace(/[^A-Za-z0-9_]/g, '_')}}"
+              "value": "{{'Workspace_' + (state.data.workspaceId || 'unbound').replace(/[^A-Za-z0-9_]/g, '_')}}"
             }
           },
           {
@@ -84,7 +84,9 @@
               "systemPrompt": "You are an autonomous engineering agent working in a persistent workspace mounted at /workspace. Maintain the project context. If you make architectural decisions or plan follow-up tasks, update the scratchpad block enclosed in === SCRATCHPAD === ... === END SCRATCHPAD ===.",
               "userPrompt": "{{state.data.fullPrompt}}",
               "outputField": "data.agentOutput",
-              "tools": ["run_command", "read_file", "write_to_file", "edit_file", "list_dir"]
+              "workspaceId": "{{state.data.workspaceId}}",
+              "checkoutKey": "{{state.data.input?.checkoutKey || state.data.checkoutKey || 'trunk'}}",
+              "tools": ["run_command", "read_file", "write_file", "edit_file", "list_dir"]
             }
           }
         ]
