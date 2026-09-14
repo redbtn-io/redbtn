@@ -176,30 +176,46 @@ class MockWorkspaceCollection {
       for (const [k, v] of Object.entries(update.$set)) {
         if (k === 'updatedAt') {
           doc.updatedAt = new Date(v);
-        } else if (
-          k === 'activeCheckouts.$[elem].leaseExpiresAt' ||
-          k === 'activeCheckouts.$.leaseExpiresAt'
-        ) {
-          const elemFilter = options?.arrayFilters?.find(
-            (af: any) => af['elem.checkoutId'] !== undefined
+        } else if (k === 'activeCheckouts.$[elem].leaseExpiresAt') {
+          // `$[elem]` semantics: update EVERY element that satisfies every
+          // condition of the matching array filter. Real Mongo errors out when
+          // the identifier has no array filter, so the mock does too — a test
+          // can never accidentally pass by falling back to "some element".
+          const elemFilter = options?.arrayFilters?.find((af: Record<string, unknown>) =>
+            Object.keys(af).some((k2) => k2.startsWith('elem.')),
           );
-          const targetCheckoutId =
-            elemFilter?.['elem.checkoutId'] ??
-            filter?.['activeCheckouts.checkoutId'] ??
-            filter?.activeCheckouts?.$elemMatch?.checkoutId;
-          const targetRunId =
-            elemFilter?.['elem.runId'] ??
-            filter?.['activeCheckouts.runId'] ??
-            filter?.activeCheckouts?.$elemMatch?.runId;
-          const target = doc.activeCheckouts.find((c) => {
-            if (targetCheckoutId && c.checkoutId !== targetCheckoutId) return false;
-            if (targetRunId && c.runId !== targetRunId) return false;
-            return true;
-          });
+          if (!elemFilter) {
+            throw new Error(
+              "No array filter found for identifier 'elem' in path 'activeCheckouts.$[elem].leaseExpiresAt'",
+            );
+          }
+          const conditions = Object.entries(elemFilter).map(
+            ([k2, v2]) => [k2.slice('elem.'.length), v2] as const,
+          );
+          for (const c of doc.activeCheckouts) {
+            if (conditions.every(([field, want]) => (c as Record<string, unknown>)[field] === want)) {
+              c.leaseExpiresAt = new Date(v);
+            }
+          }
+        } else if (k === 'activeCheckouts.$.leaseExpiresAt') {
+          // Positional `$` semantics, faithfully: it is a placeholder for the
+          // FIRST array element matched by the query — resolved from the first
+          // array condition alone, NOT from the conjunction of every dotted
+          // condition. Modelling it as "the element matching all conditions"
+          // is exactly what hid the cross-element lease bug (48a P1-8): with
+          // `{'activeCheckouts.checkoutId': X, 'activeCheckouts.runId': Y}`
+          // Mongo matches the document when X and Y live in *different*
+          // elements, and then renews the wrong one.
+          const positionalKey = Object.keys(filter ?? {}).find(
+            (fk) => fk.startsWith('activeCheckouts.') && fk !== 'activeCheckouts',
+          );
+          const field = positionalKey?.slice('activeCheckouts.'.length);
+          const want = positionalKey ? (filter as Record<string, unknown>)[positionalKey] : undefined;
+          const target = field
+            ? doc.activeCheckouts.find((c) => (c as Record<string, unknown>)[field] === want)
+            : doc.activeCheckouts[0];
           if (target) {
             target.leaseExpiresAt = new Date(v);
-          } else if (doc.activeCheckouts.length > 0) {
-            doc.activeCheckouts[0].leaseExpiresAt = new Date(v);
           }
         } else if (k === 'currentSnapshotId') {
           doc.currentSnapshotId = v;
@@ -452,6 +468,50 @@ describe('WorkspaceRepository (PR 1 CAS & Concurrency Engine)', () => {
       await expect(
         repo.renewWorkspaceLease(ws.workspaceId, checkout.checkoutId, 'run_wrong_runid')
       ).rejects.toThrow(WorkspaceLeaseLostError);
+    });
+
+    it('refuses a renew whose runId belongs to a DIFFERENT checkout (cross-element match)', async () => {
+      // 48a P1-8. The pre-#442 filter used two independent dotted conditions
+      // (`activeCheckouts.checkoutId` + `activeCheckouts.runId`), which Mongo
+      // evaluates across the whole array: a caller holding run_c1 could name
+      // c2's checkoutId, the document still matched, and the positional `$`
+      // renewed c2's lease. `$elemMatch` requires both to be in the SAME
+      // element, so this now fails closed.
+      const ws = await repo.createWorkspace({
+        userId: 'user_123',
+        name: 'Cross-Element Heartbeat',
+        maxConcurrentCheckouts: 5,
+      });
+
+      const { checkout: c1 } = await repo.checkoutWorkspace({
+        workspaceId: ws.workspaceId,
+        runId: 'run_c1',
+        workerId: 'worker_1',
+        mode: 'branch',
+        checkoutKey: 'task-1',
+      });
+      const { checkout: c2 } = await repo.checkoutWorkspace({
+        workspaceId: ws.workspaceId,
+        runId: 'run_c2',
+        workerId: 'worker_2',
+        mode: 'branch',
+        checkoutKey: 'task-2',
+      });
+
+      const c1Expiry = c1.leaseExpiresAt.getTime();
+      const c2Expiry = c2.leaseExpiresAt.getTime();
+
+      await expect(
+        repo.renewWorkspaceLease(ws.workspaceId, c2.checkoutId, 'run_c1', 45 * 60 * 1000),
+      ).rejects.toThrow(WorkspaceLeaseLostError);
+
+      const latest = await repo.getWorkspace(ws.workspaceId);
+      expect(
+        latest?.activeCheckouts.find((c) => c.checkoutId === c1.checkoutId)?.leaseExpiresAt.getTime(),
+      ).toBe(c1Expiry);
+      expect(
+        latest?.activeCheckouts.find((c) => c.checkoutId === c2.checkoutId)?.leaseExpiresAt.getTime(),
+      ).toBe(c2Expiry);
     });
 
     it('renews the exact targeted checkout in multi-checkout scenarios without mutating sibling checkouts', async () => {
