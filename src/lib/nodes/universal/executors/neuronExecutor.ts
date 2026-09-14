@@ -716,7 +716,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // lines down by the tool paths, so this lookup is free.
     const early = await neuronRegistry.getConfig(neuronId, userId).catch(() => null);
     if (early?.provider === 'claude-code') {
-      return runClaudeCodeStep({
+      return await runClaudeCodeStep({
         config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
       });
     }
@@ -727,7 +727,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // purpose, and `toolStrategy` resolves to 'none', which would discard
     // `config.tools` before the CLI could be offered them over the run bridge.
     if (early?.provider === 'agy-cli') {
-      return runAgyCliStep({
+      return await runAgyCliStep({
         config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
       });
     }
