@@ -42,6 +42,8 @@
  * or point it somewhere else:
  *   AGY_CLI_BIN=/path/to/agy AGY_LIVE_TOKEN_FILE=/path/to/antigravity-oauth-token \
  *     npx vitest run tests/nodes/agy-cli-live.test.ts
+ * Under `CI=true` (every GitHub Actions job) it stays skipped unless
+ * `AGY_CLI_LIVE=1` is set explicitly.
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
@@ -101,7 +103,14 @@ function cliVersion(): string | null {
   }
 }
 
-const LIVE = Boolean(TOKEN) && cliVersion() !== null;
+/**
+ * Never on a CI runner unless someone asks for it by name. GitHub Actions
+ * always sets `CI=true`; the self-hosted fleet runners are ordinary fleet
+ * boxes that DO carry a logged-in `agy` at DEFAULT_HOME, which turned every
+ * job landing there into a real (and flaky) Gemini session.
+ */
+const OPTED_IN = process.env.AGY_CLI_LIVE === '1';
+const LIVE = (!process.env.CI || OPTED_IN) && Boolean(TOKEN) && cliVersion() !== null;
 
 /** Cheapest model that still uses tools. Flash at low effort is ~3 s a turn. */
 const MODEL = process.env.AGY_CLI_TEST_MODEL || 'gemini-3.8-flash';
