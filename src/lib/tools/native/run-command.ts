@@ -287,14 +287,22 @@ const runCommandTool: NativeToolDefinition = {
       const msg = err instanceof Error ? err.message : String(err);
       const duration = Date.now() - startTime;
       const isAbort = msg.includes('abort') || msg.includes('cancel');
-      console.error(`[run_command] env=${environmentId} exec failed after ${duration}ms: ${msg}`);
+      // A session that carries its own code (DesktopAgentError: ENV_OFFLINE,
+      // capability_disabled, payload_too_large) has already named the failure
+      // more precisely than EXEC_FAILED can. Pass it through so the agent can
+      // act on it — an offline push connector is blocked, not retryable.
+      const sessionCode = (err as { code?: unknown })?.code;
+      const code = typeof sessionCode === 'string' && sessionCode
+        ? sessionCode
+        : isAbort ? 'ABORTED' : 'EXEC_FAILED';
+      console.error(`[run_command] env=${environmentId} exec failed after ${duration}ms (${code}): ${msg}`);
       return {
         content: [{
           type: 'text',
           text: JSON.stringify({
             success: false,
             error: msg,
-            code: isAbort ? 'ABORTED' : 'EXEC_FAILED',
+            code,
             durationMs: duration,
           }),
         }],

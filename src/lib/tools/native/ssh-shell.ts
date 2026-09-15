@@ -925,13 +925,20 @@ async function executeViaEnvironment(args: ExecuteViaEnvironmentArgs): Promise<N
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     const duration = Date.now() - startTime;
-    console.error(`[ssh_shell] env=${environmentId} exec failed after ${duration}ms: ${msg}`);
+    // Carry the session's own failure code when it has one (DesktopAgentError:
+    // ENV_OFFLINE, capability_disabled, payload_too_large). Without it an
+    // offline push connector reads as a generic exec failure and the agent
+    // retries a machine that is not there.
+    const sessionCode = (err as { code?: unknown })?.code;
+    const code = typeof sessionCode === 'string' && sessionCode ? sessionCode : undefined;
+    console.error(`[ssh_shell] env=${environmentId} exec failed after ${duration}ms${code ? ` (${code})` : ''}: ${msg}`);
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
           success: false,
           error: msg,
+          ...(code ? { code } : {}),
           environmentId,
           durationMs: duration,
         }),

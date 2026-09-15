@@ -29,6 +29,13 @@ vi.mock('../../src/lib/tools/native/desktop-request', () => ({
   requestDesktopRaw: (...a: unknown[]) => raw(...a),
 }));
 
+// The push session fences every relay op behind the hub's presence key. Stub the
+// probe to `unknown` (= "cannot tell", treated as online) so these tests keep
+// asserting relay behaviour without opening a Redis connection.
+vi.mock('../../src/lib/environments/desktop-presence', () => ({
+  probeDesktopPresence: async () => ({ verdict: 'unknown', source: 'unavailable' }),
+}));
+
 import {
   EnvironmentManager,
   DESKTOP_RELAY_MIN_TIMEOUT_MS,
