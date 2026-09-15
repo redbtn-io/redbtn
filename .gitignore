@@ -1,5 +1,8 @@
-# Ignore node_modules directory
-node_modules/
+# Ignore node_modules. No trailing slash on purpose: `node_modules/` only ever
+# matches a directory, so a *symlink* named node_modules (some dev checkouts
+# point it at a shared store) slipped past this rule and was committed by a
+# `git add -A`. The bare pattern ignores the directory and the symlink alike.
+node_modules
 test/
 
 # Ignore npm debug log
@@ -21,3 +24,10 @@ dist/
 # Transpiled by tests/nodes/claude-code-live.test.ts (see the note there);
 # the real artifact lives in dist/ and this path must never be committed.
 src/lib/mcp/run-bridge-shim.js
+
+# Claude Code local state: worktrees, settings, session scratch. Three worktrees
+# under .claude/worktrees/ were once swept into a commit as gitlinks (mode
+# 160000) with no .gitmodules entry, so every actions/checkout logged
+# "fatal: no submodule mapping found in .gitmodules for path '.claude/…'".
+# None of it belongs in the repo.
+.claude/
