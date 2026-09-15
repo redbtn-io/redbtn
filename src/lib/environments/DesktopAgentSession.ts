@@ -17,15 +17,18 @@
  * the connector implements in Goal 5. Payloads are base64; a single sftp payload is
  * capped (EXEC_SFTP_MAX_BYTES) — larger reads/writes must chunk via offset/length.
  *
- * There is no socket to hold open: presence is the readiness check and the relay's
- * timeout is the presence detector. `open()`/`close()` just manage lifecycle state
- * so the manager pool evicts correctly.
+ * There is no socket to hold open. Readiness is the hub's own presence key
+ * (`desktop-presence.ts`), checked before a relay op and re-checked while one is
+ * in flight; the relay timeout remains the backstop for everything presence
+ * cannot see. `open()`/`close()` just manage lifecycle state so the manager pool
+ * evicts correctly.
  *
  * @module lib/environments/DesktopAgentSession
  */
 
 import { EventEmitter } from 'events';
 import { requestDesktopRaw } from '../tools/native/desktop-request';
+import { probeDesktopPresence, type LivenessResult } from './desktop-presence';
 import type { IEnvironmentSession } from './IEnvironmentSession';
 import type {
   IEnvironment,
@@ -66,12 +69,43 @@ const SFTP_MAX_BYTES = (() => {
  */
 export const RELAY_GRACE_MS = 30_000;
 
-/** Error thrown when a relay op fails (connector error, timeout, oversized). */
+/**
+ * Error code for "the hub says this connector is gone".
+ *
+ * Distinct from `desktop_failed`, which every relay timeout already produces and
+ * which reads as "nothing answered — maybe it is slow". `ENV_OFFLINE` is a
+ * verdict, not a guess: the gateway's presence key for this install is absent,
+ * so no amount of further waiting can help. Tools surface the code so the agent
+ * can report blocked in one turn instead of burning the step budget.
+ */
+export const ENV_OFFLINE = 'ENV_OFFLINE';
+
+/**
+ * How often a relay op in flight re-checks that the connector is still there.
+ *
+ * The pre-flight check alone would not have caught the 2026-09-15 incident: the
+ * hub was redeployed WHILE tool calls were already waiting, so the environment
+ * went offline mid-op. 10 s is ~7x cheaper than the 70 s presence TTL it polls,
+ * so the worst case is one poll interval of wasted wait rather than the full
+ * relay timeout, and the probe is a single Redis `EXISTS`.
+ */
+export const LIVENESS_POLL_MS = 10_000;
+
+/** Error thrown when a relay op fails (connector error, timeout, oversized, offline). */
 export class DesktopAgentError extends Error {
   constructor(public readonly code: string, message: string) {
     super(message);
     this.name = 'DesktopAgentError';
   }
+}
+
+/** The message an `ENV_OFFLINE` failure carries. Shared so tests pin one string. */
+export function offlineMessage(environmentId: string, offlineForSeconds?: number): string {
+  const n = offlineForSeconds ?? 0;
+  return (
+    `Environment ${environmentId} is offline (no presence for ${n} s); ` +
+    'the runner may have lost its hub session'
+  );
 }
 
 export class DesktopAgentSession extends EventEmitter implements IEnvironmentSession {
@@ -119,19 +153,17 @@ export class DesktopAgentSession extends EventEmitter implements IEnvironmentSes
       // hand over NaN; neither is a budget, so both defer to the session's.
       const explicit = Number(opts.timeout);
       const commandTimeoutMs = Number.isFinite(explicit) && explicit > 0 ? explicit : this.timeoutMs;
-      const reply = await requestDesktopRaw({
-        userId: this.userId,
-        installId: this.installId,
-        kind: 'exec',
-        // Strictly longer than the command budget — see RELAY_GRACE_MS.
-        timeoutMs: commandTimeoutMs !== undefined ? commandTimeoutMs + RELAY_GRACE_MS : undefined,
-        payload: {
+      const reply = await this.roundTrip(
+        'exec',
+        {
           command,
           ...(opts.cwd ? { cwd: opts.cwd } : {}),
           ...(opts.env ? { env: opts.env } : {}),
           ...(commandTimeoutMs !== undefined ? { timeoutMs: commandTimeoutMs } : {}),
         },
-      });
+        // Strictly longer than the command budget — see RELAY_GRACE_MS.
+        commandTimeoutMs !== undefined ? commandTimeoutMs + RELAY_GRACE_MS : undefined,
+      );
       if (!reply || reply.ok !== true) {
         throw this.replyError(reply, 'exec');
       }
@@ -207,15 +239,95 @@ export class DesktopAgentSession extends EventEmitter implements IEnvironmentSes
 
   /** Round-trip a relay op; throw a mapped error on failure. */
   private async relay(kind: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const reply = await requestDesktopRaw({
+    const reply = await this.roundTrip(kind, payload, this.timeoutMs);
+    if (!reply || reply.ok !== true) throw this.replyError(reply, kind);
+    return reply;
+  }
+
+  /**
+   * One relay round-trip, fenced by the hub's presence key.
+   *
+   * Before: refuse to start an op against a connector the hub has already lost.
+   * During: re-probe every `LIVENESS_POLL_MS` and abandon the wait the moment
+   * the verdict flips — the redeploy case, where the connector was live when the
+   * op started. Either way the caller gets `ENV_OFFLINE` in seconds instead of
+   * holding the step for the full relay timeout.
+   *
+   * A probe that cannot reach a verdict resolves to `unknown` and is treated as
+   * online, so a Redis hiccup can never fail a run that would otherwise work.
+   */
+  private async roundTrip(
+    kind: string,
+    payload: Record<string, unknown>,
+    timeoutMs: number | undefined,
+  ): Promise<Record<string, unknown>> {
+    const before = await this.probeLiveness();
+    if (before.verdict === 'offline') throw this.offlineError(before);
+
+    const work = requestDesktopRaw({
       userId: this.userId,
       installId: this.installId,
       kind,
-      timeoutMs: this.timeoutMs,
+      timeoutMs,
       payload,
+    }) as Promise<Record<string, unknown>>;
+
+    return this.watchLiveness(work);
+  }
+
+  /** Ask the hub whether this connector is still registered. Never throws. */
+  private probeLiveness(): Promise<LivenessResult> {
+    return probeDesktopPresence({
+      userId: this.userId,
+      installId: this.installId,
+      lastSeenAt: this.env.lastSeenAt,
     });
-    if (!reply || reply.ok !== true) throw this.replyError(reply, kind);
-    return reply as Record<string, unknown>;
+  }
+
+  private offlineError(result: LivenessResult): DesktopAgentError {
+    return new DesktopAgentError(ENV_OFFLINE, offlineMessage(this.environmentId, result.offlineForSeconds));
+  }
+
+  /**
+   * Settle with `work`, or reject early with `ENV_OFFLINE` if the environment
+   * goes offline while we wait.
+   *
+   * An abandoned `work` is left to its own timeout: `requestDesktopRaw` tears
+   * its Redis pair down in a `finally` regardless of who is still listening, and
+   * failing fast is the entire point — holding the op chain for a connector that
+   * is gone is the bug.
+   */
+  private watchLiveness<T>(work: Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const timer = setInterval(() => void poll(), LIVENESS_POLL_MS);
+      // Never let the poller hold the process open on its own.
+      if (typeof timer.unref === 'function') timer.unref();
+
+      /** Claim the single settlement slot; false when someone already has it. */
+      const claim = (): boolean => {
+        if (settled) return false;
+        settled = true;
+        clearInterval(timer);
+        return true;
+      };
+
+      const poll = async (): Promise<void> => {
+        if (settled) return;
+        const result = await this.probeLiveness();
+        if (settled || result.verdict !== 'offline') return;
+        if (claim()) reject(this.offlineError(result));
+      };
+
+      work.then(
+        (value) => {
+          if (claim()) resolve(value);
+        },
+        (err: unknown) => {
+          if (claim()) reject(err);
+        },
+      );
+    });
   }
 
   private replyError(reply: Record<string, unknown> | null | undefined, kind: string): DesktopAgentError {

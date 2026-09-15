@@ -12,15 +12,21 @@
  *   release()  stop renewing  →  enqueue workspace.snapshot on the node that
  *              holds the volume  →  release the checkout
  *
+ * Three tiers of warmth, each the previous one's fallback: the CONTAINER
+ * survives a release for `config.hotIdleSeconds` and the next acquire adopts it
+ * (no start, no registration); the VOLUME survives for `config.warmTtlSeconds`
+ * and the next acquire reuses the working copy on that node; the SNAPSHOT
+ * survives everything and is restored from object storage anywhere.
+ *
  * The engine never touches the docker socket. It talks to the per-node redrun
  * worker over BullMQ, which is the one process on each node that already holds
  * /var/run/docker.sock.
  */
 import type { Db } from 'mongodb';
-import { WorkspaceRepository, warmTtlSeconds } from './WorkspaceRepository.js';
+import { WorkspaceRepository, warmTtlSeconds, hotIdleSeconds } from './WorkspaceRepository.js';
 import { createWorkspaceRegistrationToken } from './workspace-token.js';
 import { resolveGithubInstallation } from './github-installations.js';
-import type { IWorkspace, IWorkspaceCheckout, CheckoutMode } from './types.js';
+import type { IWorkspace, IWorkspaceCheckout, IParkedCheckout, CheckoutMode } from './types.js';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { Queue: BullQueue } = require('bullmq');
@@ -225,6 +231,10 @@ export class WorkspaceSession {
     this.stopRenewing();
 
     const { workspace, checkout, nodeId } = this.acquired;
+    // Above zero the node keeps the runner alive instead of destroying it, and
+    // the next checkout adopts it. The environment id travels with the request
+    // so an operator finding the marker knows what is registered in there.
+    const idleSeconds = hotIdleSeconds(workspace.config);
     let snapshotMeta:
       | { snapshotId: string; snapshotSizeBytes: number; fileCount: number; computeSeconds: number }
       | undefined;
@@ -232,6 +242,11 @@ export class WorkspaceSession {
     // that predates the field, a snapshot that never came back — means it kept
     // it, and the working copy is still warm where it was.
     let volumeRemoved = false;
+    // And whether it kept the runner alive. Only a node that says so parks one:
+    // a park nobody confirmed would send the next acquire looking for a
+    // container that does not exist.
+    let parked = false;
+    let parkedUntil: Date | null = null;
 
     try {
       const result = await this.queue.runJob(
@@ -245,10 +260,15 @@ export class WorkspaceSession {
           checkoutKey: checkout.checkoutKey,
           skipSnapshot: options.skipSnapshot ?? false,
           removeVolume: checkout.mode === 'branch',
+          ...(idleSeconds > 0
+            ? { park: { idleSeconds, environmentId: this.acquired.environmentId } }
+            : {}),
         },
         SNAPSHOT_TIMEOUT_MS
       );
       volumeRemoved = result?.volumeRemoved === true;
+      parked = result?.parked === true;
+      parkedUntil = typeof result?.parkedUntil === 'number' ? new Date(result.parkedUntil) : null;
       if (result?.snapshotId) {
         snapshotMeta = {
           snapshotId: result.snapshotId,
@@ -276,6 +296,26 @@ export class WorkspaceSession {
       await this.repo.setWorkspaceNode(workspace.workspaceId, nodeId, pinnedUntil).catch((err: Error) => {
         console.warn('[WorkspaceSession] could not refresh the node pin:', err.message);
       });
+    }
+
+    // The parked runner, if the node kept one. `clearWorkspaceNode` above
+    // already dropped the record along with the volume, so this only has to
+    // settle the case where the volume stayed and the container did not.
+    if (parked && !volumeRemoved) {
+      await this.repo
+        .setParkedCheckout(workspace.workspaceId, {
+          checkoutId: checkout.checkoutId,
+          installId: checkout.installId,
+          environmentId: this.acquired.environmentId,
+          containerName: this.acquired.containerName,
+          nodeId,
+          parkedUntil: parkedUntil ?? new Date(Date.now() + idleSeconds * 1000),
+        })
+        .catch((err: Error) => {
+          console.warn('[WorkspaceSession] could not record the parked runner:', err.message);
+        });
+    } else if (!volumeRemoved) {
+      await this.repo.clearParkedCheckout(workspace.workspaceId).catch(() => {});
     }
 
     await this.repo.releaseWorkspace({
@@ -330,6 +370,20 @@ async function resolveSpawnQueue(
 }
 
 /**
+ * The parked runner still worth going back to, or null.
+ *
+ * Expired is the same as absent: the node reaps a container the moment its park
+ * window passes, so a stale record would only send the spawn to a node with
+ * nothing warm on it and make the engine skip a registration wait it needs.
+ */
+function activeParkedCheckout(workspace: IWorkspace, nowMs: number): IParkedCheckout | null {
+  const parked = workspace.parkedCheckout;
+  if (!parked?.nodeId || !parked.installId) return null;
+  const until = parked.parkedUntil ? new Date(parked.parkedUntil).getTime() : 0;
+  return until > nowMs ? parked : null;
+}
+
+/**
  * Check out a workspace and bring its container up.
  *
  * Fails closed at every step: a failed spawn, a container that never registers,
@@ -373,6 +427,12 @@ export async function acquireWorkspace(
 
   try {
     const spawnQueue = await resolveSpawnQueue(queue, workspace, options.nodeId, now());
+    // A parked runner only counts when the spawn is actually going to the node
+    // holding it — the pin normally sends it there, but an explicit nodeId, an
+    // aged pin or a dead worker can all send it elsewhere, and a container on
+    // another node is no use to this checkout.
+    const parked = activeParkedCheckout(workspace, now());
+    const preferParked = !!parked && spawnQueue === workspaceNodeQueue(parked.nodeId);
     // Which App installation may clone this repository FOR THIS OWNER. A
     // branch-mode checkout starts from a fresh clone, so this is the job that
     // needs a token at all; the hub answers per-user, and a null — nothing
@@ -400,6 +460,7 @@ export async function acquireWorkspace(
         gitBranch: workspace.config?.gitBranch,
         ownerUserId: workspace.userId,
         githubInstallationId,
+        ...(preferParked ? { preferParked: true } : {}),
         dockerImage: workspace.config?.dockerImage,
         cpuLimit: workspace.config?.cpuLimit,
         memLimit: workspace.config?.memLimit,
@@ -413,14 +474,24 @@ export async function acquireWorkspace(
       );
     }
 
+    // An adopted container was never restarted, so it is still registered under
+    // the install id it was SPAWNED with — not the one minted for this checkout,
+    // which belongs to a container that never existed. The node's id wins.
+    const adopted = spawn.adopted === true && typeof spawn.installId === 'string' && !!spawn.installId;
+    const installId = adopted ? (spawn.installId as string) : checkout.installId;
+
     // Adopt the environmentId the GATEWAY assigned on register.
     // The checkout mints one locally and the gateway independently upserts its
     // own on (userId, installId, kind); nothing reconciled them, so every bridge
     // call targeted an environment that does not exist (48a P0-5).
+    // The one case with nothing to wait for is the container we parked
+    // ourselves: its runner never disconnected, so the environment recorded
+    // against that install id is still the live one.
+    let environmentId: string | null =
+      adopted && parked?.installId === installId ? parked.environmentId : null;
     const deadline = now() + REGISTER_TIMEOUT_MS;
-    let environmentId: string | null = null;
-    while (now() < deadline) {
-      const env = await environments.findByInstallId(workspace.userId, checkout.installId);
+    while (!environmentId && now() < deadline) {
+      const env = await environments.findByInstallId(workspace.userId, installId);
       if (env?.environmentId) {
         environmentId = env.environmentId;
         break;
@@ -429,7 +500,7 @@ export async function acquireWorkspace(
     }
     if (!environmentId) {
       throw new WorkspaceSpawnError(
-        `Workspace container for ${workspace.workspaceId} never registered an environment for installId ${checkout.installId}`
+        `Workspace container for ${workspace.workspaceId} never registered an environment for installId ${installId}`
       );
     }
 
@@ -438,7 +509,12 @@ export async function acquireWorkspace(
       nodeId: spawn.nodeId,
       containerName: spawn.containerName,
       volumeName: spawn.volumeName,
+      ...(adopted ? { installId } : {}),
     });
+    // The park is spent either way: adopted, it is this checkout's container
+    // now; not adopted, the node has already destroyed whatever was there. The
+    // release re-establishes it if the workspace still runs a hot tier.
+    if (workspace.parkedCheckout) await repo.clearParkedCheckout(workspace.workspaceId).catch(() => {});
     // Remember where the volume lives and for how long that is worth trusting,
     // so the next checkout goes back to it while it is still warm.
     const pinnedUntil = new Date(now() + warmTtlSeconds(workspace.config) * 1000);
@@ -446,7 +522,7 @@ export async function acquireWorkspace(
 
     const acquired: AcquiredWorkspace = {
       workspace,
-      checkout: { ...checkout, environmentId },
+      checkout: { ...checkout, environmentId, installId },
       environmentId,
       nodeId: spawn.nodeId,
       containerName: spawn.containerName,
