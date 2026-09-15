@@ -291,6 +291,14 @@ export interface CreateWorkspaceInput {
   resticRepository?: string;
   config?: Partial<IWorkspaceConfig>;
   maxConcurrentCheckouts?: number;
+  /**
+   * The owner's account tier (`accountLevel`, 0 = admin), which decides the
+   * workspace's warm/hot windows and concurrency — see `./tiers.ts`. Absent
+   * means "we do not know who this is", which resolves to the lowest tier; every
+   * caller that has a user in hand should pass it, or it hands out a Free
+   * workspace to a paying account.
+   */
+  accountTier?: number;
 }
 
 // --- Errors ---

@@ -46,6 +46,17 @@ export function resolveRunUserId(context: NativeToolContext): string | null {
   return typeof id === 'string' && id ? id : null;
 }
 
+/**
+ * The run owner's account tier, which decides the storage tier of any workspace
+ * this run creates (see `lib/workspaces/tiers.ts`). The run path already put it
+ * on state as `data.accountTier`; without it a managed workspace created for a
+ * paying account would be provisioned as Free.
+ */
+export function resolveRunAccountTier(context: NativeToolContext): number | undefined {
+  const tier = context?.state?.data?.accountTier;
+  return typeof tier === 'number' && Number.isFinite(tier) ? tier : undefined;
+}
+
 /** `owner/name`, a github.com URL, or an ssh remote → canonical parts + clone URL. */
 export function normalizeGithubRepo(input: unknown): { owner: string; repo: string; url: string } | null {
   const raw = String(input ?? '').trim();

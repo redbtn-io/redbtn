@@ -13,6 +13,11 @@ import {
   WorkspaceLeaseLostError,
   WorkspaceVersionConflictError,
 } from './types.js';
+import {
+  applyTierPolicy,
+  clampMaxConcurrentCheckouts,
+  workspaceTierPolicy,
+} from './tiers.js';
 
 const NANOID_ALPHABET =
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
@@ -109,6 +114,11 @@ export class WorkspaceRepository {
   async createWorkspace(input: CreateWorkspaceInput): Promise<IWorkspace> {
     const now = new Date();
     const workspaceId = input.workspaceId || generateWorkspaceId();
+    // Who is paying decides how long this workspace may stay warm, how long a
+    // runner may stay parked for it, and how many checkouts it may hold at once.
+    // A caller with no tier in hand gets the lowest policy — see ./tiers.ts.
+    const policy = workspaceTierPolicy(input.accountTier);
+    const tiered = applyTierPolicy(input.config, policy);
     // The node's redrun worker derives the real repository from its own
     // WORKSPACE_S3_* env; this field is informational. It carries no IP literal:
     // the endpoint is node configuration, not code (48a P2-6).
@@ -130,8 +140,8 @@ export class WorkspaceRepository {
         defaultCwd: '/workspace',
         gitRepoUrl: input.config?.gitRepoUrl,
         gitBranch: input.config?.gitBranch || 'main',
-        warmTtlSeconds: warmTtlSeconds(input.config),
-        hotIdleSeconds: hotIdleSeconds(input.config),
+        warmTtlSeconds: tiered.warmTtlSeconds,
+        hotIdleSeconds: tiered.hotIdleSeconds,
       },
       stats: {
         snapshotSizeBytes: 0,
@@ -141,7 +151,7 @@ export class WorkspaceRepository {
         totalComputeSeconds: 0,
       },
       version: 1,
-      maxConcurrentCheckouts: input.maxConcurrentCheckouts ?? 8,
+      maxConcurrentCheckouts: clampMaxConcurrentCheckouts(input.maxConcurrentCheckouts, policy),
       activeCheckouts: [],
       createdAt: now,
       updatedAt: now,
