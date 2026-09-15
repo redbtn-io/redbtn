@@ -19,6 +19,7 @@
 import type { Db } from 'mongodb';
 import { WorkspaceRepository, warmTtlSeconds } from './WorkspaceRepository.js';
 import { createWorkspaceRegistrationToken } from './workspace-token.js';
+import { resolveGithubInstallation } from './github-installations.js';
 import type { IWorkspace, IWorkspaceCheckout, CheckoutMode } from './types.js';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -372,6 +373,16 @@ export async function acquireWorkspace(
 
   try {
     const spawnQueue = await resolveSpawnQueue(queue, workspace, options.nodeId, now());
+    // Which App installation may clone this repository FOR THIS OWNER. A
+    // branch-mode checkout starts from a fresh clone, so this is the job that
+    // needs a token at all; the hub answers per-user, and a null — nothing
+    // linked yet, or a hub that could not answer — leaves the worker on the
+    // path it has always used (the owner's own secrets, then the allowlisted
+    // platform fallback) and a public repository still clones anonymously.
+    // Never fatal: a spawn is not a push.
+    const githubInstallationId = workspace.config?.gitRepoUrl
+      ? (await resolveGithubInstallation(workspace.userId, workspace.config.gitRepoUrl)).installationId
+      : null;
     const spawn = await queue.runJob(
       spawnQueue,
       'spawn',
@@ -388,6 +399,7 @@ export async function acquireWorkspace(
         gitRepoUrl: workspace.config?.gitRepoUrl,
         gitBranch: workspace.config?.gitBranch,
         ownerUserId: workspace.userId,
+        githubInstallationId,
         dockerImage: workspace.config?.dockerImage,
         cpuLimit: workspace.config?.cpuLimit,
         memLimit: workspace.config?.memLimit,
