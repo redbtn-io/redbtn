@@ -78,6 +78,16 @@ import {
 } from '../../../mcp/run-bridge';
 import { getRunPublisher } from '../../../run/contextLookup';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
+import {
+  createCliSlotQueue,
+  slotWaitReporter,
+  logSlotAdmission,
+  SLOT_WAIT_PROGRESS_INTERVAL_MS,
+} from './cli-slot';
+
+// Re-exported because `SLOT_WAIT_PROGRESS_INTERVAL_MS` is part of this
+// executor's surface for anyone reasoning about a queued step's heartbeat.
+export { SLOT_WAIT_PROGRESS_INTERVAL_MS };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -261,9 +271,21 @@ function abortError(message: string): Error {
  * (`prep-reports/16-phase0-smoke.md` §6). Two children do not fit any of the
  * options on the table, so the default is 1 and the limit is read at acquire
  * time so RedRun can change it without a code change.
+ *
+ * The queue itself lives in `cli-slot.ts`, shared with `agyCliExecutor` — the
+ * two CLIs cost different amounts of memory and answer to different env vars,
+ * but they had the same forty lines of semaphore twice and the copies drifted.
  */
-let activeChildren = 0;
-const waiters: Array<() => void> = [];
+const slots = createCliSlotQueue({
+  provider: 'claude-code',
+  maxConcurrent,
+  queueTimeoutError: (maxWaitMs, max) =>
+    new ClaudeCodeError(
+      'claude_code_queue_timeout',
+      `waited ${maxWaitMs} ms for one of ${max} claude-code slot(s) on this ` +
+        `worker and never got one; raise CLAUDE_CODE_MAX_CONCURRENT or add workers`,
+    ),
+});
 
 function maxConcurrent(): number {
   const raw = Number.parseInt(process.env.CLAUDE_CODE_MAX_CONCURRENT || '', 10);
@@ -283,107 +305,20 @@ export function queueWaitMs(timeoutMs: number): number {
 }
 
 /**
- * How often a queued step says it is still queued.
- *
- * The run-level watchdog interrupts a run whose `lastProgressAt` has not moved
- * for 30 minutes, and a step waiting for a slot touches nothing until its CLI
- * starts — so a run that waited longer than that was interrupted before it had
- * spawned anything at all (run_1789454327425_zvof94, 2026-09-15). Waiting for a
- * worker IS progress; it is just progress the model did not make.
+ * Wait for a slot, but never past `maxWaitMs`; see `CliSlotQueue.acquire`.
+ * Exported with `releaseSlot` so the queue can be tested without spawning a CLI.
  */
-export const SLOT_WAIT_PROGRESS_INTERVAL_MS = 60 * 1000;
-
-/**
- * Wait for a slot, but never past `maxWaitMs`.
- *
- * An unbounded wait is not "patient", it is a queue with no failure mode: with
- * `CLAUDE_CODE_MAX_CONCURRENT=1` (the default) one two-hour child parks every
- * other `claude-code` step behind it until the WORKER's own job race fails
- * them while they are still queued — and this executor would then acquire the
- * slot and spawn a real CLI child, spending subscription quota, for a run that
- * is already terminal. Failing fast with a distinct code is the honest answer:
- * the step could not get a worker, which is an operational fact worth seeing.
- *
- * `onWaiting` is called every `SLOT_WAIT_PROGRESS_INTERVAL_MS` with a reason
- * naming how many CLI children are ahead of this one (running, plus queued
- * before it), so the caller can keep the run's heartbeat alive on the channel
- * it already uses. Exported with `releaseSlot` so the queue can be tested
- * without spawning a CLI.
- */
-export async function acquireSlot(
+export function acquireSlot(
   abortSignal: AbortSignal | undefined,
   maxWaitMs: number,
   onWaiting?: (reason: string) => void,
 ): Promise<void> {
-  if (abortSignal?.aborted) throw abortError('Run aborted before claude-code slot acquired');
-  if (activeChildren < maxConcurrent()) {
-    activeChildren += 1;
-    return;
-  }
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    let timer: NodeJS.Timeout | null = null;
-    let progressTimer: NodeJS.Timeout | null = null;
-    const stopProgress = () => {
-      if (progressTimer) clearInterval(progressTimer);
-      progressTimer = null;
-    };
-    const unqueue = () => {
-      const idx = waiters.indexOf(admit);
-      if (idx >= 0) waiters.splice(idx, 1);
-      if (timer) clearTimeout(timer);
-      stopProgress();
-    };
-    const onAbort = () => {
-      if (settled) return;
-      settled = true;
-      unqueue();
-      reject(abortError('Run aborted while queued for a claude-code slot'));
-    };
-    function admit(): void {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      stopProgress();
-      abortSignal?.removeEventListener('abort', onAbort);
-      activeChildren += 1;
-      resolve();
-    }
-    if (onWaiting) {
-      progressTimer = setInterval(() => {
-        const queuedAhead = Math.max(0, waiters.indexOf(admit));
-        try {
-          onWaiting(`waiting for a CLI slot (${activeChildren + queuedAhead} ahead)`);
-        } catch {
-          /* a heartbeat that cannot be reported must not break the queue */
-        }
-      }, SLOT_WAIT_PROGRESS_INTERVAL_MS);
-      progressTimer.unref?.();
-    }
-    timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      unqueue();
-      abortSignal?.removeEventListener('abort', onAbort);
-      reject(
-        new ClaudeCodeError(
-          'claude_code_queue_timeout',
-          `waited ${maxWaitMs} ms for one of ${maxConcurrent()} claude-code slot(s) on this ` +
-            `worker and never got one; raise CLAUDE_CODE_MAX_CONCURRENT or add workers`,
-        ),
-      );
-    }, maxWaitMs);
-    timer.unref?.();
-    waiters.push(admit);
-    abortSignal?.addEventListener('abort', onAbort, { once: true });
-  });
+  return slots.acquire(abortSignal, maxWaitMs, onWaiting);
 }
 
 /** Give the slot back and admit the next queued step. */
 export function releaseSlot(): void {
-  activeChildren = Math.max(0, activeChildren - 1);
-  const next = waiters.shift();
-  if (next) next();
+  slots.release();
 }
 
 // =============================================================================
@@ -509,7 +444,7 @@ export function __liveChildCount(): number {
 
 /** Test-only: current occupancy of the worker-wide semaphore. */
 export function __claudeCodeSlotsInUse(): number {
-  return activeChildren;
+  return slots.inUse();
 }
 
 // =============================================================================
@@ -1399,16 +1334,17 @@ export async function runClaudeCodeStep(
     // (run_1789454327425_zvof94, 2026-09-15). `nodeProgress` is the channel
     // every other step event already uses, and publishing one refreshes the
     // heartbeat in `RunPublisher.publish`; there is no second channel here.
-    await acquireSlot(abortSignal, queueBudgetMs, publisher?.nodeProgress ? (reason) => {
-      const nodeId = runControlRegistry.get(runId)?.currentNodeId || stepId;
-      void Promise.resolve(publisher.nodeProgress(nodeId, reason, { data: { stepId, phase: 'queued' } })).catch(
-        (err: unknown) => {
-          // A heartbeat that cannot be published must not fail the step; the
-          // watchdog's own timeout remains the backstop.
-          console.warn(`[ClaudeCode] queued-progress publish failed for run ${runId}:`, err);
-        },
-      );
-    } : undefined);
+    await acquireSlot(
+      abortSignal,
+      queueBudgetMs,
+      slotWaitReporter({
+        publisher,
+        currentNodeId: () => runControlRegistry.get(runId)?.currentNodeId,
+        stepId,
+        runId,
+        logPrefix: 'ClaudeCode',
+      }),
+    );
     slotHeld = true;
     const queuedMs = Date.now() - queueStartedAt;
 
@@ -1421,9 +1357,11 @@ export async function runClaudeCodeStep(
         `claude-code step '${stepId}' spent its entire ${timeoutMs} ms budget queued for a slot`,
       );
     }
-    if (queuedMs > 1000) {
-      console.warn(`[ClaudeCode] step '${stepId}' waited ${queuedMs} ms for a slot`);
-    }
+    // The wait is an operational fact about THIS replica's queue, not about
+    // the model, so it is logged here and carried out on the step's `_cli`
+    // record below — the run archive is where a 14-minute wait has to be
+    // visible after the worker log has rolled.
+    logSlotAdmission('ClaudeCode', stepId, queuedMs);
 
     // Re-check liveness AFTER queueing. The run may have been cancelled, timed
     // out at the worker, or otherwise gone terminal while this step sat in the
@@ -1876,6 +1814,10 @@ export async function runClaudeCodeStep(
       requestIds: handler.state.requestIds.slice(0, 8),
       exitCode: exit.code,
       truncated: softMaxTurns || undefined,
+      // Time this step spent waiting for one of this replica's CLI slots,
+      // before its child was spawned. `durationMs` is the CLI's own clock and
+      // says nothing about the queue.
+      queuedMs,
     };
     if (handler.state.rateLimit) {
       console.log('[ClaudeCode] rate limit window', cli.rateLimit);

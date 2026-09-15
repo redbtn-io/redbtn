@@ -29,7 +29,7 @@
  * NOTE: never run this on a fleet box by hand — CI (org runners) runs it.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -1345,6 +1345,41 @@ describe('runClaudeCodeStep', () => {
       'end',
     ]);
     expect(__claudeCodeSlotsInUse()).toBe(0);
+  });
+
+  it('carries the queue wait out on `_cli` and logs the admission', async () => {
+    // A wait is invisible in the run archive unless the step carries it out:
+    // `durationMs` is the CLI's own clock and only starts once the slot is
+    // held, so a step that sat behind a sibling for a quarter of an hour read
+    // as instant. The log line is for the worker; `queuedMs` is for the
+    // archive, which is what is left after the log has rolled.
+    process.env.CLAUDE_CODE_MAX_CONCURRENT = '1';
+    process.env.CLAUDE_CODE_BIN = writeFakeCli(
+      `${EMIT_INIT}
+       setTimeout(() => {
+         emit(${JSON.stringify(RESULT_EVENT)});
+         process.exit(0);
+       }, 2500);`,
+    );
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const first = run({ timeoutMs: 60_000 });
+      // Let the first step take the only slot before the second asks for one.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const second = run({ timeoutMs: 60_000 });
+      const [ran, queued] = await Promise.all([first.promise, second.promise]);
+
+      type CliBag = Record<string, { queuedMs: number }>;
+      expect((ran['data._cli'] as CliBag)['data.coderSummary'].queuedMs).toBeLessThan(100);
+      expect((queued['data._cli'] as CliBag)['data.coderSummary'].queuedMs).toBeGreaterThan(1000);
+
+      const admitted = warn.mock.calls
+        .map((args) => args.map(String).join(' '))
+        .filter((line) => /admitted after \d+ ms waiting for a CLI slot/.test(line));
+      expect(admitted).toHaveLength(1); // the step that waited, and only it
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
