@@ -52,6 +52,24 @@ export function isGuardedExecTool(name: string): boolean {
   return !!rule && isFailClosedResource(rule.resource);
 }
 
+/**
+ * Guarded tools that are NOT subject to the FAIL-CLOSED durable audit.
+ *
+ * `workspace_for_repo` (find or create a workspace record) and
+ * `workspace_merge` (merge a pull request through the GitHub API) execute
+ * nothing on any environment. They are mapped to `exec:execute` unscoped only
+ * so the capability gate covers them at all (see tool-map.ts), and being
+ * mapped is what dragged them into Gate 7 — where "no unlogged execution" buys
+ * nothing, because there is no execution, and costs real availability: a cold
+ * audit sink refused a merge with `audit_unavailable` (2026-09-15).
+ *
+ * So they stay fully capability-gated, the kill switch and the rate limit still
+ * apply, and the attempt is still recorded — durably when the sink is up, and
+ * in the worker's log when it is not. `workspace_ship` is deliberately NOT
+ * here: it pushes code to a repository, so it keeps the hard audit.
+ */
+export const AUDIT_EXEMPT_TOOLS: ReadonlySet<string> = new Set(['workspace_for_repo', 'workspace_merge']);
+
 // ── Redis (lazy singleton, mirrors desktop-request.ts) ─────────────────────
 interface RedisLike {
   get(k: string): Promise<string | null>;
@@ -165,7 +183,13 @@ export async function runExecGuard(
   // ── Gate 7: durable audit, FAIL-CLOSED (D12). Record the ATTEMPT; if it
   //    cannot be durably written, DENY (no silent unlogged exec). ─────────────
   const ok = await auditAttempt(context, name, resource, rule.action, address, 'allowed');
-  if (!ok && process.env.EXEC_AUDIT_FAIL_OPEN !== 'true' && !shadow) {
+  if (!ok && AUDIT_EXEMPT_TOOLS.has(name)) {
+    // Nothing executes on an environment here, so the local record is enough.
+    console.warn(
+      `[exec-guard] ${name}: audit sink unavailable; allowed (audit-exempt platform tool) ` +
+        `user=${userId || 'unknown'} address=${address}`,
+    );
+  } else if (!ok && process.env.EXEC_AUDIT_FAIL_OPEN !== 'true' && !shadow) {
     throw new ExecBlockedError({
       code: 'audit_unavailable', resource, address,
       message: `Permission denied: exec attempt could not be durably audited (audit sink unavailable). ${resource} is fail-closed on audit — no unlogged execution.`,

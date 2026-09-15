@@ -3,7 +3,7 @@
  * fail-closed-on-audit. Mocks ioredis + fetch.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { runExecGuard, ExecBlockedError, isGuardedExecTool, auditAttempt, __setRedisForTest } from '../../src/lib/permissions/exec-guard';
+import { runExecGuard, ExecBlockedError, isGuardedExecTool, auditAttempt, AUDIT_EXEMPT_TOOLS, __setRedisForTest } from '../../src/lib/permissions/exec-guard';
 
 // Injected fake redis (no real connection).
 const redisState = {
@@ -89,6 +89,35 @@ describe('exec-guard — fail-closed on audit (D12)', () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false }) as Response));
     await expect(runExecGuard(ctx, 'run_command', okArgs)).resolves.toBeUndefined();
     delete process.env.EXEC_AUDIT_FAIL_OPEN;
+  });
+});
+
+// ── Platform tools: capability-gated, but not fail-closed on the AUDIT ───────
+// `workspace_for_repo` and `workspace_merge` execute nothing on an environment
+// — they are mapped to exec:execute only so the capability gate covers them —
+// so a cold audit sink must not refuse them (it refused a merge with
+// `audit_unavailable` on 2026-09-15). `workspace_ship` pushes code and stays
+// fully guarded.
+describe('exec-guard — audit-exempt platform tools', () => {
+  it('ALLOWS workspace_merge and workspace_for_repo when the audit sink is down', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false }) as Response));
+    await expect(runExecGuard(ctx, 'workspace_merge', { prUrl: 'https://github.com/o/r/pull/1' })).resolves.toBeUndefined();
+    await expect(runExecGuard(ctx, 'workspace_for_repo', { repo: 'o/r' })).resolves.toBeUndefined();
+    expect(AUDIT_EXEMPT_TOOLS.has('workspace_ship')).toBe(false);
+  });
+
+  it('STILL DENIES workspace_ship on a failed audit — it pushes code', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false }) as Response));
+    await expect(
+      runExecGuard(ctx, 'workspace_ship', { environmentId: 'env_ABC', branch: 'red/x', title: 't' }),
+    ).rejects.toMatchObject({ code: 'audit_unavailable' });
+  });
+
+  it('exemption is ONLY from the audit: the kill switch still stops an exempt tool', async () => {
+    redisState.get.mockImplementation(async (k: string) => (k === 'exec:kill:global' ? '1' : null));
+    await expect(runExecGuard(ctx, 'workspace_merge', { prUrl: 'https://github.com/o/r/pull/1' })).rejects.toMatchObject({
+      code: 'kill_switch',
+    });
   });
 });
 

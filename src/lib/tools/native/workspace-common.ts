@@ -4,6 +4,12 @@
  */
 import type { NativeToolContext, NativeMcpResult } from '../native-registry';
 import { bullLifecycleQueue, type LifecycleQueue } from '../../workspaces/WorkspaceLifecycle';
+import {
+  resolveGithubInstallation,
+  isMissingInstallation,
+  githubInstallMessage,
+  repoSlug,
+} from '../../workspaces/github-installations';
 
 type AnyObject = Record<string, any>;
 
@@ -53,3 +59,28 @@ export function normalizeGithubRepo(input: unknown): { owner: string; repo: stri
 }
 
 export const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$/;
+
+/**
+ * The App installation to put on a GitHub-facing job — or the error to return.
+ *
+ * Both shipping tools do the same two things with the hub's answer. When it
+ * says this user has no installation that can reach the repository, they refuse
+ * and say how to fix it: the push or merge would fail on GitHub anyway, and
+ * only a person can install the App. Every other answer (the hub is cold, the
+ * platform has no App configured) carries on with a null id, which leaves the
+ * worker on the path it has always used. Shared so the two tools cannot drift
+ * into two different sentences.
+ */
+export async function resolveJobInstallation(
+  userId: string | null | undefined,
+  repo: string
+): Promise<{ githubInstallationId: number | null; error?: NativeMcpResult }> {
+  const installation = await resolveGithubInstallation(userId, repo);
+  if (isMissingInstallation(installation.code)) {
+    return {
+      githubInstallationId: null,
+      error: toolError(githubInstallMessage(repoSlug(repo) ?? repo, installation.code), 'NO_GITHUB_APP'),
+    };
+  }
+  return { githubInstallationId: installation.installationId };
+}

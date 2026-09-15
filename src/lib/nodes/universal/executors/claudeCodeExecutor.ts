@@ -283,6 +283,17 @@ export function queueWaitMs(timeoutMs: number): number {
 }
 
 /**
+ * How often a queued step says it is still queued.
+ *
+ * The run-level watchdog interrupts a run whose `lastProgressAt` has not moved
+ * for 30 minutes, and a step waiting for a slot touches nothing until its CLI
+ * starts — so a run that waited longer than that was interrupted before it had
+ * spawned anything at all (run_1789454327425_zvof94, 2026-09-15). Waiting for a
+ * worker IS progress; it is just progress the model did not make.
+ */
+export const SLOT_WAIT_PROGRESS_INTERVAL_MS = 60 * 1000;
+
+/**
  * Wait for a slot, but never past `maxWaitMs`.
  *
  * An unbounded wait is not "patient", it is a queue with no failure mode: with
@@ -292,8 +303,18 @@ export function queueWaitMs(timeoutMs: number): number {
  * slot and spawn a real CLI child, spending subscription quota, for a run that
  * is already terminal. Failing fast with a distinct code is the honest answer:
  * the step could not get a worker, which is an operational fact worth seeing.
+ *
+ * `onWaiting` is called every `SLOT_WAIT_PROGRESS_INTERVAL_MS` with a reason
+ * naming how many CLI children are ahead of this one (running, plus queued
+ * before it), so the caller can keep the run's heartbeat alive on the channel
+ * it already uses. Exported with `releaseSlot` so the queue can be tested
+ * without spawning a CLI.
  */
-async function acquireSlot(abortSignal: AbortSignal | undefined, maxWaitMs: number): Promise<void> {
+export async function acquireSlot(
+  abortSignal: AbortSignal | undefined,
+  maxWaitMs: number,
+  onWaiting?: (reason: string) => void,
+): Promise<void> {
   if (abortSignal?.aborted) throw abortError('Run aborted before claude-code slot acquired');
   if (activeChildren < maxConcurrent()) {
     activeChildren += 1;
@@ -302,10 +323,16 @@ async function acquireSlot(abortSignal: AbortSignal | undefined, maxWaitMs: numb
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     let timer: NodeJS.Timeout | null = null;
+    let progressTimer: NodeJS.Timeout | null = null;
+    const stopProgress = () => {
+      if (progressTimer) clearInterval(progressTimer);
+      progressTimer = null;
+    };
     const unqueue = () => {
       const idx = waiters.indexOf(admit);
       if (idx >= 0) waiters.splice(idx, 1);
       if (timer) clearTimeout(timer);
+      stopProgress();
     };
     const onAbort = () => {
       if (settled) return;
@@ -317,9 +344,21 @@ async function acquireSlot(abortSignal: AbortSignal | undefined, maxWaitMs: numb
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      stopProgress();
       abortSignal?.removeEventListener('abort', onAbort);
       activeChildren += 1;
       resolve();
+    }
+    if (onWaiting) {
+      progressTimer = setInterval(() => {
+        const queuedAhead = Math.max(0, waiters.indexOf(admit));
+        try {
+          onWaiting(`waiting for a CLI slot (${activeChildren + queuedAhead} ahead)`);
+        } catch {
+          /* a heartbeat that cannot be reported must not break the queue */
+        }
+      }, SLOT_WAIT_PROGRESS_INTERVAL_MS);
+      progressTimer.unref?.();
     }
     timer = setTimeout(() => {
       if (settled) return;
@@ -340,7 +379,8 @@ async function acquireSlot(abortSignal: AbortSignal | undefined, maxWaitMs: numb
   });
 }
 
-function releaseSlot(): void {
+/** Give the slot back and admit the next queued step. */
+export function releaseSlot(): void {
   activeChildren = Math.max(0, activeChildren - 1);
   const next = waiters.shift();
   if (next) next();
@@ -1352,7 +1392,23 @@ export async function runClaudeCodeStep(
     // looser.
     const queueBudgetMs = Math.min(timeoutMs, queueWaitMs(timeoutMs));
     const queueStartedAt = Date.now();
-    await acquireSlot(abortSignal, queueBudgetMs);
+    // A QUEUED step is not a STALLED run. The run-level watchdog only knows
+    // `lastProgressAt`, and a step waiting for a slot writes nothing until its
+    // CLI starts — so a step that queued past the 30-minute stale window had
+    // its run interrupted before it had spawned anything at all
+    // (run_1789454327425_zvof94, 2026-09-15). `nodeProgress` is the channel
+    // every other step event already uses, and publishing one refreshes the
+    // heartbeat in `RunPublisher.publish`; there is no second channel here.
+    await acquireSlot(abortSignal, queueBudgetMs, publisher?.nodeProgress ? (reason) => {
+      const nodeId = runControlRegistry.get(runId)?.currentNodeId || stepId;
+      void Promise.resolve(publisher.nodeProgress(nodeId, reason, { data: { stepId, phase: 'queued' } })).catch(
+        (err: unknown) => {
+          // A heartbeat that cannot be published must not fail the step; the
+          // watchdog's own timeout remains the backstop.
+          console.warn(`[ClaudeCode] queued-progress publish failed for run ${runId}:`, err);
+        },
+      );
+    } : undefined);
     slotHeld = true;
     const queuedMs = Date.now() - queueStartedAt;
 

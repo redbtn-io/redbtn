@@ -11,7 +11,14 @@
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { WorkspaceRepository } from '../../workspaces/WorkspaceRepository';
 import { workspaceNodeQueue } from '../../workspaces/WorkspaceLifecycle';
-import { toolOk, toolError, resolveWorkspaceDb, resolveLifecycleQueue, BRANCH_RE } from './workspace-common';
+import {
+  toolOk,
+  toolError,
+  resolveWorkspaceDb,
+  resolveLifecycleQueue,
+  resolveJobInstallation,
+  BRANCH_RE,
+} from './workspace-common';
 
 type AnyObject = Record<string, any>;
 const PUSH_TIMEOUT_MS = 5 * 60 * 1000;
@@ -48,6 +55,9 @@ const tool: NativeToolDefinition = {
       if (!workspace) return toolError(`workspace ${ws.workspaceId} not found`, 'NOT_FOUND');
       const gitRepoUrl = workspace.config?.gitRepoUrl;
       if (!gitRepoUrl) return toolError('this workspace has no repository configured', 'NO_REPO');
+      // The push needs a token for THIS owner's App installation.
+      const { githubInstallationId, error } = await resolveJobInstallation(workspace.userId, gitRepoUrl);
+      if (error) return error;
       const result = await resolveLifecycleQueue(context).runJob(
         workspaceNodeQueue(String(ws.nodeId)),
         'push',
@@ -63,6 +73,7 @@ const tool: NativeToolDefinition = {
           base: (typeof args?.base === 'string' && args.base.trim()) || workspace.config?.gitBranch || 'main',
           gitRepoUrl,
           ownerUserId: workspace.userId,
+          githubInstallationId,
         },
         PUSH_TIMEOUT_MS
       );
