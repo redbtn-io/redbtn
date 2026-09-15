@@ -104,11 +104,15 @@ describe('workspace hot tier (parked runners)', () => {
     else process.env.INTERNAL_SERVICE_KEY = OLD_KEY;
   });
 
-  const mk = (config?: { hotIdleSeconds?: number }) =>
+  // The hot window's default AND its cap now come from the owner's storage tier
+  // (tiers.ts), so these workspaces have to say who owns them. No tier means the
+  // lowest one, which is what "hot off by default" is tested against below.
+  const mk = (config?: { hotIdleSeconds?: number }, accountTier?: number) =>
     repo.createWorkspace({
       userId: 'user-1',
       name: `hot-${Math.random().toString(36).slice(2)}`,
       ...(config ? { config } : {}),
+      ...(accountTier === undefined ? {} : { accountTier }),
     });
 
   it('stores a hot window clamped to the hour ceiling, and nothing at all by default', async () => {
@@ -122,7 +126,9 @@ describe('workspace hot tier (parked runners)', () => {
 
     if (!available) return;
     expect((await mk({ hotIdleSeconds: 300 })).config.hotIdleSeconds).toBe(300);
-    expect((await mk({ hotIdleSeconds: 99999 })).config.hotIdleSeconds).toBe(MAX_HOT_IDLE_SECONDS);
+    // The hour ceiling is the TOP tier's cap; a lower tier is clamped sooner.
+    expect((await mk({ hotIdleSeconds: 99999 }, 0)).config.hotIdleSeconds).toBe(MAX_HOT_IDLE_SECONDS);
+    expect((await mk({ hotIdleSeconds: 99999 })).config.hotIdleSeconds).toBe(300);
     expect((await mk()).config.hotIdleSeconds).toBe(0);
   });
 

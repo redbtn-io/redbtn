@@ -56,8 +56,11 @@ describe('WorkspaceRepository (real MongoDB CAS engine)', () => {
     repo = new WorkspaceRepository(db!);
   });
 
+  // `accountTier: 0` because the storage tier now decides the concurrency cap
+  // (see tiers.ts): without a tier every workspace here would be provisioned
+  // Free, whose cap is below the parallel-checkout counts these CAS tests need.
   const mkWorkspace = (over: Partial<Parameters<WorkspaceRepository['createWorkspace']>[0]> = {}) =>
-    repo.createWorkspace({ userId: 'user-1', name: `ws-${Math.random().toString(36).slice(2)}`, ...over } as any);
+    repo.createWorkspace({ userId: 'user-1', accountTier: 0, name: `ws-${Math.random().toString(36).slice(2)}`, ...over } as any);
 
   it.skipIf(!available)('serialises exclusive checkouts: the second is refused, not queued', async () => {
     const ws = await mkWorkspace();
