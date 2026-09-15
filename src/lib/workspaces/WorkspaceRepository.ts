@@ -39,6 +39,19 @@ export function generateCheckoutId(): string {
  */
 export const DEFAULT_LEASE_DURATION_MS = 30 * 60 * 1000;
 
+/**
+ * How long a node pin is worth following, in seconds. Matches the node-side
+ * volume reaper's default TTL: past it the idle volume has been deleted, so the
+ * pin points at a node with nothing warm on it.
+ */
+export const DEFAULT_WARM_TTL_SECONDS = 24 * 60 * 60;
+
+/** A workspace's warm window in seconds: its own config, or the 24 h default. */
+export function warmTtlSeconds(config?: { warmTtlSeconds?: number } | null): number {
+  const configured = config?.warmTtlSeconds;
+  return typeof configured === 'number' && configured > 0 ? configured : DEFAULT_WARM_TTL_SECONDS;
+}
+
 export function generateEnvironmentId(): string {
   return `env_${generateRandomString(12)}`;
 }
@@ -85,6 +98,7 @@ export class WorkspaceRepository {
         defaultCwd: '/workspace',
         gitRepoUrl: input.config?.gitRepoUrl,
         gitBranch: input.config?.gitBranch || 'main',
+        warmTtlSeconds: warmTtlSeconds(input.config),
       },
       stats: {
         snapshotSizeBytes: 0,
@@ -244,12 +258,40 @@ export class WorkspaceRepository {
     }
   }
 
-  /** Record the node whose docker daemon holds this workspace's named volume. */
-  async setWorkspaceNode(workspaceId: string, nodeId: string): Promise<void> {
+  /**
+   * Record the node whose docker daemon holds this workspace's named volume,
+   * and how long that is worth following. Callers holding the workspace pass
+   * `pinnedUntil` (they already know its warm window); without one it is read
+   * from the stored config, so the older two-argument call still means
+   * "pinned for the configured warm window from now".
+   */
+  async setWorkspaceNode(workspaceId: string, nodeId: string, pinnedUntil?: Date): Promise<void> {
+    const now = new Date();
+    let until = pinnedUntil;
+    if (!until) {
+      const doc = await this.collection.findOne(
+        { workspaceId } as Filter<IWorkspace>,
+        { projection: { config: 1 }, maxTimeMS: 5000 }
+      );
+      until = new Date(now.getTime() + warmTtlSeconds(doc?.config) * 1000);
+    }
     await this.collection.updateOne(
       { workspaceId } as Filter<IWorkspace>,
-      { $set: { nodeId, updatedAt: new Date() } as any }
+      { $set: { nodeId, nodePinnedUntil: until, updatedAt: now } as any }
     );
+  }
+
+  /**
+   * Forget where the volume lived. The node reports `volumeRemoved` when it
+   * deletes the working copy: nothing warm is left there, so the pin has to go
+   * with it or every later run pays a cold restore on that one node — or waits
+   * out the spawn timeout on a queue nobody consumes, if the node has left.
+   */
+  async clearWorkspaceNode(workspaceId: string): Promise<void> {
+    await this.collection.updateOne({ workspaceId } as Filter<IWorkspace>, {
+      $unset: { nodeId: '', nodePinnedUntil: '' },
+      $set: { updatedAt: new Date() },
+    } as any);
   }
 
   async renewWorkspaceLease(

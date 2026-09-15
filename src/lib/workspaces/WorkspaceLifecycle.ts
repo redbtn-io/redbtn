@@ -17,7 +17,7 @@
  * /var/run/docker.sock.
  */
 import type { Db } from 'mongodb';
-import { WorkspaceRepository } from './WorkspaceRepository.js';
+import { WorkspaceRepository, warmTtlSeconds } from './WorkspaceRepository.js';
 import { createWorkspaceRegistrationToken } from './workspace-token.js';
 import type { IWorkspace, IWorkspaceCheckout, CheckoutMode } from './types.js';
 
@@ -75,6 +75,13 @@ function getQueue(name: string): any {
 /** Injectable so tests never need Redis. */
 export interface LifecycleQueue {
   runJob(queueName: string, jobName: string, data: Record<string, unknown>, timeoutMs: number): Promise<any>;
+  /**
+   * Whether any worker is consuming `queueName`. A node-scoped queue with no
+   * consumer swallows the job until the spawn timeout, so placement asks before
+   * it pins. Optional: a queue injected by an older caller cannot answer, and
+   * an unanswerable probe keeps the pin rather than throwing warmth away.
+   */
+  hasWorkers?(queueName: string): Promise<boolean>;
 }
 
 export const bullLifecycleQueue: LifecycleQueue = {
@@ -101,6 +108,17 @@ export const bullLifecycleQueue: LifecycleQueue = {
         throw new WorkspaceSpawnError(`${jobName} on ${queueName} did not complete within ${timeoutMs}ms (state: ${state})`);
       }
       await new Promise((r) => setTimeout(r, 1000));
+    }
+  },
+
+  async hasWorkers(queueName) {
+    try {
+      const workers = await getQueue(queueName).getWorkers();
+      return Array.isArray(workers) && workers.length > 0;
+    } catch {
+      // Could not prove a consumer exists; treat the node as gone. The global
+      // queue always has one, and a cold restore beats a five-minute timeout.
+      return false;
     }
   },
 };
@@ -133,11 +151,13 @@ export interface AcquireOptions {
   leaseDurationMs?: number;
   apiUrl?: string;
   /**
-   * Pin the spawn to one node's queue. Defaults to the node that last spawned
-   * this workspace (recorded on the document): the named volume lives there, so
-   * going back to it reuses the working copy instead of restoring the whole
-   * repository from object storage. Falls back to the global queue, where any
-   * provisioned node may take the job.
+   * Pin the spawn to one node's queue, unconditionally. Left unset, placement
+   * prefers the node that last spawned this workspace (recorded on the
+   * document): the named volume lives there, so going back to it reuses the
+   * working copy instead of restoring the whole repository from object storage.
+   * That preference holds only while the pin is warm and the node still has a
+   * worker — otherwise, and by default, the job goes to the global queue, where
+   * any provisioned node may take it.
    */
   nodeId?: string;
 }
@@ -207,6 +227,10 @@ export class WorkspaceSession {
     let snapshotMeta:
       | { snapshotId: string; snapshotSizeBytes: number; fileCount: number; computeSeconds: number }
       | undefined;
+    // The node says whether it deleted the volume. Anything else — a worker
+    // that predates the field, a snapshot that never came back — means it kept
+    // it, and the working copy is still warm where it was.
+    let volumeRemoved = false;
 
     try {
       const result = await this.queue.runJob(
@@ -223,6 +247,7 @@ export class WorkspaceSession {
         },
         SNAPSHOT_TIMEOUT_MS
       );
+      volumeRemoved = result?.volumeRemoved === true;
       if (result?.snapshotId) {
         snapshotMeta = {
           snapshotId: result.snapshotId,
@@ -237,6 +262,21 @@ export class WorkspaceSession {
       console.error('[WorkspaceSession] snapshot failed; releasing the checkout anyway:', err);
     }
 
+    // The pin follows the warm data. A removed volume leaves nothing on that
+    // node, so the workspace is cold and the next acquire places it fresh; a
+    // kept one re-arms the warm window from now. Neither is worth failing the
+    // release over — placement degrades to a cold spawn, nothing is lost.
+    if (volumeRemoved) {
+      await this.repo.clearWorkspaceNode(workspace.workspaceId).catch((err: Error) => {
+        console.warn('[WorkspaceSession] could not clear the node pin:', err.message);
+      });
+    } else {
+      const pinnedUntil = new Date(Date.now() + warmTtlSeconds(workspace.config) * 1000);
+      await this.repo.setWorkspaceNode(workspace.workspaceId, nodeId, pinnedUntil).catch((err: Error) => {
+        console.warn('[WorkspaceSession] could not refresh the node pin:', err.message);
+      });
+    }
+
     await this.repo.releaseWorkspace({
       workspaceId: workspace.workspaceId,
       checkoutId: checkout.checkoutId,
@@ -246,6 +286,46 @@ export class WorkspaceSession {
       snapshotMeta,
     });
   }
+}
+
+/**
+ * Where the spawn goes.
+ *
+ * An explicit `options.nodeId` is the caller's own pin and wins outright. The
+ * workspace's recorded node is followed only while it is still worth following:
+ * the pin has not aged out, and that node's queue still has a live consumer.
+ * Nothing ever cleared `nodeId`, so a node that left the fleet kept every one
+ * of its workspaces enqueueing spawns onto a queue no process reads, and each
+ * run died at the five-minute spawn timeout instead of starting cold elsewhere.
+ */
+async function resolveSpawnQueue(
+  queue: LifecycleQueue,
+  workspace: IWorkspace,
+  explicitNodeId: string | undefined,
+  nowMs: number
+): Promise<string> {
+  if (explicitNodeId) return workspaceNodeQueue(explicitNodeId);
+
+  const pinnedNode = workspace.nodeId;
+  if (!pinnedNode) return WORKSPACE_QUEUE;
+
+  // A record written before the warm window existed carries no expiry: honour
+  // it, so nothing changes for an existing workspace until it releases once.
+  const pinnedUntil = workspace.nodePinnedUntil ? new Date(workspace.nodePinnedUntil).getTime() : null;
+  if (pinnedUntil !== null && pinnedUntil <= nowMs) {
+    console.warn(`[acquireWorkspace] ${workspace.workspaceId}: pin expired; spawning on ${WORKSPACE_QUEUE}`);
+    return WORKSPACE_QUEUE;
+  }
+
+  const nodeQueue = workspaceNodeQueue(pinnedNode);
+  const live = queue.hasWorkers ? await queue.hasWorkers(nodeQueue) : true;
+  if (!live) {
+    console.warn(
+      `[acquireWorkspace] ${workspace.workspaceId}: pinned node ${pinnedNode} has no live worker; spawning on ${WORKSPACE_QUEUE}`
+    );
+    return WORKSPACE_QUEUE;
+  }
+  return nodeQueue;
 }
 
 /**
@@ -291,8 +371,7 @@ export async function acquireWorkspace(
   });
 
   try {
-    const targetNode = options.nodeId || (workspace as any).nodeId;
-    const spawnQueue = targetNode ? workspaceNodeQueue(targetNode) : WORKSPACE_QUEUE;
+    const spawnQueue = await resolveSpawnQueue(queue, workspace, options.nodeId, now());
     const spawn = await queue.runJob(
       spawnQueue,
       'spawn',
@@ -348,8 +427,10 @@ export async function acquireWorkspace(
       containerName: spawn.containerName,
       volumeName: spawn.volumeName,
     });
-    // Remember where the volume lives, so the next checkout goes back to it.
-    await repo.setWorkspaceNode(workspace.workspaceId, spawn.nodeId).catch(() => {});
+    // Remember where the volume lives and for how long that is worth trusting,
+    // so the next checkout goes back to it while it is still warm.
+    const pinnedUntil = new Date(now() + warmTtlSeconds(workspace.config) * 1000);
+    await repo.setWorkspaceNode(workspace.workspaceId, spawn.nodeId, pinnedUntil).catch(() => {});
 
     const acquired: AcquiredWorkspace = {
       workspace,
