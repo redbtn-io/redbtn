@@ -247,6 +247,10 @@ export class WorkspaceSession {
     // container that does not exist.
     let parked = false;
     let parkedUntil: Date | null = null;
+    // Whether the release ran clean. The checkout is given back either way, but
+    // the history entry says which, so a workspace whose snapshots keep failing
+    // is visible on its own page instead of only in a worker log.
+    let outcome: 'released' | 'error' = 'released';
 
     try {
       const result = await this.queue.runJob(
@@ -280,6 +284,7 @@ export class WorkspaceSession {
     } catch (err) {
       // The checkout MUST still be released, or the workspace stays locked for
       // every future run. Snapshot failure is loud but not fatal to the lock.
+      outcome = 'error';
       console.error('[WorkspaceSession] snapshot failed; releasing the checkout anyway:', err);
     }
 
@@ -325,6 +330,9 @@ export class WorkspaceSession {
       expectedVersion: workspace.version,
       commitTrunkSnapshot: !!snapshotMeta,
       snapshotMeta,
+      outcome,
+      volumeRemoved,
+      parked: parked && !volumeRemoved,
     });
   }
 }
@@ -538,6 +546,10 @@ export async function acquireWorkspace(
         checkoutId: checkout.checkoutId,
         runId: checkout.runId,
         expectedVersion: workspace.version,
+        // A checkout that never got a container still happened, and a run that
+        // died before it started is exactly what a person looking at the
+        // activity list needs to see.
+        outcome: 'error',
       })
       .catch(() => {});
     throw err;
