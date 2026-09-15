@@ -89,6 +89,18 @@ export interface LifecycleQueue {
    * an unanswerable probe keeps the pin rather than throwing warmth away.
    */
   hasWorkers?(queueName: string): Promise<boolean>;
+  /**
+   * Add a job and return. `runJob` waits for the result, which is right for a
+   * spawn the caller cannot proceed without and wrong for fan-out work nobody
+   * is waiting on (see workspace-destroy).
+   */
+  enqueue?(queueName: string, jobName: string, data: Record<string, unknown>): Promise<void>;
+  /**
+   * Every per-node workspace queue Redis knows about, discovered from the
+   * BullMQ keyspace. The engine has no fleet registry of its own, so this is how
+   * a fan-out finds nodes a workspace document never named.
+   */
+  listNodeQueues?(): Promise<string[]>;
 }
 
 export const bullLifecycleQueue: LifecycleQueue = {
@@ -127,6 +139,40 @@ export const bullLifecycleQueue: LifecycleQueue = {
       // queue always has one, and a cold restore beats a five-minute timeout.
       return false;
     }
+  },
+
+  async enqueue(queueName, jobName, data) {
+    // Retried, unlike the jobs above: nothing is waiting on the result, so a
+    // node that is briefly unreachable should be tried again rather than lost.
+    await getQueue(queueName).add(jobName, data, {
+      removeOnComplete: 200,
+      removeOnFail: 500,
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 30_000 },
+    });
+  },
+
+  async listNodeQueues() {
+    const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
+    const pattern = `${prefix}:${WORKSPACE_QUEUE}--*:meta`;
+    const found = new Set<string>();
+    try {
+      const client = await getQueue(WORKSPACE_QUEUE).client;
+      let cursor = '0';
+      do {
+        const [next, keys]: [string, string[]] = await client.scan(cursor, 'MATCH', pattern, 'COUNT', 200);
+        cursor = next;
+        for (const key of keys) {
+          const name = key.slice(prefix.length + 1, key.length - ':meta'.length);
+          if (name.startsWith(`${WORKSPACE_QUEUE}--`)) found.add(name);
+        }
+      } while (cursor !== '0');
+    } catch {
+      // No Redis, or a keyspace this cannot walk. An empty list means "nothing
+      // discovered", which every caller already has a fallback for.
+      return [];
+    }
+    return [...found];
   },
 };
 
