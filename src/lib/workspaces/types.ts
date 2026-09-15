@@ -84,6 +84,35 @@ export interface IWorkspaceConfig {
    * scratch — or, if the node has left the fleet, to a queue nobody consumes.
    */
   warmTtlSeconds?: number;
+  /**
+   * How long the CONTAINER stays alive after a checkout releases, in seconds
+   * (default 0 — off). Above zero the release parks the runner instead of
+   * destroying it and the next checkout on that node adopts it, paying neither
+   * the container start nor the runner's registration; the working copy is warm
+   * either way. Capped at an hour: a parked runner holds this node's memory for
+   * nobody at all.
+   */
+  hotIdleSeconds?: number;
+}
+
+/**
+ * The runner a release left alive, and what the next checkout needs to take it
+ * over: the install id its environment is registered under, and where it is.
+ *
+ * Only a hint — the park marker inside the volume is what the node actually
+ * decides on — but it is what lets the engine skip the registration wait and
+ * send the spawn to the node holding the warm container.
+ */
+export interface IParkedCheckout {
+  /** The checkout that parked it. */
+  checkoutId: string;
+  /** The install id the parked runner registered under; the adopting checkout inherits it. */
+  installId: string;
+  environmentId: string;
+  containerName: string;
+  nodeId: string;
+  /** Past this, the node reaps the container and the record means nothing. */
+  parkedUntil: Date;
 }
 
 export interface IWorkspaceStats {
@@ -134,6 +163,12 @@ export interface IWorkspace {
    * those keep today's behaviour until they release once.
    */
   nodePinnedUntil?: Date | null;
+  /**
+   * The runner still alive on `nodeId` from the last release, when the
+   * workspace runs a hot tier (`config.hotIdleSeconds`). Consumed by the next
+   * acquire and cleared whenever the node does not hand it back.
+   */
+  parkedCheckout?: IParkedCheckout | null;
   /** Optimistic concurrency version counter (incremented on checkout/release). */
   version: number;
   /** Maximum number of parallel checkouts allowed (default: 8). */
