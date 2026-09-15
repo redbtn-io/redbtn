@@ -50,6 +50,11 @@ import {
 } from '../../../neurons/prompt-cache';
 import { WorkspaceRepository } from '../../../workspaces/WorkspaceRepository';
 import { acquireWorkspace, WorkspaceSession } from '../../../workspaces/WorkspaceLifecycle';
+import {
+  snapshotWorkspaceBinding,
+  restoreWorkspaceBinding,
+  type WorkspaceBindingSnapshot,
+} from '../../../workspaces/workspace-binding';
 
 /**
  * Resolve the run-level AbortSignal — see universalNode.ts for the full
@@ -638,6 +643,16 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
   // workspace out; released in the `finally` below.
   let workspaceSession: WorkspaceSession | null = null;
   const workspaceStartedAt = Date.now();
+  // What the binding looked like before we touched it. THE EXECUTOR ONLY STRIPS
+  // WHAT IT WROTE: acquiring promotes environmentId/checkoutId/ws/workingDir
+  // (and workspaceId, when it came from `parameters`) onto state, and once the
+  // `finally` releases the checkout those point at a container that has just
+  // been stopped and snapshotted. Undo exactly those writes so the next step —
+  // and, for a single-step node whose state object is passed through by
+  // reference, the next NODE — doesn't inherit a dead checkout. A
+  // `data.workspaceId` the node's own transform step wrote is NOT ours and
+  // stays: that field is the node's configuration. See workspace-binding.ts.
+  const workspaceBindingBefore: WorkspaceBindingSnapshot = snapshotWorkspaceBinding(state);
 
   try {
     // Bring a workspace container up if this step names one and nobody holds it,
@@ -1597,6 +1612,11 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
         // loud: an unreleased checkout blocks the workspace until the reaper.
         console.error('[NeuronExecutor] Failed to release workspace checkout:', releaseErr);
       }
+      // Unconditional: a release that threw still leaves the binding pointing at
+      // a checkout this step no longer owns. Only ever runs when WE owned it —
+      // when an outer owner holds the checkout `acquireWorkspaceForStep` returns
+      // null and the binding is still live.
+      restoreWorkspaceBinding(state, workspaceBindingBefore);
     }
   }
 }
