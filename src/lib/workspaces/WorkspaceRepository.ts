@@ -104,6 +104,11 @@ export class WorkspaceRepository {
     return doc;
   }
 
+  /** Lookup by the (userId, name) unique key — how a repo's managed workspace is found. */
+  async findByName(userId: string, name: string): Promise<IWorkspace | null> {
+    return (await this.collection.findOne({ userId, name } as Filter<IWorkspace>)) as IWorkspace | null;
+  }
+
   async getWorkspace(workspaceId: string): Promise<IWorkspace | null> {
     return await this.collection.findOne({ workspaceId } as Filter<IWorkspace>);
   }
