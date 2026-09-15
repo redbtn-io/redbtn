@@ -383,6 +383,10 @@ export async function acquireWorkspaceForStep(state: any): Promise<WorkspaceSess
     environmentId: session.environmentId,
     nodeId: session.acquired.nodeId,
     containerName: session.acquired.containerName,
+    // What `workspace_ship` needs to address the working copy on that node.
+    mode: session.acquired.checkout.mode,
+    checkoutKey: session.acquired.checkout.checkoutKey,
+    branch: session.acquired.checkout.branch,
   };
   setWorkspaceWorkingDir(state, session.acquired.workspace.config?.defaultCwd || '/workspace');
   if (state.parameters) {
@@ -1583,6 +1587,10 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       try {
         await workspaceSession.release({
           computeSeconds: Math.max(1, Math.round((Date.now() - workspaceStartedAt) / 1000)),
+          // A per-card ("branch") checkout is a pristine clone whose only
+          // output is the pull request it pushed; its volume is removed on
+          // release and snapshotting it would only overwrite the trunk's.
+          skipSnapshot: workspaceSession.acquired.checkout.mode === 'branch',
         });
       } catch (releaseErr) {
         // A failed release must not mask the step's own outcome, but it must be
