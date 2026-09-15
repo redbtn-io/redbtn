@@ -2,6 +2,7 @@ import type { Db, Collection, Filter } from 'mongodb';
 import { randomBytes } from 'node:crypto';
 import {
   IWorkspace,
+  IParkedCheckout,
   IWorkspaceCheckout,
   ICheckoutOptions,
   IReleaseOptions,
@@ -52,6 +53,26 @@ export function warmTtlSeconds(config?: { warmTtlSeconds?: number } | null): num
   return typeof configured === 'number' && configured > 0 ? configured : DEFAULT_WARM_TTL_SECONDS;
 }
 
+/**
+ * The ceiling on a hot (parked-container) window, in seconds.
+ *
+ * An hour, because a parked runner is memory this node is holding for nobody,
+ * and because the container keeps the registration token it was spawned with —
+ * a park long enough to outlive that token buys a runner that cannot reconnect.
+ */
+export const MAX_HOT_IDLE_SECONDS = 60 * 60;
+
+/**
+ * A workspace's hot window in seconds: its own config, clamped to
+ * 0..MAX_HOT_IDLE_SECONDS. Zero — the default — means the release destroys the
+ * container as it always has.
+ */
+export function hotIdleSeconds(config?: { hotIdleSeconds?: number } | null): number {
+  const configured = config?.hotIdleSeconds;
+  if (typeof configured !== 'number' || !Number.isFinite(configured) || configured <= 0) return 0;
+  return Math.min(Math.floor(configured), MAX_HOT_IDLE_SECONDS);
+}
+
 export function generateEnvironmentId(): string {
   return `env_${generateRandomString(12)}`;
 }
@@ -99,6 +120,7 @@ export class WorkspaceRepository {
         gitRepoUrl: input.config?.gitRepoUrl,
         gitBranch: input.config?.gitBranch || 'main',
         warmTtlSeconds: warmTtlSeconds(input.config),
+        hotIdleSeconds: hotIdleSeconds(input.config),
       },
       stats: {
         snapshotSizeBytes: 0,
@@ -234,7 +256,7 @@ export class WorkspaceRepository {
     workspaceId: string,
     checkoutId: string,
     runId: string,
-    runtime: { environmentId: string; nodeId: string; containerName?: string; volumeName?: string }
+    runtime: { environmentId: string; nodeId: string; containerName?: string; volumeName?: string; installId?: string }
   ): Promise<void> {
     const now = new Date();
     const set: Record<string, any> = {
@@ -244,6 +266,10 @@ export class WorkspaceRepository {
     };
     if (runtime.containerName) set['activeCheckouts.$[elem].containerName'] = runtime.containerName;
     if (runtime.volumeName) set['activeCheckouts.$[elem].volumeName'] = runtime.volumeName;
+    // An ADOPTED checkout inherits the parked runner's install id: the
+    // environment on the hub is registered under that one, and the freshly
+    // minted id belongs to a container that was never started.
+    if (runtime.installId) set['activeCheckouts.$[elem].installId'] = runtime.installId;
 
     const res = await this.collection.updateOne(
       { workspaceId, activeCheckouts: { $elemMatch: { checkoutId, runId } } } as Filter<IWorkspace>,
@@ -285,11 +311,31 @@ export class WorkspaceRepository {
    * Forget where the volume lived. The node reports `volumeRemoved` when it
    * deletes the working copy: nothing warm is left there, so the pin has to go
    * with it or every later run pays a cold restore on that one node — or waits
-   * out the spawn timeout on a queue nobody consumes, if the node has left.
+   * out the spawn timeout on a queue nobody consumes, if the node has left. Any
+   * parked runner went with the volume, so its record goes too.
    */
   async clearWorkspaceNode(workspaceId: string): Promise<void> {
     await this.collection.updateOne({ workspaceId } as Filter<IWorkspace>, {
-      $unset: { nodeId: '', nodePinnedUntil: '' },
+      $unset: { nodeId: '', nodePinnedUntil: '', parkedCheckout: '' },
+      $set: { updatedAt: new Date() },
+    } as any);
+  }
+
+  /**
+   * Remember the runner the node left alive, so the next acquire can go back to
+   * it. It rides with the node pin: both describe what is still warm where, and
+   * both are worthless the moment the node says otherwise.
+   */
+  async setParkedCheckout(workspaceId: string, parked: IParkedCheckout): Promise<void> {
+    await this.collection.updateOne({ workspaceId } as Filter<IWorkspace>, {
+      $set: { parkedCheckout: parked, updatedAt: new Date() } as any,
+    });
+  }
+
+  /** Forget it — the park expired, was not adopted, or went with its volume. */
+  async clearParkedCheckout(workspaceId: string): Promise<void> {
+    await this.collection.updateOne({ workspaceId } as Filter<IWorkspace>, {
+      $unset: { parkedCheckout: '' },
       $set: { updatedAt: new Date() },
     } as any);
   }
