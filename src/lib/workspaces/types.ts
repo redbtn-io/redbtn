@@ -61,6 +61,56 @@ export interface IWorkspaceCheckout {
   leaseExpiresAt: Date;
   /** When the checkout was acquired. */
   createdAt: Date;
+  /**
+   * What this checkout shipped, as the shipping tools report it.
+   *
+   * Written mid-checkout by `WorkspaceRepository.noteCheckoutShip` — the only
+   * moment the pull request is known — and copied into the history entry when
+   * the checkout releases. A checkout that never shipped has no `pr` at all.
+   */
+  pr?: ICheckoutPullRequest;
+}
+
+/** The pull request a checkout opened, and the commit it became if it merged. */
+export interface ICheckoutPullRequest {
+  /** https://github.com/<owner>/<repo>/pull/<n> */
+  url: string;
+  /** The squashed commit on the base branch, once `workspace_merge` merged it. */
+  mergedSha?: string;
+}
+
+/**
+ * One finished checkout, kept on the workspace so a person can see that their
+ * workspace ran: when, on which node, for how long, and what it shipped.
+ *
+ * Nothing else records this. `activeCheckouts` describes only what is live and
+ * the entry is dropped on release, and the run archive (`runEvents`) is keyed
+ * by run, not by workspace — so after a run ended the workspace itself had no
+ * memory of it. Appended by `releaseWorkspace`, capped at the newest
+ * CHECKOUT_HISTORY_LIMIT, oldest first.
+ */
+export interface ICheckoutHistoryEntry {
+  checkoutId: string;
+  runId: string;
+  mode: CheckoutMode;
+  checkoutKey: string;
+  branch: string;
+  /** The fleet node that held the container and volume, when the spawn bound one. */
+  nodeId?: string;
+  acquiredAt: Date;
+  releasedAt: Date;
+  /** `releasedAt - acquiredAt`, precomputed so the UI never has to subtract dates. */
+  durationMs: number;
+  /** Whether the release ran clean, or the snapshot failed and it released anyway. */
+  outcome: 'released' | 'error';
+  /** The node deleted the working copy (branch checkouts always do). */
+  volumeRemoved?: boolean;
+  /** The node kept the runner alive for the next checkout (hot tier). */
+  parked?: boolean;
+  /** The snapshot this release committed to the trunk, when it took one. */
+  snapshotId?: string | null;
+  /** What it shipped, copied off the checkout at release. */
+  pr?: ICheckoutPullRequest;
 }
 
 export interface IWorkspaceConfig {
@@ -175,6 +225,12 @@ export interface IWorkspace {
   maxConcurrentCheckouts: number;
   /** List of currently active checkout sessions. */
   activeCheckouts: IWorkspaceCheckout[];
+  /**
+   * Finished checkouts, oldest first, capped at CHECKOUT_HISTORY_LIMIT by the
+   * `$slice` on the push. Absent on documents written before the history
+   * existed, and on a workspace that has never released a checkout.
+   */
+  checkoutHistory?: ICheckoutHistoryEntry[];
 
   createdAt: Date;
   updatedAt: Date;
@@ -215,6 +271,16 @@ export interface IReleaseOptions {
     fileCount: number;
     computeSeconds: number;
   };
+  /**
+   * How this checkout ended, for the history entry. Defaults to `released`;
+   * `error` means the release went through but something on the way (the
+   * snapshot, the spawn it is unwinding) did not.
+   */
+  outcome?: 'released' | 'error';
+  /** The node reported deleting the working copy. Recorded on the entry. */
+  volumeRemoved?: boolean;
+  /** The node reported keeping the runner alive. Recorded on the entry. */
+  parked?: boolean;
 }
 
 export interface CreateWorkspaceInput {
@@ -225,6 +291,14 @@ export interface CreateWorkspaceInput {
   resticRepository?: string;
   config?: Partial<IWorkspaceConfig>;
   maxConcurrentCheckouts?: number;
+  /**
+   * The owner's account tier (`accountLevel`, 0 = admin), which decides the
+   * workspace's warm/hot windows and concurrency — see `./tiers.ts`. Absent
+   * means "we do not know who this is", which resolves to the lowest tier; every
+   * caller that has a user in hand should pass it, or it hands out a Free
+   * workspace to a paying account.
+   */
+  accountTier?: number;
 }
 
 // --- Errors ---

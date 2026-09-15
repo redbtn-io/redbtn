@@ -4,6 +4,7 @@
  */
 import type { NativeToolContext, NativeMcpResult } from '../native-registry';
 import { bullLifecycleQueue, type LifecycleQueue } from '../../workspaces/WorkspaceLifecycle';
+import { WorkspaceRepository } from '../../workspaces/WorkspaceRepository';
 import {
   resolveGithubInstallation,
   isMissingInstallation,
@@ -45,6 +46,17 @@ export function resolveRunUserId(context: NativeToolContext): string | null {
   return typeof id === 'string' && id ? id : null;
 }
 
+/**
+ * The run owner's account tier, which decides the storage tier of any workspace
+ * this run creates (see `lib/workspaces/tiers.ts`). The run path already put it
+ * on state as `data.accountTier`; without it a managed workspace created for a
+ * paying account would be provisioned as Free.
+ */
+export function resolveRunAccountTier(context: NativeToolContext): number | undefined {
+  const tier = context?.state?.data?.accountTier;
+  return typeof tier === 'number' && Number.isFinite(tier) ? tier : undefined;
+}
+
 /** `owner/name`, a github.com URL, or an ssh remote → canonical parts + clone URL. */
 export function normalizeGithubRepo(input: unknown): { owner: string; repo: string; url: string } | null {
   const raw = String(input ?? '').trim();
@@ -83,4 +95,42 @@ export async function resolveJobInstallation(
     };
   }
   return { githubInstallationId: installation.installationId };
+}
+
+/**
+ * Remember, on the run's own checkout, the pull request it just produced.
+ *
+ * `workspace_ship` learns the PR url and `workspace_merge` the merged sha, each
+ * once, mid-checkout. The workspace's release copies whatever is on the
+ * checkout into its history entry, which is the only place a person can later
+ * see that this workspace ran and what came out of it.
+ *
+ * Deliberately swallows everything. Both callers have already done the thing
+ * the user asked for by the time this runs — the branch is pushed, the PR is
+ * merged — and a failed note is a missing line in a history, not a failed ship.
+ */
+export async function noteShippedPullRequest(
+  context: NativeToolContext,
+  ws: AnyObject | null | undefined,
+  pr: { prUrl?: unknown; mergedSha?: unknown }
+): Promise<void> {
+  const workspaceId = typeof ws?.workspaceId === 'string' ? ws.workspaceId : null;
+  const checkoutId = typeof ws?.checkoutId === 'string' ? ws.checkoutId : null;
+  const prUrl = typeof pr.prUrl === 'string' ? pr.prUrl : null;
+  const mergedSha = typeof pr.mergedSha === 'string' ? pr.mergedSha : null;
+  if (!workspaceId || !checkoutId || (!prUrl && !mergedSha)) return;
+
+  try {
+    const db = resolveWorkspaceDb(context);
+    if (!db) return;
+    await new WorkspaceRepository(db as any).noteCheckoutShip(workspaceId, checkoutId, {
+      prUrl,
+      mergedSha,
+    });
+  } catch (err: unknown) {
+    console.warn(
+      '[workspace] could not record the pull request on the checkout:',
+      err instanceof Error ? err.message : String(err)
+    );
+  }
 }

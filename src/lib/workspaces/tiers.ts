@@ -1,0 +1,235 @@
+/**
+ * Storage tiers: what a workspace's warm/hot windows and concurrency default to,
+ * and how far a user may push them, as a function of who owns it.
+ *
+ * `warmTtlSeconds` (how long the node pin and the warm volume live) and
+ * `hotIdleSeconds` (how long a parked runner is held for the next checkout) were
+ * flat defaults for everybody: 24 h warm, hot off, 8 parallel checkouts,
+ * whoever you are. Both cost real fleet resources — a warm volume is disk on one
+ * node, a parked runner is that node's memory held for nobody — so the ceiling
+ * has to come from somewhere. It comes from the account tier: the tier sets the
+ * default AND the hard cap, and a user who wants a longer window moves up a
+ * tier. (Metering per-workspace overage is a later card; this is the floor it
+ * will build on.)
+ *
+ * Tier numbers are `accountLevel` on the redauth user document, which the engine
+ * already resolves onto run state as `accountTier` (see `loadUserSettings` in
+ * `src/functions/run.ts`): 0 ADMIN, 1 ENTERPRISE, 2 PRO, 3 BASIC, 4 FREE.
+ * Anything else — absent, non-numeric, out of range — is treated as FREE, which
+ * is the same fallback the run path uses and the safe direction to be wrong in.
+ *
+ * ALL the numbers live in WORKSPACE_TIER_POLICIES below; nothing else in this
+ * file hardcodes a duration. Tuning a tier is editing one row.
+ */
+
+import type { IWorkspaceConfig } from './types.js';
+
+/** Named account tiers, in `accountLevel` order. */
+export type WorkspaceTierName = 'admin' | 'enterprise' | 'pro' | 'basic' | 'free';
+
+/** What a tier gives you on one axis: what you get by default, and the ceiling. */
+export interface WorkspaceTierLimit {
+  /** Applied when the workspace does not ask for a value of its own. */
+  default: number;
+  /** The hard cap. An explicit value above this is clamped down to it, never refused. */
+  max: number;
+}
+
+export interface WorkspaceTierPolicy {
+  /** The tier this policy belongs to. */
+  tier: WorkspaceTierName;
+  /** Display name for the tier, for UI that tells a user which plan they are on. */
+  label: string;
+  /**
+   * The canonical `accountLevel` of this tier — NOT necessarily the number that
+   * was looked up: an unrecognised level resolves to the FREE policy and reports
+   * 4, so a caller can echo back the tier it actually applied.
+   */
+  accountTier: number;
+  /** How long the node pin / warm volume may live after a release. */
+  warmTtlSeconds: WorkspaceTierLimit;
+  /** How long a released runner may stay parked. 0 = off (destroy on release). */
+  hotIdleSeconds: WorkspaceTierLimit;
+  /** How many checkouts may hold this workspace at once. */
+  maxConcurrentCheckouts: WorkspaceTierLimit;
+}
+
+const HOUR = 60 * 60;
+const DAY = 24 * HOUR;
+const MINUTE = 60;
+
+/**
+ * The whole tier table. Tune here — every default and every cap in the
+ * workspace subsystem is one of these numbers.
+ *
+ * Shape notes:
+ *  - warm caps stay inside what the node-side volume reaper will honour; a pin
+ *    that outlives the volume points at a node with nothing warm on it.
+ *  - hot caps stay at or under MAX_HOT_IDLE_SECONDS (1 h): a park long enough to
+ *    outlive the runner's registration token buys a container that cannot
+ *    reconnect.
+ *  - concurrency keeps headroom above its default so a user who genuinely runs
+ *    several cards in parallel can raise it without changing plan; the cap is
+ *    what stops one workspace from taking a whole node.
+ */
+export const WORKSPACE_TIER_POLICIES: Record<WorkspaceTierName, WorkspaceTierPolicy> = {
+  admin: {
+    tier: 'admin',
+    label: 'Admin',
+    accountTier: 0,
+    warmTtlSeconds: { default: 72 * HOUR, max: 7 * DAY },
+    hotIdleSeconds: { default: 15 * MINUTE, max: 60 * MINUTE },
+    maxConcurrentCheckouts: { default: 4, max: 8 },
+  },
+  enterprise: {
+    tier: 'enterprise',
+    label: 'Enterprise',
+    accountTier: 1,
+    warmTtlSeconds: { default: 72 * HOUR, max: 7 * DAY },
+    hotIdleSeconds: { default: 15 * MINUTE, max: 60 * MINUTE },
+    maxConcurrentCheckouts: { default: 4, max: 8 },
+  },
+  pro: {
+    tier: 'pro',
+    label: 'Pro',
+    accountTier: 2,
+    warmTtlSeconds: { default: 24 * HOUR, max: 72 * HOUR },
+    hotIdleSeconds: { default: 5 * MINUTE, max: 15 * MINUTE },
+    maxConcurrentCheckouts: { default: 2, max: 4 },
+  },
+  basic: {
+    tier: 'basic',
+    label: 'Basic',
+    accountTier: 3,
+    warmTtlSeconds: { default: 24 * HOUR, max: 72 * HOUR },
+    hotIdleSeconds: { default: 5 * MINUTE, max: 15 * MINUTE },
+    maxConcurrentCheckouts: { default: 2, max: 4 },
+  },
+  free: {
+    tier: 'free',
+    label: 'Free',
+    accountTier: 4,
+    warmTtlSeconds: { default: 6 * HOUR, max: 24 * HOUR },
+    hotIdleSeconds: { default: 0, max: 5 * MINUTE },
+    maxConcurrentCheckouts: { default: 1, max: 2 },
+  },
+};
+
+/** The policy applied to anyone we cannot place — absent, unknown or out-of-range tier. */
+export const DEFAULT_WORKSPACE_TIER: WorkspaceTierName = 'free';
+
+const TIER_BY_LEVEL: readonly WorkspaceTierName[] = [
+  'admin',
+  'enterprise',
+  'pro',
+  'basic',
+  'free',
+];
+
+/** `accountLevel` → tier name, with everything unrecognised landing on FREE. */
+export function workspaceTierName(accountTier?: number | null): WorkspaceTierName {
+  if (typeof accountTier !== 'number' || !Number.isFinite(accountTier)) {
+    return DEFAULT_WORKSPACE_TIER;
+  }
+  const level = Math.floor(accountTier);
+  return TIER_BY_LEVEL[level] ?? DEFAULT_WORKSPACE_TIER;
+}
+
+/**
+ * The tier policy for an account level. This is the only entry point callers
+ * need: `workspaceTierPolicy(user.accountLevel)`.
+ */
+export function workspaceTierPolicy(accountTier?: number | null): WorkspaceTierPolicy {
+  return WORKSPACE_TIER_POLICIES[workspaceTierName(accountTier)];
+}
+
+/** A policy, or the account level to look one up from. */
+export type TierOrPolicy = WorkspaceTierPolicy | number | null | undefined;
+
+function resolvePolicy(tier: TierOrPolicy): WorkspaceTierPolicy {
+  if (tier && typeof tier === 'object' && 'maxConcurrentCheckouts' in tier) return tier;
+  return workspaceTierPolicy(typeof tier === 'number' ? tier : null);
+}
+
+/**
+ * One value against one limit: absent/unusable → the tier default, otherwise
+ * floored into `[floor, limit.max]`.
+ *
+ * `floor` is 1 for a duration nobody wants set to zero and 0 for the hot window,
+ * where zero is a meaningful setting (park nothing).
+ */
+function clampToLimit(
+  value: unknown,
+  limit: WorkspaceTierLimit,
+  floor: number,
+): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return limit.default;
+  const asked = Math.floor(value);
+  if (asked <= floor) return floor;
+  return Math.min(asked, limit.max);
+}
+
+/**
+ * Fill a workspace config's tier-governed fields: anything the caller left out
+ * takes the tier default, anything it asked for is clamped to the tier cap.
+ *
+ * Everything else on the config (image, cpu, memory, git) is passed through
+ * untouched — this function has an opinion about exactly two fields.
+ */
+export function applyTierPolicy<T extends Partial<IWorkspaceConfig>>(
+  config: T | null | undefined,
+  policy: WorkspaceTierPolicy,
+): T & { warmTtlSeconds: number; hotIdleSeconds: number } {
+  const source = (config ?? {}) as T;
+  return {
+    ...source,
+    warmTtlSeconds: clampToLimit(source.warmTtlSeconds, policy.warmTtlSeconds, 1),
+    hotIdleSeconds: clampToLimit(source.hotIdleSeconds, policy.hotIdleSeconds, 0),
+  };
+}
+
+/** How many parallel checkouts this tier allows a workspace that asked for `value`. */
+export function clampMaxConcurrentCheckouts(
+  value: unknown,
+  policy: WorkspaceTierPolicy,
+): number {
+  return clampToLimit(value, policy.maxConcurrentCheckouts, 1);
+}
+
+/** The subset of a workspace update that a tier has an opinion about. */
+export interface WorkspaceTierPatch {
+  warmTtlSeconds?: number;
+  hotIdleSeconds?: number;
+  maxConcurrentCheckouts?: number;
+}
+
+/**
+ * Clamp an UPDATE to a tier.
+ *
+ * Unlike `applyTierPolicy` this fills nothing in: a field the patch does not
+ * mention comes back absent, because an update that silently rewrote the two
+ * fields the user did not touch would reset them to the tier default every time
+ * somebody renamed a workspace. Only what was asked for is returned, capped.
+ */
+export function clampWorkspaceConfigForTier(
+  patch: WorkspaceTierPatch | null | undefined,
+  tier: TierOrPolicy,
+): WorkspaceTierPatch {
+  const policy = resolvePolicy(tier);
+  const out: WorkspaceTierPatch = {};
+  if (!patch) return out;
+
+  if (typeof patch.warmTtlSeconds === 'number' && Number.isFinite(patch.warmTtlSeconds)) {
+    out.warmTtlSeconds = clampToLimit(patch.warmTtlSeconds, policy.warmTtlSeconds, 1);
+  }
+  if (typeof patch.hotIdleSeconds === 'number' && Number.isFinite(patch.hotIdleSeconds)) {
+    out.hotIdleSeconds = clampToLimit(patch.hotIdleSeconds, policy.hotIdleSeconds, 0);
+  }
+  if (
+    typeof patch.maxConcurrentCheckouts === 'number' &&
+    Number.isFinite(patch.maxConcurrentCheckouts)
+  ) {
+    out.maxConcurrentCheckouts = clampMaxConcurrentCheckouts(patch.maxConcurrentCheckouts, policy);
+  }
+  return out;
+}

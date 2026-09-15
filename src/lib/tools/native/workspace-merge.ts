@@ -8,7 +8,14 @@
  */
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { WORKSPACE_QUEUE } from '../../workspaces/WorkspaceLifecycle';
-import { toolOk, toolError, resolveLifecycleQueue, resolveRunUserId, resolveJobInstallation } from './workspace-common';
+import {
+  toolOk,
+  toolError,
+  resolveLifecycleQueue,
+  resolveRunUserId,
+  resolveJobInstallation,
+  noteShippedPullRequest,
+} from './workspace-common';
 
 type AnyObject = Record<string, any>;
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
@@ -47,6 +54,17 @@ const tool: NativeToolDefinition = {
         { action: 'merge', prUrl, ownerUserId, timeoutMs, mergeMethod, githubInstallationId },
         timeoutMs + 60 * 1000
       );
+      // A merge that happens inside a run still holding its workspace upgrades
+      // that checkout's history entry from "opened a PR" to "merged, <sha>".
+      // A merge step running without a checkout (the usual deterministic
+      // graph step, after the agent's own run released) has nothing to write
+      // to and skips — its ship already recorded the url.
+      if (result?.merged) {
+        await noteShippedPullRequest(context, context?.state?.data?.ws, {
+          prUrl: result?.prUrl ?? prUrl,
+          mergedSha: result?.mergedSha,
+        });
+      }
       return toolOk(result ?? { ok: false });
     } catch (err: unknown) {
       return toolError(`workspace_merge failed: ${err instanceof Error ? err.message : String(err)}`, 'FAILED');
