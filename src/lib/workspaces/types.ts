@@ -76,6 +76,14 @@ export interface IWorkspaceConfig {
   gitRepoUrl?: string;
   /** Default Git branch to clone or track (default: "main"). */
   gitBranch?: string;
+  /**
+   * How long the node pin stays warm after a checkout releases, in seconds
+   * (default 86400). It tracks the node-side volume reaper's TTL: once that has
+   * deleted the idle volume there is nothing warm left to go back to, and a pin
+   * that outlives it only sends the next run to a node that must restore from
+   * scratch — or, if the node has left the fleet, to a queue nobody consumes.
+   */
+  warmTtlSeconds?: number;
 }
 
 export interface IWorkspaceStats {
@@ -119,6 +127,13 @@ export interface IWorkspace {
    * copy is reused rather than restored from object storage.
    */
   nodeId?: string;
+  /**
+   * When the `nodeId` pin stops being worth following, refreshed on every spawn
+   * and release. Past it the volume is assumed reaped and the next checkout is
+   * placed fresh. Absent on records written before the warm window existed;
+   * those keep today's behaviour until they release once.
+   */
+  nodePinnedUntil?: Date | null;
   /** Optimistic concurrency version counter (incremented on checkout/release). */
   version: number;
   /** Maximum number of parallel checkouts allowed (default: 8). */
