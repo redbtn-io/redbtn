@@ -6,6 +6,13 @@
  * every dispatch for that repository lands in the same workspace and the
  * trunk working copy is retained between runs. Returns the workspaceId the
  * producer (`acquireWorkspaceForStep`) needs on `state.data.workspaceId`.
+ *
+ * "The run's user" is the CALLER on a delegated run (see `resolveRunUserId`):
+ * the workspace this creates is the one the whole rest of the run is checked
+ * out into, so owning it is what makes the spawn, the clone, the push and the
+ * merge all happen as the caller. Its STORAGE TIER still comes from the
+ * owner's account (`resolveRunAccountTier`), which is the split
+ * RUN-AS-CALLER-DELEGATION-SPEC.md asks for.
  */
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { WorkspaceRepository } from '../../workspaces/WorkspaceRepository';
@@ -32,6 +39,7 @@ const tool: NativeToolDefinition = {
     if (!repo) return toolError('repo must be owner/name or a github.com repository URL');
     const branch = String(args?.branch || 'main').trim();
     if (!BRANCH_RE.test(branch)) return toolError('branch is not a valid git branch name');
+    // The CALLER on a delegated run; the run's own user on every other one.
     const userId = resolveRunUserId(context);
     if (!userId) return toolError('the run has no userId to own the workspace', 'NO_USER');
     const db = resolveWorkspaceDb(context);
@@ -48,6 +56,8 @@ const tool: NativeToolDefinition = {
           name,
           description: `Managed workspace for ${repo.owner}/${repo.repo} (${branch})`,
           config: { gitRepoUrl: repo.url, gitBranch: branch },
+          // The OWNER's tier, even when `userId` above is a delegated caller:
+          // storage is metered, and metering stays on the owner.
           accountTier: resolveRunAccountTier(context),
         });
         created = true;

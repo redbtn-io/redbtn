@@ -321,6 +321,21 @@ export async function resolveWorkspaceEnvironment(state: any): Promise<string | 
 }
 
 /**
+ * The automation OWNER on a run that executes as somebody else, else null.
+ *
+ * Run-as-caller delegation (RUN-AS-CALLER-DELEGATION-SPEC.md) puts the verified
+ * caller on state as `callerUserId`; `state.userId` stays the owner. The
+ * workspace tools already resolve the caller for every identity decision, so
+ * this is purely the audit marker the lifecycle jobs carry.
+ */
+function delegatedFromUserId(state: any): string | null {
+  const caller = state?.callerUserId || state?.data?.callerUserId;
+  if (typeof caller !== 'string' || !caller) return null;
+  const owner = state?.userId || state?.data?.userId;
+  return typeof owner === 'string' && owner && owner !== caller ? owner : null;
+}
+
+/**
  * THE PRODUCER.
  *
  * If the step names a `workspaceId` and nothing has checked it out yet, check it
@@ -370,12 +385,17 @@ export async function acquireWorkspaceForStep(state: any): Promise<WorkspaceSess
     /* fall through to acquire; acquire's own errors are surfaced */
   }
 
+  const delegatedFrom = delegatedFromUserId(state);
   const session = await acquireWorkspace(db, {
     workspaceId,
     runId,
     workerId: process.env.HOSTNAME || process.env.WORKER_NODE_IP || 'engine',
     checkoutKey: state.parameters?.checkoutKey || state.data?.checkoutKey,
     mode: state.parameters?.workspaceMode || state.data?.workspaceMode,
+    // Audit only, and only on a delegated run: the workspace itself already
+    // belongs to the caller, so every credential this spawn uses is the
+    // caller's. This just names the automation owner in the worker's log.
+    ...(delegatedFrom ? { delegatedFromUserId: delegatedFrom } : {}),
   });
 
   if (!state.data) state.data = {};

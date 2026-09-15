@@ -17,6 +17,7 @@ import {
   resolveWorkspaceDb,
   resolveLifecycleQueue,
   resolveJobInstallation,
+  resolveDelegatedFromUserId,
   noteShippedPullRequest,
   BRANCH_RE,
 } from './workspace-common';
@@ -51,12 +52,17 @@ const tool: NativeToolDefinition = {
     if (!title) return toolError('title is required');
     const db = resolveWorkspaceDb(context);
     if (!db) return toolError('workspace database unavailable', 'UNAVAILABLE');
+    const delegatedFromUserId = resolveDelegatedFromUserId(context);
     try {
       const workspace = await new WorkspaceRepository(db as any).getWorkspace(ws.workspaceId);
       if (!workspace) return toolError(`workspace ${ws.workspaceId} not found`, 'NOT_FOUND');
       const gitRepoUrl = workspace.config?.gitRepoUrl;
       if (!gitRepoUrl) return toolError('this workspace has no repository configured', 'NO_REPO');
-      // The push needs a token for THIS owner's App installation.
+      // The push needs a token for THIS owner's App installation. On a
+      // delegated run the workspace was created under the CALLER
+      // (`workspace_for_repo` → `resolveRunUserId`), so `workspace.userId` is
+      // already the caller and this resolves the caller's installation — no
+      // second identity decision to get wrong here.
       const { githubInstallationId, error } = await resolveJobInstallation(workspace.userId, gitRepoUrl);
       if (error) return error;
       const result = await resolveLifecycleQueue(context).runJob(
@@ -75,6 +81,9 @@ const tool: NativeToolDefinition = {
           gitRepoUrl,
           ownerUserId: workspace.userId,
           githubInstallationId,
+          // Audit only — whose automation delegated this run, when it was
+          // delegated at all. Nothing on the worker resolves against it.
+          ...(delegatedFromUserId ? { delegatedFromUserId } : {}),
         },
         PUSH_TIMEOUT_MS
       );
