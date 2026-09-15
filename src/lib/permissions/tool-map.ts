@@ -281,6 +281,14 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   // separate authority, so file ops share the single `execute` verb (split into
   // exec:read/exec:write later only if finer control is wanted).
   run_command: { resource: 'exec', action: 'execute', extract: envId },
+  // Managed-workspace shipping. `workspace_ship` acts on the run's bound
+  // workspace environment (the bridge pins environmentId), so it is scoped
+  // like run_command. `workspace_for_repo` (create/find a workspace) and
+  // `workspace_merge` (merge a PR after checks) address no single environment,
+  // so they are unscoped and need a wildcard exec grant.
+  workspace_ship: { resource: 'exec', action: 'execute', extract: envId },
+  workspace_for_repo: { resource: 'exec', action: 'execute', extract: () => ({ addresses: [], unscoped: true }) },
+  workspace_merge: { resource: 'exec', action: 'execute', extract: () => ({ addresses: [], unscoped: true }) },
   ssh_shell: { resource: 'exec', action: 'execute', extract: envId }, // inline (no environmentId) ⇒ unscoped ⇒ needs '*'
   read_file: { resource: 'exec', action: 'execute', extract: envId },
   ssh_copy: { resource: 'exec', action: 'execute', extract: envId },

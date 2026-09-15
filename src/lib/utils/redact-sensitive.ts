@@ -50,6 +50,9 @@ const URL_CREDENTIAL_RE = /([a-z][a-z0-9+.-]{0,31}:\/\/[^\s:/@]{1,256}:)[^\s@/]{
 const RPAT_RE = /\brpat_[A-Za-z0-9_-]+/g;
 const SK_RE = /\bsk-[A-Za-z0-9_-]+/g;
 const GHP_RE = /\bghp_[A-Za-z0-9]+/g;
+/** GitHub App installation / OAuth / refresh tokens and fine-grained PATs. */
+const GH_TOKEN_RE = /\b(?:ghs|gho|ghu|ghr)_[A-Za-z0-9]+/g;
+const GITHUB_PAT_RE = /\bgithub_pat_[A-Za-z0-9_]+/g;
 const AKIA_RE = /\bAKIA[0-9A-Z]{12,}/g;
 
 function redactString(value: string): string {
@@ -66,6 +69,8 @@ function redactString(value: string): string {
     .replace(RPAT_RE, REDACTED)
     .replace(SK_RE, REDACTED)
     .replace(GHP_RE, REDACTED)
+    .replace(GH_TOKEN_RE, REDACTED)
+    .replace(GITHUB_PAT_RE, REDACTED)
     .replace(AKIA_RE, REDACTED);
 }
 

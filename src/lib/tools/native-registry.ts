@@ -1533,6 +1533,19 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     console.error('[NativeRegistry] Failed to register now:', msg);
   }
 
+  // ─── Managed workspaces (spawned per run; see lib/workspaces) ─────────────
+  for (const toolName of ['workspace_for_repo', 'workspace_ship', 'workspace_merge']) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const mod = require(`./native/${toolName.replace(/_/g, '-')}.js`);
+      registry.register(toolName, mod.default || mod);
+      console.log(`[NativeRegistry] Registered built-in tool: ${toolName}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[NativeRegistry] Failed to register ${toolName}:`, msg);
+    }
+  }
+
   try {
     // Wait — sleep ms (1..300000), respects run-level AbortSignal
     // eslint-disable-next-line @typescript-eslint/no-require-imports

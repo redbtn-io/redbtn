@@ -307,6 +307,8 @@ export async function acquireWorkspace(
         branch: checkout.branch,
         apiUrl: options.apiUrl ?? process.env.WEBAPP_PUBLIC_URL ?? 'https://app.redbtn.io',
         gitRepoUrl: workspace.config?.gitRepoUrl,
+        gitBranch: workspace.config?.gitBranch,
+        ownerUserId: workspace.userId,
         dockerImage: workspace.config?.dockerImage,
         cpuLimit: workspace.config?.cpuLimit,
         memLimit: workspace.config?.memLimit,
