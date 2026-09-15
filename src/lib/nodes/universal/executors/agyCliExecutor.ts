@@ -163,6 +163,7 @@ import { runControlRegistry } from '../../../run/RunControlRegistry';
 // (runId, stepId)" in the tree; neither function reads or writes anything the
 // `claude-code` executor owns, so sharing them cannot destabilise it.
 import { sanitizeSegment, runDirRoot } from './claudeCodeExecutor';
+import { createCliSlotQueue, slotWaitReporter, logSlotAdmission } from './cli-slot';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -395,9 +396,23 @@ function abortError(message: string): Error {
  * CLI's node process, and a Flash turn is seconds rather than minutes, so the
  * default here is 2 where `claude-code`'s is 1. The limit is read at acquire
  * time so RedRun can change it without a code change.
+ *
+ * The queue itself is `cli-slot.ts`, shared with `claudeCodeExecutor`. It was
+ * the same forty lines in both files until the copies drifted: #463 gave the
+ * `claude-code` one a heartbeat while queued and left this one silent, so an
+ * `agy-cli` step that queued past the 30-minute stale window still had its run
+ * interrupted before its CLI had started.
  */
-let activeChildren = 0;
-const waiters: Array<() => void> = [];
+const slots = createCliSlotQueue({
+  provider: 'agy-cli',
+  maxConcurrent,
+  queueTimeoutError: (maxWaitMs, max) =>
+    new AgyCliError(
+      'agy_queue_timeout',
+      `waited ${maxWaitMs} ms for one of ${max} agy-cli slot(s) on this ` +
+        `worker and never got one; raise AGY_CLI_MAX_CONCURRENT or add workers`,
+    ),
+});
 
 export function maxConcurrent(): number {
   const raw = Number.parseInt(process.env.AGY_CLI_MAX_CONCURRENT || '', 10);
@@ -411,69 +426,25 @@ export function queueWaitMs(timeoutMs: number): number {
 }
 
 /**
- * Wait for a slot, but never past `maxWaitMs`.
- *
- * An unbounded wait is a queue with no failure mode: a queued step would sit
- * until the WORKER's own job race failed it, and this executor would then
- * acquire the slot and spend subscription quota on a run that is already
- * terminal. Failing with a distinct code is the honest answer.
+ * Wait for a slot, but never past `maxWaitMs`; see `CliSlotQueue.acquire`.
+ * Exported with `releaseSlot` so the queue can be tested without spawning a CLI.
  */
-async function acquireSlot(abortSignal: AbortSignal | undefined, maxWaitMs: number): Promise<void> {
-  if (abortSignal?.aborted) throw abortError('Run aborted before agy-cli slot acquired');
-  if (activeChildren < maxConcurrent()) {
-    activeChildren += 1;
-    return;
-  }
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    let timer: NodeJS.Timeout | null = null;
-    const unqueue = () => {
-      const idx = waiters.indexOf(admit);
-      if (idx >= 0) waiters.splice(idx, 1);
-      if (timer) clearTimeout(timer);
-    };
-    const onAbort = () => {
-      if (settled) return;
-      settled = true;
-      unqueue();
-      reject(abortError('Run aborted while queued for an agy-cli slot'));
-    };
-    function admit(): void {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      abortSignal?.removeEventListener('abort', onAbort);
-      activeChildren += 1;
-      resolve();
-    }
-    timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      unqueue();
-      abortSignal?.removeEventListener('abort', onAbort);
-      reject(
-        new AgyCliError(
-          'agy_queue_timeout',
-          `waited ${maxWaitMs} ms for one of ${maxConcurrent()} agy-cli slot(s) on this ` +
-            `worker and never got one; raise AGY_CLI_MAX_CONCURRENT or add workers`,
-        ),
-      );
-    }, maxWaitMs);
-    timer.unref?.();
-    waiters.push(admit);
-    abortSignal?.addEventListener('abort', onAbort, { once: true });
-  });
+export function acquireSlot(
+  abortSignal: AbortSignal | undefined,
+  maxWaitMs: number,
+  onWaiting?: (reason: string) => void,
+): Promise<void> {
+  return slots.acquire(abortSignal, maxWaitMs, onWaiting);
 }
 
-function releaseSlot(): void {
-  activeChildren = Math.max(0, activeChildren - 1);
-  const next = waiters.shift();
-  if (next) next();
+/** Give the slot back and admit the next queued step. */
+export function releaseSlot(): void {
+  slots.release();
 }
 
 /** Test-only: current occupancy of the worker-wide semaphore. */
 export function __agySlotsInUse(): number {
-  return activeChildren;
+  return slots.inUse();
 }
 
 // =============================================================================
@@ -1285,7 +1256,23 @@ export async function runAgyCliStep(
   try {
     const queueBudgetMs = Math.min(timeoutMs, queueWaitMs(timeoutMs));
     const queueStartedAt = Date.now();
-    await acquireSlot(abortSignal, queueBudgetMs);
+    // A QUEUED step is not a STALLED run. The run-level watchdog only knows
+    // `lastProgressAt`, and a step waiting for a slot writes nothing until its
+    // CLI starts, so a step that queued past the 30-minute stale window had its
+    // run interrupted before it had spawned anything at all. `nodeProgress` is
+    // the channel every other step event already uses, and publishing one
+    // refreshes the heartbeat in `RunPublisher.publish`.
+    await acquireSlot(
+      abortSignal,
+      queueBudgetMs,
+      slotWaitReporter({
+        publisher,
+        currentNodeId: () => runControlRegistry.get(runId)?.currentNodeId,
+        stepId,
+        runId,
+        logPrefix: 'AgyCli',
+      }),
+    );
     slotHeld = true;
     const queuedMs = Date.now() - queueStartedAt;
 
@@ -1296,9 +1283,11 @@ export async function runAgyCliStep(
         `agy-cli step '${stepId}' spent its entire ${timeoutMs} ms budget queued for a slot`,
       );
     }
-    if (queuedMs > 1000) {
-      console.warn(`[AgyCli] step '${stepId}' waited ${queuedMs} ms for a slot`);
-    }
+    // The wait is an operational fact about THIS replica's queue, not about the
+    // model, so it is logged here and carried out on the step's `_cli` record
+    // below — the run archive is where a long wait has to stay visible after
+    // the worker log has rolled.
+    logSlotAdmission('AgyCli', stepId, queuedMs);
 
     // Re-check liveness AFTER queueing: the whole point is to not spend
     // subscription quota on an answer nobody will read.
@@ -1732,6 +1721,10 @@ export async function runAgyCliStep(
       permissionDenialNames: denials.slice(0, 20).map((d) => d?.display_name || d?.action || null),
       usage,
       exitCode: exit.code,
+      // Time this step spent waiting for one of this replica's CLI slots,
+      // before its child was spawned. `durationMs` is the CLI's own clock and
+      // says nothing about the queue.
+      queuedMs,
     };
 
     const cliBag: AnyObject = { ...(state?.data?._cli ?? {}), [stepId]: cli };

@@ -97,9 +97,13 @@ describe('workspace placement (node pin, warm window, live worker)', () => {
     else process.env.INTERNAL_SERVICE_KEY = OLD_KEY;
   });
 
-  const mk = (config?: { warmTtlSeconds?: number }) =>
+  // Tier 2 (Pro) is the band whose warm default IS DEFAULT_WARM_TTL_SECONDS, so
+  // placement keeps being tested against the 24 h window it has always used —
+  // the storage tier (tiers.ts) now picks that default per account.
+  const mk = (config?: { warmTtlSeconds?: number }, accountTier = 2) =>
     repo.createWorkspace({
       userId: 'user-1',
+      accountTier,
       name: `pl-${Math.random().toString(36).slice(2)}`,
       ...(config ? { config } : {}),
     });

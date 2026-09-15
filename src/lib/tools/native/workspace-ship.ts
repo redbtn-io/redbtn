@@ -17,6 +17,7 @@ import {
   resolveWorkspaceDb,
   resolveLifecycleQueue,
   resolveJobInstallation,
+  noteShippedPullRequest,
   BRANCH_RE,
 } from './workspace-common';
 
@@ -77,6 +78,11 @@ const tool: NativeToolDefinition = {
         },
         PUSH_TIMEOUT_MS
       );
+      // The pull request is known here and nowhere else. Parked on the active
+      // checkout, the release copies it into the workspace's history, so the
+      // detail page can say what this run shipped. Never fatal: the push
+      // already happened, and a bookkeeping failure must not report it as one.
+      await noteShippedPullRequest(context, ws, { prUrl: result?.prUrl });
       return toolOk(result ?? { ok: false });
     } catch (err: unknown) {
       return toolError(`workspace_ship failed: ${err instanceof Error ? err.message : String(err)}`, 'FAILED');

@@ -21,6 +21,7 @@ import { executeStep } from './stepExecutor';
 import { getNodeSystemPrefix } from '../../utils/node-helpers';
 import { runControlRegistry } from '../../run/RunControlRegistry';
 import { getRunPublisher, getMeteringClient } from '../../run/contextLookup';
+import { stripWorkspaceBinding } from '../../workspaces/workspace-binding';
 import type { NodeConfig } from './types';
 
 // Debug logging - set to true to enable verbose logs
@@ -184,6 +185,31 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
     const graphNodeId = graphNodeId_temp;
     const nodeId = nodeConfig.nodeId || 'universal';
 
+    // THE ERROR-HANDLER TRANSITION.
+    //
+    // `error_handler` is the one node every failure funnels into: a step that
+    // throws returns `data.nextGraph = 'error_handler'` below, and every edge
+    // the compiler emits checks for exactly that before its own routing (see
+    // graphs/compiler.ts). The routing functions themselves are pure — LangGraph
+    // conditional edges may only pick a target — so the first place the engine
+    // can touch state on that transition is here, at the handler's own entry.
+    //
+    // Strip the failed node's workspace binding before it runs. The handler is a
+    // reporting node; inheriting `data.workspaceId` from whatever just died made
+    // its neuron step check the workspace out a SECOND time (2026-09-15,
+    // run_1789454028274_vweebx — the leaked container had to be removed by hand).
+    // A handler that genuinely wants a working copy still gets one: its own
+    // `parameters` are rebuilt from its own config a few lines down, after this.
+    const errorHandlerStrip =
+        graphNodeId === 'error_handler' && state.data?.nextGraph === 'error_handler'
+            ? stripWorkspaceBinding(state)
+            : {};
+    if (Object.keys(errorHandlerStrip).length > 0) {
+        console.log(
+            `[UniversalNode] error_handler: stripped workspace binding (${Object.keys(errorHandlerStrip).join(', ')})`,
+        );
+    }
+
     // Check if this is a nodeId reference (registry mode)
     if (nodeConfig.nodeId && !nodeConfig.steps) {
         if (DEBUG)
@@ -295,6 +321,13 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
     const stateUpdates: Record<string, any> = {
         nodeCounter: currentNodeCount + 1
     };
+
+    // Carry the error-handler strip into the returned update. Deleting the keys
+    // off `state.data` above covers THIS node's steps; the explicit `undefined`
+    // is what the `data` reducer needs to clear them for everything downstream.
+    for (const key of Object.keys(errorHandlerStrip)) {
+        stateUpdates[`data.${key}`] = undefined;
+    }
 
     // Execute steps sequentially
     for (let i = 0; i < steps.length; i++) {

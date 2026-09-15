@@ -283,7 +283,7 @@ describe('PR 5: MCP Run-Bridge & Neuron Workspace Binding', () => {
 
   describe('Neuron Fallback with Workspace Binding', () => {
     it('THROWS instead of binding to another run\'s checkout when this run has none', async () => {
-      // With maxConcurrentCheckouts defaulting to 8 and branch mode built for
+      // With parallel checkouts allowed by every tier and branch mode built for
       // parallel cards, the old `activeCheckouts[length-1]` fallback executed a
       // run's tools inside ANOTHER run's container (48a P0-6).
       const other: Partial<IWorkspaceCheckout> = {

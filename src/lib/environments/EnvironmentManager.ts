@@ -309,10 +309,17 @@ export class EnvironmentManager {
    */
   status(environmentId: string): EnvironmentStatus | null {
     // SSH-oriented introspection — read the concrete session's runtime fields.
-    // A push (DesktopAgentSession) entry returns undefined for the SSH-only
-    // fields, which the status API tolerates.
     const session = this.sessions.get(environmentId) as EnvironmentSession | undefined;
     if (!session) return null;
+    // The reconnect buffer belongs to `EnvironmentSession`. A push
+    // (DesktopAgentSession) entry has no socket to drop and therefore no buffer
+    // at all, so reading `.length` off the missing queue threw `Cannot read
+    // properties of undefined (reading 'length')` and took the whole status
+    // call with it — every desktop/workspace environment's status was broken.
+    // Called from a lifecycle listener, `emitLifecycle` swallowed the throw, so
+    // it only ever surfaced as a line in the worker log.
+    const pendingCommands = (session as unknown as { pendingCommands?: unknown[] }).pendingCommands;
+    const pendingBytes = (session as unknown as { pendingBytes?: number }).pendingBytes;
     return {
       environmentId,
       userId: session.userId,
@@ -320,8 +327,8 @@ export class EnvironmentManager {
       openedAt: session.openedAt,
       lastUsedAt: session.lastUsedAt,
       reconnectAttempt: session.reconnectAttempt,
-      pendingCommandCount: (session as unknown as { pendingCommands: unknown[] }).pendingCommands.length,
-      pendingCommandBytes: (session as unknown as { pendingBytes: number }).pendingBytes,
+      pendingCommandCount: Array.isArray(pendingCommands) ? pendingCommands.length : 0,
+      pendingCommandBytes: typeof pendingBytes === 'number' ? pendingBytes : 0,
     };
   }
 

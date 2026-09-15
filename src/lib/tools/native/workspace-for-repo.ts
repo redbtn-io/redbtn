@@ -9,7 +9,7 @@
  */
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { WorkspaceRepository } from '../../workspaces/WorkspaceRepository';
-import { toolOk, toolError, resolveWorkspaceDb, resolveRunUserId, normalizeGithubRepo, BRANCH_RE } from './workspace-common';
+import { toolOk, toolError, resolveWorkspaceDb, resolveRunUserId, resolveRunAccountTier, normalizeGithubRepo, BRANCH_RE } from './workspace-common';
 
 type AnyObject = Record<string, any>;
 
@@ -48,6 +48,7 @@ const tool: NativeToolDefinition = {
           name,
           description: `Managed workspace for ${repo.owner}/${repo.repo} (${branch})`,
           config: { gitRepoUrl: repo.url, gitBranch: branch },
+          accountTier: resolveRunAccountTier(context),
         });
         created = true;
       }

@@ -41,6 +41,13 @@ export const LEASE_RENEW_INTERVAL_MS = 60 * 1000;
 const SPAWN_TIMEOUT_MS = 5 * 60 * 1000;
 const REGISTER_TIMEOUT_MS = 3 * 60 * 1000;
 const SNAPSHOT_TIMEOUT_MS = 15 * 60 * 1000;
+/**
+ * Bound on the teardown of a container the spawn already brought up but no
+ * session will ever own. Shorter than a release: `skipSnapshot` makes it a
+ * stop-and-remove, and the acquire that is failing behind it should not wait a
+ * snapshot's worth of time to report why.
+ */
+const ORPHAN_TEARDOWN_TIMEOUT_MS = 2 * 60 * 1000;
 
 export class WorkspaceSpawnError extends Error {
   constructor(message: string) {
@@ -89,6 +96,18 @@ export interface LifecycleQueue {
    * an unanswerable probe keeps the pin rather than throwing warmth away.
    */
   hasWorkers?(queueName: string): Promise<boolean>;
+  /**
+   * Add a job and return. `runJob` waits for the result, which is right for a
+   * spawn the caller cannot proceed without and wrong for fan-out work nobody
+   * is waiting on (see workspace-destroy).
+   */
+  enqueue?(queueName: string, jobName: string, data: Record<string, unknown>): Promise<void>;
+  /**
+   * Every per-node workspace queue Redis knows about, discovered from the
+   * BullMQ keyspace. The engine has no fleet registry of its own, so this is how
+   * a fan-out finds nodes a workspace document never named.
+   */
+  listNodeQueues?(): Promise<string[]>;
 }
 
 export const bullLifecycleQueue: LifecycleQueue = {
@@ -128,7 +147,133 @@ export const bullLifecycleQueue: LifecycleQueue = {
       return false;
     }
   },
+
+  async enqueue(queueName, jobName, data) {
+    // Retried, unlike the jobs above: nothing is waiting on the result, so a
+    // node that is briefly unreachable should be tried again rather than lost.
+    await getQueue(queueName).add(jobName, data, {
+      removeOnComplete: 200,
+      removeOnFail: 500,
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 30_000 },
+    });
+  },
+
+  async listNodeQueues() {
+    const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
+    const pattern = `${prefix}:${WORKSPACE_QUEUE}--*:meta`;
+    const found = new Set<string>();
+    try {
+      const client = await getQueue(WORKSPACE_QUEUE).client;
+      let cursor = '0';
+      do {
+        const [next, keys]: [string, string[]] = await client.scan(cursor, 'MATCH', pattern, 'COUNT', 200);
+        cursor = next;
+        for (const key of keys) {
+          const name = key.slice(prefix.length + 1, key.length - ':meta'.length);
+          if (name.startsWith(`${WORKSPACE_QUEUE}--`)) found.add(name);
+        }
+      } while (cursor !== '0');
+    } catch {
+      // No Redis, or a keyspace this cannot walk. An empty list means "nothing
+      // discovered", which every caller already has a fallback for.
+      return [];
+    }
+    return [...found];
+  },
 };
+
+/**
+ * Everything the node needs to hand a running container back.
+ *
+ * Two callers compose this job: `WorkspaceSession.release`, at the end of a
+ * healthy checkout, and `acquireWorkspace`, when something after the spawn
+ * resolved leaves a container nobody owns. They MUST agree — a second,
+ * hand-rolled version of this job is how the orphan gets left behind — so the
+ * shape lives here and both go through `buildReleaseJobData`.
+ */
+export interface ReleaseJobInput {
+  workspaceId: string;
+  checkoutId: string;
+  mode: CheckoutMode;
+  checkoutKey: string;
+  /** True on the teardown paths: nothing worth keeping was produced. */
+  skipSnapshot: boolean;
+  /**
+   * Keep the runner alive for the next checkout. Only a healthy release parks:
+   * a checkout that died before it was handed out has no warm container to
+   * offer, and parking one would leave the very orphan this is tearing down.
+   */
+  park?: { idleSeconds: number; environmentId: string };
+}
+
+export function buildReleaseJobData(input: ReleaseJobInput): Record<string, unknown> {
+  return {
+    action: 'snapshot',
+    workspaceId: input.workspaceId,
+    checkoutId: input.checkoutId,
+    mode: input.mode,
+    checkoutKey: input.checkoutKey,
+    skipSnapshot: input.skipSnapshot,
+    // A branch checkout's volume is that checkout's own working copy and dies
+    // with it; trunk (exclusive) keeps it warm on the node for the next one.
+    removeVolume: input.mode === 'branch',
+    ...(input.park && input.park.idleSeconds > 0 ? { park: input.park } : {}),
+  };
+}
+
+/** A container the spawn job brought up, addressed the way its node expects. */
+interface SpawnedContainer {
+  nodeId: string;
+  workspaceId: string;
+  checkoutId: string;
+  mode: CheckoutMode;
+  checkoutKey: string;
+}
+
+/**
+ * Destroy a container that came up but will never be handed to a session.
+ *
+ * `acquireWorkspace`'s catch used to release the checkout in Mongo and nothing
+ * else, on the reasoning that the worker destroys the container on any
+ * spawn-side failure. True only for failures INSIDE the spawn job. Once spawn
+ * has RESOLVED the container is up and the node considers it delivered, so a
+ * registration timeout — or anything else on the way to returning the session —
+ * left it running with no run attached (prod 2026-09-15, ws_is8EX3zJRoEh/
+ * chk_zdj49o23Sc, removed by hand).
+ *
+ * Failures here are swallowed. The Mongo release MUST still happen: a leaked
+ * container is bad, a leaked container plus a workspace locked against every
+ * future run is worse.
+ */
+async function teardownOrphanedSpawn(
+  queue: LifecycleQueue,
+  spawned: SpawnedContainer,
+  reason: string
+): Promise<void> {
+  console.error(
+    `[acquireWorkspace] ${spawned.workspaceId}/${spawned.checkoutId}: ${reason} — the container is already up on ${spawned.nodeId}; tearing it down before releasing the checkout`
+  );
+  try {
+    await queue.runJob(
+      workspaceNodeQueue(spawned.nodeId),
+      'snapshot',
+      buildReleaseJobData({
+        workspaceId: spawned.workspaceId,
+        checkoutId: spawned.checkoutId,
+        mode: spawned.mode,
+        checkoutKey: spawned.checkoutKey,
+        skipSnapshot: true,
+      }),
+      ORPHAN_TEARDOWN_TIMEOUT_MS
+    );
+  } catch (err) {
+    console.error(
+      `[acquireWorkspace] ${spawned.workspaceId}/${spawned.checkoutId}: teardown on ${spawned.nodeId} failed; releasing the checkout anyway:`,
+      err
+    );
+  }
+}
 
 /** The Environment the GATEWAY created when the runner registered. */
 export interface EnvironmentLookup {
@@ -247,23 +392,25 @@ export class WorkspaceSession {
     // container that does not exist.
     let parked = false;
     let parkedUntil: Date | null = null;
+    // Whether the release ran clean. The checkout is given back either way, but
+    // the history entry says which, so a workspace whose snapshots keep failing
+    // is visible on its own page instead of only in a worker log.
+    let outcome: 'released' | 'error' = 'released';
 
     try {
       const result = await this.queue.runJob(
         workspaceNodeQueue(nodeId),
         'snapshot',
-        {
-          action: 'snapshot',
+        buildReleaseJobData({
           workspaceId: workspace.workspaceId,
           checkoutId: checkout.checkoutId,
           mode: checkout.mode,
           checkoutKey: checkout.checkoutKey,
           skipSnapshot: options.skipSnapshot ?? false,
-          removeVolume: checkout.mode === 'branch',
           ...(idleSeconds > 0
             ? { park: { idleSeconds, environmentId: this.acquired.environmentId } }
             : {}),
-        },
+        }),
         SNAPSHOT_TIMEOUT_MS
       );
       volumeRemoved = result?.volumeRemoved === true;
@@ -280,6 +427,7 @@ export class WorkspaceSession {
     } catch (err) {
       // The checkout MUST still be released, or the workspace stays locked for
       // every future run. Snapshot failure is loud but not fatal to the lock.
+      outcome = 'error';
       console.error('[WorkspaceSession] snapshot failed; releasing the checkout anyway:', err);
     }
 
@@ -325,6 +473,9 @@ export class WorkspaceSession {
       expectedVersion: workspace.version,
       commitTrunkSnapshot: !!snapshotMeta,
       snapshotMeta,
+      outcome,
+      volumeRemoved,
+      parked: parked && !volumeRemoved,
     });
   }
 }
@@ -425,6 +576,10 @@ export async function acquireWorkspace(
     ttlSeconds: Math.ceil(leaseDurationMs / 1000) * 4,
   });
 
+  // Set the moment the spawn job RESOLVES, and from then on a container is
+  // running on that node whether or not this acquire ever returns a session.
+  let spawned: SpawnedContainer | null = null;
+
   try {
     const spawnQueue = await resolveSpawnQueue(queue, workspace, options.nodeId, now());
     // A parked runner only counts when the spawn is actually going to the node
@@ -469,10 +624,22 @@ export async function acquireWorkspace(
     );
 
     if (!spawn?.ok || !spawn?.nodeId) {
+      // The spawn itself failed: the worker already destroyed whatever it had
+      // started, and without a node id there is nowhere to send a teardown.
       throw new WorkspaceSpawnError(
         `Workspace spawn for ${workspace.workspaceId} returned no node (${JSON.stringify(spawn)})`
       );
     }
+
+    // The container is up. Everything below this line runs with something
+    // real on a node, so every exit from here has to go through the teardown.
+    spawned = {
+      nodeId: spawn.nodeId as string,
+      workspaceId: workspace.workspaceId,
+      checkoutId: checkout.checkoutId,
+      mode: checkout.mode,
+      checkoutKey: checkout.checkoutKey,
+    };
 
     // An adopted container was never restarted, so it is still registered under
     // the install id it was SPAWNED with — not the one minted for this checkout,
@@ -530,14 +697,24 @@ export async function acquireWorkspace(
     };
     return new WorkspaceSession(repo, acquired, queue, leaseDurationMs);
   } catch (err) {
-    // Nothing is running (the worker destroys the container on any spawn-side
-    // failure), so give the slot straight back.
+    // A spawn-side failure leaves nothing running — the worker destroys the
+    // container itself — but a failure AFTER the spawn resolved leaves one up
+    // with no run attached. Give the node its container back first; the Mongo
+    // release happens either way.
+    if (spawned) {
+      await teardownOrphanedSpawn(queue, spawned, err instanceof Error ? err.message : String(err));
+    }
+    // Then give the slot back.
     await repo
       .releaseWorkspace({
         workspaceId: workspace.workspaceId,
         checkoutId: checkout.checkoutId,
         runId: checkout.runId,
         expectedVersion: workspace.version,
+        // A checkout that never got a container still happened, and a run that
+        // died before it started is exactly what a person looking at the
+        // activity list needs to see.
+        outcome: 'error',
       })
       .catch(() => {});
     throw err;

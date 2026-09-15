@@ -4,6 +4,7 @@ import {
   IWorkspace,
   IParkedCheckout,
   IWorkspaceCheckout,
+  ICheckoutHistoryEntry,
   ICheckoutOptions,
   IReleaseOptions,
   CreateWorkspaceInput,
@@ -12,6 +13,11 @@ import {
   WorkspaceLeaseLostError,
   WorkspaceVersionConflictError,
 } from './types.js';
+import {
+  applyTierPolicy,
+  clampMaxConcurrentCheckouts,
+  workspaceTierPolicy,
+} from './tiers.js';
 
 const NANOID_ALPHABET =
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
@@ -77,6 +83,16 @@ export function generateEnvironmentId(): string {
   return `env_${generateRandomString(12)}`;
 }
 
+/**
+ * How many finished checkouts a workspace remembers.
+ *
+ * Fifty is a few weeks of a busy workspace and a couple of kilobytes on the
+ * document — enough for "did this ship?" without turning `agentWorkspaces` into
+ * a run log. The cap is enforced by the `$slice` on the push, so it holds
+ * whatever the document arrived with; nothing has to prune.
+ */
+export const CHECKOUT_HISTORY_LIMIT = 50;
+
 export class WorkspaceRepository {
   private collectionName = 'agentWorkspaces';
 
@@ -98,6 +114,11 @@ export class WorkspaceRepository {
   async createWorkspace(input: CreateWorkspaceInput): Promise<IWorkspace> {
     const now = new Date();
     const workspaceId = input.workspaceId || generateWorkspaceId();
+    // Who is paying decides how long this workspace may stay warm, how long a
+    // runner may stay parked for it, and how many checkouts it may hold at once.
+    // A caller with no tier in hand gets the lowest policy — see ./tiers.ts.
+    const policy = workspaceTierPolicy(input.accountTier);
+    const tiered = applyTierPolicy(input.config, policy);
     // The node's redrun worker derives the real repository from its own
     // WORKSPACE_S3_* env; this field is informational. It carries no IP literal:
     // the endpoint is node configuration, not code (48a P2-6).
@@ -119,8 +140,8 @@ export class WorkspaceRepository {
         defaultCwd: '/workspace',
         gitRepoUrl: input.config?.gitRepoUrl,
         gitBranch: input.config?.gitBranch || 'main',
-        warmTtlSeconds: warmTtlSeconds(input.config),
-        hotIdleSeconds: hotIdleSeconds(input.config),
+        warmTtlSeconds: tiered.warmTtlSeconds,
+        hotIdleSeconds: tiered.hotIdleSeconds,
       },
       stats: {
         snapshotSizeBytes: 0,
@@ -130,7 +151,7 @@ export class WorkspaceRepository {
         totalComputeSeconds: 0,
       },
       version: 1,
-      maxConcurrentCheckouts: input.maxConcurrentCheckouts ?? 8,
+      maxConcurrentCheckouts: clampMaxConcurrentCheckouts(input.maxConcurrentCheckouts, policy),
       activeCheckouts: [],
       createdAt: now,
       updatedAt: now,
@@ -285,6 +306,42 @@ export class WorkspaceRepository {
   }
 
   /**
+   * Record what this checkout shipped, on the checkout itself.
+   *
+   * The pull request is known exactly once — inside `workspace_ship`'s reply,
+   * and again inside `workspace_merge`'s — and both are mid-checkout, long
+   * before the release that writes the history entry. Parking it on the active
+   * checkout is what lets the release copy it across without the two tools
+   * having to know a history exists.
+   *
+   * The two fields are set through their own dot paths so a merge note cannot
+   * blank the url a ship note wrote, and a re-ship cannot blank a merged sha.
+   * Returns whether it landed: a checkout that has already been released (or
+   * reaped) is not an error worth failing a successful push over, and the
+   * callers treat a false as "nothing to record it on".
+   */
+  async noteCheckoutShip(
+    workspaceId: string,
+    checkoutId: string,
+    pr: { prUrl?: string | null; mergedSha?: string | null }
+  ): Promise<boolean> {
+    const set: Record<string, any> = {};
+    if (typeof pr.prUrl === 'string' && pr.prUrl) set['activeCheckouts.$[elem].pr.url'] = pr.prUrl;
+    if (typeof pr.mergedSha === 'string' && pr.mergedSha) {
+      set['activeCheckouts.$[elem].pr.mergedSha'] = pr.mergedSha;
+    }
+    if (Object.keys(set).length === 0) return false;
+    set.updatedAt = new Date();
+
+    const res = await this.collection.updateOne(
+      { workspaceId, activeCheckouts: { $elemMatch: { checkoutId } } } as Filter<IWorkspace>,
+      { $set: set },
+      { arrayFilters: [{ 'elem.checkoutId': checkoutId }] }
+    );
+    return res.matchedCount > 0;
+  }
+
+  /**
    * Record the node whose docker daemon holds this workspace's named volume,
    * and how long that is worth following. Callers holding the workspace pass
    * `pinnedUntil` (they already know its warm window); without one it is read
@@ -374,6 +431,50 @@ export class WorkspaceRepository {
     }
   }
 
+  /**
+   * The history entry for a checkout that is about to be pulled.
+   *
+   * Read separately because the `$pull` that ends the checkout destroys the
+   * only copy of its acquisition time, node and pull request; the write that
+   * follows is still guarded on the checkout, so a checkout reaped between the
+   * two reads as the conflict it already was rather than as a silent no-op.
+   */
+  private async buildHistoryEntry(
+    workspaceId: string,
+    checkoutId: string,
+    runId: string,
+    releasedAt: Date,
+    options: IReleaseOptions,
+    snapshotId: string | null
+  ): Promise<ICheckoutHistoryEntry | null> {
+    const doc = await this.collection.findOne(
+      { workspaceId, activeCheckouts: { $elemMatch: { checkoutId, runId } } } as Filter<IWorkspace>,
+      { projection: { activeCheckouts: 1 }, maxTimeMS: 5000 }
+    );
+    const checkout = doc?.activeCheckouts?.find(
+      (c) => c.checkoutId === checkoutId && c.runId === runId
+    );
+    if (!checkout) return null;
+
+    const acquiredAt = checkout.createdAt ? new Date(checkout.createdAt) : releasedAt;
+    return {
+      checkoutId,
+      runId,
+      mode: checkout.mode,
+      checkoutKey: checkout.checkoutKey,
+      branch: checkout.branch,
+      ...(checkout.nodeId ? { nodeId: checkout.nodeId } : {}),
+      acquiredAt,
+      releasedAt,
+      durationMs: Math.max(0, releasedAt.getTime() - acquiredAt.getTime()),
+      outcome: options.outcome === 'error' ? 'error' : 'released',
+      ...(options.volumeRemoved === true ? { volumeRemoved: true } : {}),
+      ...(options.parked === true ? { parked: true } : {}),
+      ...(snapshotId ? { snapshotId } : {}),
+      ...(checkout.pr?.url ? { pr: { ...checkout.pr } } : {}),
+    };
+  }
+
   async releaseWorkspace(options: IReleaseOptions): Promise<void> {
     const {
       workspaceId,
@@ -384,6 +485,21 @@ export class WorkspaceRepository {
       snapshotMeta,
     } = options;
     const now = new Date();
+    const snapshotId = commitTrunkSnapshot && snapshotMeta ? snapshotMeta.snapshotId : null;
+    // Best effort, and deliberately so: a history that cannot be written must
+    // never be the reason a checkout stays held. The release below is the part
+    // that matters.
+    const historyEntry = await this.buildHistoryEntry(
+      workspaceId,
+      checkoutId,
+      runId,
+      now,
+      options,
+      snapshotId
+    ).catch((err: Error) => {
+      console.warn('[WorkspaceRepository] could not read the checkout for history:', err.message);
+      return null;
+    });
 
     const update: Record<string, any> = {
       $pull: { activeCheckouts: { checkoutId, runId } },
@@ -395,6 +511,13 @@ export class WorkspaceRepository {
           : {}),
       },
       $set: { updatedAt: now },
+      ...(historyEntry
+        ? {
+            $push: {
+              checkoutHistory: { $each: [historyEntry], $slice: -CHECKOUT_HISTORY_LIMIT },
+            },
+          }
+        : {}),
     };
 
     if (commitTrunkSnapshot && snapshotMeta) {
