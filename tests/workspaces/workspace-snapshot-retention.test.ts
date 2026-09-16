@@ -17,6 +17,12 @@
  * numbers on a document that never agreed to a policy would prune a paying
  * account's history on a guess.
  *
+ * Since 2026-09-16 the default and the CAP are separate (George: "give me the
+ * best retention, if possible no time limit, just latest N"): the top two plans
+ * may push `keepLast` to 100 and set `keepWithinDays` to 0, which is "no time
+ * bound — keep the latest N, however old they are". The other three keep the
+ * floor of 1 day, where a zero is a typo rather than a purchase.
+ *
  * Hermetic: pure functions over the tier table plus an in-memory Db. No Mongo,
  * no Redis, no queue, no docker socket.
  */
@@ -29,19 +35,29 @@ import {
   buildReleaseJobData,
   clampSnapshotRetention,
   clampWorkspaceConfigForTier,
+  describeSnapshotRetention,
   usableRetentionOutcome,
   workspaceTierPolicy,
   type LifecycleQueue,
   type WorkspaceTierName,
 } from '../../src/lib/workspaces';
 
-/** What each plan is documented to keep: [keepLast, keepWithinDays]. */
+/** What each plan is documented to keep BY DEFAULT: [keepLast, keepWithinDays]. */
 const EXPECTED: Record<WorkspaceTierName, [number, number]> = {
   admin: [30, 30],
   enterprise: [30, 30],
   pro: [10, 14],
   basic: [10, 14],
   free: [3, 7],
+};
+
+/** How far each plan may be pushed: [keepLast, keepWithinDays, allowNoTimeLimit]. */
+const EXPECTED_MAX: Record<WorkspaceTierName, [number, number, boolean]> = {
+  admin: [100, 30, true],
+  enterprise: [100, 30, true],
+  pro: [10, 14, false],
+  basic: [10, 14, false],
+  free: [3, 7, false],
 };
 
 /** Enough of a Db for WorkspaceRepository.createWorkspace. */
@@ -80,6 +96,31 @@ describe('the tier table carries a retention for every plan', () => {
       expect(Number.isInteger(policy.snapshotRetention.keepLast)).toBe(true);
       expect(policy.snapshotRetention.keepLast).toBeGreaterThan(0);
       expect(policy.snapshotRetention.keepWithinDays).toBeGreaterThan(0);
+    }
+  });
+
+  it('gives every tier a ceiling that is at least its default', () => {
+    for (const [name, policy] of Object.entries(WORKSPACE_TIER_POLICIES)) {
+      const [keepLast, keepWithinDays, allowNoTimeLimit] = EXPECTED_MAX[name as WorkspaceTierName];
+      expect(policy.snapshotRetentionMax, `${name} has no ceiling`).toEqual({
+        keepLast,
+        keepWithinDays,
+        allowNoTimeLimit,
+      });
+      // A cap below the default would hand out a policy the same table refuses
+      // to accept back — every create would be clamped on the way in.
+      expect(policy.snapshotRetentionMax.keepLast).toBeGreaterThanOrEqual(
+        policy.snapshotRetention.keepLast,
+      );
+      expect(policy.snapshotRetentionMax.keepWithinDays).toBeGreaterThanOrEqual(
+        policy.snapshotRetention.keepWithinDays,
+      );
+    }
+    // Only the two plans that pay for it may drop the time bound.
+    expect(workspaceTierPolicy(0).snapshotRetentionMax.allowNoTimeLimit).toBe(true);
+    expect(workspaceTierPolicy(1).snapshotRetentionMax.allowNoTimeLimit).toBe(true);
+    for (const tier of [2, 3, 4]) {
+      expect(workspaceTierPolicy(tier).snapshotRetentionMax.allowNoTimeLimit).toBe(false);
     }
   });
 
@@ -153,9 +194,11 @@ describe('an update clamps the retention it mentions and invents none', () => {
     expect(
       clampWorkspaceConfigForTier({ snapshotRetention: { keepLast: 99, keepWithinDays: 3 } }, 3),
     ).toEqual({ snapshotRetention: { keepLast: 10, keepWithinDays: 3 } });
+    // Admin's keepLast ceiling is 100, so 99 is a legal ask; the window is still
+    // capped at 30 days, because an unbounded WINDOW is asked for with 0.
     expect(
       clampWorkspaceConfigForTier({ snapshotRetention: { keepLast: 99, keepWithinDays: 99 } }, 0),
-    ).toEqual({ snapshotRetention: { keepLast: 30, keepWithinDays: 30 } });
+    ).toEqual({ snapshotRetention: { keepLast: 99, keepWithinDays: 30 } });
   });
 
   it('stays silent about retention when the patch does not mention it', () => {
@@ -166,6 +209,128 @@ describe('an update clamps the retention it mentions and invents none', () => {
     expect('snapshotRetention' in out).toBe(false);
     expect(clampWorkspaceConfigForTier({}, 2)).toEqual({});
     expect(clampWorkspaceConfigForTier({ snapshotRetention: null } as any, 2)).toEqual({});
+  });
+});
+
+/**
+ * "Backfill workspaces for sure but give me the best retention, if possible no
+ * time limit, just latest N." — George, 2026-09-16.
+ *
+ * The tier table could not say it: `keepLast` was capped at the default it also
+ * handed out, and every `keepWithinDays` was floored at 1 day, so the narrowest
+ * time bound a workspace could ask for was "anything from yesterday". These are
+ * the two halves of saying it, and the three plans that must NOT be able to.
+ */
+describe('the top plans can ask for the latest N and no time limit', () => {
+  it('accepts keepWithinDays 0 on admin and enterprise, and floors it to 1 elsewhere', () => {
+    for (const tier of [0, 1]) {
+      expect(clampSnapshotRetention({ keepLast: 100, keepWithinDays: 0 }, workspaceTierPolicy(tier))).toEqual({
+        keepLast: 100,
+        keepWithinDays: 0,
+      });
+    }
+    // A zero on a plan that did not buy it is a typo, not a purchase: reading it
+    // as "forever" would grow storage on a slip of the finger.
+    for (const [tier, keepLast] of [
+      [2, 10],
+      [3, 10],
+      [4, 3],
+    ] as Array<[number, number]>) {
+      expect(clampSnapshotRetention({ keepLast: 999, keepWithinDays: 0 }, workspaceTierPolicy(tier))).toEqual({
+        keepLast,
+        keepWithinDays: 1,
+      });
+    }
+    // Negative is a typo on EVERY plan, unbounded or not — "keep within -3 days"
+    // is not a request for no bound, it is a slip, and it lands on the same
+    // floor the tier would apply to a zero.
+    expect(clampSnapshotRetention({ keepLast: 5, keepWithinDays: -3 }, workspaceTierPolicy(0))).toEqual({
+      keepLast: 5,
+      keepWithinDays: 0,
+    });
+    expect(clampSnapshotRetention({ keepLast: 5, keepWithinDays: -3 }, workspaceTierPolicy(2))).toEqual({
+      keepLast: 5,
+      keepWithinDays: 1,
+    });
+  });
+
+  it('lets admin keep the last 100 and still caps basic at 10', () => {
+    expect(clampSnapshotRetention({ keepLast: 100, keepWithinDays: 30 }, workspaceTierPolicy(0))).toEqual({
+      keepLast: 100,
+      keepWithinDays: 30,
+    });
+    expect(clampSnapshotRetention({ keepLast: 100, keepWithinDays: 30 }, workspaceTierPolicy(3))).toEqual({
+      keepLast: 10,
+      keepWithinDays: 14,
+    });
+    // Above the raised ceiling is still clamped, not refused.
+    expect(clampSnapshotRetention({ keepLast: 5000, keepWithinDays: 0 }, workspaceTierPolicy(1))).toEqual({
+      keepLast: 100,
+      keepWithinDays: 0,
+    });
+  });
+
+  it('leaves the DEFAULT alone — a new admin workspace still gets 30 and 30', async () => {
+    // The point of splitting default from cap: raising the ceiling must not
+    // quietly triple what every workspace on the plan starts out keeping.
+    const { repo } = mkRepo();
+    const ws = await repo.createWorkspace({ userId: 'user-1', name: 'admin-ws', accountTier: 0 } as any);
+    expect(ws.config.snapshotRetention).toEqual({ keepLast: 30, keepWithinDays: 30 });
+
+    // And asking for it explicitly is what gets you the unbounded policy.
+    const unbounded = await repo.createWorkspace({
+      userId: 'user-1',
+      name: 'latest-n',
+      accountTier: 0,
+      config: { snapshotRetention: { keepLast: 100, keepWithinDays: 0 } },
+    } as any);
+    expect(unbounded.config.snapshotRetention).toEqual({ keepLast: 100, keepWithinDays: 0 });
+
+    // An update is the other way in, and clamps the same.
+    expect(
+      clampWorkspaceConfigForTier({ snapshotRetention: { keepLast: 100, keepWithinDays: 0 } }, 1),
+    ).toEqual({ snapshotRetention: { keepLast: 100, keepWithinDays: 0 } });
+    expect(
+      clampWorkspaceConfigForTier({ snapshotRetention: { keepLast: 100, keepWithinDays: 0 } }, 2),
+    ).toEqual({ snapshotRetention: { keepLast: 10, keepWithinDays: 1 } });
+  });
+});
+
+describe('describeSnapshotRetention — the one place that words it', () => {
+  it('drops the window entirely when there is no time limit', () => {
+    expect(describeSnapshotRetention({ keepLast: 100, keepWithinDays: 0 })).toBe('keep the last 100');
+    // The whole reason this exists: a template that always prints the day count
+    // renders `keepWithinDays: 0` as "within 0 days", which reads as the exact
+    // opposite of what the policy means.
+    expect(describeSnapshotRetention({ keepLast: 30, keepWithinDays: 30 })).toBe(
+      'keep the last 30, within 30 days',
+    );
+    expect(describeSnapshotRetention({ keepLast: 10, keepWithinDays: 14 })).toBe(
+      'keep the last 10, within 14 days',
+    );
+    expect(describeSnapshotRetention({ keepLast: 3, keepWithinDays: 1 })).toBe(
+      'keep the last 3, within 1 day',
+    );
+  });
+
+  it('says "keep everything" for the workspace that never agreed to a policy', () => {
+    // Absent retention is not "keep nothing" — it is the pre-policy behaviour,
+    // and a UI that said otherwise would describe a pruning that never happens.
+    for (const junk of [undefined, null, {}, 'forever', 42, { keepWithinDays: 7 }, { keepLast: 0, keepWithinDays: 7 }]) {
+      expect(describeSnapshotRetention(junk as any), `worded ${JSON.stringify(junk)}`).toBe(
+        'keep everything',
+      );
+    }
+  });
+
+  it('words every tier default and every tier ceiling', () => {
+    expect(describeSnapshotRetention(WORKSPACE_TIER_POLICIES.free.snapshotRetention)).toBe(
+      'keep the last 3, within 7 days',
+    );
+    const admin = WORKSPACE_TIER_POLICIES.admin.snapshotRetentionMax;
+    expect(
+      describeSnapshotRetention({ keepLast: admin.keepLast, keepWithinDays: 0 }),
+    ).toBe('keep the last 100');
   });
 });
 
@@ -202,6 +367,28 @@ describe('the release job carries the policy only when it will take a snapshot',
         buildReleaseJobData({ ...base, skipSnapshot: false, snapshotRetention: junk as any }),
       ).not.toHaveProperty('snapshotRetention');
     }
+  });
+
+  it('carries an unbounded policy verbatim, zero and all', () => {
+    // The node reads `keepWithinDays: 0` as "omit --keep-within", so the zero
+    // must survive the trip. Dropping it here would silently reinstate a time
+    // bound the workspace paid to remove.
+    const data = buildReleaseJobData({
+      ...base,
+      skipSnapshot: false,
+      snapshotRetention: { keepLast: 100, keepWithinDays: 0 },
+    });
+    expect(data.snapshotRetention).toEqual({ keepLast: 100, keepWithinDays: 0 });
+
+    // `keepLast: 0` is still nonsense — it would forget the snapshot this
+    // release just took — and still means no policy at all.
+    expect(
+      buildReleaseJobData({
+        ...base,
+        skipSnapshot: false,
+        snapshotRetention: { keepLast: 0, keepWithinDays: 0 },
+      }),
+    ).not.toHaveProperty('snapshotRetention');
   });
 
   it('leaves every other field of the job exactly as it was', () => {
@@ -403,6 +590,12 @@ describe('the release carries the forget outcome back off the job result', () =>
       keepLast: 3,
       keepWithinDays: 7,
       removed: 12,
+    });
+    // An unbounded policy comes back the same way it went out.
+    expect(usableRetentionOutcome({ keepLast: 100, keepWithinDays: 0, removed: 5 })).toEqual({
+      keepLast: 100,
+      keepWithinDays: 0,
+      removed: 5,
     });
     // A count that is not a whole number of snapshots is an unknown, not a zero.
     for (const removed of [undefined, 'twelve', -1, NaN, Infinity, {}, true]) {

@@ -128,9 +128,16 @@ export interface ICheckoutHistoryEntry {
  * default AND the ceiling.
  */
 export interface IWorkspaceSnapshotRetention {
-  /** Always keep this many of the most recent snapshots. */
+  /** Always keep this many of the most recent snapshots. Never 0. */
   keepLast: number;
-  /** Also keep every snapshot taken within this many days. */
+  /**
+   * Also keep every snapshot taken within this many days.
+   *
+   * `0` means NO TIME BOUND: keep the latest `keepLast` and nothing else,
+   * however old they are. Only the tiers whose `snapshotRetentionMax` says
+   * `allowNoTimeLimit` may be clamped to it (see `clampSnapshotRetention`); on
+   * every other plan a zero is floored to 1 day.
+   */
   keepWithinDays: number;
 }
 
@@ -347,6 +354,7 @@ export interface IReleaseOptions {
  */
 export interface IReleaseRetention {
   keepLast: number;
+  /** As `IWorkspaceSnapshotRetention.keepWithinDays`: 0 is "no time bound". */
   keepWithinDays: number;
   removed: number | null;
 }
