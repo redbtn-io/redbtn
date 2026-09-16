@@ -23,6 +23,7 @@
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 import { environmentManager } from '../../environments/EnvironmentManager';
 import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
+import { resolveRunUserIdOrEmpty } from './_run-identity';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -102,11 +103,15 @@ const writeFileTool: NativeToolDefinition = {
       mode = args.mode;
     }
 
-    // ── userId source ──────────────────────────────────────────────────────
-    const userId =
-      (context?.state as AnyObject | undefined)?.userId
-      || (context?.state as AnyObject | undefined)?.data?.userId
-      || '';
+    // ── userId source — the DELEGATED caller first (state.callerUserId, set by
+    // buildInitialState iff the run executes as executionIdentity:'caller'),
+    // then the run owner. An environment and its SSH key are caller-side
+    // resources under docs/RUN-AS-CALLER-DELEGATION-SPEC.md, exactly as for the
+    // ssh_* tools. Resolving only the owner here is what denied every file/exec
+    // tool on a delegated run with ENV_ACCESS_DENIED while ssh_run_async on the
+    // SAME environment worked (run_1789534315735_ixbvhn, 2026-09-16).
+    // Undelegated runs carry no callerUserId, so they are unchanged.
+    const userId = resolveRunUserIdOrEmpty(context);
     if (!userId) {
       return toolError('NO_USER', 'write_file requires a userId in graph state — got empty. This usually means the tool was invoked outside a run context.');
     }

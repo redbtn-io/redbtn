@@ -35,6 +35,7 @@ import { enforceToolCapability } from '../../permissions/enforce';
 import { readAllowlistedSshKey } from './ssh-key-path';
 import { safeFetch } from '../../net/ssrf-guard';
 import { callerIsTrusted } from './_outbound-url';
+import { resolveRunUserId, resolveRunUserIdOrEmpty } from './_run-identity';
 
 // Test seam — mirrors ssh_shell's factory so the inline SSH path can be
 // exercised with a mock client (no real network) in unit tests.
@@ -103,9 +104,13 @@ function buildLibraryAccessHeaders(context: NativeToolContext): Record<string, s
   const authToken =
     (context?.state?.authToken as string | undefined) ||
     (context?.state?.data?.authToken as string | undefined);
-  const userId =
-    (context?.state?.userId as string | undefined) ||
-    (context?.state?.data?.userId as string | undefined);
+  // The DELEGATED caller first, then the run owner — the same rule the rest of
+  // this tool now uses. On a delegated run the library read must be access
+  // checked as the person the run acts FOR: with an owner-resolved header and a
+  // caller-resolved environment (below), a caller could trigger a delegated
+  // automation that copies the OWNER's private documents onto the CALLER's own
+  // host. Undelegated runs carry no callerUserId and are unchanged.
+  const userId = resolveRunUserId(context);
   const internalKey = process.env.INTERNAL_SERVICE_KEY;
 
   if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
@@ -668,10 +673,13 @@ interface ExecuteViaEnvironmentArgs {
  */
 async function executeViaEnvironment(args: ExecuteViaEnvironmentArgs): Promise<NativeMcpResult> {
   const { environmentId, files, remotePath, overwrite, isDirectoryHint, context, publisher, nodeId, startTime } = args;
-  const userId =
-    (context?.state as AnyObject | undefined)?.userId
-    || (context?.state as AnyObject | undefined)?.data?.userId
-    || '';
+  // The DELEGATED caller first, then the run owner. Environments are
+  // caller-resolved under docs/RUN-AS-CALLER-DELEGATION-SPEC.md; ssh_copy was
+  // the one ssh-family tool that never got the rule, which the spec recorded as
+  // an open item and production confirmed on 2026-09-16
+  // (run_1789534315735_ixbvhn: ENV_ACCESS_DENIED on the caller's environment
+  // while ssh_run_async against the SAME environment worked).
+  const userId = resolveRunUserIdOrEmpty(context);
 
   if (!userId) {
     return {
