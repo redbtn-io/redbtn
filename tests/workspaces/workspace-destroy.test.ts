@@ -11,6 +11,7 @@ import {
   destroyWorkspace,
   WorkspaceBusyError,
   nodeIdsFromWorkspace,
+  workspaceEverTouchedANode,
   liveCheckoutIds,
   ANY_WORKSPACE_NODE,
   WORKSPACE_QUEUE,
@@ -112,6 +113,30 @@ function checkout(overrides: Partial<IWorkspace['activeCheckouts'][number]> = {}
     createdAt: new Date(NOW - 60_000),
     ...overrides,
   };
+}
+
+/** One finished checkout, as `releaseWorkspace` appends it. */
+function historyEntry(overrides: Partial<NonNullable<IWorkspace['checkoutHistory']>[number]> = {}) {
+  return {
+    checkoutId: 'chk_done',
+    runId: 'run-0',
+    mode: 'exclusive' as const,
+    checkoutKey: 'trunk',
+    branch: 'main',
+    acquiredAt: new Date(NOW - 7_200_000),
+    releasedAt: new Date(NOW - 7_000_000),
+    durationMs: 200_000,
+    outcome: 'released' as const,
+    ...overrides,
+  };
+}
+
+/** A workspace that has run before but names no node any more (the pin was cleared). */
+function ranOnceDoc(overrides: Partial<IWarmWorkspace> = {}): IWarmWorkspace {
+  return workspaceDoc({
+    stats: { ...workspaceDoc().stats, totalRunCount: 2, totalComputeSeconds: 900 },
+    ...overrides,
+  });
 }
 
 describe('destroyWorkspace', () => {
@@ -237,11 +262,13 @@ describe('destroyWorkspace', () => {
   });
 
   it('falls back to every discovered queue with a live worker, then to the global queue', async () => {
+    // `ranOnceDoc` names no node but has run: the pin is gone, the state it
+    // left may not be, so the fan-out is still owed.
     const withWorkers = fakeQueue({
       discovered: [workspaceNodeQueue('10.100.0.5'), workspaceNodeQueue('10.100.0.9')],
       workers: { [workspaceNodeQueue('10.100.0.5')]: true, [workspaceNodeQueue('10.100.0.9')]: false },
     });
-    const a = fakeDb(workspaceDoc());
+    const a = fakeDb(ranOnceDoc());
     const discovered = await destroyWorkspace(a.db, 'ws_abc123', {}, { queue: withWorkers.queue, now });
     expect(discovered.jobsEnqueued).toEqual(['10.100.0.5']);
     expect(withWorkers.enqueued[0].data.purgeSnapshots).toBe(true);
@@ -249,7 +276,7 @@ describe('destroyWorkspace', () => {
     // Nothing recorded and nothing discovered: the global queue still reaches a
     // node, and the snapshots are the one thing no reaper would ever remove.
     const none = fakeQueue();
-    const b = fakeDb(workspaceDoc());
+    const b = fakeDb(ranOnceDoc());
     const global = await destroyWorkspace(b.db, 'ws_abc123', {}, { queue: none.queue, now });
     expect(global.jobsEnqueued).toEqual([ANY_WORKSPACE_NODE]);
     expect(none.enqueued[0].queueName).toBe(WORKSPACE_QUEUE);
@@ -271,6 +298,106 @@ describe('destroyWorkspace', () => {
     expect(enqueued[0].data.purgeSnapshots).toBe(true);
     expect(current()).toBeNull();
     warn.mockRestore();
+  });
+
+  it('enqueues nothing for a workspace that has never been on a node', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    // Exactly the production case: a scratch workspace nobody ever checked out.
+    // No pin, no parked runner, no checkout, no history, zeroed stats.
+    const { db, ops, current } = fakeDb(workspaceDoc());
+    // A fleet that WOULD have taken six no-op destroy jobs, had it been asked.
+    const { queue, enqueued } = fakeQueue({
+      discovered: [workspaceNodeQueue('10.100.0.5'), workspaceNodeQueue('10.100.0.7')],
+      workers: { [workspaceNodeQueue('10.100.0.5')]: true, [workspaceNodeQueue('10.100.0.7')]: true },
+    });
+
+    const result = await destroyWorkspace(db, 'ws_abc123', { requestedBy: 'user-1' }, { queue, now });
+
+    // No job anywhere — not even the global queue, whose only reason to exist is
+    // purging a restic repository this workspace never created.
+    expect(result).toEqual({ deleted: true, jobsEnqueued: [] });
+    expect(enqueued).toHaveLength(0);
+    expect(ops.map((o) => o.op)).toEqual(['findOne', 'updateOne', 'deleteOne']);
+    expect(current()).toBeNull();
+    expect(log.mock.calls.map((args) => String(args[0]))).toContain(
+      '[destroyWorkspace] ws_abc123 deleted; never touched a node, no cleanup enqueued',
+    );
+    log.mockRestore();
+  });
+
+  it('still fans out for a workspace whose only record is a finished checkout', async () => {
+    // The history names a node that has since left the fleet, and
+    // `nodeIdsFromWorkspace` does not read history — so this is the discovery
+    // path, and it must still run: that node may have been rebuilt, and the
+    // release that wrote this entry may have left a snapshot behind.
+    const { db } = fakeDb(workspaceDoc({ checkoutHistory: [historyEntry({ nodeId: '10.100.0.99' })] }));
+    const { queue, enqueued } = fakeQueue({
+      discovered: [workspaceNodeQueue('10.100.0.5')],
+      workers: { [workspaceNodeQueue('10.100.0.5')]: true },
+    });
+
+    const result = await destroyWorkspace(db, 'ws_abc123', {}, { queue, now });
+
+    expect(result.jobsEnqueued).toEqual(['10.100.0.5']);
+    expect(enqueued).toHaveLength(1);
+    expect(enqueued[0].data.purgeSnapshots).toBe(true);
+  });
+
+  it('still reaches a node for a workspace that has snapshots but no node', async () => {
+    // Snapshots are the state nothing on the fleet ever expires, so a byte of
+    // them is enough to owe the fan-out even with no queue to discover: the
+    // global queue reaches one node, which is all a purge needs.
+    const { db } = fakeDb(
+      workspaceDoc({ stats: { ...workspaceDoc().stats, snapshotSizeBytes: 4_096 } }),
+    );
+    const { queue, enqueued } = fakeQueue();
+
+    const result = await destroyWorkspace(db, 'ws_abc123', {}, { queue, now });
+
+    expect(result.jobsEnqueued).toEqual([ANY_WORKSPACE_NODE]);
+    expect(enqueued[0].queueName).toBe(WORKSPACE_QUEUE);
+    expect(enqueued[0].data.purgeSnapshots).toBe(true);
+  });
+});
+
+describe('workspaceEverTouchedANode', () => {
+  it('is false only for a workspace that has been nowhere', () => {
+    expect(workspaceEverTouchedANode(workspaceDoc())).toBe(false);
+  });
+
+  const evidence: Array<[string, Partial<IWarmWorkspace>]> = [
+    ['the node pin', { nodeId: '10.100.0.5' }],
+    ['a pin window left behind', { nodePinnedUntil: new Date(NOW - 1000) }],
+    [
+      'a parked runner',
+      {
+        parkedCheckout: {
+          checkoutId: 'chk_parked',
+          installId: 'i',
+          environmentId: 'env_p',
+          containerName: 'c',
+          nodeId: '10.100.0.7',
+          parkedUntil: new Date(NOW + 1000),
+        },
+      },
+    ],
+    ['an active checkout', { activeCheckouts: [checkout({ leaseExpiresAt: new Date(NOW - 1) })] }],
+    ['a finished checkout', { checkoutHistory: [historyEntry()] }],
+    ['a trunk snapshot id', { currentSnapshotId: 'abc123' }],
+    ['a sampled warm volume', { stats: { ...workspaceDoc().stats, warmVolumes: [{ nodeId: '10.100.0.9' }] } }],
+    ['sampled warm bytes', { stats: { ...workspaceDoc().stats, warmBytes: 1 } as IWarmWorkspace['stats'] }],
+    ['snapshot bytes', { stats: { ...workspaceDoc().stats, snapshotSizeBytes: 1 } }],
+    ['a snapshot timestamp', { stats: { ...workspaceDoc().stats, lastSnapshotAt: new Date(NOW - 1000) } }],
+    ['a file count', { stats: { ...workspaceDoc().stats, fileCount: 12 } }],
+    ['a run count', { stats: { ...workspaceDoc().stats, totalRunCount: 1 } }],
+    ['a legacy run count', { stats: { ...workspaceDoc().stats, totalRuns: 1 } as IWarmWorkspace['stats'] }],
+    ['compute seconds', { stats: { ...workspaceDoc().stats, totalComputeSeconds: 30 } }],
+  ];
+
+  // One-sided on purpose: a wrong yes costs the fan-out we did anyway, a wrong
+  // no strands a restic repository nothing expires.
+  it.each(evidence)('is true for %s', (_label, overrides) => {
+    expect(workspaceEverTouchedANode(workspaceDoc(overrides))).toBe(true);
   });
 });
 
