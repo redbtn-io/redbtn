@@ -12,7 +12,7 @@
  * out into, so owning it is what makes the spawn, the clone, the push and the
  * merge all happen as the caller. Its STORAGE TIER still comes from the
  * owner's account (`resolveRunAccountTier`), which is the split
- * RUN-AS-CALLER-DELEGATION-SPEC.md asks for.
+ * docs/RUN-AS-CALLER-DELEGATION-SPEC.md asks for.
  */
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { WorkspaceRepository } from '../../workspaces/WorkspaceRepository';

@@ -353,8 +353,8 @@ export interface AcquireOptions {
    */
   nodeId?: string;
   /**
-   * Run-as-caller delegation (RUN-AS-CALLER-DELEGATION-SPEC.md): the OWNER of
-   * the automation, on a run that executes as somebody else.
+   * Run-as-caller delegation (docs/RUN-AS-CALLER-DELEGATION-SPEC.md): the
+   * OWNER of the automation, on a run that executes as somebody else.
    *
    * AUDIT ONLY, and deliberately not an identity. Every identity decision on
    * this path already reads `workspace.userId` — which IS the caller, because
@@ -657,7 +657,7 @@ export async function acquireWorkspace(
     // NOTE `workspace.userId` — not the run's owner. A delegated run's
     // workspace was created under the CALLER by `workspace_for_repo`, so this
     // asks the hub for the CALLER's installation and the spawn clones with the
-    // caller's grant (RUN-AS-CALLER-DELEGATION-SPEC.md).
+    // caller's grant (docs/RUN-AS-CALLER-DELEGATION-SPEC.md).
     const githubInstallationId = workspace.config?.gitRepoUrl
       ? (await resolveGithubInstallation(workspace.userId, workspace.config.gitRepoUrl)).installationId
       : null;

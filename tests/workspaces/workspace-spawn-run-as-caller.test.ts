@@ -1,13 +1,13 @@
 /**
  * The spawn job a delegated run enqueues.
  *
- * The producer half of run-as-caller (RUN-AS-CALLER-DELEGATION-SPEC.md, card
- * 6aa9cc389cd36ab33ad10d76). `acquireWorkspace` never sees the run's state: it
- * keys every identity decision off the WORKSPACE DOCUMENT, so the fix that
- * matters is upstream — `workspace_for_repo` now creates the workspace under
- * the caller, and the spawn's `ownerUserId` and the GitHub App installation
- * follow for free. What this pins is that nothing on the spawn path
- * reintroduces the run owner, and that the audit marker rides along.
+ * The producer half of run-as-caller (docs/RUN-AS-CALLER-DELEGATION-SPEC.md,
+ * card 6aa9cc389cd36ab33ad10d76). `acquireWorkspace` never sees the run's
+ * state: it keys every identity decision off the WORKSPACE DOCUMENT, so the fix
+ * that matters is upstream — `workspace_for_repo` now creates the workspace
+ * under the caller, and the spawn's `ownerUserId` and the GitHub App
+ * installation follow for free. What this pins is that nothing on the spawn
+ * path reintroduces the run owner, and that the audit marker rides along.
  *
  * The repository and the hub are faked the way `workspace-spawn-teardown.test.ts`
  * fakes them: no Mongo, no Redis, no network.
