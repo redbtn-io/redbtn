@@ -124,6 +124,7 @@ export {
   enrichInput,
   SecretsDelegationError,
   type EnrichInputOptions,
+  type SecretsIdentity,
 } from './enrich-input';
 
 export {
