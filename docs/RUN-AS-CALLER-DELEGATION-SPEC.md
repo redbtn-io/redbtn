@@ -1,7 +1,9 @@
 # Run-as-caller delegation
 
 Status: describes shipped behaviour. Written from the code in `redbtn-io/redbtn`
-(engine) and `redbtn-io/webapp` (hub) as of engine `0.0.261-alpha`.
+(engine) and `redbtn-io/webapp` (hub) as of engine `0.0.263-alpha`, with
+`secretsIdentity` (section 4) added after the 2026-09-16 board-dispatch
+incident.
 
 Comments in the engine, the hub and the redrun worker cite this file. It was
 never committed until now, so this document is reconstructed from the
@@ -33,6 +35,12 @@ Two invariants hold everywhere:
    have is an error. It never falls back to the owner's copy. That fallback
    would be a cross-tenant credential leak, which is the whole reason this
    mechanism is shaped the way it is.
+
+Secrets are the one resource an automation may take back off the caller, with
+`secretsIdentity: 'owner'`, for the case where the declared secrets are the
+automation's OWN credentials rather than the caller's. That is a per-automation,
+admin-gated choice made up front, not a fallback: section 4, "The one exception:
+the automation's own secrets".
 
 ## 2. Definitions
 
@@ -81,6 +89,16 @@ identity resolution.
 **`executionIdentity`.** `'owner' | 'caller'`, default `'owner'`. The opt-in that
 turns delegation on. Declared in
 `webapp src/lib/database/models/automation/Automation.ts`.
+
+**`secretsIdentity`.** `'caller' | 'owner'`, default `'caller'`. A second
+automation-level field, read only on a delegated run, that decides which
+identity `secretRefs` resolve against. `'caller'` is the rule in section 1 and
+every delegated run behaves as it always has. `'owner'` moves the secrets — and
+nothing else — back onto the owner's undelegated path, for an automation whose
+declared secrets are the AUTOMATION'S OWN credentials rather than the caller's.
+Declared alongside `executionIdentity` in the same model; carried on the BullMQ
+job and consumed as `RunOptions.secretsIdentity`. See section 4, "The one
+exception: the automation's own secrets".
 
 ## 3. How a run becomes delegated
 
@@ -144,19 +162,30 @@ body field, header or query parameter anywhere on this route that sets, hints at
 or overrides the acting identity. `connectionIdentityUserId` is computed solely
 from the `user.userId` that `verifyAuth` returned.
 
-**Where it is turned on.** `executionIdentity` and `callerInvokable` are schema
-fields with defaults `'owner'` and `false`. Neither the create route
-(`webapp src/app/api/automations/route.ts`, `POST`) nor the update route
-(`webapp src/app/api/automations/[automationId]/route.ts`, `PUT`) destructures
-them out of the request body, so today they are not settable through the public
-automations API and no settings UI exposes them. See section 7.
+**Where it is turned on.** `executionIdentity`, `callerInvokable` and
+`secretsIdentity` are schema fields with defaults `'owner'`, `false` and
+`'caller'`. All three are written through one shared gate,
+`resolveExecutionIdentityFields` in
+`webapp src/lib/automations/execution-identity.ts`, which the create route
+(`webapp src/app/api/automations/route.ts`, `POST`) and the update route
+(`webapp src/app/api/automations/[automationId]/route.ts`, `PUT`) both call.
+The gate is two-layered — OWNER (the routes' own role gate) **and** platform
+admin (`accountLevel` 0) — it validates the enum values, treats a supplied
+value equal to the stored one as a no-op, and audits every real change as one
+`automation_execution_identity_change` event. The settings UI is
+`AutomationIdentitySection` on the automation edit page, which shows a non-admin
+the same three settings read-only rather than controls that would 403.
 
 **Into the engine.** `RunOptions.connectionIdentityUserId` reaches
 `buildInitialState`, which puts `callerUserId` on state, and reaches the
 `ConnectionManager` construction inside `run`, which is built with
-`userId: options.connectionIdentityUserId ?? options.userId`. The step from the
-BullMQ job to `RunOptions` happens in the worker (`@redbtn/worker`), a separate
-repository that was not read for this document.
+`userId: options.connectionIdentityUserId ?? options.userId`.
+`RunOptions.secretsIdentity` travels the same road: `buildInitialState` records
+it at `state.data.secretsIdentity` on delegated runs, and the worker forwards it
+into `enrichInput` as `EnrichInputOptions.secretsIdentity` beside
+`secretsIdentityUserId`. The step from the BullMQ job to `RunOptions` happens in
+the worker (`@redbtn/worker`), a separate repository that was not read for this
+document; both fields are forwarded there the same way.
 
 **Through subgraphs.** `engine src/lib/nodes/universal/executors/graphExecutor.ts`
 copies `callerUserId` into the subgraph's `subInput` and mirrors it to
@@ -170,7 +199,7 @@ owner-identity child.
 | Resource | Enforced by |
 | --- | --- |
 | User OAuth connections (by id and by provider default) | `engine src/functions/run.ts` `run` builds `ConnectionManager` with `userId: options.connectionIdentityUserId ?? options.userId`; `engine src/lib/connections/ConnectionManager.ts` rejects any connection whose `connection.userId` differs from that id. The underlying fetcher, `createConnectionFetcher` in `webapp src/lib/connections/connection-fetcher.ts`, filters every query by `userId`; the worker is what constructs it for a job (see section 3, "Into the engine"). |
-| Secrets (`automation.secretNames`, `{{secret:NAME}}` placeholders, `_secrets.NAME` graph references) | `engine src/lib/run/enrich-input.ts` `enrichInput` (`EnrichInputOptions.secretsIdentityUserId`) and `resolveSecrets`. When the delegated identity is present, `scope` is forced to `'user'` and both `scopeId` and `userId` become the caller, so the automation bucket and the owner's bucket are unreachable. |
+| Secrets (`automation.secretNames`, `{{secret:NAME}}` placeholders, `_secrets.NAME` graph references) — **unless the automation sets `secretsIdentity: 'owner'`** | `engine src/lib/run/enrich-input.ts` `enrichInput` (`EnrichInputOptions.secretsIdentityUserId` + `EnrichInputOptions.secretsIdentity`) and `resolveSecrets`. When the delegated identity is present and `secretsIdentity` is `'caller'` (the default), `scope` is forced to `'user'` and both `scopeId` and `userId` become the caller, so the automation bucket and the owner's bucket are unreachable. See the exception below. |
 | Environments and their SSH credentials (`ssh_shell`, `ssh_tail`, `ssh_jobs`, `ssh_kill`, `ssh_run_async`) | `executeViaEnvironment` in `engine src/lib/tools/native/ssh-shell.ts` and `resolveUserId` in `ssh-tail.ts`, `ssh-jobs.ts`, `ssh-kill.ts` and `ssh-run-async.ts`, all reading `state.callerUserId \|\| state.data.callerUserId \|\| state.userId \|\| state.data.userId`. The document lookup, the owner-or-public access check and the `secretRef` resolution are `loadAndResolveEnvironment` in `engine src/lib/environments/loadAndResolveEnvironment.ts`, which resolves the key in the passed identity's own scope with no owner fallback. |
 | Managed workspace ownership | `resolveRunUserId` in `engine src/lib/tools/native/workspace-common.ts`, used by `engine src/lib/tools/native/workspace-for-repo.ts` to find or create the workspace. Because that one call decides `workspace.userId`, every later identity decision follows from it. |
 | GitHub App installation (clone, push, merge) | `resolveJobInstallation` in `workspace-common.ts` calling `resolveGithubInstallation` in `engine src/lib/workspaces/github-installations.ts`. `acquireWorkspace` (`engine src/lib/workspaces/WorkspaceLifecycle.ts`) resolves it for `workspace.userId`; `engine src/lib/tools/native/workspace-ship.ts` for `workspace.userId`; `engine src/lib/tools/native/workspace-merge.ts` for `resolveRunUserId`. |
@@ -188,6 +217,42 @@ owner-identity child.
 | Run record, run state and change events | `AutomationRun.userId`, `initializeRunState({ userId: ownerUserId })` and both `emitResourceChange` calls in the trigger route. |
 | Global-state refs (`{{state:ns.key}}`) | `resolveStateRefs` in `engine src/lib/run/enrich-input.ts` takes the run `userId` (owner) and has no delegated parameter. |
 | Stream sessions | The stream branch of the trigger route; see section 3, step 10. |
+| Secrets, **when the automation sets `secretsIdentity: 'owner'`** | `resolveSecrets` in `engine src/lib/run/enrich-input.ts`. See below. |
+
+### The one exception: the automation's own secrets
+
+Caller-scoped secrets assume the secrets in question belong to the caller. For a
+personal automation that is right. For a platform BOT it is backwards: the bot's
+graph declares the BOT'S OWN credentials as `secretRefs` — the board API token
+it posts with, the SSH key its executor uses — and lends them to work it performs
+on a tenant's behalf. Under the default rule those names are looked up in the
+caller's account, where they cannot exist, and the run dies before its first node
+with `SecretsDelegationError`. That is what happened to the board automation on
+2026-09-16 (`RED_BOARD_TOKEN`, `SSH_KEY`).
+
+`automation.secretsIdentity: 'owner'` is the opt-out, and it is deliberately
+narrow:
+
+- **Only secrets move.** Connections, environments, workspaces, the GitHub App
+  installation and every lifecycle job stay caller-resolved exactly as the tables
+  above describe. The board dispatch still acts on the *board owner's*
+  installation and workspaces via `callerUserId`; only the bot's own keys come
+  from the bot.
+- **The owner's path is the undelegated path, verbatim.** `resolveSecrets`
+  discards the delegated identity for this one lookup, so `scope` /`scopeId` /
+  `userId` are what an owner-triggered run would have produced (the automation
+  bucket for an automation run, the owner otherwise) — including its graceful
+  degradation on a name that does not resolve. Fail-closed
+  (`SecretsDelegationError`) belongs to `'caller'` and is unreachable here.
+- **It is not a fallback.** There is no "try the caller, then the owner"
+  anywhere. The automation picks one identity up front, admin-gated, and that is
+  the one used. A `'caller'` automation can still never read the owner's
+  secrets.
+- **It is announced.** One line per run:
+  `[enrich-input] secrets resolved as owner <id> for delegated run <runId> (secretsIdentity=owner)`.
+
+`'caller'` remains the default for every delegated run, including every
+automation that predates the field, so nothing already in flight moves.
 
 ## 5. Audit trail
 
@@ -201,13 +266,24 @@ owner-identity child.
   names the caller.
 
 **On the queue job** (`webapp src/lib/queue/client.ts`, `submitRunJob`): `userId`
-is the owner, `connectionIdentityUserId` is added only when set, and
-`trigger.metadata` carries `triggeredBy` and `ownerUserId`.
+is the owner, `connectionIdentityUserId` is added only when set,
+`secretsIdentity` is added only on a delegated run, and `trigger.metadata`
+carries `triggeredBy` and `ownerUserId`.
 
 **On run state** (`engine src/functions/run.ts`, `buildInitialState`): both
 identities are present at once, `state.userId` (owner) and `state.callerUserId`
 plus `state.data.callerUserId` (caller). Anything reading state can tell a
 delegated run from an undelegated one by the presence of the second.
+`state.data.secretsIdentity` is stamped on delegated runs only, with the
+effective value (`'caller'` when the automation did not opt out), so a run's own
+checkpointed state records which account lent it its secrets.
+
+**On the automation's write path** (`webapp src/lib/automations/execution-identity.ts`,
+`logExecutionIdentityChange`): every change to `executionIdentity`,
+`callerInvokable` or `secretsIdentity` writes one
+`automation_execution_identity_change` audit event naming the automation, its
+owner, the admin who made the change and each field's before/after
+(`fromSecretsIdentity` / `toSecretsIdentity` for this one).
 
 **On worker lifecycle jobs**: `delegatedFromUserId` carries the owner outward.
 It is produced by `resolveDelegatedFromUserId` (`workspace-common.ts`, for the
@@ -247,13 +323,19 @@ that allowlist is evaluated against the caller: an automation owner appearing in
 `WORKSPACE_GH_APP_FALLBACK_OWNERS` does not let an arbitrary caller's agent
 borrow the platform's installation.
 
-**Caller does not hold a referenced secret.** `resolveSecrets` throws
-`SecretsDelegationError` (code `SECRETS_DELEGATION_MISSING`), whose message names
-the caller and every missing secret name and states that there is no fallback to
-the owner. This fires on three paths: Mongo unavailable, an underlying resolve
-failure, and the post-resolve check for names that did not resolve. On an
-undelegated run all three degrade gracefully instead, which is the pre-existing
-behaviour.
+**Caller does not hold a referenced secret.** On a `secretsIdentity: 'caller'`
+run (the default), `resolveSecrets` throws `SecretsDelegationError` (code
+`SECRETS_DELEGATION_MISSING`), whose message names the caller and every missing
+secret name and states that there is no fallback to the owner. This fires on
+three paths: Mongo unavailable, an underlying resolve failure, and the
+post-resolve check for names that did not resolve. On an undelegated run — and
+on a `secretsIdentity: 'owner'` run, which takes that same path — all three
+degrade gracefully instead, which is the pre-existing behaviour.
+
+If this error names secrets that are the AUTOMATION'S own credentials rather
+than anything the caller could hold, the automation wants
+`secretsIdentity: 'owner'` (section 4), not a caller who has been told to
+duplicate the bot's keys into their account.
 
 There is no `MissingConnections` error class anywhere in the engine or the hub.
 `SecretsDelegationError` is the only delegation-specific error that names the
@@ -318,17 +400,18 @@ should change.
 
 ### Turning delegation on
 
-`executionIdentity` and `callerInvokable` have no write path in the public
-automations API and no settings UI. Setting them today means writing the
-automation document directly. Whether they should be exposed, and with what
-confirmation, is open.
+Settled. `executionIdentity`, `callerInvokable` and `secretsIdentity` are
+written through `resolveExecutionIdentityFields` from both automation write
+routes, gated on OWNER **and** platform admin (`accountLevel` 0), audited on
+every change, and surfaced in `AutomationIdentitySection` on the automation edit
+page (read-only for a non-admin). See section 3, "Where it is turned on".
 
 ### Board dispatch identity
 
-Open, tracked on card `6aa9cc389cd36ab33ad10d76` (referenced from the commit
-that landed the workspace half of this mechanism, engine #478, first released in
-`0.0.260-alpha`). A board dispatch runs work on behalf of whoever moved the
-card, and there are two shapes on the table:
+Tracked on card `6aa9cc389cd36ab33ad10d76` (referenced from the commit that
+landed the workspace half of this mechanism, engine #478, first released in
+`0.0.260-alpha`). Two shapes were on the table for how a board dispatch acts on
+behalf of whoever moved the card:
 
 1. **Per-tenant automation.** Each tenant owns an
    `executionIdentity: 'caller'` automation, and the dispatch triggers it
@@ -342,8 +425,14 @@ card, and there are two shapes on the table:
    1 in section 1 currently forbids. It would need its own authentication,
    scoping and audit story.
 
-No decision is recorded here. Both are noted so that whoever picks this up knows
-what the trade-off is.
+Shape 1 was taken, and running it in production surfaced what `secretsIdentity`
+now fixes: the dispatch must use the BOARD OWNER's connections, installation and
+workspaces (which `callerUserId` already gave it) while the platform bot's own
+`secretRefs` keep resolving against the automation owner. The dispatch
+automation therefore sets `executionIdentity: 'caller'` **and**
+`secretsIdentity: 'owner'`. Invariant 1 is untouched — the acting identity is
+still derived from the caller's verified authentication, and `secretsIdentity`
+is a property of the automation, not something a request can assert.
 
 ### What this document could not verify
 
@@ -354,8 +443,10 @@ code read in this repository:
 - **The BullMQ job to `RunOptions` hop.** The worker (`@redbtn/worker`) is what
   reads `connectionIdentityUserId` off the job, builds the connection fetcher
   with it, and passes it to `run` and into `enrichInput` as
-  `secretsIdentityUserId`. Every statement in this document about that hop
-  comes from the engine-side and hub-side comments that describe it.
+  `secretsIdentityUserId`. `secretsIdentity` rides the same hop, forwarded
+  verbatim onto `RunOptions.secretsIdentity` and
+  `EnrichInputOptions.secretsIdentity`. Every statement in this document about
+  that hop comes from the engine-side and hub-side comments that describe it.
 - **The redrun worker's credential resolution.** Section 5 and section 6
   describe `credentialIdentityLine`, `fallbackCredentialOwners` and the
   installation-token path from `redrun worker/src/lib/github-app.ts`, read as a
