@@ -24,11 +24,14 @@ import { describe, it, expect } from 'vitest';
 import {
   WORKSPACE_TIER_POLICIES,
   WorkspaceRepository,
+  WorkspaceSession,
   applyTierPolicy,
   buildReleaseJobData,
   clampSnapshotRetention,
   clampWorkspaceConfigForTier,
+  usableRetentionOutcome,
   workspaceTierPolicy,
+  type LifecycleQueue,
   type WorkspaceTierName,
 } from '../../src/lib/workspaces';
 
@@ -211,5 +214,208 @@ describe('the release job carries the policy only when it will take a snapshot',
       checkoutKey: 'trunk',
       removeVolume: false,
     });
+  });
+});
+
+/**
+ * The other direction: what the node did comes BACK.
+ *
+ * Two live passes on 2026-09-15 logged "→ removed applied" and reported
+ * `removed: null`, so nobody could tell whether a repository holding 15
+ * snapshots under keep-last 3 had been trimmed at all. redrun now returns a
+ * count on the job result; this is the half that remembers it, so the answer
+ * survives the worker log's retention window and shows up on the workspace.
+ */
+
+/** Captures the release update instead of writing it. Enough Db for `releaseWorkspace`. */
+function releaseCapture(checkout = { checkoutId: 'chk_1', runId: 'run_1' }) {
+  const updates: Array<{ filter: any; update: any }> = [];
+  const db = {
+    collection() {
+      return {
+        async findOne() {
+          return {
+            activeCheckouts: [
+              {
+                ...checkout,
+                mode: 'exclusive',
+                checkoutKey: 'trunk',
+                branch: 'main',
+                createdAt: new Date('2026-09-15T21:00:00Z'),
+              },
+            ],
+          };
+        },
+        async updateOne(filter: any, update: any) {
+          updates.push({ filter, update });
+          return { matchedCount: 1, modifiedCount: 1 };
+        },
+      };
+    },
+  } as any;
+  return { repo: new WorkspaceRepository(db), updates };
+}
+
+const SNAPSHOT_META = {
+  snapshotId: 'snap-1',
+  snapshotSizeBytes: 42,
+  fileCount: 7,
+  computeSeconds: 3,
+};
+
+describe('releaseWorkspace records what the forget pass cost', () => {
+  const release = (over: Record<string, unknown>) => ({
+    workspaceId: 'ws_abc',
+    checkoutId: 'chk_1',
+    runId: 'run_1',
+    commitTrunkSnapshot: true,
+    snapshotMeta: SNAPSHOT_META,
+    ...over,
+  });
+
+  it('writes the timestamp and the count beside the snapshot, in one update', async () => {
+    const { repo, updates } = releaseCapture();
+    await repo.releaseWorkspace(release({ retention: { keepLast: 3, keepWithinDays: 7, removed: 12 } }) as any);
+
+    expect(updates).toHaveLength(1);
+    const $set = updates[0].update.$set;
+    expect($set['stats.lastSnapshotRetentionRemoved']).toBe(12);
+    expect($set['stats.lastSnapshotRetentionAt']).toBeInstanceOf(Date);
+    // The SAME instant as the snapshot it followed: one release is one write, so
+    // a workspace page can never show this release's snapshot next to the last
+    // release's prune.
+    expect($set['stats.lastSnapshotRetentionAt']).toEqual($set['stats.lastSnapshotAt']);
+
+    // Zero is a real answer — nothing was old enough — and must not be confused
+    // with the unknown below.
+    const none = releaseCapture();
+    await none.repo.releaseWorkspace(
+      release({ retention: { keepLast: 3, keepWithinDays: 7, removed: 0 } }) as any,
+    );
+    expect(none.updates[0].update.$set['stats.lastSnapshotRetentionRemoved']).toBe(0);
+
+    // And null is "it ran, restic did not say": the timestamp still moves,
+    // because the repository really was trimmed, only by an unknown amount.
+    const unknown = releaseCapture();
+    await unknown.repo.releaseWorkspace(
+      release({ retention: { keepLast: 3, keepWithinDays: 7, removed: null } }) as any,
+    );
+    const set = unknown.updates[0].update.$set;
+    expect(set['stats.lastSnapshotRetentionRemoved']).toBeNull();
+    expect(set['stats.lastSnapshotRetentionAt']).toBeInstanceOf(Date);
+  });
+
+  it('touches neither field when the release says nothing about retention', async () => {
+    // A workspace with no policy, a worker too old to report one, and a snapshot
+    // that never came back are all this case. Stamping a null over the last real
+    // count would erase the only record that the history was ever pruned.
+    const { repo, updates } = releaseCapture();
+    await repo.releaseWorkspace(release({}) as any);
+    const $set = updates[0].update.$set;
+    expect('stats.lastSnapshotRetentionAt' in $set).toBe(false);
+    expect('stats.lastSnapshotRetentionRemoved' in $set).toBe(false);
+    // The snapshot half of the same update is untouched by any of this.
+    expect($set['stats.lastSnapshotAt']).toBeInstanceOf(Date);
+    expect($set['currentSnapshotId']).toBe('snap-1');
+
+    // Including on a teardown release, which takes no snapshot at all.
+    const teardown = releaseCapture();
+    await teardown.repo.releaseWorkspace({
+      workspaceId: 'ws_abc',
+      checkoutId: 'chk_1',
+      runId: 'run_1',
+      outcome: 'error',
+    } as any);
+    expect('stats.lastSnapshotRetentionAt' in teardown.updates[0].update.$set).toBe(false);
+  });
+});
+
+describe('the release carries the forget outcome back off the job result', () => {
+  /** A session over fakes: no Mongo, no Redis, no queue, no docker socket. */
+  function session(snapshotResult: any) {
+    const released: any[] = [];
+    const repo = {
+      async releaseWorkspace(options: any) {
+        released.push(options);
+      },
+      async setWorkspaceNode() {},
+      async clearWorkspaceNode() {},
+      async clearParkedCheckout() {},
+      async setParkedCheckout() {},
+    } as any;
+    const queue: LifecycleQueue = {
+      async runJob() {
+        if (snapshotResult instanceof Error) throw snapshotResult;
+        return snapshotResult;
+      },
+    };
+    const acquired = {
+      workspace: {
+        workspaceId: 'ws_abc',
+        version: 1,
+        config: { snapshotRetention: { keepLast: 3, keepWithinDays: 7 } },
+      },
+      checkout: { checkoutId: 'chk_1', runId: 'run_1', mode: 'exclusive', checkoutKey: 'trunk', installId: 'i' },
+      environmentId: 'env_1',
+      nodeId: '10.100.0.5',
+      containerName: 'ws_abc_chk_1',
+      volumeName: 'ws_abc_data',
+    } as any;
+    return { session: new WorkspaceSession(repo, acquired, queue, 60_000), released };
+  }
+
+  const snapshotOk = (over: Record<string, unknown> = {}) => ({
+    ok: true,
+    snapshotId: 'snap-1',
+    snapshotSizeBytes: 42,
+    fileCount: 7,
+    durationSeconds: 3,
+    ...over,
+  });
+
+  it('passes the node\'s count straight through to the repository', async () => {
+    const s = session(snapshotOk({ retention: { keepLast: 3, keepWithinDays: 7, removed: 12 } }));
+    await s.session.release();
+    expect(s.released[0].retention).toEqual({ keepLast: 3, keepWithinDays: 7, removed: 12 });
+
+    // `removed: null` — the worker's "it ran, restic did not say" — stays null
+    // rather than collapsing to zero or dropping the whole outcome.
+    const unknown = session(snapshotOk({ retention: { keepLast: 3, keepWithinDays: 7, removed: null } }));
+    await unknown.session.release();
+    expect(unknown.released[0].retention).toEqual({ keepLast: 3, keepWithinDays: 7, removed: null });
+  });
+
+  it('sends nothing when the node reported nothing, and never over a failed release', async () => {
+    const quiet = session(snapshotOk());
+    await quiet.session.release();
+    expect('retention' in quiet.released[0]).toBe(false);
+
+    // The snapshot job failed outright: the checkout is still given back, but
+    // this release knows nothing about the repository and says nothing.
+    const failed = session(new Error('snapshot timed out'));
+    await failed.session.release();
+    expect(failed.released[0].outcome).toBe('error');
+    expect('retention' in failed.released[0]).toBe(false);
+  });
+
+  it('refuses a job result that is not the policy it claims to have applied', () => {
+    expect(usableRetentionOutcome({ keepLast: 3, keepWithinDays: 7, removed: 12 })).toEqual({
+      keepLast: 3,
+      keepWithinDays: 7,
+      removed: 12,
+    });
+    // A count that is not a whole number of snapshots is an unknown, not a zero.
+    for (const removed of [undefined, 'twelve', -1, NaN, Infinity, {}, true]) {
+      expect(usableRetentionOutcome({ keepLast: 3, keepWithinDays: 7, removed })).toEqual({
+        keepLast: 3,
+        keepWithinDays: 7,
+        removed: null,
+      });
+    }
+    // No policy, no record: a malformed message must not stamp a timestamp and a
+    // null over the last real answer.
+    for (const junk of [undefined, null, {}, 'forgot', 42, [], { removed: 12 }, { keepLast: 0, keepWithinDays: 7, removed: 1 }]) {
+      expect(usableRetentionOutcome(junk), `accepted ${JSON.stringify(junk)}`).toBeNull();
+    }
   });
 });
