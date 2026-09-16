@@ -205,6 +205,23 @@ export interface IWorkspaceStats {
   totalRunCount: number;
   /** Cumulative compute duration across all checkouts. */
   totalComputeSeconds: number;
+  /**
+   * When a release last ran the forget pass over this workspace's restic
+   * repository.
+   *
+   * Absent on a workspace whose releases never carried a policy: its history has
+   * never been pruned, which is a different thing from pruned and nothing went.
+   */
+  lastSnapshotRetentionAt?: Date;
+  /**
+   * How many snapshots that pass removed.
+   *
+   * `null` is "it ran, restic's output did not say how much" — the worker
+   * distinguishes that from `0`, which is a real "nothing was old enough", and
+   * so does this. Reading null as zero would report a repository as trimmed when
+   * nobody knows whether it was.
+   */
+  lastSnapshotRetentionRemoved?: number | null;
 }
 
 export interface IWorkspace {
@@ -310,6 +327,28 @@ export interface IReleaseOptions {
   volumeRemoved?: boolean;
   /** The node reported keeping the runner alive. Recorded on the entry. */
   parked?: boolean;
+  /**
+   * What the node's forget pass did, as the snapshot job reported it.
+   *
+   * Absent leaves `stats.lastSnapshotRetention*` exactly as they were: a release
+   * that carried no policy, a worker too old to report one, and a snapshot that
+   * never came back are all "this release says nothing about retention", and
+   * stamping them over the last real answer would erase it.
+   */
+  retention?: IReleaseRetention;
+}
+
+/**
+ * The outcome of one restic forget, off the snapshot job result.
+ *
+ * `removed: null` means the forget ran and the count is unknown — restic's
+ * output held no number, or the forget itself failed and the worker swallowed it
+ * because the snapshot had already succeeded.
+ */
+export interface IReleaseRetention {
+  keepLast: number;
+  keepWithinDays: number;
+  removed: number | null;
 }
 
 export interface CreateWorkspaceInput {

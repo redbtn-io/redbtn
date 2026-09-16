@@ -33,6 +33,7 @@ import type {
   IWorkspaceCheckout,
   IParkedCheckout,
   IWorkspaceSnapshotRetention,
+  IReleaseRetention,
   CheckoutMode,
 } from './types.js';
 
@@ -239,6 +240,30 @@ function usableRetention(
   return { keepLast: Math.floor(keepLast), keepWithinDays: Math.floor(keepWithinDays) };
 }
 
+/**
+ * The forget outcome a release may RECORD, read back off the job result.
+ *
+ * The result is JSON off a queue, not a type. A worker that predates the field
+ * sends nothing, and anything that is not the policy it claims to have applied
+ * is treated as nothing: the alternative is stamping a timestamp and a null over
+ * the last real count on the strength of a malformed message.
+ *
+ * `removed` stays as it came when it is a whole count of zero or more — 0 is a
+ * real "nothing was old enough" — and becomes null otherwise, which is what the
+ * worker already means by "it ran, restic did not say".
+ */
+export function usableRetentionOutcome(value: unknown): IReleaseRetention | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const { keepLast, keepWithinDays, removed } = value as Record<string, unknown>;
+  const policy = usableRetention({ keepLast, keepWithinDays } as IWorkspaceSnapshotRetention);
+  if (!policy) return null;
+  const counted =
+    typeof removed === 'number' && Number.isFinite(removed) && removed >= 0
+      ? Math.floor(removed)
+      : null;
+  return { ...policy, removed: counted };
+}
+
 export function buildReleaseJobData(input: ReleaseJobInput): Record<string, unknown> {
   // Only a job that will actually back something up carries a forget policy: a
   // teardown release (`skipSnapshot`) adds no snapshot, so pruning on its way
@@ -353,8 +378,8 @@ export interface AcquireOptions {
    */
   nodeId?: string;
   /**
-   * Run-as-caller delegation (RUN-AS-CALLER-DELEGATION-SPEC.md): the OWNER of
-   * the automation, on a run that executes as somebody else.
+   * Run-as-caller delegation (docs/RUN-AS-CALLER-DELEGATION-SPEC.md): the
+   * OWNER of the automation, on a run that executes as somebody else.
    *
    * AUDIT ONLY, and deliberately not an identity. Every identity decision on
    * this path already reads `workspace.userId` — which IS the caller, because
@@ -447,6 +472,10 @@ export class WorkspaceSession {
     // container that does not exist.
     let parked = false;
     let parkedUntil: Date | null = null;
+    // What the node's forget pass did, if it ran one. Absent on every release
+    // that carried no policy and on every worker older than the field, and
+    // absent is carried through as absent so the recorded numbers stand.
+    let retention: IReleaseRetention | null = null;
     // Whether the release ran clean. The checkout is given back either way, but
     // the history entry says which, so a workspace whose snapshots keep failing
     // is visible on its own page instead of only in a worker log.
@@ -475,6 +504,7 @@ export class WorkspaceSession {
       volumeRemoved = result?.volumeRemoved === true;
       parked = result?.parked === true;
       parkedUntil = typeof result?.parkedUntil === 'number' ? new Date(result.parkedUntil) : null;
+      retention = usableRetentionOutcome(result?.retention);
       if (result?.snapshotId) {
         snapshotMeta = {
           snapshotId: result.snapshotId,
@@ -535,6 +565,7 @@ export class WorkspaceSession {
       outcome,
       volumeRemoved,
       parked: parked && !volumeRemoved,
+      ...(retention ? { retention } : {}),
     });
   }
 }
@@ -657,7 +688,7 @@ export async function acquireWorkspace(
     // NOTE `workspace.userId` — not the run's owner. A delegated run's
     // workspace was created under the CALLER by `workspace_for_repo`, so this
     // asks the hub for the CALLER's installation and the spawn clones with the
-    // caller's grant (RUN-AS-CALLER-DELEGATION-SPEC.md).
+    // caller's grant (docs/RUN-AS-CALLER-DELEGATION-SPEC.md).
     const githubInstallationId = workspace.config?.gitRepoUrl
       ? (await resolveGithubInstallation(workspace.userId, workspace.config.gitRepoUrl)).installationId
       : null;

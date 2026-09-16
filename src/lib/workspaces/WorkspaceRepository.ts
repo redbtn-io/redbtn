@@ -529,6 +529,20 @@ export class WorkspaceRepository {
       update.$set['stats.lastSnapshotAt'] = now;
     }
 
+    // What the forget pass cost the repository, recorded in the SAME update as
+    // the snapshot it followed — one release is one write, so a workspace page
+    // never shows a snapshot from this release beside a prune from the last.
+    // Absent retention writes nothing at all: see IReleaseOptions.retention.
+    if (options.retention) {
+      const { removed } = options.retention;
+      update.$set['stats.lastSnapshotRetentionAt'] = now;
+      // null is "unknown", and only a whole count of zero or more is a count.
+      update.$set['stats.lastSnapshotRetentionRemoved'] =
+        typeof removed === 'number' && Number.isFinite(removed) && removed >= 0
+          ? Math.floor(removed)
+          : null;
+    }
+
     // Guarded on the CHECKOUT, not on the document version. `version` is $inc'd
     // by every other checkout, by the reaper and by the UI's PATCH, so with
     // parallel branch checkouts a whole-document CAS was guaranteed to conflict
