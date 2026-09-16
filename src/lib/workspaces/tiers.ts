@@ -2,6 +2,12 @@
  * Storage tiers: what a workspace's warm/hot windows and concurrency default to,
  * and how far a user may push them, as a function of who owns it.
  *
+ * `snapshotRetention` (how much restic history a trunk workspace keeps) joins
+ * them: every release wrote a snapshot nothing ever forgot, so storage grew
+ * until the workspace was deleted. How much history is worth paying to keep is
+ * the same question as how long a volume stays warm, and it gets the same
+ * answer — the tier.
+ *
  * `warmTtlSeconds` (how long the node pin and the warm volume live) and
  * `hotIdleSeconds` (how long a parked runner is held for the next checkout) were
  * flat defaults for everybody: 24 h warm, hot off, 8 parallel checkouts,
@@ -22,7 +28,7 @@
  * file hardcodes a duration. Tuning a tier is editing one row.
  */
 
-import type { IWorkspaceConfig } from './types.js';
+import type { IWorkspaceConfig, IWorkspaceSnapshotRetention } from './types.js';
 
 /** Named account tiers, in `accountLevel` order. */
 export type WorkspaceTierName = 'admin' | 'enterprise' | 'pro' | 'basic' | 'free';
@@ -52,6 +58,16 @@ export interface WorkspaceTierPolicy {
   hotIdleSeconds: WorkspaceTierLimit;
   /** How many checkouts may hold this workspace at once. */
   maxConcurrentCheckouts: WorkspaceTierLimit;
+  /**
+   * How much snapshot history a release leaves behind.
+   *
+   * Unlike the limits above this is not a {default, max} pair: the tier's
+   * numbers ARE both. They are what a new workspace gets, and they are the
+   * ceiling an explicit setting is clamped to — asking for more history than
+   * the plan pays for is the whole thing the cap exists to stop, and asking for
+   * LESS is always allowed.
+   */
+  snapshotRetention: IWorkspaceSnapshotRetention;
 }
 
 const HOUR = 60 * 60;
@@ -71,6 +87,9 @@ const MINUTE = 60;
  *  - concurrency keeps headroom above its default so a user who genuinely runs
  *    several cards in parallel can raise it without changing plan; the cap is
  *    what stops one workspace from taking a whole node.
+ *  - retention is two rules at once and restic keeps a snapshot matching
+ *    EITHER, so `keepLast` protects a burst of releases in one afternoon and
+ *    `keepWithinDays` protects a workspace nobody has touched for a fortnight.
  */
 export const WORKSPACE_TIER_POLICIES: Record<WorkspaceTierName, WorkspaceTierPolicy> = {
   admin: {
@@ -80,6 +99,7 @@ export const WORKSPACE_TIER_POLICIES: Record<WorkspaceTierName, WorkspaceTierPol
     warmTtlSeconds: { default: 72 * HOUR, max: 7 * DAY },
     hotIdleSeconds: { default: 15 * MINUTE, max: 60 * MINUTE },
     maxConcurrentCheckouts: { default: 4, max: 8 },
+    snapshotRetention: { keepLast: 30, keepWithinDays: 30 },
   },
   enterprise: {
     tier: 'enterprise',
@@ -88,6 +108,7 @@ export const WORKSPACE_TIER_POLICIES: Record<WorkspaceTierName, WorkspaceTierPol
     warmTtlSeconds: { default: 72 * HOUR, max: 7 * DAY },
     hotIdleSeconds: { default: 15 * MINUTE, max: 60 * MINUTE },
     maxConcurrentCheckouts: { default: 4, max: 8 },
+    snapshotRetention: { keepLast: 30, keepWithinDays: 30 },
   },
   pro: {
     tier: 'pro',
@@ -96,6 +117,7 @@ export const WORKSPACE_TIER_POLICIES: Record<WorkspaceTierName, WorkspaceTierPol
     warmTtlSeconds: { default: 24 * HOUR, max: 72 * HOUR },
     hotIdleSeconds: { default: 5 * MINUTE, max: 15 * MINUTE },
     maxConcurrentCheckouts: { default: 2, max: 4 },
+    snapshotRetention: { keepLast: 10, keepWithinDays: 14 },
   },
   basic: {
     tier: 'basic',
@@ -104,6 +126,7 @@ export const WORKSPACE_TIER_POLICIES: Record<WorkspaceTierName, WorkspaceTierPol
     warmTtlSeconds: { default: 24 * HOUR, max: 72 * HOUR },
     hotIdleSeconds: { default: 5 * MINUTE, max: 15 * MINUTE },
     maxConcurrentCheckouts: { default: 2, max: 4 },
+    snapshotRetention: { keepLast: 10, keepWithinDays: 14 },
   },
   free: {
     tier: 'free',
@@ -112,6 +135,7 @@ export const WORKSPACE_TIER_POLICIES: Record<WorkspaceTierName, WorkspaceTierPol
     warmTtlSeconds: { default: 6 * HOUR, max: 24 * HOUR },
     hotIdleSeconds: { default: 0, max: 5 * MINUTE },
     maxConcurrentCheckouts: { default: 1, max: 2 },
+    snapshotRetention: { keepLast: 3, keepWithinDays: 7 },
   },
 };
 
@@ -179,12 +203,43 @@ function clampToLimit(
 export function applyTierPolicy<T extends Partial<IWorkspaceConfig>>(
   config: T | null | undefined,
   policy: WorkspaceTierPolicy,
-): T & { warmTtlSeconds: number; hotIdleSeconds: number } {
+): T & {
+  warmTtlSeconds: number;
+  hotIdleSeconds: number;
+  snapshotRetention: IWorkspaceSnapshotRetention;
+} {
   const source = (config ?? {}) as T;
   return {
     ...source,
     warmTtlSeconds: clampToLimit(source.warmTtlSeconds, policy.warmTtlSeconds, 1),
     hotIdleSeconds: clampToLimit(source.hotIdleSeconds, policy.hotIdleSeconds, 0),
+    snapshotRetention: clampSnapshotRetention(source.snapshotRetention, policy),
+  };
+}
+
+/**
+ * How much history this tier lets a workspace that asked for `value` keep.
+ *
+ * Absent or unusable → the tier's own numbers. A partial ask ({keepLast} with
+ * no window, say) fills the other half from the tier rather than inventing a
+ * zero, because a retention with a zero in it is a policy that forgets
+ * everything. Each half is floored at 1 and capped at the tier's, so a user may
+ * always keep LESS than their plan pays for and never more.
+ */
+export function clampSnapshotRetention(
+  value: unknown,
+  policy: WorkspaceTierPolicy,
+): IWorkspaceSnapshotRetention {
+  const ceiling = policy.snapshotRetention;
+  if (!value || typeof value !== 'object') return { ...ceiling };
+  const asked = value as Partial<IWorkspaceSnapshotRetention>;
+  const half = (n: unknown, max: number): number => {
+    if (typeof n !== 'number' || !Number.isFinite(n)) return max;
+    return Math.min(Math.max(1, Math.floor(n)), max);
+  };
+  return {
+    keepLast: half(asked.keepLast, ceiling.keepLast),
+    keepWithinDays: half(asked.keepWithinDays, ceiling.keepWithinDays),
   };
 }
 
@@ -201,6 +256,7 @@ export interface WorkspaceTierPatch {
   warmTtlSeconds?: number;
   hotIdleSeconds?: number;
   maxConcurrentCheckouts?: number;
+  snapshotRetention?: IWorkspaceSnapshotRetention;
 }
 
 /**
@@ -230,6 +286,12 @@ export function clampWorkspaceConfigForTier(
     Number.isFinite(patch.maxConcurrentCheckouts)
   ) {
     out.maxConcurrentCheckouts = clampMaxConcurrentCheckouts(patch.maxConcurrentCheckouts, policy);
+  }
+  // An update is also how a workspace older than retention acquires one: the
+  // patch says `snapshotRetention` and the tier decides how much of it is
+  // allowed. Still nothing is filled in for a patch that stays silent.
+  if (patch.snapshotRetention && typeof patch.snapshotRetention === 'object') {
+    out.snapshotRetention = clampSnapshotRetention(patch.snapshotRetention, policy);
   }
   return out;
 }

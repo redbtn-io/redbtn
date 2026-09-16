@@ -113,6 +113,27 @@ export interface ICheckoutHistoryEntry {
   pr?: ICheckoutPullRequest;
 }
 
+/**
+ * How much snapshot history a workspace keeps.
+ *
+ * Every release of a trunk checkout writes an UNTAGGED restic snapshot into the
+ * workspace's own repository, and until this existed nothing ever removed one:
+ * the history grew for the life of the workspace and was only ever collected
+ * when the workspace itself was deleted. These two numbers are the forget
+ * policy the node applies right after a successful backup — restic keeps a
+ * snapshot that satisfies EITHER rule, so a busy day is not pruned down to
+ * `keepLast` and a quiet month still keeps something.
+ *
+ * Both come from the owner's storage tier (see ./tiers.ts), which supplies the
+ * default AND the ceiling.
+ */
+export interface IWorkspaceSnapshotRetention {
+  /** Always keep this many of the most recent snapshots. */
+  keepLast: number;
+  /** Also keep every snapshot taken within this many days. */
+  keepWithinDays: number;
+}
+
 export interface IWorkspaceConfig {
   /** Docker image used for the workspace container runner. */
   dockerImage: string;
@@ -143,6 +164,14 @@ export interface IWorkspaceConfig {
    * nobody at all.
    */
   hotIdleSeconds?: number;
+  /**
+   * How many snapshots the trunk repository keeps, and for how long (default:
+   * the owner's tier, filled at create). ABSENT means "forget nothing" — every
+   * workspace created before retention existed has no value here, and pruning a
+   * paying account's history on a guess is not a default worth having. Those
+   * documents pick one up the next time their config is saved.
+   */
+  snapshotRetention?: IWorkspaceSnapshotRetention;
 }
 
 /**

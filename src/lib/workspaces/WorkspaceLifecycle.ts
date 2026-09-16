@@ -16,7 +16,9 @@
  * survives a release for `config.hotIdleSeconds` and the next acquire adopts it
  * (no start, no registration); the VOLUME survives for `config.warmTtlSeconds`
  * and the next acquire reuses the working copy on that node; the SNAPSHOT
- * survives everything and is restored from object storage anywhere.
+ * survives everything and is restored from object storage anywhere — for as
+ * long as `config.snapshotRetention` says, which the release job carries to the
+ * node so the backup and the forget happen in the same place.
  *
  * The engine never touches the docker socket. It talks to the per-node redrun
  * worker over BullMQ, which is the one process on each node that already holds
@@ -26,7 +28,13 @@ import type { Db } from 'mongodb';
 import { WorkspaceRepository, warmTtlSeconds, hotIdleSeconds } from './WorkspaceRepository.js';
 import { createWorkspaceRegistrationToken } from './workspace-token.js';
 import { resolveGithubInstallation } from './github-installations.js';
-import type { IWorkspace, IWorkspaceCheckout, IParkedCheckout, CheckoutMode } from './types.js';
+import type {
+  IWorkspace,
+  IWorkspaceCheckout,
+  IParkedCheckout,
+  IWorkspaceSnapshotRetention,
+  CheckoutMode,
+} from './types.js';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { Queue: BullQueue } = require('bullmq');
@@ -207,9 +215,35 @@ export interface ReleaseJobInput {
   park?: { idleSeconds: number; environmentId: string };
   /** See `AcquireOptions.delegatedFromUserId`. Audit only; usually absent. */
   delegatedFromUserId?: string;
+  /**
+   * The forget policy the node applies after the backup — `config.snapshotRetention`,
+   * resolved from the owner's tier at create.
+   *
+   * Absent on every workspace created before retention existed, and absent is
+   * carried through as absent: the worker's old behaviour (keep everything) is
+   * the only safe reading of a document that never agreed to a policy, and
+   * substituting the FREE numbers would prune a paying account's history on a
+   * guess. Those workspaces pick one up the next time their config is saved.
+   */
+  snapshotRetention?: IWorkspaceSnapshotRetention;
+}
+
+/** A retention the worker can actually act on, or nothing at all. */
+function usableRetention(
+  value: IWorkspaceSnapshotRetention | null | undefined,
+): IWorkspaceSnapshotRetention | null {
+  if (!value || typeof value !== 'object') return null;
+  const { keepLast, keepWithinDays } = value;
+  const ok = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 1;
+  if (!ok(keepLast) || !ok(keepWithinDays)) return null;
+  return { keepLast: Math.floor(keepLast), keepWithinDays: Math.floor(keepWithinDays) };
 }
 
 export function buildReleaseJobData(input: ReleaseJobInput): Record<string, unknown> {
+  // Only a job that will actually back something up carries a forget policy: a
+  // teardown release (`skipSnapshot`) adds no snapshot, so pruning on its way
+  // past would delete history this release did nothing to earn.
+  const retention = input.skipSnapshot ? null : usableRetention(input.snapshotRetention);
   return {
     action: 'snapshot',
     workspaceId: input.workspaceId,
@@ -222,6 +256,7 @@ export function buildReleaseJobData(input: ReleaseJobInput): Record<string, unkn
     removeVolume: input.mode === 'branch',
     ...(input.park && input.park.idleSeconds > 0 ? { park: input.park } : {}),
     ...(input.delegatedFromUserId ? { delegatedFromUserId: input.delegatedFromUserId } : {}),
+    ...(retention ? { snapshotRetention: retention } : {}),
   };
 }
 
@@ -427,6 +462,9 @@ export class WorkspaceSession {
           mode: checkout.mode,
           checkoutKey: checkout.checkoutKey,
           skipSnapshot: options.skipSnapshot ?? false,
+          ...(workspace.config?.snapshotRetention
+            ? { snapshotRetention: workspace.config.snapshotRetention }
+            : {}),
           ...(idleSeconds > 0
             ? { park: { idleSeconds, environmentId: this.acquired.environmentId } }
             : {}),
