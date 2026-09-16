@@ -225,18 +225,30 @@ export interface ReleaseJobInput {
    * the only safe reading of a document that never agreed to a policy, and
    * substituting the FREE numbers would prune a paying account's history on a
    * guess. Those workspaces pick one up the next time their config is saved.
+   *
+   * `keepWithinDays: 0` travels verbatim and means "no time bound": the node
+   * runs the forget with `--keep-last N` and no `--keep-within`.
    */
   snapshotRetention?: IWorkspaceSnapshotRetention;
 }
 
-/** A retention the worker can actually act on, or nothing at all. */
+/**
+ * A retention the worker can actually act on, or nothing at all.
+ *
+ * `keepWithinDays: 0` is the one zero that passes: it is "no time bound, keep
+ * the latest `keepLast`", and the worker turns it into a `restic forget` with
+ * no `--keep-within` at all. Everything else — an absent half, a zero
+ * `keepLast`, a string — is no policy, because a half-written one reaches the
+ * node as `--keep-last undefined`.
+ */
 function usableRetention(
   value: IWorkspaceSnapshotRetention | null | undefined,
 ): IWorkspaceSnapshotRetention | null {
   if (!value || typeof value !== 'object') return null;
   const { keepLast, keepWithinDays } = value;
-  const ok = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 1;
-  if (!ok(keepLast) || !ok(keepWithinDays)) return null;
+  const whole = (n: unknown, min: number): n is number =>
+    typeof n === 'number' && Number.isFinite(n) && n >= min;
+  if (!whole(keepLast, 1) || !whole(keepWithinDays, 0)) return null;
   return { keepLast: Math.floor(keepLast), keepWithinDays: Math.floor(keepWithinDays) };
 }
 
