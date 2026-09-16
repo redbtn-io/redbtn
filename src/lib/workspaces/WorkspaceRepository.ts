@@ -115,7 +115,8 @@ export class WorkspaceRepository {
     const now = new Date();
     const workspaceId = input.workspaceId || generateWorkspaceId();
     // Who is paying decides how long this workspace may stay warm, how long a
-    // runner may stay parked for it, and how many checkouts it may hold at once.
+    // runner may stay parked for it, how many checkouts it may hold at once, and
+    // how much snapshot history its releases leave behind.
     // A caller with no tier in hand gets the lowest policy — see ./tiers.ts.
     const policy = workspaceTierPolicy(input.accountTier);
     const tiered = applyTierPolicy(input.config, policy);
@@ -142,6 +143,7 @@ export class WorkspaceRepository {
         gitBranch: input.config?.gitBranch || 'main',
         warmTtlSeconds: tiered.warmTtlSeconds,
         hotIdleSeconds: tiered.hotIdleSeconds,
+        snapshotRetention: tiered.snapshotRetention,
       },
       stats: {
         snapshotSizeBytes: 0,
