@@ -225,6 +225,10 @@ export async function destroyWorkspace(
       await enqueueDestroy(queue, target.queueName, {
         action: 'destroy',
         workspaceId,
+        // The workspace's own user, which is the CALLER for anything a
+        // delegated run created (`workspace_for_repo` → `resolveRunUserId`).
+        // There is no run state here — a destroy is an API delete, not a step —
+        // so there is no delegation to mark: the document is the only identity.
         userId: workspace.userId,
         purgeSnapshots,
       });

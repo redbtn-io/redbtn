@@ -40,17 +40,80 @@ export function resolveLifecycleQueue(context: NativeToolContext): LifecycleQueu
   return (context?.state?.workspaceQueue as LifecycleQueue | undefined) || bullLifecycleQueue;
 }
 
+/**
+ * The identity these tools ACT AS.
+ *
+ * Run-as-caller delegation (RUN-AS-CALLER-DELEGATION-SPEC.md): an automation
+ * declared `executionIdentity:'caller'` + `callerInvokable` is triggered by
+ * somebody who is not its owner, the hub puts that VERIFIED caller on the run,
+ * and `buildInitialState` mirrors it onto state as `callerUserId` (top level
+ * and `data.callerUserId`). The spec's rule is that CONNECTIONS, ENVIRONMENTS
+ * and SECRETS resolve as the caller while LLM access, tier gating and metering
+ * stay on the owner.
+ *
+ * A managed workspace is squarely on the caller's side of that line: it is a
+ * checkout of the caller's repository, reached with the caller's GitHub App
+ * installation, on a container that runs the caller's code. Before this
+ * preferred `callerUserId`, a delegated board dispatch found or created the
+ * OWNER's workspace and asked the hub for the OWNER's installation, so the run
+ * shipped with the owner's repositories and credentials — the exact inversion
+ * the spec exists to prevent. Same precedence as ssh_shell / ssh_tail /
+ * ssh_kill, which already read `state.callerUserId || state.userId`.
+ *
+ * Undelegated runs have no `callerUserId` and fall through to the owner chain,
+ * so nothing about a normal run changes.
+ */
 export function resolveRunUserId(context: NativeToolContext): string | null {
+  const s = context?.state;
+  const caller = s?.callerUserId || s?.data?.callerUserId;
+  if (typeof caller === 'string' && caller) return caller;
+  return resolveRunOwnerUserId(context);
+}
+
+/**
+ * The run OWNER — the automation's owner on a delegated run, and the same
+ * person as the caller on every other one.
+ *
+ * Deliberately NOT caller-aware: this is the identity the spec keeps every
+ * billing-shaped decision on (tier gating, metering, redToken ledger). Use it
+ * for anything that spends or records against an account, and
+ * `resolveRunUserId` for anything the run reaches for on the caller's behalf.
+ */
+export function resolveRunOwnerUserId(context: NativeToolContext): string | null {
   const s = context?.state;
   const id = s?.data?.userId || s?.userId || s?.data?.options?.userId;
   return typeof id === 'string' && id ? id : null;
 }
 
 /**
- * The run owner's account tier, which decides the storage tier of any workspace
+ * The owner to stamp on a lifecycle job as `delegatedFromUserId`, or null when
+ * this run is not delegated.
+ *
+ * AUDIT ONLY. Nothing on the worker resolves a credential, a secret or a
+ * repository against it — the job's `ownerUserId` (the caller, who owns the
+ * workspace) is the only identity that decides anything. This exists so a
+ * worker log line can say whose automation a caller's container came from,
+ * which is otherwise unrecoverable once the job leaves the engine.
+ */
+export function resolveDelegatedFromUserId(context: NativeToolContext): string | null {
+  const s = context?.state;
+  const caller = s?.callerUserId || s?.data?.callerUserId;
+  if (typeof caller !== 'string' || !caller) return null;
+  const owner = resolveRunOwnerUserId(context);
+  return owner && owner !== caller ? owner : null;
+}
+
+/**
+ * The run OWNER's account tier, which decides the storage tier of any workspace
  * this run creates (see `lib/workspaces/tiers.ts`). The run path already put it
  * on state as `data.accountTier`; without it a managed workspace created for a
  * paying account would be provisioned as Free.
+ *
+ * Stays the OWNER's tier on a delegated run, and deliberately so: the storage
+ * this workspace consumes is billed to the account whose automation asked for
+ * it, and tier gating is one of the three things
+ * RUN-AS-CALLER-DELEGATION-SPEC.md keeps on the owner. The caller decides WHICH
+ * repository is checked out; the owner's plan decides how much of it is kept.
  */
 export function resolveRunAccountTier(context: NativeToolContext): number | undefined {
   const tier = context?.state?.data?.accountTier;
@@ -82,6 +145,13 @@ export const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$/;
  * platform has no App configured) carries on with a null id, which leaves the
  * worker on the path it has always used. Shared so the two tools cannot drift
  * into two different sentences.
+ *
+ * `userId` is the CALLER on a delegated run (the workspace's owner), never the
+ * automation's owner: an installation is a credential, and a delegated run
+ * reaches GitHub as the person who triggered it. A caller with no installation
+ * gets NO_GITHUB_APP even when the owner has one — borrowing the owner's
+ * installation would hand the caller's agent every repository the owner
+ * granted.
  */
 export async function resolveJobInstallation(
   userId: string | null | undefined,

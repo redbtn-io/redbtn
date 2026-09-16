@@ -205,6 +205,8 @@ export interface ReleaseJobInput {
    * offer, and parking one would leave the very orphan this is tearing down.
    */
   park?: { idleSeconds: number; environmentId: string };
+  /** See `AcquireOptions.delegatedFromUserId`. Audit only; usually absent. */
+  delegatedFromUserId?: string;
 }
 
 export function buildReleaseJobData(input: ReleaseJobInput): Record<string, unknown> {
@@ -219,6 +221,7 @@ export function buildReleaseJobData(input: ReleaseJobInput): Record<string, unkn
     // with it; trunk (exclusive) keeps it warm on the node for the next one.
     removeVolume: input.mode === 'branch',
     ...(input.park && input.park.idleSeconds > 0 ? { park: input.park } : {}),
+    ...(input.delegatedFromUserId ? { delegatedFromUserId: input.delegatedFromUserId } : {}),
   };
 }
 
@@ -249,7 +252,8 @@ interface SpawnedContainer {
 async function teardownOrphanedSpawn(
   queue: LifecycleQueue,
   spawned: SpawnedContainer,
-  reason: string
+  reason: string,
+  delegatedFromUserId?: string
 ): Promise<void> {
   console.error(
     `[acquireWorkspace] ${spawned.workspaceId}/${spawned.checkoutId}: ${reason} — the container is already up on ${spawned.nodeId}; tearing it down before releasing the checkout`
@@ -264,6 +268,7 @@ async function teardownOrphanedSpawn(
         mode: spawned.mode,
         checkoutKey: spawned.checkoutKey,
         skipSnapshot: true,
+        ...(delegatedFromUserId ? { delegatedFromUserId } : {}),
       }),
       ORPHAN_TEARDOWN_TIMEOUT_MS
     );
@@ -312,6 +317,19 @@ export interface AcquireOptions {
    * any provisioned node may take it.
    */
   nodeId?: string;
+  /**
+   * Run-as-caller delegation (RUN-AS-CALLER-DELEGATION-SPEC.md): the OWNER of
+   * the automation, on a run that executes as somebody else.
+   *
+   * AUDIT ONLY, and deliberately not an identity. Every identity decision on
+   * this path already reads `workspace.userId` — which IS the caller, because
+   * `workspace_for_repo` created the workspace under
+   * `resolveRunUserId` — so the spawn's `ownerUserId` and the installation the
+   * hub resolves are the caller's without this field existing. It rides along
+   * so the worker can say in one log line whose automation a caller's
+   * container came from; nothing resolves against it.
+   */
+  delegatedFromUserId?: string;
 }
 
 export interface AcquiredWorkspace {
@@ -332,7 +350,9 @@ export class WorkspaceSession {
     private readonly repo: WorkspaceRepository,
     readonly acquired: AcquiredWorkspace,
     private readonly queue: LifecycleQueue,
-    private readonly leaseDurationMs: number
+    private readonly leaseDurationMs: number,
+    /** See `AcquireOptions.delegatedFromUserId`. Audit only; usually absent. */
+    private readonly delegatedFromUserId?: string
   ) {}
 
   get environmentId(): string {
@@ -410,6 +430,7 @@ export class WorkspaceSession {
           ...(idleSeconds > 0
             ? { park: { idleSeconds, environmentId: this.acquired.environmentId } }
             : {}),
+          ...(this.delegatedFromUserId ? { delegatedFromUserId: this.delegatedFromUserId } : {}),
         }),
         SNAPSHOT_TIMEOUT_MS
       );
@@ -595,6 +616,10 @@ export async function acquireWorkspace(
     // path it has always used (the owner's own secrets, then the allowlisted
     // platform fallback) and a public repository still clones anonymously.
     // Never fatal: a spawn is not a push.
+    // NOTE `workspace.userId` — not the run's owner. A delegated run's
+    // workspace was created under the CALLER by `workspace_for_repo`, so this
+    // asks the hub for the CALLER's installation and the spawn clones with the
+    // caller's grant (RUN-AS-CALLER-DELEGATION-SPEC.md).
     const githubInstallationId = workspace.config?.gitRepoUrl
       ? (await resolveGithubInstallation(workspace.userId, workspace.config.gitRepoUrl)).installationId
       : null;
@@ -613,8 +638,12 @@ export async function acquireWorkspace(
         apiUrl: options.apiUrl ?? process.env.WEBAPP_PUBLIC_URL ?? 'https://app.redbtn.io',
         gitRepoUrl: workspace.config?.gitRepoUrl,
         gitBranch: workspace.config?.gitBranch,
+        // The workspace's own user: the caller on a delegated run, and the
+        // only identity the worker resolves credentials against.
         ownerUserId: workspace.userId,
         githubInstallationId,
+        // Audit only (see AcquireOptions.delegatedFromUserId).
+        ...(options.delegatedFromUserId ? { delegatedFromUserId: options.delegatedFromUserId } : {}),
         ...(preferParked ? { preferParked: true } : {}),
         dockerImage: workspace.config?.dockerImage,
         cpuLimit: workspace.config?.cpuLimit,
@@ -695,14 +724,19 @@ export async function acquireWorkspace(
       containerName: spawn.containerName,
       volumeName: spawn.volumeName,
     };
-    return new WorkspaceSession(repo, acquired, queue, leaseDurationMs);
+    return new WorkspaceSession(repo, acquired, queue, leaseDurationMs, options.delegatedFromUserId);
   } catch (err) {
     // A spawn-side failure leaves nothing running — the worker destroys the
     // container itself — but a failure AFTER the spawn resolved leaves one up
     // with no run attached. Give the node its container back first; the Mongo
     // release happens either way.
     if (spawned) {
-      await teardownOrphanedSpawn(queue, spawned, err instanceof Error ? err.message : String(err));
+      await teardownOrphanedSpawn(
+        queue,
+        spawned,
+        err instanceof Error ? err.message : String(err),
+        options.delegatedFromUserId
+      );
     }
     // Then give the slot back.
     await repo

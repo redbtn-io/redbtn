@@ -13,6 +13,7 @@ import {
   toolError,
   resolveLifecycleQueue,
   resolveRunUserId,
+  resolveDelegatedFromUserId,
   resolveJobInstallation,
   noteShippedPullRequest,
 } from './workspace-common';
@@ -42,7 +43,11 @@ const tool: NativeToolDefinition = {
     }
     const timeoutMs = Math.min(MAX_TIMEOUT_MS, Math.max(1000, Number(args?.timeoutMs) || DEFAULT_TIMEOUT_MS));
     const mergeMethod = ['squash', 'merge', 'rebase'].includes(String(args?.mergeMethod)) ? String(args.mergeMethod) : 'squash';
+    // Who the merge happens AS: the caller on a delegated run, the run's own
+    // user otherwise. Named `ownerUserId` because that is the field the worker
+    // reads — on a delegated run the caller IS the workspace's owner.
     const ownerUserId = resolveRunUserId(context);
+    const delegatedFromUserId = resolveDelegatedFromUserId(context);
     // Merging is a write on the repository, so it needs this user's own App
     // installation too — the pull request names the repo the token must cover.
     const { githubInstallationId, error } = await resolveJobInstallation(ownerUserId, `${pr[1]}/${pr[2]}`);
@@ -51,7 +56,16 @@ const tool: NativeToolDefinition = {
       const result = await resolveLifecycleQueue(context).runJob(
         WORKSPACE_QUEUE,
         'merge',
-        { action: 'merge', prUrl, ownerUserId, timeoutMs, mergeMethod, githubInstallationId },
+        {
+          action: 'merge',
+          prUrl,
+          ownerUserId,
+          timeoutMs,
+          mergeMethod,
+          githubInstallationId,
+          // Audit only — the worker logs it and resolves nothing against it.
+          ...(delegatedFromUserId ? { delegatedFromUserId } : {}),
+        },
         timeoutMs + 60 * 1000
       );
       // A merge that happens inside a run still holding its workspace upgrades
