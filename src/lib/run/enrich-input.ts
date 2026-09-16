@@ -516,7 +516,7 @@ export async function resolveSecrets(
       return { resolvedSecrets, enriched: input };
     }
 
-    // Run-as-caller delegation (RUN-AS-CALLER-DELEGATION-SPEC.md): when a
+    // Run-as-caller delegation (docs/RUN-AS-CALLER-DELEGATION-SPEC.md): when a
     // delegated identity is supplied, secrets resolve against the CALLER's
     // own user scope — mirroring how connections already resolve via
     // createConnectionFetcher(connectionIdentityUserId ?? userId) in the

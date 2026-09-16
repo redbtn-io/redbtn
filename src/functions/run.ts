@@ -115,13 +115,13 @@ export interface ConnectionFetcher {
 export interface RunOptions {
   userId: string;
   /**
-   * Run-as-caller delegation (RUN-AS-CALLER-DELEGATION-SPEC.md). When set, user
-   * OAuth CONNECTIONS resolve against THIS user (the triggering caller) instead
-   * of `userId` (the owner) — so a service-owned graph can act on each caller's
-   * own accounts. Secrets, LLM/compute and metering stay on `userId` (owner).
-   * Absent ⇒ owner-resolved (today's behaviour). Unspoofable (set server-side
-   * from the caller's verified auth); resolution is fail-closed (a missing
-   * caller connection never falls back to the owner's).
+   * Run-as-caller delegation (docs/RUN-AS-CALLER-DELEGATION-SPEC.md). When set,
+   * user OAuth CONNECTIONS resolve against THIS user (the triggering caller)
+   * instead of `userId` (the owner) — so a service-owned graph can act on each
+   * caller's own accounts. Secrets, LLM/compute and metering stay on `userId`
+   * (owner). Absent ⇒ owner-resolved (today's behaviour). Unspoofable (set
+   * server-side from the caller's verified auth); resolution is fail-closed (a
+   * missing caller connection never falls back to the owner's).
    */
   connectionIdentityUserId?: string;
   graphId?: string;
@@ -791,7 +791,7 @@ CRITICAL RULES:
     // when present so a delegated run reaches the CALLER's machines and
     // credentials — never the owner's. Deliberately a SEPARATE field from
     // `userId`: neuron tier-gating and redToken metering must stay on the
-    // owner (RUN-AS-CALLER-DELEGATION-SPEC.md).
+    // owner (docs/RUN-AS-CALLER-DELEGATION-SPEC.md).
     ...(options.connectionIdentityUserId
       ? { callerUserId: options.connectionIdentityUserId }
       : {}),

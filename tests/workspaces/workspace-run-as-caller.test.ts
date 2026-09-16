@@ -6,9 +6,10 @@
  * is not its owner, the hub puts that VERIFIED caller on the run as
  * `connectionIdentityUserId`, and `buildInitialState` mirrors it onto state as
  * `callerUserId` (top level and `data.callerUserId`).
- * RUN-AS-CALLER-DELEGATION-SPEC.md's rule is that connections, environments and
- * secretRefs resolve as the CALLER while LLM access, tier gating and metering
- * stay on the OWNER. `ssh_shell` / `ssh_tail` / `ssh_kill` already follow it.
+ * docs/RUN-AS-CALLER-DELEGATION-SPEC.md's rule is that connections,
+ * environments and secretRefs resolve as the CALLER while LLM access, tier
+ * gating and metering stay on the OWNER. `ssh_shell` / `ssh_tail` / `ssh_kill`
+ * already follow it.
  *
  * The workspace tools did not. `resolveRunUserId` read only the owner chain, so
  * a delegated board dispatch found or created the OWNER's workspace, asked the

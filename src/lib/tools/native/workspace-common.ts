@@ -43,13 +43,13 @@ export function resolveLifecycleQueue(context: NativeToolContext): LifecycleQueu
 /**
  * The identity these tools ACT AS.
  *
- * Run-as-caller delegation (RUN-AS-CALLER-DELEGATION-SPEC.md): an automation
- * declared `executionIdentity:'caller'` + `callerInvokable` is triggered by
- * somebody who is not its owner, the hub puts that VERIFIED caller on the run,
- * and `buildInitialState` mirrors it onto state as `callerUserId` (top level
- * and `data.callerUserId`). The spec's rule is that CONNECTIONS, ENVIRONMENTS
- * and SECRETS resolve as the caller while LLM access, tier gating and metering
- * stay on the owner.
+ * Run-as-caller delegation (docs/RUN-AS-CALLER-DELEGATION-SPEC.md): an
+ * automation declared `executionIdentity:'caller'` + `callerInvokable` is
+ * triggered by somebody who is not its owner, the hub puts that VERIFIED
+ * caller on the run, and `buildInitialState` mirrors it onto state as
+ * `callerUserId` (top level and `data.callerUserId`). The spec's rule is that
+ * CONNECTIONS, ENVIRONMENTS and SECRETS resolve as the caller while LLM access,
+ * tier gating and metering stay on the owner.
  *
  * A managed workspace is squarely on the caller's side of that line: it is a
  * checkout of the caller's repository, reached with the caller's GitHub App
@@ -112,8 +112,9 @@ export function resolveDelegatedFromUserId(context: NativeToolContext): string |
  * Stays the OWNER's tier on a delegated run, and deliberately so: the storage
  * this workspace consumes is billed to the account whose automation asked for
  * it, and tier gating is one of the three things
- * RUN-AS-CALLER-DELEGATION-SPEC.md keeps on the owner. The caller decides WHICH
- * repository is checked out; the owner's plan decides how much of it is kept.
+ * docs/RUN-AS-CALLER-DELEGATION-SPEC.md keeps on the owner. The caller decides
+ * WHICH repository is checked out; the owner's plan decides how much of it is
+ * kept.
  */
 export function resolveRunAccountTier(context: NativeToolContext): number | undefined {
   const tier = context?.state?.data?.accountTier;
