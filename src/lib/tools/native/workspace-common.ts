@@ -11,6 +11,10 @@ import {
   githubInstallMessage,
   repoSlug,
 } from '../../workspaces/github-installations';
+import {
+  resolveRunUserId as sharedResolveRunUserId,
+  resolveRunOwnerUserId as sharedResolveRunOwnerUserId,
+} from './_run-identity';
 
 type AnyObject = Record<string, any>;
 
@@ -62,12 +66,15 @@ export function resolveLifecycleQueue(context: NativeToolContext): LifecycleQueu
  *
  * Undelegated runs have no `callerUserId` and fall through to the owner chain,
  * so nothing about a normal run changes.
+ *
+ * The rule itself lives in `./_run-identity.ts` — the environment file/exec
+ * tools (`run_command`, `read_file`, `write_file`, `edit_file`, `list_dir`,
+ * `glob`, `grep_files`, `ssh_copy`, the desktop tools) need the same
+ * precedence and must not import the workspace/BullMQ stack to get it. This
+ * export is kept because the spec and the workspace tests name it.
  */
 export function resolveRunUserId(context: NativeToolContext): string | null {
-  const s = context?.state;
-  const caller = s?.callerUserId || s?.data?.callerUserId;
-  if (typeof caller === 'string' && caller) return caller;
-  return resolveRunOwnerUserId(context);
+  return sharedResolveRunUserId(context);
 }
 
 /**
@@ -78,11 +85,12 @@ export function resolveRunUserId(context: NativeToolContext): string | null {
  * billing-shaped decision on (tier gating, metering, redToken ledger). Use it
  * for anything that spends or records against an account, and
  * `resolveRunUserId` for anything the run reaches for on the caller's behalf.
+ *
+ * Unchanged behaviour; the chain moved to `./_run-identity.ts` beside the
+ * caller-first rule that falls back to it.
  */
 export function resolveRunOwnerUserId(context: NativeToolContext): string | null {
-  const s = context?.state;
-  const id = s?.data?.userId || s?.userId || s?.data?.options?.userId;
-  return typeof id === 'string' && id ? id : null;
+  return sharedResolveRunOwnerUserId(context);
 }
 
 /**

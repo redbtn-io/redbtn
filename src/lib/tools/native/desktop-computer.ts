@@ -75,19 +75,31 @@
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
+import { resolveRunUserId } from './_run-identity';
 import { requestDesktop, requestDesktopRaw, type ComputerAction, type ComputerResultMessage } from './desktop-request';
 import { RELAY_GRACE_MS } from '../../environments/DesktopAgentSession';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
-/** Resolve the target user from run state — same precedence as alert_desktop. */
+/**
+ * The identity these tools target — same precedence as `alert_desktop`: the
+ * DELEGATED caller first (`state.callerUserId`, set by `buildInitialState` iff
+ * the run executes as `executionIdentity:'caller'`), then the run owner, then
+ * the legacy `state.options.userId` these tools have always accepted as a last
+ * resort.
+ *
+ * A desktop is reached through an Environment, and environments are
+ * caller-resolved under docs/RUN-AS-CALLER-DELEGATION-SPEC.md — resolving only
+ * the owner sent a delegated run's desktop calls at the OWNER's machine, or
+ * more often failed the environment access check outright. Undelegated runs
+ * carry no `callerUserId`, so they are unchanged.
+ */
 function resolveUserId(context: NativeToolContext): string | null {
-  const uid =
-    (context?.state?.userId as string | undefined) ||
-    (context?.state?.data?.userId as string | undefined) ||
+  const userId =
+    resolveRunUserId(context) ||
     (context?.state?.options?.userId as string | undefined);
-  return uid && String(uid).trim() ? String(uid).trim() : null;
+  return userId && String(userId).trim() ? String(userId).trim() : null;
 }
 
 /** Per-tool override of the round-trip timeout (ms). */

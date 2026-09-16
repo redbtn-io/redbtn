@@ -3,7 +3,8 @@
 Status: describes shipped behaviour. Written from the code in `redbtn-io/redbtn`
 (engine) and `redbtn-io/webapp` (hub) as of engine `0.0.263-alpha`, with
 `secretsIdentity` (section 4) added after the 2026-09-16 board-dispatch
-incident.
+incident and the environment file/exec tools aligned with the same table later
+that day (section 4, "2026-09-16").
 
 Comments in the engine, the hub and the redrun worker cite this file. It was
 never committed until now, so this document is reconstructed from the
@@ -200,8 +201,8 @@ owner-identity child.
 | --- | --- |
 | User OAuth connections (by id and by provider default) | `engine src/functions/run.ts` `run` builds `ConnectionManager` with `userId: options.connectionIdentityUserId ?? options.userId`; `engine src/lib/connections/ConnectionManager.ts` rejects any connection whose `connection.userId` differs from that id. The underlying fetcher, `createConnectionFetcher` in `webapp src/lib/connections/connection-fetcher.ts`, filters every query by `userId`; the worker is what constructs it for a job (see section 3, "Into the engine"). |
 | Secrets (`automation.secretNames`, `{{secret:NAME}}` placeholders, `_secrets.NAME` graph references) — **unless the automation sets `secretsIdentity: 'owner'`** | `engine src/lib/run/enrich-input.ts` `enrichInput` (`EnrichInputOptions.secretsIdentityUserId` + `EnrichInputOptions.secretsIdentity`) and `resolveSecrets`. When the delegated identity is present and `secretsIdentity` is `'caller'` (the default), `scope` is forced to `'user'` and both `scopeId` and `userId` become the caller, so the automation bucket and the owner's bucket are unreachable. See the exception below. |
-| Environments and their SSH credentials (`ssh_shell`, `ssh_tail`, `ssh_jobs`, `ssh_kill`, `ssh_run_async`) | `executeViaEnvironment` in `engine src/lib/tools/native/ssh-shell.ts` and `resolveUserId` in `ssh-tail.ts`, `ssh-jobs.ts`, `ssh-kill.ts` and `ssh-run-async.ts`, all reading `state.callerUserId \|\| state.data.callerUserId \|\| state.userId \|\| state.data.userId`. The document lookup, the owner-or-public access check and the `secretRef` resolution are `loadAndResolveEnvironment` in `engine src/lib/environments/loadAndResolveEnvironment.ts`, which resolves the key in the passed identity's own scope with no owner fallback. |
-| Managed workspace ownership | `resolveRunUserId` in `engine src/lib/tools/native/workspace-common.ts`, used by `engine src/lib/tools/native/workspace-for-repo.ts` to find or create the workspace. Because that one call decides `workspace.userId`, every later identity decision follows from it. |
+| Environments and their SSH credentials — **every** tool that touches one: the ssh family (`ssh_shell`, `ssh_tail`, `ssh_jobs`, `ssh_kill`, `ssh_run_async`, `ssh_copy`), the file and exec pack (`run_command`, `read_file`, `write_file`, `edit_file`, `list_dir`, `glob`, `grep_files`) and the desktop pair (`alert_desktop`, `desktop_computer`'s `desktop_exec` / `desktop_screenshot` / the rest) | `executeViaEnvironment` in `engine src/lib/tools/native/ssh-shell.ts` and `resolveUserId` in `ssh-tail.ts`, `ssh-jobs.ts`, `ssh-kill.ts` and `ssh-run-async.ts` read `state.callerUserId \|\| state.data.callerUserId \|\| state.userId \|\| state.data.userId` inline. Every other tool in the list gets the identical rule from `resolveRunUserId` in `engine src/lib/tools/native/_run-identity.ts` (the desktop pair through their own `resolveUserId`, which adds a legacy `state.options.userId` last resort; `ssh_copy` uses it for the environment **and** for the `X-User-Id` on its Knowledge Library access check). The document lookup, the owner-or-public access check and the `secretRef` resolution are `loadAndResolveEnvironment` in `engine src/lib/environments/loadAndResolveEnvironment.ts`, which resolves the key in the passed identity's own scope with no owner fallback. Covered by `engine tests/security/env-tools-run-as-caller.test.ts`. |
+| Managed workspace ownership | `resolveRunUserId` in `engine src/lib/tools/native/workspace-common.ts` (a delegation to the shared `_run-identity.ts`), used by `engine src/lib/tools/native/workspace-for-repo.ts` to find or create the workspace. Because that one call decides `workspace.userId`, every later identity decision follows from it. |
 | GitHub App installation (clone, push, merge) | `resolveJobInstallation` in `workspace-common.ts` calling `resolveGithubInstallation` in `engine src/lib/workspaces/github-installations.ts`. `acquireWorkspace` (`engine src/lib/workspaces/WorkspaceLifecycle.ts`) resolves it for `workspace.userId`; `engine src/lib/tools/native/workspace-ship.ts` for `workspace.userId`; `engine src/lib/tools/native/workspace-merge.ts` for `resolveRunUserId`. |
 | Lifecycle job ownership (`spawn`, `push`, `merge`, `snapshot`, `destroy`) | `ownerUserId: workspace.userId` on the spawn job in `acquireWorkspace` and on the push job in `workspace-ship.ts`; `ownerUserId: resolveRunUserId(context)` on the merge job in `workspace-merge.ts`; `userId: workspace.userId` on the destroy job in `engine src/lib/workspaces/workspace-destroy.ts`. The field is named `ownerUserId` because that is what the worker reads; on a delegated run the caller **is** the workspace's owner. |
 | Subgraph steps | `engine src/lib/nodes/universal/executors/graphExecutor.ts`, which propagates `callerUserId` into the child state. |
@@ -253,6 +254,45 @@ narrow:
 
 `'caller'` remains the default for every delegated run, including every
 automation that predates the field, so nothing already in flight moves.
+
+### 2026-09-16: the file and exec tools joined the ssh family
+
+The table above always put environments on the caller's side. Only the ssh
+family implemented it, and production showed exactly what that cost.
+
+Run `run_1789534315735_ixbvhn` (2026-09-16 04:52Z). A board owned by a second
+tenant dispatched a card through an automation owned by George.
+`workspace_for_repo` correctly created the workspace under the CALLER, and the
+runner environment `env_mdFnVzNuxppa` belonged to the CALLER. So:
+
+- **Worked**, because they already resolved `state.callerUserId` first:
+  `ssh_run_async`, `ssh_tail`, `ssh_jobs`.
+- **Denied**, because they resolved the run OWNER only — every one of them with
+  `ENV_ACCESS_DENIED: User 69a0b790a0ae8660290a78da does not have access to
+  environment env_mdFnVzNuxppa`: `run_command`, `list_dir`, `glob`, `read_file`,
+  `write_file`, `edit_file`, `grep_files`, `ssh_copy`.
+
+One unlocked door, eight locked ones, on the same machine. The agent inside the
+run behaved correctly — it declined to funnel a whole card's work through the
+single tool that happened to answer, and reported the card blocked — so this
+surfaced as a stalled card rather than as a half-done delegated build.
+
+What changed: the precedence
+(`state.callerUserId || state.data.callerUserId || state.userId ||
+state.data.userId`) now has exactly one definition, `resolveRunUserId` in
+`engine src/lib/tools/native/_run-identity.ts`, and every tool in the
+environments row reads it — including the desktop pair, which reaches a machine
+through an environment like everything else, and `ssh_copy`, whose open item in
+section 7 this closes. `ssh_copy` moved at both ends: its Knowledge Library
+access check sends the caller as `X-User-Id` too, because an owner-resolved
+library read feeding a caller-resolved SFTP write is a path for copying the
+owner's private documents onto the caller's host.
+
+`resolveRunOwnerUserId` did not move: tier gating, metering and the redToken
+ledger stay owner-keyed, exactly as the Owner-resolved table says. Undelegated
+runs carry no `callerUserId` and are byte-for-byte unchanged, which
+`engine tests/security/env-tools-run-as-caller.test.ts` asserts for all ten
+tools alongside the two delegated shapes.
 
 ## 5. Audit trail
 
@@ -344,10 +384,14 @@ produces the null described two paragraphs below, not an error of its own.
 
 **Caller cannot use an environment.** `loadAndResolveEnvironment` throws
 `EnvironmentAccessDeniedError` (`ENV_ACCESS_DENIED`) when the environment is
-neither theirs nor public, and `EnvironmentSharedSecretMissingError`
-(`ENV_SHARED_SECRET_MISSING`) when they reach a public environment but hold no
-secret of its `secretRef` name in their own scope. The second message tells them
-which secret to create. The owner's key is never shared.
+neither the resolved identity's nor public, and
+`EnvironmentSharedSecretMissingError` (`ENV_SHARED_SECRET_MISSING`) when they
+reach a public environment but hold no secret of its `secretRef` name in their
+own scope. The second message tells them which secret to create. The owner's key
+is never shared. Read the first as "the identity this tool acted as has no such
+environment" — when only SOME of a run's tools raise it against ONE environment,
+the tools disagree about who they are, which is the 2026-09-16 defect in
+section 4.
 
 **Caller does not own a referenced connection.** `ConnectionManager` returns
 null for any connection whose `connection.userId` differs from the resolved
@@ -361,8 +405,10 @@ is no `callerUserId` on state, so `resolveRunUserId` equals
 `resolveRunOwnerUserId`, the ssh resolvers fall through to the owner chain,
 `resolveDelegatedFromUserId` returns null, and no delegation key is added to any
 job or document. This is asserted directly in
-`engine tests/workspaces/workspace-run-as-caller.test.ts` and
-`engine tests/workspaces/workspace-spawn-run-as-caller.test.ts`.
+`engine tests/workspaces/workspace-run-as-caller.test.ts`,
+`engine tests/workspaces/workspace-spawn-run-as-caller.test.ts` and, for all ten
+environment file/exec/desktop tools,
+`engine tests/security/env-tools-run-as-caller.test.ts`.
 
 ## 7. Non-goals and open questions
 
@@ -388,12 +434,6 @@ should change.
   chain. It does not read `state.callerUserId`, so run listings are access
   checked as the owner. The name collision is a reading hazard, not a
   delegation.
-- **`ssh_copy` environment resolution.**
-  `engine src/lib/tools/native/ssh-copy.ts` reads only
-  `state.userId || state.data.userId` when resolving an `environmentId`, unlike
-  the other ssh tools. On a delegated run it therefore reaches the owner's
-  environment. This looks like an oversight rather than a decision; it is
-  recorded here as observed behaviour.
 - **Global-state refs**, which resolve against the run's owner.
 - **Metering.** Owner-keyed in v1, deliberately, with the per-trigger rate limit
   in section 3 as the compensating control.
@@ -459,3 +499,6 @@ Two rules, both load-bearing:
 - Resolve caller-scoped resources fail-closed. Never fall back to the owner.
 - Keep anything that spends or records against an account on
   `resolveRunOwnerUserId`, not `resolveRunUserId`.
+- Get both from `src/lib/tools/native/_run-identity.ts` rather than writing the
+  chain again. Every open-coded copy of it so far has been a copy that fell
+  behind (section 4, "2026-09-16").
