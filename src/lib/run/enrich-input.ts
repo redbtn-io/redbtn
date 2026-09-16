@@ -439,6 +439,21 @@ export async function collectGraphReferencedSecretNames(
 // =============================================================================
 
 /**
+ * Which identity a delegated run resolves `secretRefs` against.
+ *
+ * `'caller'` (the default for every delegated run) is the rule in
+ * docs/RUN-AS-CALLER-DELEGATION-SPEC.md §1: the caller's own secrets, or an
+ * error. `'owner'` is the automation-level opt-out for the case that rule gets
+ * wrong — a platform BOT whose graph declares the bot's OWN credentials
+ * (`RED_BOARD_TOKEN`, the executor's `SSH_KEY`) as `secretRefs` and lends them
+ * to work it performs on a tenant's behalf. Under `'owner'` only the secrets
+ * move back to the owner; connections, environments and workspaces stay
+ * caller-resolved, so the run still cannot reach the owner's accounts or
+ * machines.
+ */
+export type SecretsIdentity = 'caller' | 'owner';
+
+/**
  * Thrown when a run executing under a DELEGATED identity (run-as-caller,
  * `executionIdentity:'caller'`) references secrets the caller does not hold.
  *
@@ -475,8 +490,20 @@ export async function resolveSecrets(
   runId: string,
   graphReferencedNames: string[] = [],
   secretsIdentityUserId?: string,
+  secretsIdentity?: SecretsIdentity,
 ): Promise<{ resolvedSecrets: Record<string, string>; enriched: Record<string, unknown> }> {
   const resolvedSecrets: Record<string, string> = {};
+
+  // Automation-level opt-out from caller-scoped secrets
+  // (docs/RUN-AS-CALLER-DELEGATION-SPEC.md §4). `secretsIdentity:'owner'`
+  // keeps THIS run's secretRefs on the owner while connections, environments
+  // and workspaces stay caller-resolved — the shape a platform bot needs when
+  // the secrets in question are its OWN credentials rather than the caller's.
+  // Everything below then takes the undelegated path verbatim, including its
+  // graceful degradation, because that is exactly what an owner-resolved run
+  // has always done.
+  const resolveSecretsAsOwner = secretsIdentity === 'owner';
+  const delegatedSecretsUserId = resolveSecretsAsOwner ? undefined : secretsIdentityUserId;
 
   // Collect secret names from three sources:
   //   1. automation.secretNames   — explicit per-automation declaration
@@ -506,11 +533,11 @@ export async function resolveSecrets(
     const mongoose = (await import('mongoose')).default;
     const db = mongoose.connection.db;
     if (!db) {
-      if (secretsIdentityUserId) {
+      if (delegatedSecretsUserId) {
         // Delegated run: silently continuing with unresolved secrets would
         // surface later as a confusing tool failure (or worse, a template
         // string leaking `{{secret:NAME}}` downstream). Fail loud instead.
-        throw new SecretsDelegationError(secretNames, secretsIdentityUserId, runId);
+        throw new SecretsDelegationError(secretNames, delegatedSecretsUserId, runId);
       }
       console.warn(`[enrich-input] MongoDB not connected — cannot resolve secrets for run ${runId}`);
       return { resolvedSecrets, enriched: input };
@@ -523,8 +550,8 @@ export async function resolveSecrets(
     // worker. The automation's secret bucket and the owner's global bucket
     // are deliberately unreachable from a delegated run: a caller-invokable
     // automation must never hand the owner's credentials to a stranger.
-    const scopeId = secretsIdentityUserId ?? (automationDoc?.automationId ?? userId);
-    const scope = secretsIdentityUserId ? 'user' : (automationDoc ? 'automation' : 'user');
+    const scopeId = delegatedSecretsUserId ?? (automationDoc?.automationId ?? userId);
+    const scope = delegatedSecretsUserId ? 'user' : (automationDoc ? 'automation' : 'user');
     // Owner of the secrets we're allowed to resolve. For automation-scoped runs
     // that's the automation's creator (automationDoc.userId), NOT the run's
     // triggering user — otherwise a triggerer could resolve someone else's
@@ -533,7 +560,17 @@ export async function resolveSecrets(
     // Passing userId lets the hardened redsecrets fallback (>=0.2.0) match only
     // documents owned by that user; the installed 0.1.0 ignores the field, so
     // this is forward-compatible and safe to land ahead of the package fix.
-    const ownerUserId = secretsIdentityUserId ?? (automationDoc?.userId ?? userId);
+    const ownerUserId = delegatedSecretsUserId ?? (automationDoc?.userId ?? userId);
+
+    // One greppable line saying the bot's own secrets were used on a run that
+    // is otherwise executing as somebody else. Without it, a delegated run
+    // reaching the owner's secret bucket is indistinguishable in the logs from
+    // one that never delegated at all.
+    if (resolveSecretsAsOwner && secretsIdentityUserId) {
+      console.log(
+        `[enrich-input] secrets resolved as owner ${ownerUserId} for delegated run ${runId} (secretsIdentity=owner)`,
+      );
+    }
 
     const batch = await secretsRepo.resolve(db, {
       names: secretNames,
@@ -550,7 +587,7 @@ export async function resolveSecrets(
     }
   } catch (err) {
     if (err instanceof SecretsDelegationError) throw err;
-    if (secretsIdentityUserId) {
+    if (delegatedSecretsUserId) {
       // Delegated run: a resolve failure must not degrade into "run with
       // whatever resolved" — that path's only safe terminal state is an error.
       console.error(`[enrich-input] Secret resolution failed for delegated run ${runId}:`, err);
@@ -562,10 +599,10 @@ export async function resolveSecrets(
   // Fail closed for delegated runs: every referenced secret must have resolved
   // from the CALLER's scope. Missing names error out here rather than falling
   // back to the owner (cross-tenant leak) or continuing unresolved.
-  if (secretsIdentityUserId) {
+  if (delegatedSecretsUserId) {
     const missing = secretNames.filter((n) => !(n in resolvedSecrets));
     if (missing.length > 0) {
-      throw new SecretsDelegationError(missing, secretsIdentityUserId, runId);
+      throw new SecretsDelegationError(missing, delegatedSecretsUserId, runId);
     }
   }
 
@@ -651,6 +688,18 @@ export interface EnrichInputOptions {
    * caller-scoped connection resolution. Omitted = owner-resolved (unchanged).
    */
   secretsIdentityUserId?: string;
+  /**
+   * Automation-level override for WHICH identity `secretsIdentityUserId`'s run
+   * resolves secrets against. Only read when `secretsIdentityUserId` is set.
+   *
+   *   'caller' (default) — unchanged: the caller's own scope, fail-closed.
+   *   'owner'  — resolve secrets exactly as an undelegated run does, against
+   *              the automation owner. For a bot lending its OWN credentials;
+   *              connections, environments and workspaces stay caller-resolved.
+   *
+   * docs/RUN-AS-CALLER-DELEGATION-SPEC.md §4.
+   */
+  secretsIdentity?: SecretsIdentity;
 }
 
 /**
@@ -671,6 +720,7 @@ export async function enrichInput(options: EnrichInputOptions): Promise<Enrichme
     automationId,
     conversationId,
     secretsIdentityUserId,
+    secretsIdentity,
   } = options;
 
   let { graphId, input } = options;
@@ -715,7 +765,15 @@ export async function enrichInput(options: EnrichInputOptions): Promise<Enrichme
   // or agent works without a pre-seeded graphInputs placeholder.
   const graphReferencedSecretNames = await collectGraphReferencedSecretNames(graphId);
   const { resolvedSecrets, enriched: afterSecrets } =
-    await resolveSecrets(input, userId, automationDoc, runId, graphReferencedSecretNames, secretsIdentityUserId);
+    await resolveSecrets(
+      input,
+      userId,
+      automationDoc,
+      runId,
+      graphReferencedSecretNames,
+      secretsIdentityUserId,
+      secretsIdentity,
+    );
   input = afterSecrets;
 
   // ── Step 5: Resolve global-state refs ───────────────────────────────────────

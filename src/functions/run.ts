@@ -13,7 +13,7 @@
  * @module functions/run
  */
 import type { Red } from '../index';
-import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys, RunConfig } from '../lib/run';
+import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys, RunConfig, type SecretsIdentity } from '../lib/run';
 import { runControlRegistry, type CancelResult } from '../lib/run/RunControlRegistry';
 import { getOrCreateMeteringClient } from '../lib/run/meteringClient';
 import { resolveCapabilityProfile } from '../lib/permissions/resolve';
@@ -124,6 +124,25 @@ export interface RunOptions {
    * missing caller connection never falls back to the owner's).
    */
   connectionIdentityUserId?: string;
+  /**
+   * Which identity a DELEGATED run resolves `secretRefs` against
+   * (docs/RUN-AS-CALLER-DELEGATION-SPEC.md §4). Only meaningful together with
+   * `connectionIdentityUserId`; ignored on an undelegated run, which always
+   * resolves as `userId`.
+   *
+   *   'caller' (default) — today's behaviour: secrets come from the CALLER's
+   *     own scope, fail-closed (`SecretsDelegationError`). Right for a user's
+   *     personal credentials.
+   *   'owner' — secrets resolve against the automation OWNER, exactly as an
+   *     undelegated run does. For a platform BOT lending its OWN credentials
+   *     (a board API token, the executor's SSH key) to work it performs on a
+   *     tenant's behalf: the tenant's connections, environments and
+   *     workspaces still resolve as the caller, only the bot's secrets do not.
+   *
+   * Set from `automation.secretsIdentity` by the hub's trigger route and
+   * carried on the BullMQ job; never a run-time parameter.
+   */
+  secretsIdentity?: SecretsIdentity;
   graphId?: string;
   conversationId?: string;
   threadId?: string;
@@ -819,6 +838,14 @@ CRITICAL RULES:
       ...(options.connectionIdentityUserId
         ? { callerUserId: options.connectionIdentityUserId }
         : {}),
+      // Audit: which identity this delegated run resolved secrets against.
+      // Only stamped on a delegated run — an undelegated one always resolves
+      // as the owner, so the field would carry no information. Default
+      // 'caller' keeps every pre-existing delegated run reading the same as
+      // before (docs/RUN-AS-CALLER-DELEGATION-SPEC.md §4).
+      ...(options.connectionIdentityUserId
+        ? { secretsIdentity: options.secretsIdentity ?? 'caller' }
+        : {}),
       accountTier: userSettings.accountTier,
       defaultNeuronId: userSettings.defaultNeuronId,
       defaultWorkerNeuronId: userSettings.defaultWorkerNeuronId,
@@ -1425,6 +1452,7 @@ async function subscribeForInterrupt(
 
 export const __test__ = {
   subscribeForInterrupt,
+  buildInitialState,
 };
 
 // =============================================================================
