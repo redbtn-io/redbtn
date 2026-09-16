@@ -21,10 +21,17 @@
  * The document is the map of where to look: the node pin, the parked runner, the
  * node each active checkout bound to, and every node that has reported a warm
  * volume for it (`stats.warmVolumes[]`, written by the workers' storage
- * sampler). When the document names no node at all — a workspace that never ran,
- * or one whose records predate the sampler — every workspace queue with a live
- * consumer is asked instead, so the fan-out is a superset of "wherever it could
- * be" rather than a guess.
+ * sampler). When the document names no node but has been somewhere — records
+ * that predate the sampler, a run whose pin has since been cleared — every
+ * workspace queue with a live consumer is asked instead, so the fan-out is a
+ * superset of "wherever it could be" rather than a guess.
+ *
+ * A workspace that has never been anywhere is the one case that needs no fan-out
+ * at all. Nothing on the document was ever written by a node, so there is no
+ * volume, no parked runner, and no restic repository — the first snapshot is
+ * what creates one. Discovery for such a workspace enqueued a no-op destroy on
+ * every live node and made whichever drew the purge log `could not read the
+ * restic repository`; `workspaceEverTouchedANode` is the test that stops it.
  *
  * Fan-out is best effort by design. A node that is down when the job is enqueued
  * picks it up when it returns; a node that never gets one converges anyway,
@@ -142,6 +149,81 @@ export function nodeIdsFromWorkspace(workspace: IWorkspace, extra: string[] = []
 }
 
 /**
+ * Everything on a workspace stats document that only a node could have written.
+ *
+ * `IWorkspaceStats` declares the snapshot and run counters; the storage
+ * sampler's fields belong to the workers, so they are read structurally here the
+ * same way `nodeIdsFromWorkspace` reads `warmVolumes`.
+ */
+interface NodeEvidenceStats {
+  warmVolumes?: WarmVolumeEntry[];
+  warmBytes?: number;
+  snapshotSizeBytes?: number;
+  lastSnapshotAt?: Date | string | null;
+  fileCount?: number;
+  totalRunCount?: number;
+  /**
+   * Not written by this repository — `releaseWorkspace` increments
+   * `totalRunCount`. Read anyway because operator reports and hand-written
+   * records use the shorter name, and reading one field too many only ever
+   * costs a fan-out that was already the old behaviour.
+   */
+  totalRuns?: number;
+  totalComputeSeconds?: number;
+}
+
+/** Above zero. A value that is not a number at all is not the 0 a fresh document carries. */
+function positiveNumber(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  const n = Number(value);
+  return Number.isFinite(n) ? n > 0 : true;
+}
+
+function nonBlankString(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * Has this workspace ever been on a node?
+ *
+ * Deliberately one-sided: any trace at all answers yes, because a wrong yes
+ * costs the fan-out we already did today, while a wrong no leaks a restic
+ * repository that nothing on the fleet expires. So it reads every field a node
+ * or a run that reached one writes — the pin and its warm window, a parked
+ * runner, a checkout live or finished, the sampler's warm volumes, and every
+ * snapshot and run counter — not just the ones that name a node.
+ *
+ * What it does NOT read is `version`. That counter says "this document was
+ * written", not "this workspace ran", and the writes that matter here all leave
+ * a field of their own: a release increments `stats.totalRunCount` and appends
+ * to `checkoutHistory`, and a committed snapshot sets `currentSnapshotId` and
+ * the three `stats` snapshot fields. Volumes converge without us anyway — the
+ * node-side reaper removes any workspace-labelled volume whose document is gone
+ * — so the only state a wrong answer could strand is the snapshots, and the
+ * document records those explicitly.
+ */
+export function workspaceEverTouchedANode(workspace: Partial<IWorkspace>): boolean {
+  if (nonBlankString(workspace.nodeId)) return true;
+  if (workspace.nodePinnedUntil) return true;
+  if (workspace.parkedCheckout) return true;
+  if ((workspace.activeCheckouts ?? []).length > 0) return true;
+  if ((workspace.checkoutHistory ?? []).length > 0) return true;
+  if (nonBlankString(workspace.currentSnapshotId)) return true;
+
+  const stats = (workspace.stats ?? {}) as NodeEvidenceStats;
+  if (Array.isArray(stats.warmVolumes) && stats.warmVolumes.length > 0) return true;
+  if (positiveNumber(stats.warmBytes)) return true;
+  if (positiveNumber(stats.snapshotSizeBytes)) return true;
+  if (stats.lastSnapshotAt) return true;
+  if (positiveNumber(stats.fileCount)) return true;
+  if (positiveNumber(stats.totalRunCount)) return true;
+  if (positiveNumber(stats.totalRuns)) return true;
+  if (positiveNumber(stats.totalComputeSeconds)) return true;
+
+  return false;
+}
+
+/**
  * Where the destroy jobs go.
  *
  * The document's own nodes are never probed: a node that is merely down still
@@ -160,9 +242,15 @@ async function resolveDestroyTargets(
     return named.map((nodeId) => ({ nodeId, queueName: workspaceNodeQueue(nodeId) }));
   }
 
-  // Nothing recorded. Ask every workspace queue that currently has a consumer,
-  // which is the closest the engine gets to enumerating the fleet without a node
-  // registry of its own.
+  // Nothing recorded, and nothing ever was: no pin, no parked runner, no
+  // checkout past or present, no snapshot, no sampled volume. There is nowhere
+  // for a destroy job to go, and no target list is the signal for that — the
+  // caller deletes the document and enqueues nothing.
+  if (!workspaceEverTouchedANode(workspace)) return [];
+
+  // Recorded once and cleared since. Ask every workspace queue that currently
+  // has a consumer, which is the closest the engine gets to enumerating the
+  // fleet without a node registry of its own.
   const discovered = queue.listNodeQueues ? await queue.listNodeQueues().catch(() => []) : [];
   const live: DestroyTarget[] = [];
   for (const queueName of discovered) {
@@ -212,6 +300,16 @@ export async function destroyWorkspace(
   } as never);
 
   const targets = await resolveDestroyTargets(queue, workspace, options.nodeIds ?? []);
+
+  // Never been on a node: the document was the only thing this workspace had.
+  // Deleting it is the whole cleanup, and an empty `jobsEnqueued` is what says
+  // so — the hub renders `cleanup.nodes` straight from it.
+  if (targets.length === 0) {
+    await collection.deleteOne({ workspaceId } as never);
+    console.log(`[destroyWorkspace] ${workspaceId} deleted; never touched a node, no cleanup enqueued`);
+    return { deleted: true, jobsEnqueued: [] };
+  }
+
   const jobsEnqueued: string[] = [];
   let snapshotsAssigned = false;
 
