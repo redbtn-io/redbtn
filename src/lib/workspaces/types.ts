@@ -270,6 +270,12 @@ export interface IWorkspace {
    * The runner still alive on `nodeId` from the last release, when the
    * workspace runs a hot tier (`config.hotIdleSeconds`). Consumed by the next
    * acquire and cleared whenever the node does not hand it back.
+   *
+   * Three things retract it, because a record that outlives its container makes
+   * the workspace read as warm when it is cold: the acquire, as soon as the
+   * spawn answers (adopted or not); the acquire's failure path, when it aimed
+   * at the park and the spawn never came back; and the node itself, whose park
+   * sweep clears the record for the container it has just reaped.
    */
   parkedCheckout?: IParkedCheckout | null;
   /** Optimistic concurrency version counter (incremented on checkout/release). */

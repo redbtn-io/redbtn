@@ -19,6 +19,7 @@ import {
   MAX_HOT_IDLE_SECONDS,
   hotIdleSeconds,
   workspaceNodeQueue,
+  WorkspaceSpawnError,
   type LifecycleQueue,
 } from '../../src/lib/workspaces';
 
@@ -265,5 +266,126 @@ describe('workspace hot tier (parked runners)', () => {
     expect(jobs[0].data.preferParked).toBeUndefined();
     expect(lookups).toEqual([session.acquired.checkout.installId]);
     expect(session.environmentId).toBe('env_fresh');
+  });
+
+  // ── The record has to retract itself ───────────────────────────────────────
+  // The node's park sweep reaps a container the moment its window passes and
+  // tells the workspace document so (redrun `workspace-park-sweep.ts`). These
+  // cover the other side of that: the two acquires the sweep cannot speak for,
+  // because by then the container it would have reported is already gone.
+
+  it.skipIf(!available)('retracts a park the spawn did not hand back, even when the acquire then dies', async () => {
+    // The sweep reaped this container minutes ago; the record outlived it. The
+    // spawn's adoption probe finds nothing, starts a fresh container — and that
+    // one never registers, so the acquire throws. Before, the clear sat below
+    // the registration wait and never ran: the workspace kept reading warm and
+    // the next acquire aimed its spawn at the same absent park.
+    const ws = await mk({ hotIdleSeconds: 300 });
+    await repo.setWorkspaceNode(ws.workspaceId, NODE, new Date(Date.now() + 3600_000));
+    await repo.setParkedCheckout(ws.workspaceId, {
+      checkoutId: 'chk_reaped',
+      installId: 'ws_abc_chk_reaped',
+      environmentId: 'env_reaped',
+      containerName: 'ws_abc_chk_reaped',
+      nodeId: NODE,
+      parkedUntil: new Date(Date.now() + 240_000),
+    });
+    // A spawn that did NOT adopt: the node destroyed the park and started fresh.
+    const { queue, jobs } = fakeQueue({ spawn: spawnOk() });
+
+    const lookups: string[] = [];
+    const never = {
+      async findByInstallId(_userId: string, installId: string) {
+        lookups.push(installId);
+        return null;
+      },
+    };
+    // Walk the registration deadline past in one step rather than waiting three
+    // real minutes: the first four reads place the spawn, the rest are the loop.
+    const base = Date.now();
+    let reads = 0;
+    const now = () => (++reads <= 4 ? base : base + 10 * 60_000);
+
+    await expect(
+      acquireWorkspace(
+        db!,
+        { workspaceId: ws.workspaceId, runId: 'R1', workerId: 'w1' },
+        { queue, environments: never, now, sleep: async () => {} },
+      ),
+    ).rejects.toThrow(WorkspaceSpawnError);
+
+    expect(jobs[0].data.preferParked).toBe(true);
+    // A cold spawn registers as ITSELF, so the wait is for the id this checkout
+    // minted — never the parked one, whose container the node just destroyed.
+    expect(lookups).toHaveLength(1);
+    expect(lookups[0]).not.toBe('ws_abc_chk_reaped');
+    const doc = await repo.getWorkspace(ws.workspaceId);
+    expect(doc!.parkedCheckout).toBeUndefined();
+    // And the checkout went back, so the workspace is not left locked.
+    expect(doc!.activeCheckouts).toEqual([]);
+  });
+
+  it.skipIf(!available)('retracts a park when the spawn it aimed at never came back at all', async () => {
+    // Nothing on the node will ever report this one: the adoption probe runs
+    // inside the spawn and destroys a park it cannot take over, so a spawn that
+    // then fails leaves a container the sweep can no longer find — and a record
+    // only this side can retract.
+    const ws = await mk({ hotIdleSeconds: 300 });
+    await repo.setWorkspaceNode(ws.workspaceId, NODE, new Date(Date.now() + 3600_000));
+    await repo.setParkedCheckout(ws.workspaceId, {
+      checkoutId: 'chk_reaped',
+      installId: 'ws_abc_chk_reaped',
+      environmentId: 'env_reaped',
+      containerName: 'ws_abc_chk_reaped',
+      nodeId: NODE,
+      parkedUntil: new Date(Date.now() + 240_000),
+    });
+    const dead: LifecycleQueue = {
+      async runJob() {
+        throw new WorkspaceSpawnError('spawn on workspace-lifecycle--10.100.0.5 did not complete within 300000ms');
+      },
+      async hasWorkers() {
+        return true;
+      },
+    };
+
+    await expect(
+      acquireWorkspace(db!, { workspaceId: ws.workspaceId, runId: 'R1', workerId: 'w1' }, { queue: dead, environments: fakeGateway().gateway }),
+    ).rejects.toThrow(WorkspaceSpawnError);
+
+    const doc = await repo.getWorkspace(ws.workspaceId);
+    expect(doc!.parkedCheckout).toBeUndefined();
+    expect(doc!.activeCheckouts).toEqual([]);
+  });
+
+  it.skipIf(!available)('leaves a park alone when the failed spawn was never going to it', async () => {
+    // The pin sends this spawn to OTHER, so nothing touched the container on
+    // NODE. Retracting the record here would cool a workspace that is still
+    // warm; that park is the other node's to reap and to report.
+    const ws = await mk({ hotIdleSeconds: 300 });
+    const OTHER = '10.100.0.7';
+    await repo.setWorkspaceNode(ws.workspaceId, OTHER, new Date(Date.now() + 3600_000));
+    await repo.setParkedCheckout(ws.workspaceId, {
+      checkoutId: 'chk_old',
+      installId: 'ws_abc_chk_old',
+      environmentId: 'env_parked',
+      containerName: 'ws_abc_chk_old',
+      nodeId: NODE,
+      parkedUntil: new Date(Date.now() + 240_000),
+    });
+    const dead: LifecycleQueue = {
+      async runJob() {
+        throw new WorkspaceSpawnError('nope');
+      },
+      async hasWorkers() {
+        return true;
+      },
+    };
+
+    await expect(
+      acquireWorkspace(db!, { workspaceId: ws.workspaceId, runId: 'R1', workerId: 'w1' }, { queue: dead, environments: fakeGateway().gateway }),
+    ).rejects.toThrow(WorkspaceSpawnError);
+
+    expect((await repo.getWorkspace(ws.workspaceId))!.parkedCheckout).toMatchObject({ containerName: 'ws_abc_chk_old' });
   });
 });
