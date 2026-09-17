@@ -681,6 +681,11 @@ export async function acquireWorkspace(
   // Set the moment the spawn job RESOLVES, and from then on a container is
   // running on that node whether or not this acquire ever returns a session.
   let spawned: SpawnedContainer | null = null;
+  // Whether this acquire aimed its spawn at the parked runner. Hoisted out of
+  // the try because the failure path has to know: a spawn that aimed at a park
+  // and did not come back leaves a record nothing on the node can retract —
+  // the container the sweep would have reported is already gone.
+  let preferParked = false;
 
   try {
     const spawnQueue = await resolveSpawnQueue(queue, workspace, options.nodeId, now());
@@ -689,7 +694,7 @@ export async function acquireWorkspace(
     // aged pin or a dead worker can all send it elsewhere, and a container on
     // another node is no use to this checkout.
     const parked = activeParkedCheckout(workspace, now());
-    const preferParked = !!parked && spawnQueue === workspaceNodeQueue(parked.nodeId);
+    preferParked = !!parked && spawnQueue === workspaceNodeQueue(parked.nodeId);
     // Which App installation may clone this repository FOR THIS OWNER. A
     // branch-mode checkout starts from a fresh clone, so this is the job that
     // needs a token at all; the hub answers per-user, and a null — nothing
@@ -757,6 +762,29 @@ export async function acquireWorkspace(
     const adopted = spawn.adopted === true && typeof spawn.installId === 'string' && !!spawn.installId;
     const installId = adopted ? (spawn.installId as string) : checkout.installId;
 
+    // The park is spent the moment the spawn answers: adopted, the container
+    // belongs to THIS checkout now; not adopted, the node has already destroyed
+    // whatever was on that volume (`adoptParkedContainer`'s discard) before
+    // starting a fresh one. Either way the record describes something that no
+    // longer exists, and the release re-establishes it if the workspace still
+    // runs a hot tier.
+    //
+    // Cleared HERE rather than after the registration wait below, which can
+    // throw: an acquire that died waiting for a fresh container to register
+    // used to leave `parkedCheckout` naming a container the node had already
+    // removed, so the workspace read as warm when it was cold and every later
+    // acquire aimed its spawn at a park that was not there. `parked` above is
+    // read from the in-memory document, so the adoption shortcut underneath is
+    // unaffected by this write.
+    if (workspace.parkedCheckout) {
+      if (preferParked && !adopted) {
+        console.warn(
+          `[acquireWorkspace] ${workspace.workspaceId}: parked runner on ${parked?.nodeId} was not adopted; clearing the record`
+        );
+      }
+      await repo.clearParkedCheckout(workspace.workspaceId).catch(() => {});
+    }
+
     // Adopt the environmentId the GATEWAY assigned on register.
     // The checkout mints one locally and the gateway independently upserts its
     // own on (userId, installId, kind); nothing reconciled them, so every bridge
@@ -788,10 +816,6 @@ export async function acquireWorkspace(
       volumeName: spawn.volumeName,
       ...(adopted ? { installId } : {}),
     });
-    // The park is spent either way: adopted, it is this checkout's container
-    // now; not adopted, the node has already destroyed whatever was there. The
-    // release re-establishes it if the workspace still runs a hot tier.
-    if (workspace.parkedCheckout) await repo.clearParkedCheckout(workspace.workspaceId).catch(() => {});
     // Remember where the volume lives and for how long that is worth trusting,
     // so the next checkout goes back to it while it is still warm.
     const pinnedUntil = new Date(now() + warmTtlSeconds(workspace.config) * 1000);
@@ -819,6 +843,13 @@ export async function acquireWorkspace(
         options.delegatedFromUserId
       );
     }
+    // A spawn that never resolved still ran the adoption probe on the node, and
+    // that probe destroys a parked container it cannot take over. Nothing will
+    // ever report that one — the sweep only speaks for containers it finds —
+    // so the record has to go from this side or the workspace reads warm until
+    // some later acquire happens to succeed. Only when this acquire actually
+    // aimed at the park: a record on another node is that node's to retract.
+    if (preferParked) await repo.clearParkedCheckout(workspace.workspaceId).catch(() => {});
     // Then give the slot back.
     await repo
       .releaseWorkspace({
