@@ -42,6 +42,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import Redis from 'ioredis';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -124,6 +125,7 @@ export interface RequestDesktopArgs {
 
 const CMD_CHANNEL_PREFIX = 'desktop:cmd:';
 const REPLY_CHANNEL_PREFIX = 'desktop:reply:';
+const STREAM_CHANNEL_PREFIX = 'desktop:stream:';
 
 // Connected desktops reply in well under a second; this bounds the wait when
 // NO desktop is connected (the round-trip timeout is our presence detector).
@@ -190,27 +192,16 @@ export async function requestDesktop(args: RequestDesktopArgs): Promise<Computer
   let sub: any = null;
 
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const IORedis = require('ioredis');
     const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 
     // Publisher / commands connection. A subscriber-mode connection can't run
     // normal commands (SCAN/PUBLISH), so we keep a SECOND dedicated subscriber
     // connection below — same split the gateway + entity-stream code uses.
-    pub = new IORedis(redisUrl, { maxRetriesPerRequest: 3 });
-
-    // NOTE: we deliberately do NOT pre-gate on a presence SCAN. `SCAN ... MATCH`
-    // is unreliable for finding a single key in a large keyspace (COUNT is a
-    // per-iteration hint, not a guarantee), so it produced false "no desktop"
-    // results even when a desktop was connected. Instead the round-trip TIMEOUT
-    // is the source of truth: a connected desktop replies in well under a
-    // second; if nothing answers within `timeoutMs` we return a clean
-    // "no desktop responded" failure. The cost is only paid when no desktop is
-    // actually connected.
+    pub = new Redis(redisUrl, { maxRetriesPerRequest: 3 });
 
     // Dedicated subscriber. `maxRetriesPerRequest: null` mirrors the gateway's
     // subscriber connection (BullMQ/ioredis subscriber-mode requirement).
-    sub = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+    sub = new Redis(redisUrl, { maxRetriesPerRequest: null });
 
     const result = await new Promise<ComputerResultMessage>((resolve) => {
       let settled = false;
@@ -295,6 +286,9 @@ export interface RequestDesktopRawArgs {
   payload?: AnyObject;
   timeoutMs?: number;
   installId: string;
+  id?: string;
+  onChunk?: (chunk: { stream: 'stdout' | 'stderr'; chunk: string; seq: number }) => void;
+  abortSignal?: AbortSignal;
 }
 
 /**
@@ -305,7 +299,7 @@ export interface RequestDesktopRawArgs {
  * { ok:false, error:{ code:'desktop_failed', message } } on any failure.
  */
 export async function requestDesktopRaw(args: RequestDesktopRawArgs): Promise<AnyObject> {
-  const id = randomUUID();
+  const id = args.id || randomUUID();
   const timeoutMs =
     typeof args.timeoutMs === 'number' && Number.isFinite(args.timeoutMs) && args.timeoutMs > 0
       ? args.timeoutMs
@@ -319,16 +313,16 @@ export async function requestDesktopRaw(args: RequestDesktopRawArgs): Promise<An
 
   const cmdChannel = `${CMD_CHANNEL_PREFIX}${userId}:${installId}`;
   const replyChannel = `${REPLY_CHANNEL_PREFIX}${id}`;
+  const streamChannel = `${STREAM_CHANNEL_PREFIX}${id}`;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let pub: any = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let sub: any = null;
+  let abortListener: (() => void) | null = null;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const IORedis = require('ioredis');
     const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-    pub = new IORedis(redisUrl, { maxRetriesPerRequest: 3 });
-    sub = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+    pub = new Redis(redisUrl, { maxRetriesPerRequest: 3 });
+    sub = new Redis(redisUrl, { maxRetriesPerRequest: null });
     const result = await new Promise<AnyObject>((resolve) => {
       let settled = false;
       let timer: NodeJS.Timeout | null = null;
@@ -336,9 +330,12 @@ export async function requestDesktopRaw(args: RequestDesktopRawArgs): Promise<An
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        if (abortListener && args.abortSignal) {
+          args.abortSignal.removeEventListener('abort', abortListener);
+        }
         resolve(value);
       };
-      sub.on('message', (_channel: string, payload: string) => {
+      sub.on('message', (channel: string, payload: string) => {
         let parsed: AnyObject | null = null;
         try {
           parsed = JSON.parse(payload) as AnyObject;
@@ -346,11 +343,35 @@ export async function requestDesktopRaw(args: RequestDesktopRawArgs): Promise<An
           return;
         }
         if (!parsed || typeof parsed !== 'object') return;
+        if (channel === streamChannel) {
+          if (args.onChunk && parsed.kind === 'exec_chunk') {
+            args.onChunk({
+              stream: parsed.stream === 'stderr' ? 'stderr' : 'stdout',
+              chunk: typeof parsed.chunk === 'string' ? parsed.chunk : '',
+              seq: typeof parsed.seq === 'number' ? parsed.seq : 0,
+            });
+          }
+          return;
+        }
         finish({ ...parsed, ok: parsed.ok === true });
       });
+
+      const channels = args.onChunk ? [replyChannel, streamChannel] : [replyChannel];
       sub
-        .subscribe(replyChannel)
+        .subscribe(...channels)
         .then(() => {
+          if (args.abortSignal) {
+            if (args.abortSignal.aborted) {
+              void pub.publish(cmdChannel, JSON.stringify({ kind: 'exec_cancel', id }));
+            } else {
+              abortListener = () => {
+                if (pub) {
+                  void pub.publish(cmdChannel, JSON.stringify({ kind: 'exec_cancel', id }));
+                }
+              };
+              args.abortSignal.addEventListener('abort', abortListener, { once: true });
+            }
+          }
           const message = JSON.stringify({ kind: args.kind, id, ...(args.payload || {}) });
           return pub.publish(cmdChannel, message);
         })
@@ -370,6 +391,9 @@ export async function requestDesktopRaw(args: RequestDesktopRawArgs): Promise<An
     const m = err instanceof Error ? err.message : String(err);
     return { ok: false, error: { code: 'desktop_failed', message: m } };
   } finally {
+    if (abortListener && args.abortSignal) {
+      args.abortSignal.removeEventListener('abort', abortListener);
+    }
     if (sub) {
       try { await sub.unsubscribe(); } catch { /* ignore */ }
       try { await sub.quit(); } catch { /* ignore */ }

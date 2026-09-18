@@ -44,6 +44,61 @@ describe('DesktopAgentSession — exec', () => {
     const r = await session().exec('nope');
     expect(r.exitCode).toBe(127);
   });
+  it('surfaces stream chunks to opts.onChunk and emits exec_chunk events', async () => {
+    raw.mockImplementation(async (...allArgs: any[]) => {
+      if (allArgs.length === 0) return { ok: true };
+      const args = allArgs[0];
+      args.onChunk?.({ stream: 'stdout', chunk: 'hello ', seq: 0 });
+      args.onChunk?.({ stream: 'stderr', chunk: 'err ', seq: 1 });
+      args.onChunk?.({ stream: 'stdout', chunk: 'world', seq: 2 });
+      return { ok: true, result: { stdout: 'hello world', stderr: 'err ', exitCode: 0, durationMs: 10, truncated: false } };
+    });
+    const s = session();
+    const emittedEvents: any[] = [];
+    s.on('exec_chunk', (e) => emittedEvents.push(e));
+    const capturedChunks: any[] = [];
+    const r = await s.exec('echo hi', {
+      onChunk: (c) => capturedChunks.push(c),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(capturedChunks).toEqual([
+      { stream: 'stdout', chunk: 'hello ', seq: 0 },
+      { stream: 'stderr', chunk: 'err ', seq: 1 },
+      { stream: 'stdout', chunk: 'world', seq: 2 },
+    ]);
+    expect(emittedEvents.length).toBe(3);
+    expect(emittedEvents[0]).toEqual({
+      environmentId: 'env_ABC',
+      command: 'echo hi',
+      stream: 'stdout',
+      chunk: 'hello ',
+      seq: 0,
+    });
+  });
+  it('falls back to buffered output on opts.onChunk if no chunks were streamed', async () => {
+    raw.mockResolvedValue({
+      ok: true,
+      result: { stdout: 'buffered out', stderr: 'buffered err', exitCode: 0, durationMs: 5, truncated: false },
+    });
+    const s = session();
+    const capturedChunks: any[] = [];
+    const r = await s.exec('legacy-cmd', {
+      onChunk: (c) => capturedChunks.push(c),
+    });
+    expect(r.stdout).toBe('buffered out');
+    expect(capturedChunks).toEqual([
+      { stream: 'stdout', chunk: 'buffered out', seq: 0 },
+      { stream: 'stderr', chunk: 'buffered err', seq: 1 },
+    ]);
+  });
+  it('forwards abortSignal to requestDesktopRaw', async () => {
+    raw.mockResolvedValue({ ok: true, result: { exitCode: 0 } });
+    const ac = new AbortController();
+    await session().exec('sleep 10', { abortSignal: ac.signal });
+    expect(raw).toHaveBeenCalledWith(expect.objectContaining({
+      abortSignal: ac.signal,
+    }));
+  });
 });
 
 describe('DesktopAgentSession — sftp', () => {

@@ -674,12 +674,16 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
           }
         }
 
+        let chunkSeq = 0;
         channelStream.on('data', (data: Buffer) => {
           const chunk = data.toString('utf8');
           stdout += chunk;
           if (stdout.length > EXEC_MAX_OUTPUT_BYTES) {
             stdout = stdout.slice(stdout.length - EXEC_MAX_OUTPUT_BYTES);
             truncatedStdout = true;
+          }
+          if (opts.onChunk && chunk) {
+            opts.onChunk({ stream: 'stdout', chunk, seq: chunkSeq++ });
           }
         });
 
@@ -699,6 +703,9 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
           if (stderr.length > EXEC_MAX_OUTPUT_BYTES) {
             stderr = stderr.slice(stderr.length - EXEC_MAX_OUTPUT_BYTES);
             truncatedStderr = true;
+          }
+          if (opts.onChunk && chunk) {
+            opts.onChunk({ stream: 'stderr', chunk, seq: chunkSeq++ });
           }
         });
 
