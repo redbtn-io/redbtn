@@ -252,16 +252,34 @@ const runCommandTool: NativeToolDefinition = {
 
     // ── Execute ───────────────────────────────────────────────────────────
     try {
+      let streamedBytes = 0;
       const result = await session.exec(command, {
         cwd: workingDir,
         env: envVars,
         timeout: timeout > 0 ? timeout : undefined,
         abortSignal: context?.abortSignal || undefined,
+        onChunk: (chunk) => {
+          streamedBytes += chunk.chunk.length;
+          if (publisher) {
+            try {
+              (publisher as AnyObject).publish({
+                type: 'tool_output',
+                nodeId,
+                data: {
+                  chunk: chunk.chunk,
+                  stream: chunk.stream,
+                  seq: chunk.seq,
+                  totalBytes: streamedBytes,
+                },
+              });
+            } catch { /* ignore */ }
+          }
+        },
       });
       const duration = Date.now() - startTime;
       const success = result.exitCode === 0;
 
-      if (publisher) {
+      if (publisher && streamedBytes === 0 && (result.stdout || result.stderr)) {
         try {
           (publisher as AnyObject).publish({
             type: 'tool_output',
