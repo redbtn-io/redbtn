@@ -260,6 +260,14 @@ const runCommandTool: NativeToolDefinition = {
         abortSignal: context?.abortSignal || undefined,
         onChunk: (chunk) => {
           streamedBytes += chunk.chunk.length;
+          if (context?.onChunk) {
+            try {
+              context.onChunk(chunk.chunk, chunk.stream);
+            } catch (cbErr: unknown) {
+              const msg = cbErr instanceof Error ? cbErr.message : String(cbErr);
+              console.warn('[run_command] onChunk callback error:', msg);
+            }
+          }
           if (publisher) {
             try {
               (publisher as AnyObject).publish({
