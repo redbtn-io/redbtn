@@ -213,4 +213,30 @@ describe('ssh_shell — environmentId mode', () => {
     expect(JSON.parse(result.content[0].text).success).toBe(true);
     expect(loadAndResolveEnvironment).toHaveBeenCalledWith('env_pool', 'user_a');
   });
+
+  it('forwards stream chunks to context.onChunk during environment execution', async () => {
+    const env = buildEnv({ environmentId: 'env_pool', userId: 'user_a' });
+    vi.mocked(loadAndResolveEnvironment).mockResolvedValue({
+      env,
+      sshKey: '-----PRIVATE KEY-----',
+    });
+
+    const chunks: Array<{ chunk: string; stream: string }> = [];
+    const onChunk = vi.fn((chunk: string, stream: string) => {
+      chunks.push({ chunk, stream });
+    });
+
+    const result = await sshShellTool.handler(
+      { environmentId: 'env_pool', command: 'echo hello' },
+      {
+        ...buildContext('user_a'),
+        onChunk,
+      } as never,
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(onChunk).toHaveBeenCalled();
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(chunks.some((c) => c.stream === 'stdout')).toBe(true);
+  });
 });

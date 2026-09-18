@@ -26,7 +26,7 @@ const { getFakePub, getFakeSub, MockRedisConstructor } = vi.hoisted(() => {
   let fakePubInstance: any = null;
   let fakeSubInstance: any = null;
 
-  const MockRedisConstructor = vi.fn().mockImplementation((...args: any[]) => {
+  const MockRedisConstructor = vi.fn().mockImplementation(function (...args: any[]) {
     if (args.length === 0) return {};
     const opts = args[1];
     if (opts?.maxRetriesPerRequest === null) {

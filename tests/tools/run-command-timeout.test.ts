@@ -262,4 +262,27 @@ describe('run_command — RUN_COMMAND_DEFAULT_TIMEOUT_MS', () => {
   test('unset gives the built-in 10 minutes', async () => {
     expect(await appliedTimeoutWithEnv(undefined)).toBe(DEFAULT_TIMEOUT_MS);
   });
+
+  test('forwards stream chunks to context.onChunk', async () => {
+    const exec = vi.fn(async (_cmd: string, opts?: any) => {
+      opts?.onChunk?.({ chunk: 'hello world', stream: 'stdout', seq: 0 });
+      opts?.onChunk?.({ chunk: 'err occurred', stream: 'stderr', seq: 1 });
+      return { stdout: 'hello world', stderr: 'err occurred', exitCode: 0, durationMs: 5, truncated: false };
+    });
+    vi.mocked(environmentManager.acquire).mockResolvedValue({ exec } as any);
+
+    const receivedChunks: Array<{ chunk: string; stream: string }> = [];
+    const context = makeMockContext({
+      onChunk: (chunk: string, stream: 'stdout' | 'stderr') => {
+        receivedChunks.push({ chunk, stream });
+      },
+    });
+
+    const result = await runCommandTool.handler({ command: 'echo hello' }, context);
+    expect(result.isError).toBeUndefined();
+    expect(receivedChunks).toEqual([
+      { chunk: 'hello world', stream: 'stdout' },
+      { chunk: 'err occurred', stream: 'stderr' },
+    ]);
+  });
 });
