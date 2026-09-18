@@ -183,6 +183,13 @@ export interface IEnvironment {
 // Exec / SFTP options + results
 // ---------------------------------------------------------------------------
 
+/** Single streaming output chunk from an in-flight exec execution. */
+export interface ExecChunk {
+  stream: 'stdout' | 'stderr';
+  chunk: string;
+  seq: number;
+}
+
 /**
  * Options for `EnvironmentSession.exec()`.
  */
@@ -195,6 +202,8 @@ export interface ExecOptions {
   timeout?: number;
   /** External cancellation signal (e.g. from `runControlRegistry`). */
   abortSignal?: AbortSignal;
+  /** Callback invoked as live output chunks arrive from the execution. */
+  onChunk?: (chunk: ExecChunk) => void;
 }
 
 /**

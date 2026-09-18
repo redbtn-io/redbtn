@@ -34,6 +34,7 @@ import type {
   IEnvironment,
   ExecOptions,
   ExecResult,
+  ExecChunk,
   SftpReadOptions,
   SftpWriteOptions,
   SftpStatResult,
@@ -153,6 +154,19 @@ export class DesktopAgentSession extends EventEmitter implements IEnvironmentSes
       // hand over NaN; neither is a budget, so both defer to the session's.
       const explicit = Number(opts.timeout);
       const commandTimeoutMs = Number.isFinite(explicit) && explicit > 0 ? explicit : this.timeoutMs;
+      const chunksReceived: ExecChunk[] = [];
+      const onChunk = (chunk: ExecChunk) => {
+        chunksReceived.push(chunk);
+        try {
+          this.emit('exec_chunk', {
+            environmentId: this.environmentId,
+            command,
+            ...chunk,
+          });
+        } catch { /* best-effort emit */ }
+        opts.onChunk?.(chunk);
+      };
+
       const reply = await this.roundTrip(
         'exec',
         {
@@ -163,14 +177,31 @@ export class DesktopAgentSession extends EventEmitter implements IEnvironmentSes
         },
         // Strictly longer than the command budget — see RELAY_GRACE_MS.
         commandTimeoutMs !== undefined ? commandTimeoutMs + RELAY_GRACE_MS : undefined,
+        {
+          onChunk,
+          abortSignal: opts.abortSignal,
+        },
       );
       if (!reply || reply.ok !== true) {
         throw this.replyError(reply, 'exec');
       }
       const r = (reply.result ?? {}) as Partial<ExecResult>;
+      const stdout = typeof r.stdout === 'string' ? r.stdout : '';
+      const stderr = typeof r.stderr === 'string' ? r.stderr : '';
+
+      // Buffered fallback for older connectors that don't emit chunks
+      if (chunksReceived.length === 0 && opts.onChunk) {
+        if (stdout) {
+          opts.onChunk({ stream: 'stdout', chunk: stdout, seq: 0 });
+        }
+        if (stderr) {
+          opts.onChunk({ stream: 'stderr', chunk: stderr, seq: stdout ? 1 : 0 });
+        }
+      }
+
       return {
-        stdout: typeof r.stdout === 'string' ? r.stdout : '',
-        stderr: typeof r.stderr === 'string' ? r.stderr : '',
+        stdout,
+        stderr,
         exitCode: typeof r.exitCode === 'number' ? r.exitCode : (reply.ok ? 0 : 1),
         durationMs: typeof r.durationMs === 'number' ? r.durationMs : 0,
         truncated: r.truncated === true,
@@ -260,6 +291,10 @@ export class DesktopAgentSession extends EventEmitter implements IEnvironmentSes
     kind: string,
     payload: Record<string, unknown>,
     timeoutMs: number | undefined,
+    extra?: {
+      onChunk?: (chunk: ExecChunk) => void;
+      abortSignal?: AbortSignal;
+    },
   ): Promise<Record<string, unknown>> {
     const before = await this.probeLiveness();
     if (before.verdict === 'offline') throw this.offlineError(before);
@@ -270,6 +305,8 @@ export class DesktopAgentSession extends EventEmitter implements IEnvironmentSes
       kind,
       timeoutMs,
       payload,
+      onChunk: extra?.onChunk,
+      abortSignal: extra?.abortSignal,
     }) as Promise<Record<string, unknown>>;
 
     return this.watchLiveness(work);
