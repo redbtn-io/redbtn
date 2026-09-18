@@ -882,16 +882,42 @@ async function executeViaEnvironment(args: ExecuteViaEnvironmentArgs): Promise<N
 
   // ── Exec ────────────────────────────────────────────────────────────────
   try {
+    let streamedBytes = 0;
     const result = await session.exec(command, {
       cwd: workingDir,
       env,
       timeout: timeout > 0 ? timeout : undefined,
       abortSignal: context?.abortSignal || undefined,
+      onChunk: (chunk) => {
+        streamedBytes += chunk.chunk.length;
+        if (context?.onChunk) {
+          try {
+            context.onChunk(chunk.chunk, chunk.stream);
+          } catch (cbErr: unknown) {
+            const msg = cbErr instanceof Error ? cbErr.message : String(cbErr);
+            console.warn('[ssh_shell] onChunk callback error:', msg);
+          }
+        }
+        if (publisher) {
+          try {
+            (publisher as AnyObject).publish({
+              type: 'tool_output',
+              nodeId,
+              data: {
+                chunk: chunk.chunk,
+                stream: chunk.stream,
+                seq: chunk.seq,
+                totalBytes: streamedBytes,
+              },
+            });
+          } catch { /* ignore */ }
+        }
+      },
     });
     const duration = Date.now() - startTime;
     const success = result.exitCode === 0;
 
-    if (publisher) {
+    if (publisher && streamedBytes === 0 && (result.stdout || result.stderr)) {
       try {
         (publisher as AnyObject).publish({
           type: 'tool_output',
