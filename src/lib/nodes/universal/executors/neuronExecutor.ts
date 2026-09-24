@@ -2272,6 +2272,58 @@ function stripInlineImageData(s: string): string {
     .replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g, 'data:image/*;base64,<omitted>')
     .replace(/"(dataUrl|base64|data)"\s*:\s*"[A-Za-z0-9+/=]{80,}"/g, '"$1":"<omitted>"');
 }
+/**
+ * Recursively walk an unwrapped tool result, extract image payloads into the
+ * `images` array (as data URLs for vision models), and return a shallow/deep
+ * clone with heavy base64 strings omitted so the text transcript stays compact.
+ */
+function extractAndStripImages(val: unknown, images: string[]): unknown {
+  if (!val || typeof val !== 'object') {
+    return val;
+  }
+
+  if (Array.isArray(val)) {
+    return val.map((item) => extractAndStripImages(item, images));
+  }
+
+  const obj = val as Record<string, unknown>;
+  const copy: Record<string, unknown> = {};
+
+  // Check if obj itself represents an image or has top-level image data
+  const dataUrl =
+    typeof obj.dataUrl === 'string' && obj.dataUrl.startsWith('data:')
+      ? obj.dataUrl
+      : null;
+  const b64 =
+    typeof obj.base64 === 'string' && obj.base64.length > 80
+      ? obj.base64
+      : typeof obj.imageBase64 === 'string' && obj.imageBase64.length > 80
+      ? obj.imageBase64
+      : null;
+
+  if (dataUrl) {
+    images.push(dataUrl);
+  } else if (b64) {
+    const mime =
+      (typeof obj.mimeType === 'string' && obj.mimeType) ||
+      (typeof obj.format === 'string' ? `image/${obj.format}` : 'image/png');
+    images.push(`data:${mime};base64,${b64}`);
+  }
+
+  for (const [k, v] of Object.entries(obj)) {
+    // Drop heavy raw image payloads
+    if (k === 'base64' || k === 'imageBase64' || k === 'dataUrl') {
+      continue;
+    }
+    // If the property is 'data' and it's a long base64 string, drop it
+    if (k === 'data' && typeof v === 'string' && v.length > 80) {
+      continue;
+    }
+    copy[k] = extractAndStripImages(v, images);
+  }
+
+  return copy;
+}
 
 /**
  * Format a tool result for the model's message thread. Detects MCP image
@@ -2315,28 +2367,18 @@ export function formatToolResultForModel(result: unknown): { text: string; image
       return { text: text.slice(0, MAX_TOOL_TEXT), images };
     }
 
-    // Shape 2: UNWRAPPED image result. tool-resolver.ts strips the MCP wrapper
+    // Shape 2: UNWRAPPED tool result. tool-resolver.ts strips the MCP wrapper
     // and returns the text block's parsed JSON — so desktop_screenshot arrives
     // here as {ok,format,width,height,mimeType,dataUrl,base64} and the image
-    // block is already gone. Recover the pixels from dataUrl / base64 so vision
-    // still works, and emit compact metadata with those heavy fields removed.
-    const dataUrl =
-      typeof obj.dataUrl === 'string' && (obj.dataUrl as string).startsWith('data:')
-        ? (obj.dataUrl as string)
-        : null;
-    const b64 = typeof obj.base64 === 'string' && (obj.base64 as string).length > 80 ? (obj.base64 as string) : null;
-    if (dataUrl || b64) {
-      if (dataUrl) {
-        images.push(dataUrl);
-      } else {
-        const mime =
-          (typeof obj.mimeType === 'string' && obj.mimeType) ||
-          (typeof obj.format === 'string' ? `image/${obj.format}` : 'image/png');
-        images.push(`data:${mime};base64,${b64}`);
-      }
-      const { base64: _b, dataUrl: _d, data: _dat, ...rest } = obj;
-      void _b; void _d; void _dat;
-      return { text: stripInlineImageData(safeStringify(rest)).slice(0, MAX_TOOL_TEXT), images };
+    // block is already gone. Also extracts nested images from:
+    // - desktop_hover (result.image)
+    // - desktop_wait_for (result.evidence on timeout)
+    // - desktop_batch (results[i].result.image / evidence)
+    // Recover the pixels so vision still works, and emit compact metadata
+    // with heavy base64 fields removed.
+    const cleaned = extractAndStripImages(obj, images);
+    if (images.length > 0) {
+      return { text: stripInlineImageData(safeStringify(cleaned)).slice(0, MAX_TOOL_TEXT), images };
     }
   }
 
