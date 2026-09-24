@@ -177,6 +177,76 @@ function invalidRegionResult(): NativeMcpResult {
   }, true);
 }
 
+/** Optional crop dimensions in click space, or undefined when absent/invalid. */
+function resolveSize(args: AnyObject): { w: number; h: number } | undefined {
+  const raw = args?.size;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const w = Number(raw.w);
+  const h = Number(raw.h);
+  if (Number.isFinite(w) && w >= 1 && Number.isFinite(h) && h >= 1) {
+    return { w: Math.round(w), h: Math.round(h) };
+  }
+  return undefined;
+}
+
+/** Optional crop center in click space or 'cursor', or undefined when absent/invalid. */
+function resolveAround(args: AnyObject): { x: number; y: number } | 'cursor' | undefined {
+  const raw = args?.around;
+  if (raw === 'cursor') return 'cursor';
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const x = Number(raw.x);
+  const y = Number(raw.y);
+  if (Number.isFinite(x) && Number.isFinite(y)) {
+    return { x, y };
+  }
+  return undefined;
+}
+
+interface ExtractedImage {
+  data: string;
+  mimeType: string;
+}
+
+/**
+ * Recursively find any base64 image objects (e.g. action `result.image`, batch step
+ * results with `image`, or `evidence`), extract them as MCP image blocks, and
+ * strip the base64 payload from the JSON text to prevent polluting context.
+ */
+function extractImagesAndStrip(root: unknown): { cleaned: unknown; images: ExtractedImage[] } {
+  const images: ExtractedImage[] = [];
+  if (!root || typeof root !== 'object') {
+    return { cleaned: root, images };
+  }
+
+  const clone = JSON.parse(JSON.stringify(root));
+
+  function walk(node: any) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      const val = node[key];
+      if (val && typeof val === 'object') {
+        if (typeof val.base64 === 'string' && val.base64.length > 0) {
+          const mimeType = val.format === 'jpeg' ? 'image/jpeg' : 'image/png';
+          images.push({ data: val.base64, mimeType });
+          delete val.base64;
+        } else if (typeof val.imageBase64 === 'string' && val.imageBase64.length > 0) {
+          const mimeType = val.format ? `image/${val.format}` : 'image/png';
+          images.push({ data: val.imageBase64, mimeType });
+          delete val.imageBase64;
+        }
+        walk(val);
+      }
+    }
+  }
+
+  walk(clone);
+  return { cleaned: clone, images };
+}
+
 /** Standard text-only result wrapper. */
 function textResult(value: unknown, isError = false): NativeMcpResult {
   return {
@@ -270,15 +340,29 @@ function inputFailure(result: ComputerResultMessage): DesktopFailure | null {
  */
 function inputResult(result: ComputerResultMessage): NativeMcpResult {
   const failure = inputFailure(result);
-  return textResult(
+  const payload: AnyObject = {
+    // A dry run claims ok:true. It did nothing, so it is not ok.
+    ok: failure === null,
+    ...(result.result ? { result: result.result } : {}),
+    ...(result.image ? { image: result.image } : {}),
+    ...(failure ? { error: failure } : {}),
+  };
+  const { cleaned, images } = extractImagesAndStrip(payload);
+  const content: NativeMcpResult['content'] = [
+    ...images.map((img) => ({
+      type: 'image' as const,
+      data: img.data,
+      mimeType: img.mimeType,
+    })),
     {
-      // A dry run claims ok:true. It did nothing, so it is not ok.
-      ok: failure === null,
-      ...(result.result ? { result: result.result } : {}),
-      ...(failure ? { error: failure } : {}),
+      type: 'text' as const,
+      text: JSON.stringify(cleaned),
     },
-    failure !== null,
-  );
+  ];
+  return {
+    content,
+    ...(failure !== null ? { isError: true } : {}),
+  };
 }
 
 /**
@@ -525,6 +609,35 @@ const desktopScreenshotTool: NativeToolDefinition = {
         },
         required: ['x', 'y', 'w', 'h'],
       },
+      around: {
+        description:
+          'Crop a window centered on coordinates {x, y} in click space or around the current live mouse position ("cursor").',
+        oneOf: [
+          {
+            type: 'object',
+            description: 'Target coordinates {x, y} in click space.',
+            properties: {
+              x: { type: 'number', description: 'X coordinate in click space.' },
+              y: { type: 'number', description: 'Y coordinate in click space.' },
+            },
+            required: ['x', 'y'],
+          },
+          {
+            type: 'string',
+            enum: ['cursor'],
+            description: 'Center the crop on the current mouse position.',
+          },
+        ],
+      },
+      size: {
+        type: 'object',
+        description:
+          'Width and height in click space for the crop (defaults to 400x200). Used when `around` is specified.',
+        properties: {
+          w: { type: 'integer', minimum: 1, description: 'Width in click space.' },
+          h: { type: 'integer', minimum: 1, description: 'Height in click space.' },
+        },
+      },
       fullRes: {
         type: 'boolean',
         description:
@@ -545,11 +658,15 @@ const desktopScreenshotTool: NativeToolDefinition = {
     if (display === null) return invalidDisplayResult();
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
+    const around = resolveAround(rawArgs);
+    const size = resolveSize(rawArgs);
     const fullRes = rawArgs?.fullRes === true;
     const request: ComputerAction = { action: 'screenshot', format };
     if (display !== undefined) request.display = display;
     // Passed through verbatim; the desktop clamps the rect (computerUse.ts).
     if (region !== undefined) request.region = region;
+    if (around !== undefined) request.around = around;
+    if (size !== undefined) request.size = size;
     if (fullRes) request.fullRes = true;
     const result = await runAction(context, request, rawArgs);
     if (!result) return noUserResult();
@@ -587,7 +704,9 @@ const desktopScreenshotTool: NativeToolDefinition = {
             // What am I looking at? — echoed so the model can tell a zoomed
             // crop from the default overview without guessing from dimensions.
             region: region ?? null,
-            fullRes: region === undefined ? fullRes : false,
+            around: around ?? null,
+            size: size ?? null,
+            fullRes: region === undefined && around === undefined ? fullRes : false,
             mimeType,
             dataUrl,
             base64: img.base64,
@@ -631,6 +750,12 @@ const desktopClickTool: NativeToolDefinition = {
       double: { type: 'boolean', description: 'Perform a double-click. Default false.' },
       smooth: { type: 'boolean', description: 'Move the cursor smoothly to coordinates before clicking. Default false.' },
       speed: { type: 'string', enum: ['normal', 'fast', 'instant'], description: 'Movement speed preset. Default normal.' },
+      screenshot: { type: 'boolean', description: 'Capture and return a crop around where the click landed as an MCP image block' },
+      size: {
+        type: 'object',
+        description: 'Crop dimensions {w, h} in click space around click point (defaults to 400x200)',
+        properties: { w: { type: 'number' }, h: { type: 'number' } },
+      },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
     required: ['environmentId', 'x', 'y'],
@@ -646,6 +771,7 @@ const desktopClickTool: NativeToolDefinition = {
       rawArgs?.button === 'right' ? 'right' : rawArgs?.button === 'middle' ? 'middle' : 'left';
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
+    const size = resolveSize(rawArgs);
     const request: ComputerAction = {
       action: 'mouse',
       op: 'click',
@@ -656,6 +782,8 @@ const desktopClickTool: NativeToolDefinition = {
     };
     if (rawArgs?.smooth === true) request.smooth = true;
     if (rawArgs?.speed !== undefined) request.speed = rawArgs.speed;
+    if (rawArgs?.screenshot === true) request.screenshot = true;
+    if (size !== undefined) request.size = size;
     if (display !== undefined) request.display = display;
     const result = await runAction(
       context,
@@ -1195,6 +1323,12 @@ const desktopClickTextTool: NativeToolDefinition = {
         },
         required: ['x', 'y', 'w', 'h'],
       },
+      screenshot: { type: 'boolean', description: 'Capture and return a crop around where the click landed as an MCP image block' },
+      size: {
+        type: 'object',
+        description: 'Crop dimensions {w, h} in click space around click point (defaults to 400x200)',
+        properties: { w: { type: 'number' }, h: { type: 'number' } },
+      },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
     },
     required: ['environmentId'],
@@ -1210,6 +1344,7 @@ const desktopClickTextTool: NativeToolDefinition = {
     if (display === null) return invalidDisplayResult();
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
+    const size = resolveSize(rawArgs);
     const request: ComputerAction = {
       action: 'ocr',
       op: 'click',
@@ -1220,6 +1355,8 @@ const desktopClickTextTool: NativeToolDefinition = {
       double: rawArgs?.double === true,
       offset: rawArgs?.offset,
     };
+    if (rawArgs?.screenshot === true) request.screenshot = true;
+    if (size !== undefined) request.size = size;
     if (display !== undefined) request.display = display;
     if (region !== undefined) request.region = region;
 
@@ -1247,6 +1384,7 @@ const desktopFindImageTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       template: { type: 'string', description: 'Base64-encoded PNG/JPEG template image to find.' },
+      templateBase64: { type: 'string', description: 'Alias for template (base64-encoded PNG/JPEG).' },
       image: { type: 'string', description: 'Alias for template (base64-encoded PNG/JPEG).' },
       threshold: { type: 'number', minimum: 0, maximum: 1, description: 'Similarity threshold 0.0–1.0 (default 0.8).' },
       display: {
@@ -1271,7 +1409,14 @@ const desktopFindImageTool: NativeToolDefinition = {
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
-    const template = typeof rawArgs?.template === 'string' ? rawArgs.template : (typeof rawArgs?.image === 'string' ? rawArgs.image : '');
+    const template =
+      typeof rawArgs?.template === 'string'
+        ? rawArgs.template
+        : typeof rawArgs?.templateBase64 === 'string'
+          ? rawArgs.templateBase64
+          : typeof rawArgs?.image === 'string'
+            ? rawArgs.image
+            : '';
     if (!template) {
       return textResult({ ok: false, error: { code: 'computer_failed', message: 'template (base64 image) is required' } }, true);
     }
@@ -1326,6 +1471,7 @@ const desktopWaitForTool: NativeToolDefinition = {
       text: { type: 'string', description: 'Text substring to wait for.' },
       regex: { type: 'string', description: 'Regular expression to wait for.' },
       template: { type: 'string', description: 'Base64 image template to wait for.' },
+      templateBase64: { type: 'string', description: 'Alias for template (base64 image).' },
       image: { type: 'string', description: 'Alias for template (base64 image).' },
       gone: { type: 'boolean', description: 'If true, wait for the target to DISAPPEAR. Default false.' },
       timeoutMs: { type: 'integer', description: 'Max wait time in ms (default 10000, max 60000).' },
@@ -1354,7 +1500,14 @@ const desktopWaitForTool: NativeToolDefinition = {
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
     const text = typeof rawArgs?.text === 'string' ? rawArgs.text : undefined;
     const regex = typeof rawArgs?.regex === 'string' ? rawArgs.regex : undefined;
-    const template = typeof rawArgs?.template === 'string' ? rawArgs.template : (typeof rawArgs?.image === 'string' ? rawArgs.image : undefined);
+    const template =
+      typeof rawArgs?.template === 'string'
+        ? rawArgs.template
+        : typeof rawArgs?.templateBase64 === 'string'
+          ? rawArgs.templateBase64
+          : typeof rawArgs?.image === 'string'
+            ? rawArgs.image
+            : undefined;
     if (!text && !regex && !template) {
       return textResult({ ok: false, error: { code: 'computer_failed', message: 'wait_for requires text, regex, or template' } }, true);
     }
@@ -1379,23 +1532,25 @@ const desktopWaitForTool: NativeToolDefinition = {
     const result = await runAction(context, request, rawArgs, 5000);
     if (!result) return noUserResult();
 
-    const content: Array<Record<string, unknown>> = [];
-    const evidence = (result.result as any)?.evidence || (result.error as any)?.evidence;
-    if (evidence?.imageBase64 || evidence?.base64) {
-      const data = evidence.imageBase64 || evidence.base64;
-      const mime = evidence.format ? `image/${evidence.format}` : 'image/png';
-      content.push({ type: 'image', data, mimeType: mime });
-    }
-    content.push({
-      type: 'text',
-      text: JSON.stringify({
-        ok: result.ok,
-        ...(result.result ? { result: result.result } : {}),
-        ...(result.error ? { error: result.error } : {}),
-      }),
-    });
+    const payload: AnyObject = {
+      ok: result.ok,
+      ...(result.result ? { result: result.result } : {}),
+      ...(result.error ? { error: result.error } : {}),
+    };
+    const { cleaned, images } = extractImagesAndStrip(payload);
+    const content: NativeMcpResult['content'] = [
+      ...images.map((img) => ({
+        type: 'image' as const,
+        data: img.data,
+        mimeType: img.mimeType,
+      })),
+      {
+        type: 'text' as const,
+        text: JSON.stringify(cleaned),
+      },
+    ];
     return {
-      content: content as any,
+      content,
       ...(result.ok !== true ? { isError: true } : {}),
     };
   },
@@ -1438,6 +1593,12 @@ const desktopHoverTool: NativeToolDefinition = {
         },
         required: ['x', 'y', 'w', 'h'],
       },
+      screenshot: { type: 'boolean', description: 'Capture and return a screenshot after hovering (default: false)' },
+      size: {
+        type: 'object',
+        description: 'Crop dimensions {w, h} in click space for post-hover screenshot (defaults to 400x200)',
+        properties: { w: { type: 'number' }, h: { type: 'number' } },
+      },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
     },
     required: ['environmentId', 'x', 'y'],
@@ -1453,6 +1614,7 @@ const desktopHoverTool: NativeToolDefinition = {
     if (display === null) return invalidDisplayResult();
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
+    const size = resolveSize(rawArgs);
     const request: ComputerAction = {
       action: 'mouse',
       op: 'hover',
@@ -1461,32 +1623,14 @@ const desktopHoverTool: NativeToolDefinition = {
       dwellMs: typeof rawArgs?.dwellMs === 'number' ? rawArgs.dwellMs : undefined,
       wiggle: rawArgs?.wiggle !== false,
     };
+    if (rawArgs?.screenshot === true) request.screenshot = true;
+    if (size !== undefined) request.size = size;
     if (display !== undefined) request.display = display;
     if (region !== undefined) request.region = region;
 
     const result = await runAction(context, request, rawArgs);
     if (!result) return noUserResult();
-
-    const failure = inputFailure(result);
-    const content: Array<Record<string, unknown>> = [];
-    const evidence = (result.result as any)?.screenshot || (result.result as any)?.evidence || (result.result as any)?.image;
-    if (evidence?.base64 || evidence?.imageBase64) {
-      const data = evidence.base64 || evidence.imageBase64;
-      const mime = evidence.format ? `image/${evidence.format}` : 'image/png';
-      content.push({ type: 'image', data, mimeType: mime });
-    }
-    content.push({
-      type: 'text',
-      text: JSON.stringify({
-        ok: failure === null,
-        ...(result.result ? { result: result.result } : {}),
-        ...(failure ? { error: failure } : {}),
-      }),
-    });
-    return {
-      content: content as any,
-      ...(failure !== null ? { isError: true } : {}),
-    };
+    return inputResult(result);
   },
 };
 
@@ -1522,6 +1666,12 @@ const desktopDragTool: NativeToolDefinition = {
       button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button to hold (default: left).' },
       durationMs: { type: 'integer', description: 'Drag duration in ms (default 500).' },
       smooth: { type: 'boolean', description: 'Smooth movement along bezier path (default true).' },
+      screenshot: { type: 'boolean', description: 'Capture and return a crop around where the drag landed as an MCP image block' },
+      size: {
+        type: 'object',
+        description: 'Crop dimensions {w, h} in click space around landing point (defaults to 400x200)',
+        properties: { w: { type: 'number' }, h: { type: 'number' } },
+      },
       display: {
         type: 'integer',
         minimum: 0,
@@ -1543,6 +1693,7 @@ const desktopDragTool: NativeToolDefinition = {
     }
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
+    const size = resolveSize(rawArgs);
 
     const request: ComputerAction = {
       action: 'mouse',
@@ -1553,6 +1704,8 @@ const desktopDragTool: NativeToolDefinition = {
       durationMs: typeof rawArgs?.durationMs === 'number' ? rawArgs.durationMs : undefined,
       smooth: rawArgs?.smooth !== false,
     };
+    if (rawArgs?.screenshot === true) request.screenshot = true;
+    if (size !== undefined) request.size = size;
     if (display !== undefined) request.display = display;
 
     const result = await runAction(context, request, rawArgs);
@@ -1618,12 +1771,24 @@ const desktopBatchTool: NativeToolDefinition = {
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
-    const steps = Array.isArray(rawArgs?.steps) ? rawArgs.steps : [];
-    if (steps.length === 0) {
+    const rawSteps = Array.isArray(rawArgs?.steps) ? rawArgs.steps : [];
+    if (rawSteps.length === 0) {
       return textResult({ ok: false, error: { code: 'computer_failed', message: 'steps must be a non-empty array' } }, true);
     }
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
+
+    const steps = rawSteps.map((step) => {
+      if (!step || typeof step !== 'object') return step;
+      const s = { ...(step as Record<string, unknown>) };
+      if (s.op === undefined && s.action !== undefined) {
+        s.op = s.action;
+      }
+      if (s.template === undefined && s.templateBase64 !== undefined) {
+        s.template = s.templateBase64;
+      }
+      return s;
+    });
 
     const request: ComputerAction = {
       action: 'batch',
@@ -1636,30 +1801,25 @@ const desktopBatchTool: NativeToolDefinition = {
     const result = await runAction(context, request, rawArgs, 125000);
     if (!result) return noUserResult();
 
-    const content: Array<Record<string, unknown>> = [];
-    const stepResults = (result.result as any)?.results;
-    if (Array.isArray(stepResults)) {
-      for (let i = 0; i < stepResults.length; i++) {
-        const s = stepResults[i];
-        const res = (s as any)?.result || (s as any);
-        const evidence = res?.evidence || res?.image || res?.screenshot;
-        if (evidence?.base64 || evidence?.imageBase64) {
-          const data = evidence.base64 || evidence.imageBase64;
-          const mime = evidence.format ? `image/${evidence.format}` : 'image/png';
-          content.push({ type: 'image', data, mimeType: mime });
-        }
-      }
-    }
-    content.push({
-      type: 'text',
-      text: JSON.stringify({
-        ok: result.ok,
-        ...(result.result ? { result: result.result } : {}),
-        ...(result.error ? { error: result.error } : {}),
-      }),
-    });
+    const payload: AnyObject = {
+      ok: result.ok,
+      ...(result.result ? { result: result.result } : {}),
+      ...(result.error ? { error: result.error } : {}),
+    };
+    const { cleaned, images } = extractImagesAndStrip(payload);
+    const content: NativeMcpResult['content'] = [
+      ...images.map((img) => ({
+        type: 'image' as const,
+        data: img.data,
+        mimeType: img.mimeType,
+      })),
+      {
+        type: 'text' as const,
+        text: JSON.stringify(cleaned),
+      },
+    ];
     return {
-      content: content as any,
+      content,
       ...(result.ok !== true ? { isError: true } : {}),
     };
   },
