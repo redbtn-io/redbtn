@@ -89,6 +89,8 @@ export interface GraphGlobalConfig {
   enableFastpath?: boolean;
   /** Default neuron role for nodes without specific assignment */
   defaultNeuronRole?: 'chat' | 'worker' | 'specialist';
+  /** Maximum recursion limit / step cycles before termination (default: 10000, max: 100000) */
+  recursionLimit?: number;
 }
 
 /**
@@ -199,6 +201,8 @@ export interface GraphConfig {
   neuronAssignments?: Record<string, string>;
   /** Graph-level configuration options */
   config?: GraphGlobalConfig;
+  /** Top-level recursion limit override (default: 10000, max: 100000) */
+  recursionLimit?: number;
   /**
    * Capability profile for this graph (the permissions layer).
    *
