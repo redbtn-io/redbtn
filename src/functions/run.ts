@@ -448,7 +448,16 @@ function getRunProgressWatchdogIntervalMs(idleTimeoutMs: number): number {
   );
 }
 
-function getRunConfigTimeoutMs(compiledGraph: any): number {
+export const DEFAULT_MAX_RUN_TIMEOUT_S = 43200; // 12 hours ceiling
+
+export function getMaxRunTimeoutSeconds(): number {
+  return readPositiveMs(
+    process.env.ENGINE_MAX_RUN_TIMEOUT_S ? Number(process.env.ENGINE_MAX_RUN_TIMEOUT_S) * 1000 : undefined,
+    DEFAULT_MAX_RUN_TIMEOUT_S * 1000,
+  ) / 1000;
+}
+
+export function getRunConfigTimeoutMs(compiledGraph: any): number {
   // `compiledGraph.config` is the whole GraphConfig; per-graph timeout lives
   // on its nested `config: GraphGlobalConfig` block. The original read used
   // `compiledGraph.config.timeout` which is undefined on every graph in the
@@ -456,13 +465,23 @@ function getRunConfigTimeoutMs(compiledGraph: any): number {
   // capped every chat/agent/worker run at 300s. Read the nested path; also
   // accept the legacy top-level position for forward-compat if anything is
   // ever shaped that way.
+  const maxTimeoutMs = getMaxRunTimeoutSeconds() * 1000;
   const configuredSeconds =
     compiledGraph?.config?.config?.timeout ?? compiledGraph?.config?.timeout;
   if (configuredSeconds !== undefined && configuredSeconds !== null) {
     const seconds = typeof configuredSeconds === 'number' ? configuredSeconds : Number(configuredSeconds);
-    if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return Math.min(seconds * 1000, maxTimeoutMs);
+    }
+    if (seconds === 0) {
+      return 0; // Explicitly disabled
+    }
   }
-  return readPositiveMs(process.env.RUN_CONFIG_TIMEOUT_MS, DEFAULT_RUN_CONFIG_TIMEOUT_MS);
+  const envTimeoutMs = readPositiveMs(process.env.RUN_CONFIG_TIMEOUT_MS, DEFAULT_RUN_CONFIG_TIMEOUT_MS);
+  if (envTimeoutMs > 0) {
+    return Math.min(envTimeoutMs, maxTimeoutMs);
+  }
+  return 0;
 }
 
 async function getLastProgressAt(publisher: RunPublisher): Promise<string | undefined> {
