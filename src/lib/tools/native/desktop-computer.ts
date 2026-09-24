@@ -759,7 +759,7 @@ const desktopScreenshotTool: NativeToolDefinition = {
             sourceHeight: img.sourceHeight,
             clickSpace: img.clickSpace,
             display: img.display,
-            captureMode: img.captureMode ?? (win ? 'window' : undefined),
+            captureMode: img.captureMode ?? null,
             windowRect: img.windowRect ?? null,
             window: win ?? null,
             // What am I looking at? — echoed so the model can tell a zoomed
@@ -1811,15 +1811,13 @@ const desktopDragTool: NativeToolDefinition = {
       window: WINDOW_TARGET_SCHEMA,
       to: {
         type: 'object',
-        description: 'Destination coordinates in click space. Required.',
-        properties: { x: { type: 'number' }, y: { type: 'number' } },
-        required: ['x', 'y'],
+        description: 'Destination coordinates in click space (x, y) or normalized (nx, ny). Required.',
+        properties: { x: { type: 'number' }, y: { type: 'number' }, nx: { type: 'number' }, ny: { type: 'number' } },
       },
       from: {
         type: 'object',
-        description: 'Source starting coordinates in click space (omitted = current position).',
-        properties: { x: { type: 'number' }, y: { type: 'number' } },
-        required: ['x', 'y'],
+        description: 'Source starting coordinates in click space (x, y) or normalized (nx, ny) (omitted = current position).',
+        properties: { x: { type: 'number' }, y: { type: 'number' }, nx: { type: 'number' }, ny: { type: 'number' } },
       },
       button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button to hold (default: left).' },
       durationMs: { type: 'integer', description: 'Drag duration in ms (default 500).' },
@@ -1841,13 +1839,29 @@ const desktopDragTool: NativeToolDefinition = {
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
-    if (!rawArgs?.to || typeof rawArgs.to !== 'object' || !Number.isFinite(Number(rawArgs.to.x)) || !Number.isFinite(Number(rawArgs.to.y))) {
-      return textResult({ ok: false, error: { code: 'computer_failed', message: 'to {x, y} is required and must be finite numbers' } }, true);
+    const rawTo = rawArgs?.to;
+    if (!rawTo || typeof rawTo !== 'object') {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'to is required and must be an object with {x, y} or {nx, ny}' } }, true);
     }
-    const to = { x: Number(rawArgs.to.x), y: Number(rawArgs.to.y) };
-    let from: { x: number; y: number } | undefined = undefined;
-    if (rawArgs?.from && typeof rawArgs.from === 'object' && Number.isFinite(Number(rawArgs.from.x)) && Number.isFinite(Number(rawArgs.from.y))) {
-      from = { x: Number(rawArgs.from.x), y: Number(rawArgs.from.y) };
+    const hasToXY = Number.isFinite(Number(rawTo.x)) && Number.isFinite(Number(rawTo.y));
+    const hasToNorm = Number.isFinite(Number(rawTo.nx)) && Number.isFinite(Number(rawTo.ny));
+    if (!hasToXY && !hasToNorm) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'to requires either finite (x, y) or (nx, ny) numbers' } }, true);
+    }
+    const to = hasToXY
+      ? { x: Number(rawTo.x), y: Number(rawTo.y) }
+      : { nx: Number(rawTo.nx), ny: Number(rawTo.ny) };
+
+    let from: { x?: number; y?: number; nx?: number; ny?: number } | undefined = undefined;
+    if (rawArgs?.from && typeof rawArgs.from === 'object') {
+      const rawFrom = rawArgs.from;
+      const hasFromXY = Number.isFinite(Number(rawFrom.x)) && Number.isFinite(Number(rawFrom.y));
+      const hasFromNorm = Number.isFinite(Number(rawFrom.nx)) && Number.isFinite(Number(rawFrom.ny));
+      if (hasFromXY) {
+        from = { x: Number(rawFrom.x), y: Number(rawFrom.y) };
+      } else if (hasFromNorm) {
+        from = { nx: Number(rawFrom.nx), ny: Number(rawFrom.ny) };
+      }
     }
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();

@@ -58,7 +58,7 @@ export type BatchStep =
   | { op: 'type'; text: string; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; label?: string }
   | { op: 'move'; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; dx?: number; dy?: number; relative?: boolean; transport?: 'injected' | 'virtual-hid'; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: ClickRegion | NormalizedRegion; label?: string }
   | { op: 'hover'; x: number; y: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; dwellMs?: number; wiggle?: boolean; screenshot?: boolean; region?: ClickRegion | NormalizedRegion; size?: { w: number; h: number }; label?: string }
-  | { op: 'drag'; from?: { x: number; y: number }; to: { x: number; y: number }; display?: number; window?: WindowTarget; button?: 'left' | 'right' | 'middle'; durationMs?: number; smooth?: boolean; region?: ClickRegion | NormalizedRegion; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
+  | { op: 'drag'; from?: { x?: number; y?: number; nx?: number; ny?: number }; to: { x?: number; y?: number; nx?: number; ny?: number }; display?: number; window?: WindowTarget; button?: 'left' | 'right' | 'middle'; durationMs?: number; smooth?: boolean; region?: ClickRegion | NormalizedRegion; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
   | { op: 'scroll'; dx?: number; dy?: number; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; region?: ClickRegion | NormalizedRegion; label?: string }
   | { op: 'wait'; ms?: number; durationMs?: number; region?: ClickRegion | NormalizedRegion; label?: string }
   | { op: 'wait_for'; text?: string; regex?: string; template?: string; image?: string; gone?: boolean; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; display?: number; timeoutMs?: number; intervalMs?: number; threshold?: number; label?: string }
@@ -112,8 +112,8 @@ export type ComputerAction =
       region?: ClickRegion | NormalizedRegion;
       screenshot?: boolean;
       size?: { w: number; h: number };
-      to?: { x: number; y: number };
-      from?: { x: number; y: number };
+      to?: { x?: number; y?: number; nx?: number; ny?: number };
+      from?: { x?: number; y?: number; nx?: number; ny?: number };
     }
   | {
       action: 'keyboard';

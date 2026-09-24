@@ -325,6 +325,33 @@ describe('new desktop perception and input tools', () => {
     );
   });
 
+  test('desktop_drag sends drag action with normalized nx and ny coordinates', async () => {
+    const res = await desktopDrag.handler(
+      {
+        environmentId: 'env_desktop',
+        window: 'Game App',
+        from: { nx: 0.2, ny: 0.3 },
+        to: { nx: 0.7, ny: 0.8 },
+        button: 'left',
+        durationMs: 500,
+      },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'drag',
+          window: 'Game App',
+          from: { nx: 0.2, ny: 0.3 },
+          to: { nx: 0.7, ny: 0.8 },
+          durationMs: 500,
+        }),
+      }),
+    );
+  });
+
   test('desktop_batch validates steps and routes atomic batch sequence', async () => {
     requestDesktopMock.mockResolvedValueOnce({
       kind: 'computer_result',
@@ -769,6 +796,33 @@ describe('desktop screenshot around and action screenshot parity (Addendum 2)', 
     expect(body.captureMode).toBe('display-crop');
     expect(body.windowRect).toEqual({ x: 50, y: 50, width: 800, height: 600 });
     expect(body.window).toBe('Black Desert');
+  });
+
+  test('desktop_screenshot does not invent captureMode when desktop does not report one', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      ok: true,
+      image: {
+        format: 'jpeg',
+        base64: dummyB64,
+        width: 800,
+        height: 600,
+        clickSpace: { w: 800, h: 600 },
+      },
+    });
+
+    const res = await desktopScreenshot.handler(
+      {
+        environmentId: 'env_desktop',
+        window: 'Terminal',
+      },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    const body = textBody(res);
+    expect(body.ok).toBe(true);
+    expect(body.captureMode).toBeNull();
+    expect(body.window).toBe('Terminal');
   });
 
   test('desktop_click and desktop_move support window targeting and normalized nx, ny coordinates', async () => {
