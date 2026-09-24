@@ -433,3 +433,266 @@ describe('neuronExecutor formatToolResultForModel image delivery', () => {
     expect(formatted.text).not.toContain(dummyB64);
   });
 });
+
+describe('desktop screenshot around and action screenshot parity (Addendum 2)', () => {
+  const dummyB64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+  test('desktop_screenshot supports around: {x,y} and size: {w,h}', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_shot_1',
+      ok: true,
+      image: { format: 'png', base64: dummyB64, width: 300, height: 150 },
+    });
+    const res = await desktopScreenshot.handler(
+      { environmentId: 'env_desktop', around: { x: 500, y: 300 }, size: { w: 300, h: 150 } },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'screenshot',
+          around: { x: 500, y: 300 },
+          size: { w: 300, h: 150 },
+        }),
+      }),
+    );
+    const body = textBody(res);
+    expect(body.around).toEqual({ x: 500, y: 300 });
+    expect(body.size).toEqual({ w: 300, h: 150 });
+  });
+
+  test('desktop_screenshot supports around: "cursor"', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_shot_2',
+      ok: true,
+      image: { format: 'png', base64: dummyB64, width: 400, height: 200 },
+    });
+    const res = await desktopScreenshot.handler(
+      { environmentId: 'env_desktop', around: 'cursor' },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'screenshot',
+          around: 'cursor',
+        }),
+      }),
+    );
+    const body = textBody(res);
+    expect(body.around).toBe('cursor');
+  });
+
+  test('desktop_click forwards screenshot:true and size, returning extracted MCP image block', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_click_1',
+      ok: true,
+      result: {
+        op: 'click',
+        x: 200,
+        y: 400,
+        image: {
+          format: 'png',
+          base64: dummyB64,
+          width: 400,
+          height: 200,
+        },
+      },
+    });
+
+    const res = await desktopClick.handler(
+      { environmentId: 'env_desktop', x: 200, y: 400, screenshot: true, size: { w: 400, h: 200 } },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'click',
+          screenshot: true,
+          size: { w: 400, h: 200 },
+        }),
+      }),
+    );
+    expect(res.content.some((b) => b.type === 'image' && (b as any).data === dummyB64)).toBe(true);
+    const body = textBody(res);
+    expect(body.ok).toBe(true);
+    expect(body.result.image?.base64).toBeUndefined(); // base64 stripped from text JSON
+    expect(body.result.image?.width).toBe(400);
+  });
+
+  test('desktop_hover forwards screenshot:true and size', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_hover_1',
+      ok: true,
+      result: {
+        op: 'hover',
+        x: 150,
+        y: 250,
+        image: {
+          format: 'png',
+          base64: dummyB64,
+          width: 300,
+          height: 150,
+        },
+      },
+    });
+
+    const res = await desktopHover.handler(
+      { environmentId: 'env_desktop', x: 150, y: 250, screenshot: true, size: { w: 300, h: 150 } },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'hover',
+          screenshot: true,
+          size: { w: 300, h: 150 },
+        }),
+      }),
+    );
+    expect(res.content.some((b) => b.type === 'image' && (b as any).data === dummyB64)).toBe(true);
+  });
+
+  test('desktop_drag forwards screenshot:true and size', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_drag_1',
+      ok: true,
+      result: {
+        op: 'drag',
+        image: {
+          format: 'png',
+          base64: dummyB64,
+          width: 400,
+          height: 200,
+        },
+      },
+    });
+
+    const res = await desktopDrag.handler(
+      { environmentId: 'env_desktop', to: { x: 300, y: 300 }, screenshot: true, size: { w: 400, h: 200 } },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'drag',
+          screenshot: true,
+          size: { w: 400, h: 200 },
+        }),
+      }),
+    );
+    expect(res.content.some((b) => b.type === 'image' && (b as any).data === dummyB64)).toBe(true);
+  });
+
+  test('desktop_click_text forwards screenshot:true and size', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_click_text_1',
+      ok: true,
+      result: {
+        op: 'click',
+        image: {
+          format: 'png',
+          base64: dummyB64,
+          width: 400,
+          height: 200,
+        },
+      },
+    });
+
+    const res = await desktopClickText.handler(
+      { environmentId: 'env_desktop', text: 'Submit', screenshot: true, size: { w: 400, h: 200 } },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'ocr',
+          op: 'click',
+          screenshot: true,
+          size: { w: 400, h: 200 },
+        }),
+      }),
+    );
+    expect(res.content.some((b) => b.type === 'image' && (b as any).data === dummyB64)).toBe(true);
+  });
+
+  test('desktop_find_image and desktop_wait_for accept templateBase64 alias', async () => {
+    await desktopFindImage.handler(
+      { environmentId: 'env_desktop', templateBase64: dummyB64 },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'find_image',
+          template: dummyB64,
+        }),
+      }),
+    );
+
+    await desktopWaitFor.handler(
+      { environmentId: 'env_desktop', templateBase64: dummyB64 },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'wait_for',
+          template: dummyB64,
+        }),
+      }),
+    );
+  });
+
+  test('desktop_batch normalizes action -> op, templateBase64 -> template and extracts images', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_batch_1',
+      ok: true,
+      result: {
+        results: [
+          { ok: true, op: 'click', image: { format: 'png', base64: dummyB64 } },
+        ],
+      },
+    });
+
+    const res = await desktopBatch.handler(
+      {
+        environmentId: 'env_desktop',
+        steps: [
+          { action: 'click', x: 100, y: 100, screenshot: true },
+          { action: 'wait_for', templateBase64: dummyB64 },
+        ],
+      },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'batch',
+          steps: [
+            expect.objectContaining({ op: 'click', x: 100, y: 100, screenshot: true }),
+            expect.objectContaining({ op: 'wait_for', template: dummyB64 }),
+          ],
+        }),
+      }),
+    );
+    expect(res.content.some((b) => b.type === 'image' && (b as any).data === dummyB64)).toBe(true);
+  });
+});
