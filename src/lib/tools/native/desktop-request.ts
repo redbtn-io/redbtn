@@ -48,18 +48,18 @@ import Redis from 'ioredis';
 type AnyObject = Record<string, any>;
 
 export type BatchStep =
-  | { op: 'click'; x?: number; y?: number; display?: number; button?: 'left' | 'right' | 'middle'; double?: boolean; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: { x: number; y: number; w: number; h: number }; label?: string }
-  | { op: 'click_text'; text?: string; regex?: string; region?: { x: number; y: number; w: number; h: number }; occurrence?: number | 'first' | 'last'; button?: 'left' | 'right' | 'middle'; double?: boolean; offset?: { x: number; y: number }; display?: number; label?: string }
+  | { op: 'click'; x?: number; y?: number; display?: number; button?: 'left' | 'right' | 'middle'; double?: boolean; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: { x: number; y: number; w: number; h: number }; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
+  | { op: 'click_text'; text?: string; regex?: string; region?: { x: number; y: number; w: number; h: number }; occurrence?: number | 'first' | 'last'; button?: 'left' | 'right' | 'middle'; double?: boolean; offset?: { x: number; y: number }; display?: number; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
   | { op: 'key'; keys: string[]; durationMs?: number; opMode?: 'tap' | 'down' | 'up'; opKind?: 'tap' | 'down' | 'up'; region?: { x: number; y: number; w: number; h: number }; label?: string }
   | { op: 'type'; text: string; region?: { x: number; y: number; w: number; h: number }; label?: string }
   | { op: 'move'; x?: number; y?: number; display?: number; dx?: number; dy?: number; relative?: boolean; transport?: 'injected' | 'virtual-hid'; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: { x: number; y: number; w: number; h: number }; label?: string }
-  | { op: 'hover'; x: number; y: number; display?: number; dwellMs?: number; wiggle?: boolean; region?: { x: number; y: number; w: number; h: number }; label?: string }
-  | { op: 'drag'; from?: { x: number; y: number }; to: { x: number; y: number }; display?: number; button?: 'left' | 'right' | 'middle'; durationMs?: number; smooth?: boolean; region?: { x: number; y: number; w: number; h: number }; label?: string }
+  | { op: 'hover'; x: number; y: number; display?: number; dwellMs?: number; wiggle?: boolean; screenshot?: boolean; region?: { x: number; y: number; w: number; h: number }; size?: { w: number; h: number }; label?: string }
+  | { op: 'drag'; from?: { x: number; y: number }; to: { x: number; y: number }; display?: number; button?: 'left' | 'right' | 'middle'; durationMs?: number; smooth?: boolean; region?: { x: number; y: number; w: number; h: number }; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
   | { op: 'scroll'; dx?: number; dy?: number; display?: number; region?: { x: number; y: number; w: number; h: number }; label?: string }
   | { op: 'wait'; ms?: number; durationMs?: number; region?: { x: number; y: number; w: number; h: number }; label?: string }
   | { op: 'wait_for'; text?: string; regex?: string; template?: string; image?: string; gone?: boolean; region?: { x: number; y: number; w: number; h: number }; display?: number; timeoutMs?: number; intervalMs?: number; threshold?: number; label?: string }
   | { op: 'assert_text'; text?: string; regex?: string; region?: { x: number; y: number; w: number; h: number }; display?: number; label?: string }
-  | { op: 'screenshot'; region?: { x: number; y: number; w: number; h: number }; display?: number; format?: 'png' | 'jpeg'; label?: string };
+  | { op: 'screenshot'; region?: { x: number; y: number; w: number; h: number }; around?: { x: number; y: number } | 'cursor'; size?: { w: number; h: number }; display?: number; format?: 'png' | 'jpeg'; label?: string };
 
 /**
  * Computer-use action — discriminated union mirroring redAgent
@@ -72,6 +72,7 @@ export type ComputerAction =
    *    grounding, but small text is unreadable.
    *  - `region` (CLICK SPACE coords): native-resolution crop of that area —
    *    the "zoom in" path. The desktop clamps the rect to the display.
+   *  - `around`: crop centered on `{x, y}` in click space or `'cursor'`, with optional `size: {w, h}` (defaults to 400x200).
    *  - `fullRes`: whole screen at native resolution (large; escape hatch).
    */
   | {
@@ -80,6 +81,8 @@ export type ComputerAction =
       format?: 'png' | 'jpeg';
       region?: { x: number; y: number; w: number; h: number };
       fullRes?: boolean;
+      around?: { x: number; y: number } | 'cursor';
+      size?: { w: number; h: number };
     }
   | {
       action: 'mouse';
@@ -101,6 +104,8 @@ export type ComputerAction =
       dwellMs?: number;
       wiggle?: boolean;
       region?: { x: number; y: number; w: number; h: number };
+      screenshot?: boolean;
+      size?: { w: number; h: number };
       to?: { x: number; y: number };
       from?: { x: number; y: number };
     }
@@ -125,6 +130,8 @@ export type ComputerAction =
       double?: boolean;
       offset?: { x: number; y: number };
       display?: number;
+      screenshot?: boolean;
+      size?: { w: number; h: number };
       imagePath?: string;
       imageBase64?: string;
       scale?: number;
