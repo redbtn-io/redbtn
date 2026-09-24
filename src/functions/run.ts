@@ -85,7 +85,9 @@ export class RunConfigTimeoutError extends Error {
     public readonly runId: string,
     public readonly timeoutMs: number,
   ) {
-    super(`Run ${runId} exceeded configured timeout of ${timeoutMs}ms`);
+    super(
+      `Run ${runId} exceeded configured timeout of ${timeoutMs}ms. You can adjust it by setting graph.config.timeout (capped by ENGINE_MAX_RUN_TIMEOUT_S) or the ENGINE_DEFAULT_RUN_TIMEOUT_S environment variable.`,
+    );
   }
 }
 
@@ -244,16 +246,12 @@ export interface StreamingRunResult {
 const DEFAULT_GRAPH_ID = SYSTEM_TEMPLATES.DEFAULT;
 const DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS = RunConfig.RUN_PROGRESS_STALE_MS;
 const DEFAULT_RUN_PROGRESS_WATCHDOG_INTERVAL_MS = 30 * 1000;
-// 0 = NO hard wall-clock cap by default. A run that is actively making
-// progress must never be killed for taking "too long" (a long build, a slow
-// install, a big migration). The progress-idle watchdog
-// (DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS, 30 min of NO progress) is the real
-// safety net for genuinely-stuck runs. A graph/automation can still opt into
-// a hard wall-clock timeout via `config.timeout` (seconds) or the
-// RUN_CONFIG_TIMEOUT_MS env var. Previously this defaulted to 300s, which
-// silently aborted any run — actively working or not — at exactly 5 minutes
-// (observed killing long Red Coder commands mid-execution).
-const DEFAULT_RUN_CONFIG_TIMEOUT_MS = 0;
+// Wall-clock run timeout is governed by getRunConfigTimeoutMs():
+// - Graphs without timeout default to 12h (DEFAULT_RUN_TIMEOUT_S / ENGINE_DEFAULT_RUN_TIMEOUT_S).
+// - Explicit timeout: 0 is treated as "no graph limit" and receives the platform ceiling (24h).
+// - Explicit positive timeouts are honoured, capped at the platform ceiling (DEFAULT_MAX_RUN_TIMEOUT_S / ENGINE_MAX_RUN_TIMEOUT_S).
+// In parallel, the progress-idle watchdog (DEFAULT_RUN_PROGRESS_IDLE_TIMEOUT_MS, 30 min of NO progress)
+// protects against genuinely-stuck runs. There is never a truly unbounded run.
 
 function generateRunId(): string {
   return `run_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
@@ -448,7 +446,8 @@ function getRunProgressWatchdogIntervalMs(idleTimeoutMs: number): number {
   );
 }
 
-export const DEFAULT_MAX_RUN_TIMEOUT_S = 43200; // 12 hours ceiling
+export const DEFAULT_MAX_RUN_TIMEOUT_S = 86400; // 24 hours ceiling
+export const DEFAULT_RUN_TIMEOUT_S = 43200; // 12 hours default for unset timeout
 
 export function getMaxRunTimeoutSeconds(): number {
   return readPositiveMs(
@@ -457,14 +456,24 @@ export function getMaxRunTimeoutSeconds(): number {
   ) / 1000;
 }
 
+export function getDefaultRunTimeoutSeconds(): number {
+  return readPositiveMs(
+    process.env.ENGINE_DEFAULT_RUN_TIMEOUT_S ? Number(process.env.ENGINE_DEFAULT_RUN_TIMEOUT_S) * 1000 : undefined,
+    DEFAULT_RUN_TIMEOUT_S * 1000,
+  ) / 1000;
+}
+
 export function getRunConfigTimeoutMs(compiledGraph: any): number {
   // `compiledGraph.config` is the whole GraphConfig; per-graph timeout lives
-  // on its nested `config: GraphGlobalConfig` block. The original read used
-  // `compiledGraph.config.timeout` which is undefined on every graph in the
-  // wild — that fell through to the env / 5-minute default and silently
-  // capped every chat/agent/worker run at 300s. Read the nested path; also
-  // accept the legacy top-level position for forward-compat if anything is
-  // ever shaped that way.
+  // on its nested `config: GraphGlobalConfig` block. Read the nested path,
+  // falling back to legacy top-level position for forward-compat.
+  //
+  // Decided semantics:
+  // - unset: default 12h (ENGINE_DEFAULT_RUN_TIMEOUT_S, default 43200s), capped at ceiling.
+  // - explicit 0: treated as "no graph limit", so it receives the platform ceiling.
+  //   There is NEVER a truly unbounded run.
+  // - explicit positive: honoured, capped at the platform ceiling (ENGINE_MAX_RUN_TIMEOUT_S, default 86400s / 24h).
+  // - RUN_CONFIG_TIMEOUT_MS env var: if set and positive, honoured (when graph timeout is unset), capped at ceiling.
   const maxTimeoutMs = getMaxRunTimeoutSeconds() * 1000;
   const configuredSeconds =
     compiledGraph?.config?.config?.timeout ?? compiledGraph?.config?.timeout;
@@ -474,14 +483,15 @@ export function getRunConfigTimeoutMs(compiledGraph: any): number {
       return Math.min(seconds * 1000, maxTimeoutMs);
     }
     if (seconds === 0) {
-      return 0; // Explicitly disabled
+      return maxTimeoutMs; // Explicit 0 -> treated as "no graph limit" -> platform ceiling
     }
   }
-  const envTimeoutMs = readPositiveMs(process.env.RUN_CONFIG_TIMEOUT_MS, DEFAULT_RUN_CONFIG_TIMEOUT_MS);
+  const envTimeoutMs = readPositiveMs(process.env.RUN_CONFIG_TIMEOUT_MS, 0);
   if (envTimeoutMs > 0) {
     return Math.min(envTimeoutMs, maxTimeoutMs);
   }
-  return 0;
+  const defaultTimeoutMs = getDefaultRunTimeoutSeconds() * 1000;
+  return Math.min(defaultTimeoutMs, maxTimeoutMs);
 }
 
 async function getLastProgressAt(publisher: RunPublisher): Promise<string | undefined> {
@@ -642,10 +652,10 @@ async function executeWithRunProgressWatchdog(
     configTimeoutMs: number;
   },
 ): Promise<RunResult> {
+  console.log(`[run] ${args.runId} effective configTimeoutMs: ${args.configTimeoutMs}, idleTimeoutMs: ${args.idleTimeoutMs}`);
   const progressWatchdog = startRunProgressWatchdog(args);
-  // Hard wall-clock cap is opt-in: only race against it when a positive
-  // timeout was configured (graph config.timeout / RUN_CONFIG_TIMEOUT_MS).
-  // Default 0 → no cap; the progress watchdog handles genuinely-stuck runs.
+  // Wall-clock timeout is always enforced (capped at platform ceiling).
+  // Default 12h for unset, 24h ceiling for explicit 0. There is never a truly unbounded run.
   const configTimeout = args.configTimeoutMs > 0 ? startRunConfigTimeout(args) : null;
   try {
     const racers: Promise<RunResult>[] = [operation(), progressWatchdog.promise];
