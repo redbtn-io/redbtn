@@ -21,6 +21,7 @@ import {
 } from '../../../run/contextLookup';
 import { resolveCapabilityProfile } from '../../../permissions/resolve';
 import { MODEL_DRIVEN_STATE_KEY, isModelDrivenState } from '../../../tools/caller-trust';
+import { resolveRecursionLimit, isGraphRecursionError, formatRecursionLimitError } from '../../../graphs/recursionLimit';
 
 export interface GraphStepConfig {
     /** ID of the graph to invoke (must exist in MongoDB graphs collection) */
@@ -343,7 +344,22 @@ export async function executeGraph(
     // collide with the parent run's checkpoint. Doubles as the capability
     // scopeId below (unique per invocation → concurrency-safe).
     const threadId = `subgraph_${graphId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const invokeConfig = { configurable: { thread_id: threadId } };
+
+    let subConfig: any;
+    try {
+        subConfig = (compiledGraph as any)?.config
+            || (typeof graphRegistry.getConfig === 'function'
+                ? await graphRegistry.getConfig(graphId, userId)
+                : undefined);
+    } catch {
+        // Fall back to undefined subConfig
+    }
+
+    const subRecursionLimit = resolveRecursionLimit(subConfig);
+    const invokeConfig = {
+        configurable: { thread_id: threadId },
+        recursionLimit: subRecursionLimit,
+    };
 
     // -----------------------------------------------------------------------
     // SUBGRAPH-SCOPED CAPABILITY PROFILE.
@@ -363,10 +379,6 @@ export async function executeGraph(
     // -----------------------------------------------------------------------
     let capabilityScopeId: string | undefined;
     try {
-        const subConfig: any = (compiledGraph as any)?.config
-            || (typeof graphRegistry.getConfig === 'function'
-                ? await graphRegistry.getConfig(graphId, userId)
-                : undefined);
         const subProfile = resolveCapabilityProfile(subConfig);
         if (subProfile && subConfig) {
             const trusted =
@@ -405,6 +417,11 @@ export async function executeGraph(
         } else {
             result = await compiledGraph.graph.invoke(subInput, invokeConfig);
         }
+    } catch (err) {
+        if (isGraphRecursionError(err)) {
+            throw new Error(formatRecursionLimitError(err, subRecursionLimit));
+        }
+        throw err;
     } finally {
         if (capabilityScopeId) clearSubgraphProfile(capabilityScopeId);
     }

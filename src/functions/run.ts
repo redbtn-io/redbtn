@@ -19,6 +19,7 @@ import { getOrCreateMeteringClient } from '../lib/run/meteringClient';
 import { resolveCapabilityProfile } from '../lib/permissions/resolve';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
+import { resolveRecursionLimit, isGraphRecursionError, formatRecursionLimitError } from '../lib/graphs/recursionLimit';
 import { SYSTEM_TEMPLATES } from '../lib/types/graph';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const IORedisModule = require('ioredis');
@@ -875,11 +876,13 @@ async function executeNonStreaming(
   try {
     const conversationId = initialState.data.conversationId;
     const threadId = initialState.data.options.threadId || runId;
+    const recursionLimit = resolveRecursionLimit(compiledGraph?.config);
     const invokeConfig = { 
       configurable: { 
         conversation_id: conversationId,
         thread_id: threadId 
-      } 
+      },
+      recursionLimit,
     };
     const result = await compiledGraph.graph.invoke(initialState, invokeConfig);
     const rawResponse = result.data?.response || result.response;
@@ -936,7 +939,10 @@ async function executeNonStreaming(
       tools: state?.tools || [],
     };
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
+    const recursionLimit = resolveRecursionLimit(compiledGraph?.config);
+    const errorMessage = isGraphRecursionError(error)
+      ? formatRecursionLimitError(error, recursionLimit)
+      : error instanceof Error ? error.message : String(error);
     const errorStack = error instanceof Error ? error.stack : undefined;
     // External interrupt — emit a terminal `run_interrupted` event instead of
     // `run_error`. State at the last completed graph node is already in
@@ -1053,12 +1059,14 @@ async function executeStreaming(
   try {
     const conversationId = initialState.data.conversationId;
     const threadId = initialState.data.options.threadId || runId;
+    const recursionLimit = resolveRecursionLimit(compiledGraph?.config);
     const streamConfig = { 
       version: 'v1' as const, 
       configurable: { 
         conversation_id: conversationId,
         thread_id: threadId 
-      } 
+      },
+      recursionLimit,
     };
     const stream = compiledGraph.graph.streamEvents(initialState, streamConfig);
     // Read the run-control AbortSignal from the registry. This is the
@@ -1214,7 +1222,10 @@ async function executeStreaming(
       tools: state?.tools || [],
     };
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
+    const recursionLimit = resolveRecursionLimit(compiledGraph?.config);
+    const errorMessage = isGraphRecursionError(error)
+      ? formatRecursionLimitError(error, recursionLimit)
+      : error instanceof Error ? error.message : String(error);
     const errorStack = error instanceof Error ? error.stack : undefined;
     // External interrupt — clean shutdown via publisher.interrupt() so
     // subscribers see a terminal `run_interrupted` event (not `run_error`).
