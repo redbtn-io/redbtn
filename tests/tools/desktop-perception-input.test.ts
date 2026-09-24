@@ -27,6 +27,7 @@ import {
   desktopHover,
   desktopDrag,
   desktopBatch,
+  desktopListWindows,
 } from '../../src/lib/tools/native/desktop-computer';
 import { formatToolResultForModel } from '../../src/lib/nodes/universal/executors/neuronExecutor';
 
@@ -694,5 +695,230 @@ describe('desktop screenshot around and action screenshot parity (Addendum 2)', 
       }),
     );
     expect(res.content.some((b) => b.type === 'image' && (b as any).data === dummyB64)).toBe(true);
+  });
+
+  test('desktop_list_windows dispatches list_windows action and returns windows', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_win_1',
+      ok: true,
+      windows: [
+        {
+          id: 1234,
+          title: 'Black Desert',
+          bounds: { x: 100, y: 100, width: 1920, height: 1080 },
+          display: 0,
+          focused: true,
+          minimized: false,
+        },
+      ],
+    });
+
+    const res = await desktopListWindows.handler(
+      { environmentId: 'env_desktop' },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: { action: 'list_windows' },
+      }),
+    );
+    const body = textBody(res);
+    expect(body.ok).toBe(true);
+    expect(body.windows).toHaveLength(1);
+    expect(body.windows[0].title).toBe('Black Desert');
+  });
+
+  test('desktop_screenshot supports window targeting, normalized region, and reports captureMode and windowRect', async () => {
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_shot_1',
+      ok: true,
+      image: {
+        format: 'png',
+        base64: dummyB64,
+        width: 800,
+        height: 600,
+        captureMode: 'display-crop',
+        windowRect: { x: 50, y: 50, width: 800, height: 600 },
+        clickSpace: { w: 800, h: 600 },
+      },
+    });
+
+    const res = await desktopScreenshot.handler(
+      {
+        environmentId: 'env_desktop',
+        window: 'Black Desert',
+        region: { nx: 0.1, ny: 0.1, nw: 0.8, nh: 0.8 },
+      },
+      makeContext(),
+    );
+    expect(res.isError).toBeFalsy();
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'screenshot',
+          window: 'Black Desert',
+          region: { nx: 0.1, ny: 0.1, nw: 0.8, nh: 0.8 },
+        }),
+      }),
+    );
+    const body = textBody(res);
+    expect(body.ok).toBe(true);
+    expect(body.captureMode).toBe('display-crop');
+    expect(body.windowRect).toEqual({ x: 50, y: 50, width: 800, height: 600 });
+    expect(body.window).toBe('Black Desert');
+  });
+
+  test('desktop_click and desktop_move support window targeting and normalized nx, ny coordinates', async () => {
+    await desktopClick.handler(
+      { environmentId: 'env_desktop', window: { id: 42 }, nx: 0.5, ny: 0.75 },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'click',
+          window: { id: 42 },
+          nx: 0.5,
+          ny: 0.75,
+        }),
+      }),
+    );
+
+    await desktopMove.handler(
+      { environmentId: 'env_desktop', window: 'GameWindow', nx: 0.2, ny: 0.3 },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'move',
+          window: 'GameWindow',
+          nx: 0.2,
+          ny: 0.3,
+        }),
+      }),
+    );
+  });
+
+  test('desktop_read_text, desktop_find_text, desktop_click_text, desktop_hover, desktop_drag, and desktop_wait_for forward window parameter', async () => {
+    await desktopReadText.handler(
+      { environmentId: 'env_desktop', window: 'GameWindow' },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'ocr',
+          op: 'read',
+          window: 'GameWindow',
+        }),
+      }),
+    );
+
+    await desktopFindText.handler(
+      { environmentId: 'env_desktop', text: 'Start', window: 'GameWindow' },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'ocr',
+          op: 'find',
+          text: 'Start',
+          window: 'GameWindow',
+        }),
+      }),
+    );
+
+    await desktopClickText.handler(
+      { environmentId: 'env_desktop', text: 'Play', window: 'GameWindow' },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'ocr',
+          op: 'click',
+          text: 'Play',
+          window: 'GameWindow',
+        }),
+      }),
+    );
+
+    await desktopHover.handler(
+      { environmentId: 'env_desktop', x: 200, y: 300, window: 'GameWindow' },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'hover',
+          x: 200,
+          y: 300,
+          window: 'GameWindow',
+        }),
+      }),
+    );
+
+    await desktopDrag.handler(
+      { environmentId: 'env_desktop', to: { x: 500, y: 500 }, window: 'GameWindow' },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'drag',
+          to: { x: 500, y: 500 },
+          window: 'GameWindow',
+        }),
+      }),
+    );
+
+    await desktopWaitFor.handler(
+      { environmentId: 'env_desktop', text: 'Ready', window: 'GameWindow' },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'wait_for',
+          text: 'Ready',
+          window: 'GameWindow',
+        }),
+      }),
+    );
+  });
+
+  test('desktop_batch forwards batch-level window and inherits onto child steps', async () => {
+    await desktopBatch.handler(
+      {
+        environmentId: 'env_desktop',
+        window: 'GameWindow',
+        steps: [
+          { action: 'click', nx: 0.5, ny: 0.5 },
+          { action: 'move', x: 100, y: 100, window: 'OtherWindow' },
+        ],
+      },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'batch',
+          window: 'GameWindow',
+          steps: [
+            expect.objectContaining({ op: 'click', nx: 0.5, ny: 0.5, window: 'GameWindow' }),
+            expect.objectContaining({ op: 'move', x: 100, y: 100, window: 'OtherWindow' }),
+          ],
+        }),
+      }),
+    );
   });
 });

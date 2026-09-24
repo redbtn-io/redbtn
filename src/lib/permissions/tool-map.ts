@@ -337,6 +337,7 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   desktop_hover: { resource: 'computer', action: 'control', extract: envId },
   desktop_drag: { resource: 'computer', action: 'control', extract: envId },
   desktop_batch: { resource: 'computer', action: 'control', extract: envId },
+  desktop_list_windows: { resource: 'computer', action: 'read', extract: envId },
 
   // ── Graph tools ───────────────────────────────────────────────────────────
   invoke_graph: { resource: 'graph', action: 'execute', extract: graphId },

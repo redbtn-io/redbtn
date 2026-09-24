@@ -47,19 +47,23 @@ import Redis from 'ioredis';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
+export type WindowTarget = string | { id: string | number };
+export type ClickRegion = { x: number; y: number; w: number; h: number };
+export type NormalizedRegion = { nx: number; ny: number; nw: number; nh: number };
+
 export type BatchStep =
-  | { op: 'click'; x?: number; y?: number; display?: number; button?: 'left' | 'right' | 'middle'; double?: boolean; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: { x: number; y: number; w: number; h: number }; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
-  | { op: 'click_text'; text?: string; regex?: string; region?: { x: number; y: number; w: number; h: number }; occurrence?: number | 'first' | 'last'; button?: 'left' | 'right' | 'middle'; double?: boolean; offset?: { x: number; y: number }; display?: number; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
-  | { op: 'key'; keys: string[]; durationMs?: number; opMode?: 'tap' | 'down' | 'up'; opKind?: 'tap' | 'down' | 'up'; region?: { x: number; y: number; w: number; h: number }; label?: string }
-  | { op: 'type'; text: string; region?: { x: number; y: number; w: number; h: number }; label?: string }
-  | { op: 'move'; x?: number; y?: number; display?: number; dx?: number; dy?: number; relative?: boolean; transport?: 'injected' | 'virtual-hid'; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: { x: number; y: number; w: number; h: number }; label?: string }
-  | { op: 'hover'; x: number; y: number; display?: number; dwellMs?: number; wiggle?: boolean; screenshot?: boolean; region?: { x: number; y: number; w: number; h: number }; size?: { w: number; h: number }; label?: string }
-  | { op: 'drag'; from?: { x: number; y: number }; to: { x: number; y: number }; display?: number; button?: 'left' | 'right' | 'middle'; durationMs?: number; smooth?: boolean; region?: { x: number; y: number; w: number; h: number }; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
-  | { op: 'scroll'; dx?: number; dy?: number; display?: number; region?: { x: number; y: number; w: number; h: number }; label?: string }
-  | { op: 'wait'; ms?: number; durationMs?: number; region?: { x: number; y: number; w: number; h: number }; label?: string }
-  | { op: 'wait_for'; text?: string; regex?: string; template?: string; image?: string; gone?: boolean; region?: { x: number; y: number; w: number; h: number }; display?: number; timeoutMs?: number; intervalMs?: number; threshold?: number; label?: string }
-  | { op: 'assert_text'; text?: string; regex?: string; region?: { x: number; y: number; w: number; h: number }; display?: number; label?: string }
-  | { op: 'screenshot'; region?: { x: number; y: number; w: number; h: number }; around?: { x: number; y: number } | 'cursor'; size?: { w: number; h: number }; display?: number; format?: 'png' | 'jpeg'; label?: string };
+  | { op: 'click'; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; button?: 'left' | 'right' | 'middle'; double?: boolean; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: ClickRegion | NormalizedRegion; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
+  | { op: 'click_text'; text?: string; regex?: string; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; occurrence?: number | 'first' | 'last'; button?: 'left' | 'right' | 'middle'; double?: boolean; offset?: { x: number; y: number }; display?: number; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
+  | { op: 'key'; keys: string[]; durationMs?: number; opMode?: 'tap' | 'down' | 'up'; opKind?: 'tap' | 'down' | 'up'; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; label?: string }
+  | { op: 'type'; text: string; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; label?: string }
+  | { op: 'move'; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; dx?: number; dy?: number; relative?: boolean; transport?: 'injected' | 'virtual-hid'; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: ClickRegion | NormalizedRegion; label?: string }
+  | { op: 'hover'; x: number; y: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; dwellMs?: number; wiggle?: boolean; screenshot?: boolean; region?: ClickRegion | NormalizedRegion; size?: { w: number; h: number }; label?: string }
+  | { op: 'drag'; from?: { x: number; y: number }; to: { x: number; y: number }; display?: number; window?: WindowTarget; button?: 'left' | 'right' | 'middle'; durationMs?: number; smooth?: boolean; region?: ClickRegion | NormalizedRegion; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
+  | { op: 'scroll'; dx?: number; dy?: number; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; region?: ClickRegion | NormalizedRegion; label?: string }
+  | { op: 'wait'; ms?: number; durationMs?: number; region?: ClickRegion | NormalizedRegion; label?: string }
+  | { op: 'wait_for'; text?: string; regex?: string; template?: string; image?: string; gone?: boolean; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; display?: number; timeoutMs?: number; intervalMs?: number; threshold?: number; label?: string }
+  | { op: 'assert_text'; text?: string; regex?: string; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; display?: number; label?: string }
+  | { op: 'screenshot'; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; around?: { x: number; y: number } | 'cursor'; size?: { w: number; h: number }; display?: number; format?: 'png' | 'jpeg'; label?: string };
 
 /**
  * Computer-use action — discriminated union mirroring redAgent
@@ -78,8 +82,9 @@ export type ComputerAction =
   | {
       action: 'screenshot';
       display?: number;
+      window?: WindowTarget;
       format?: 'png' | 'jpeg';
-      region?: { x: number; y: number; w: number; h: number };
+      region?: ClickRegion | NormalizedRegion;
       fullRes?: boolean;
       around?: { x: number; y: number } | 'cursor';
       size?: { w: number; h: number };
@@ -90,6 +95,7 @@ export type ComputerAction =
       x?: number;
       y?: number;
       display?: number;
+      window?: WindowTarget;
       nx?: number;
       ny?: number;
       button?: 'left' | 'right' | 'middle';
@@ -103,7 +109,7 @@ export type ComputerAction =
       durationMs?: number;
       dwellMs?: number;
       wiggle?: boolean;
-      region?: { x: number; y: number; w: number; h: number };
+      region?: ClickRegion | NormalizedRegion;
       screenshot?: boolean;
       size?: { w: number; h: number };
       to?: { x: number; y: number };
@@ -122,7 +128,8 @@ export type ComputerAction =
       op: 'read' | 'find' | 'click';
       text?: string;
       regex?: string;
-      region?: { x: number; y: number; w: number; h: number };
+      region?: ClickRegion | NormalizedRegion;
+      window?: WindowTarget;
       occurrence?: number | 'first' | 'last' | 'all';
       caseSensitive?: boolean;
       fuzzy?: boolean | number;
@@ -143,7 +150,8 @@ export type ComputerAction =
       template?: string;
       image?: string;
       gone?: boolean;
-      region?: { x: number; y: number; w: number; h: number };
+      region?: ClickRegion | NormalizedRegion;
+      window?: WindowTarget;
       display?: number;
       timeoutMs?: number;
       intervalMs?: number;
@@ -152,7 +160,8 @@ export type ComputerAction =
   | {
       action: 'find_image';
       template: string;
-      region?: { x: number; y: number; w: number; h: number };
+      region?: ClickRegion | NormalizedRegion;
+      window?: WindowTarget;
       display?: number;
       threshold?: number;
       maxResults?: number;
@@ -163,12 +172,15 @@ export type ComputerAction =
   | {
       action: 'batch';
       steps: BatchStep[];
+      window?: WindowTarget;
+      display?: number;
       stopOnFail?: boolean;
       stopOnError?: boolean;
       abortOnError?: boolean;
       maxDurationMs?: number;
       durationCapMs?: number;
     }
+  | { action: 'list_windows' }
   | { action: 'screen_info' };
 
 /**
@@ -189,6 +201,8 @@ export interface ComputerResultMessage {
     sourceWidth?: number;
     sourceHeight?: number;
     clickSpace?: { w: number; h: number };
+    captureMode?: 'window' | 'display-crop';
+    windowRect?: { x: number; y: number; width: number; height: number };
   };
   screen?: {
     displays: Array<{
@@ -201,6 +215,14 @@ export interface ComputerResultMessage {
       primary: boolean;
     }>;
   };
+  windows?: Array<{
+    id: string | number;
+    title: string;
+    bounds: { x: number; y: number; width: number; height: number };
+    display?: number;
+    focused?: boolean;
+    minimized?: boolean;
+  }>;
   ocr?: {
     text?: string;
     lines?: Array<{
@@ -263,6 +285,7 @@ export function normalizeComputerReply(id: string, parsed: AnyObject): ComputerR
     ok: parsed.ok === true,
     ...(parsed.image ? { image: parsed.image } : {}),
     ...(parsed.screen ? { screen: parsed.screen } : {}),
+    ...(parsed.windows ? { windows: parsed.windows } : {}),
     ...(parsed.ocr ? { ocr: parsed.ocr } : {}),
     ...(parsed.matches ? { matches: parsed.matches } : {}),
     ...(parsed.clickSpace ? { clickSpace: parsed.clickSpace } : {}),

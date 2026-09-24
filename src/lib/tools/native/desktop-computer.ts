@@ -144,8 +144,38 @@ function invalidDisplayResult(): NativeMcpResult {
   }, true);
 }
 
-/** A screenshot crop rectangle in CLICK SPACE (the coordinate space clicks use). */
-type ScreenshotRegion = { x: number; y: number; w: number; h: number };
+/** Target window parameter schema shared across perception and input tools. */
+const WINDOW_TARGET_SCHEMA = {
+  description: 'Target window title substring or { id } to perform action in window-relative coordinates.',
+  oneOf: [
+    { type: 'string', description: 'Window title substring to match (case-insensitive).' },
+    {
+      type: 'object',
+      properties: {
+        id: {
+          description: 'Window identifier (number or string).',
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+        },
+      },
+      required: ['id'],
+    },
+  ],
+};
+
+function resolveWindow(args: AnyObject): string | { id: string | number } | undefined {
+  const raw = args?.window;
+  if (!raw) return undefined;
+  if (typeof raw === 'string' && raw.trim()) return raw.trim();
+  if (typeof raw === 'object' && (typeof raw.id === 'string' || typeof raw.id === 'number')) {
+    return { id: raw.id };
+  }
+  return undefined;
+}
+
+/** A screenshot crop rectangle in CLICK SPACE (the coordinate space clicks use) or normalized coords. */
+type ScreenshotRegion =
+  | { x: number; y: number; w: number; h: number }
+  | { nx: number; ny: number; nw: number; nh: number };
 
 /**
  * Optional crop rectangle, or null when explicitly invalid.
@@ -159,11 +189,32 @@ function resolveRegion(args: AnyObject): ScreenshotRegion | undefined | null {
   const raw = args?.region;
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+
+  if ('nx' in raw && 'ny' in raw && 'nw' in raw && 'nh' in raw) {
+    const nx = Number((raw as AnyObject).nx);
+    const ny = Number((raw as AnyObject).ny);
+    const nw = Number((raw as AnyObject).nw);
+    const nh = Number((raw as AnyObject).nh);
+    if (
+      Number.isFinite(nx) &&
+      Number.isFinite(ny) &&
+      Number.isFinite(nw) &&
+      Number.isFinite(nh) &&
+      nw > 0 &&
+      nh > 0
+    ) {
+      return { nx, ny, nw, nh };
+    }
+    return null;
+  }
+
   const { x, y, w, h } = raw as AnyObject;
+  const width = w ?? (raw as AnyObject).width;
+  const height = h ?? (raw as AnyObject).height;
   const offset = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 0;
   const extent = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 1;
-  if (!offset(x) || !offset(y) || !extent(w) || !extent(h)) return null;
-  return { x, y, w, h };
+  if (!offset(x) || !offset(y) || !extent(width) || !extent(height)) return null;
+  return { x, y, w: width, h: height };
 }
 
 function invalidRegionResult(): NativeMcpResult {
@@ -586,6 +637,7 @@ const desktopScreenshotTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
       format: {
         type: 'string',
         enum: ['png', 'jpeg'],
@@ -606,6 +658,10 @@ const desktopScreenshotTool: NativeToolDefinition = {
           y: { type: 'integer', minimum: 0, description: 'Top edge in click space.' },
           w: { type: 'integer', minimum: 1, description: 'Width in click space.' },
           h: { type: 'integer', minimum: 1, description: 'Height in click space.' },
+          nx: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized left edge (0-1).' },
+          ny: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized top edge (0-1).' },
+          nw: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized width (0-1).' },
+          nh: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized height (0-1).' },
         },
         required: ['x', 'y', 'w', 'h'],
       },
@@ -661,8 +717,10 @@ const desktopScreenshotTool: NativeToolDefinition = {
     const around = resolveAround(rawArgs);
     const size = resolveSize(rawArgs);
     const fullRes = rawArgs?.fullRes === true;
+    const win = resolveWindow(rawArgs);
     const request: ComputerAction = { action: 'screenshot', format };
     if (display !== undefined) request.display = display;
+    if (win !== undefined) request.window = win;
     // Passed through verbatim; the desktop clamps the rect (computerUse.ts).
     if (region !== undefined) request.region = region;
     if (around !== undefined) request.around = around;
@@ -701,6 +759,9 @@ const desktopScreenshotTool: NativeToolDefinition = {
             sourceHeight: img.sourceHeight,
             clickSpace: img.clickSpace,
             display: img.display,
+            captureMode: img.captureMode ?? (win ? 'window' : undefined),
+            windowRect: img.windowRect ?? null,
+            window: win ?? null,
             // What am I looking at? — echoed so the model can tell a zoomed
             // crop from the default overview without guessing from dimensions.
             region: region ?? null,
@@ -721,7 +782,7 @@ const desktopScreenshotTool: NativeToolDefinition = {
 
 const desktopClickTool: NativeToolDefinition = {
   description:
-    "Click the mouse in the CLICK SPACE reported by desktop_screenshot on the current user's connected desktop (redAgent). Supports display targeting, left/right/middle button, double-click, and smooth movement.",
+    "Click the mouse in the CLICK SPACE reported by desktop_screenshot on the current user's connected desktop (redAgent). Supports window targeting, normalized coordinates (nx, ny), display targeting, left/right/middle button, double-click, and smooth movement.",
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -734,8 +795,11 @@ const desktopClickTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
-      x: { type: 'number', description: 'Absolute X pixel coordinate. Required.' },
-      y: { type: 'number', description: 'Absolute Y pixel coordinate. Required.' },
+      window: WINDOW_TARGET_SCHEMA,
+      x: { type: 'number', description: 'Absolute X pixel coordinate in click space (optional if nx provided).' },
+      y: { type: 'number', description: 'Absolute Y pixel coordinate in click space (optional if ny provided).' },
+      nx: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized horizontal coordinate (0.0 to 1.0) across display or window.' },
+      ny: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized vertical coordinate (0.0 to 1.0) across display or window.' },
       display: {
         type: 'integer',
         minimum: 0,
@@ -758,28 +822,40 @@ const desktopClickTool: NativeToolDefinition = {
       },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
-    required: ['environmentId', 'x', 'y'],
+    required: ['environmentId'],
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
-    const x = Number(rawArgs?.x);
-    const y = Number(rawArgs?.y);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      return textResult({ ok: false, error: { code: 'computer_failed', message: 'x and y must be finite numbers' } }, true);
+    const x = rawArgs?.x !== undefined ? Number(rawArgs.x) : undefined;
+    const y = rawArgs?.y !== undefined ? Number(rawArgs.y) : undefined;
+    const nx = rawArgs?.nx !== undefined ? Number(rawArgs.nx) : undefined;
+    const ny = rawArgs?.ny !== undefined ? Number(rawArgs.ny) : undefined;
+    const hasAbsolute = x !== undefined && y !== undefined && Number.isFinite(x) && Number.isFinite(y);
+    const hasNormalized = nx !== undefined && ny !== undefined && Number.isFinite(nx) && Number.isFinite(ny);
+    if (!hasAbsolute && !hasNormalized) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'x and y or nx and ny must be finite numbers' } }, true);
     }
     const button: 'left' | 'right' | 'middle' =
       rawArgs?.button === 'right' ? 'right' : rawArgs?.button === 'middle' ? 'middle' : 'left';
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
     const size = resolveSize(rawArgs);
+    const win = resolveWindow(rawArgs);
     const request: ComputerAction = {
       action: 'mouse',
       op: 'click',
-      x,
-      y,
       button,
       double: rawArgs?.double === true,
     };
+    if (hasAbsolute) {
+      request.x = x;
+      request.y = y;
+    }
+    if (hasNormalized) {
+      request.nx = nx;
+      request.ny = ny;
+    }
+    if (win !== undefined) request.window = win;
     if (rawArgs?.smooth === true) request.smooth = true;
     if (rawArgs?.speed !== undefined) request.speed = rawArgs.speed;
     if (rawArgs?.screenshot === true) request.screenshot = true;
@@ -799,7 +875,7 @@ const desktopClickTool: NativeToolDefinition = {
 
 const desktopMoveTool: NativeToolDefinition = {
   description:
-    "Move the mouse pointer in the CLICK SPACE reported by desktop_screenshot on the current user's connected desktop (redAgent). Supports absolute or relative moves, virtual-hid or injected transport, smooth interpolation, and speed presets.",
+    "Move the mouse pointer in the CLICK SPACE reported by desktop_screenshot on the current user's connected desktop (redAgent). Supports absolute or relative moves, window targeting, normalized coordinates (nx, ny), virtual-hid or injected transport, smooth interpolation, and speed presets.",
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -812,8 +888,11 @@ const desktopMoveTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
-      x: { type: 'number', description: 'Absolute X pixel coordinate in click space.' },
-      y: { type: 'number', description: 'Absolute Y pixel coordinate in click space.' },
+      window: WINDOW_TARGET_SCHEMA,
+      x: { type: 'number', description: 'Absolute X pixel coordinate in click space (optional if relative or nx provided).' },
+      y: { type: 'number', description: 'Absolute Y pixel coordinate in click space (optional if relative or ny provided).' },
+      nx: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized horizontal coordinate (0.0 to 1.0) across display or window.' },
+      ny: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized vertical coordinate (0.0 to 1.0) across display or window.' },
       relative: { type: 'boolean', description: 'Relative movement if true. Default false.' },
       dx: { type: 'number', description: 'Relative horizontal delta in pixels (for relative moves).' },
       dy: { type: 'number', description: 'Relative vertical delta in pixels (for relative moves).' },
@@ -828,34 +907,46 @@ const desktopMoveTool: NativeToolDefinition = {
       },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
-    required: ['environmentId', 'x', 'y'],
+    required: ['environmentId'],
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
     const relative = rawArgs?.relative === true;
-    const x = Number(rawArgs?.x);
-    const y = Number(rawArgs?.y);
+    const x = rawArgs?.x !== undefined ? Number(rawArgs.x) : undefined;
+    const y = rawArgs?.y !== undefined ? Number(rawArgs.y) : undefined;
+    const nx = rawArgs?.nx !== undefined ? Number(rawArgs.nx) : undefined;
+    const ny = rawArgs?.ny !== undefined ? Number(rawArgs.ny) : undefined;
     const dx = Number(rawArgs?.dx);
     const dy = Number(rawArgs?.dy);
+    const hasAbsolute = x !== undefined && y !== undefined && Number.isFinite(x) && Number.isFinite(y);
+    const hasNormalized = nx !== undefined && ny !== undefined && Number.isFinite(nx) && Number.isFinite(ny);
 
     if (relative) {
       if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
         return textResult({ ok: false, error: { code: 'computer_failed', message: 'relative move requires finite dx and dy' } }, true);
       }
     } else {
-      if (!Number.isFinite(x) || !Number.isFinite(y)) {
-        return textResult({ ok: false, error: { code: 'computer_failed', message: 'x and y must be finite numbers' } }, true);
+      if (!hasAbsolute && !hasNormalized) {
+        return textResult({ ok: false, error: { code: 'computer_failed', message: 'x and y or nx and ny must be finite numbers' } }, true);
       }
     }
 
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
+    const win = resolveWindow(rawArgs);
     const request: ComputerAction = {
       action: 'mouse',
       op: 'move',
-      x: Number.isFinite(x) ? x : undefined,
-      y: Number.isFinite(y) ? y : undefined,
     };
+    if (hasAbsolute) {
+      request.x = x;
+      request.y = y;
+    }
+    if (hasNormalized) {
+      request.nx = nx;
+      request.ny = ny;
+    }
+    if (win !== undefined) request.window = win;
     if (relative) {
       request.relative = true;
       if (Number.isFinite(dx)) request.dx = dx;
@@ -967,7 +1058,7 @@ const desktopKeyTool: NativeToolDefinition = {
 
 const desktopScrollTool: NativeToolDefinition = {
   description:
-    "Scroll the mouse wheel on the current user's connected desktop (redAgent). Positive dy scrolls down, positive dx scrolls right. Returns { ok, result } with the desktop's evidence for what it actually did; if real control is off nothing scrolls and this comes back as an error.",
+    "Scroll the mouse wheel on the current user's connected desktop (redAgent). Positive dy scrolls down, positive dx scrolls right. Supports window targeting and normalized coordinates. Returns { ok, result } with the desktop's evidence for what it actually did; if real control is off nothing scrolls and this comes back as an error.",
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -980,10 +1071,18 @@ const desktopScrollTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
       dx: { type: 'number', description: 'Horizontal wheel delta (positive = right). Default 0.' },
       dy: { type: 'number', description: 'Vertical wheel delta (positive = down). Default 0.' },
       x: { type: 'number', description: 'Optional pointer X to scroll at (absolute pixels).' },
       y: { type: 'number', description: 'Optional pointer Y to scroll at (absolute pixels).' },
+      nx: { type: 'number', minimum: 0, maximum: 1, description: 'Optional normalized X to scroll at (0.0 to 1.0).' },
+      ny: { type: 'number', minimum: 0, maximum: 1, description: 'Optional normalized Y to scroll at (0.0 to 1.0).' },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
     required: ['environmentId'],
@@ -992,9 +1091,16 @@ const desktopScrollTool: NativeToolDefinition = {
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
     const dx = Number.isFinite(Number(rawArgs?.dx)) ? Number(rawArgs.dx) : 0;
     const dy = Number.isFinite(Number(rawArgs?.dy)) ? Number(rawArgs.dy) : 0;
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+    const win = resolveWindow(rawArgs);
     const req: ComputerAction = { action: 'mouse', op: 'scroll', dx, dy };
     if (Number.isFinite(Number(rawArgs?.x))) req.x = Number(rawArgs.x);
     if (Number.isFinite(Number(rawArgs?.y))) req.y = Number(rawArgs.y);
+    if (Number.isFinite(Number(rawArgs?.nx))) req.nx = Number(rawArgs.nx);
+    if (Number.isFinite(Number(rawArgs?.ny))) req.ny = Number(rawArgs.ny);
+    if (win !== undefined) req.window = win;
+    if (display !== undefined) req.display = display;
     const result = await runAction(context, req, rawArgs);
     if (!result) return noUserResult();
     return inputResult(result);
@@ -1125,7 +1231,7 @@ const desktopListTool: NativeToolDefinition = {
 
 const desktopReadTextTool: NativeToolDefinition = {
   description:
-    'Read on-screen text using on-device OCR (Windows.Media.Ocr / macOS Vision). Returns detected lines and words with bounding boxes in CLICK SPACE coords.',
+    'Read on-screen text using on-device OCR (Windows.Media.Ocr / macOS Vision). Supports window targeting and returns detected lines and words with bounding boxes in CLICK SPACE coords.',
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -1138,6 +1244,7 @@ const desktopReadTextTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
       display: {
         type: 'integer',
         minimum: 0,
@@ -1145,14 +1252,17 @@ const desktopReadTextTool: NativeToolDefinition = {
       },
       region: {
         type: 'object',
-        description: 'Crop region in click-space coords.',
+        description: 'Crop region in click-space coords ({x,y,w,h} or {nx,ny,nw,nh}).',
         properties: {
           x: { type: 'number', description: 'Left edge in click space.' },
           y: { type: 'number', description: 'Top edge in click space.' },
           w: { type: 'number', description: 'Width in click space.' },
           h: { type: 'number', description: 'Height in click space.' },
+          nx: { type: 'number', description: 'Normalized left edge (0-1).' },
+          ny: { type: 'number', description: 'Normalized top edge (0-1).' },
+          nw: { type: 'number', description: 'Normalized width (0-1).' },
+          nh: { type: 'number', description: 'Normalized height (0-1).' },
         },
-        required: ['x', 'y', 'w', 'h'],
       },
       imageBase64: {
         type: 'string',
@@ -1168,8 +1278,10 @@ const desktopReadTextTool: NativeToolDefinition = {
     if (display === null) return invalidDisplayResult();
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
+    const win = resolveWindow(rawArgs);
     const request: ComputerAction = { action: 'ocr', op: 'read' };
     if (display !== undefined) request.display = display;
+    if (win !== undefined) request.window = win;
     if (region !== undefined) request.region = region;
     if (typeof rawArgs?.imageBase64 === 'string') request.imageBase64 = rawArgs.imageBase64;
 
@@ -1190,6 +1302,7 @@ const desktopReadTextTool: NativeToolDefinition = {
       clickSpace: result.clickSpace || (result.result as any)?.clickSpace || ocr.clickSpace,
       display: display ?? 0,
       region: region ?? null,
+      ...(win ? { window: win } : {}),
     });
   },
 };
@@ -1198,7 +1311,7 @@ const desktopReadTextTool: NativeToolDefinition = {
 
 const desktopFindTextTool: NativeToolDefinition = {
   description:
-    'Find text on screen using on-device OCR. Returns matching occurrences with bounding boxes and click-center coordinates in CLICK SPACE.',
+    'Find text on screen using on-device OCR. Supports window targeting and returns matching occurrences with bounding boxes and click-center coordinates in CLICK SPACE.',
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -1211,6 +1324,7 @@ const desktopFindTextTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
       text: { type: 'string', description: 'Text substring to find.' },
       regex: { type: 'string', description: 'Regular expression pattern to find.' },
       caseSensitive: { type: 'boolean', description: 'Case-sensitive search (default: false).' },
@@ -1221,14 +1335,17 @@ const desktopFindTextTool: NativeToolDefinition = {
       },
       region: {
         type: 'object',
-        description: 'Crop region in click-space coords.',
+        description: 'Crop region in click-space coords ({x,y,w,h} or {nx,ny,nw,nh}).',
         properties: {
           x: { type: 'number' },
           y: { type: 'number' },
           w: { type: 'number' },
           h: { type: 'number' },
+          nx: { type: 'number' },
+          ny: { type: 'number' },
+          nw: { type: 'number' },
+          nh: { type: 'number' },
         },
-        required: ['x', 'y', 'w', 'h'],
       },
       imageBase64: {
         type: 'string',
@@ -1249,6 +1366,7 @@ const desktopFindTextTool: NativeToolDefinition = {
     if (display === null) return invalidDisplayResult();
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
+    const win = resolveWindow(rawArgs);
     const request: ComputerAction = {
       action: 'ocr',
       op: 'find',
@@ -1257,6 +1375,7 @@ const desktopFindTextTool: NativeToolDefinition = {
       caseSensitive: rawArgs?.caseSensitive === true,
     };
     if (display !== undefined) request.display = display;
+    if (win !== undefined) request.window = win;
     if (region !== undefined) request.region = region;
     if (typeof rawArgs?.imageBase64 === 'string') request.imageBase64 = rawArgs.imageBase64;
 
@@ -1276,6 +1395,7 @@ const desktopFindTextTool: NativeToolDefinition = {
       clickSpace: result.clickSpace || (result.result as any)?.clickSpace || result.ocr?.clickSpace,
       display: display ?? 0,
       region: region ?? null,
+      ...(win ? { window: win } : {}),
     });
   },
 };
@@ -1284,7 +1404,7 @@ const desktopFindTextTool: NativeToolDefinition = {
 
 const desktopClickTextTool: NativeToolDefinition = {
   description:
-    'Find text on screen using OCR and click it. Solves UI automation without hardcoded pixel coordinates.',
+    'Find text on screen using OCR and click it. Supports window targeting and solves UI automation without hardcoded pixel coordinates.',
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -1297,6 +1417,7 @@ const desktopClickTextTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
       text: { type: 'string', description: 'Text substring to find and click.' },
       regex: { type: 'string', description: 'Regular expression pattern to find and click.' },
       occurrence: { description: 'Which occurrence to click: 1-based index, "first", or "last" (default: 1).' },
@@ -1314,14 +1435,17 @@ const desktopClickTextTool: NativeToolDefinition = {
       },
       region: {
         type: 'object',
-        description: 'Crop region in click-space coords.',
+        description: 'Crop region in click-space coords ({x,y,w,h} or {nx,ny,nw,nh}).',
         properties: {
           x: { type: 'number' },
           y: { type: 'number' },
           w: { type: 'number' },
           h: { type: 'number' },
+          nx: { type: 'number' },
+          ny: { type: 'number' },
+          nw: { type: 'number' },
+          nh: { type: 'number' },
         },
-        required: ['x', 'y', 'w', 'h'],
       },
       screenshot: { type: 'boolean', description: 'Capture and return a crop around where the click landed as an MCP image block' },
       size: {
@@ -1345,6 +1469,7 @@ const desktopClickTextTool: NativeToolDefinition = {
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
     const size = resolveSize(rawArgs);
+    const win = resolveWindow(rawArgs);
     const request: ComputerAction = {
       action: 'ocr',
       op: 'click',
@@ -1355,6 +1480,7 @@ const desktopClickTextTool: NativeToolDefinition = {
       double: rawArgs?.double === true,
       offset: rawArgs?.offset,
     };
+    if (win !== undefined) request.window = win;
     if (rawArgs?.screenshot === true) request.screenshot = true;
     if (size !== undefined) request.size = size;
     if (display !== undefined) request.display = display;
@@ -1370,7 +1496,7 @@ const desktopClickTextTool: NativeToolDefinition = {
 
 const desktopFindImageTool: NativeToolDefinition = {
   description:
-    'Find a template image on screen using pure TypeScript template matching (NCC). Returns matching occurrences with bounding boxes and click-center coordinates in CLICK SPACE.',
+    'Find a template image on screen using pure TypeScript template matching (NCC). Supports window targeting and returns matching occurrences with bounding boxes and click-center coordinates in CLICK SPACE.',
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -1383,6 +1509,7 @@ const desktopFindImageTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
       template: { type: 'string', description: 'Base64-encoded PNG/JPEG template image to find.' },
       templateBase64: { type: 'string', description: 'Alias for template (base64-encoded PNG/JPEG).' },
       image: { type: 'string', description: 'Alias for template (base64-encoded PNG/JPEG).' },
@@ -1394,14 +1521,17 @@ const desktopFindImageTool: NativeToolDefinition = {
       },
       region: {
         type: 'object',
-        description: 'Crop region in click-space coords.',
+        description: 'Crop region in click-space coords ({x,y,w,h} or {nx,ny,nw,nh}).',
         properties: {
           x: { type: 'number' },
           y: { type: 'number' },
           w: { type: 'number' },
           h: { type: 'number' },
+          nx: { type: 'number' },
+          ny: { type: 'number' },
+          nw: { type: 'number' },
+          nh: { type: 'number' },
         },
-        required: ['x', 'y', 'w', 'h'],
       },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
     },
@@ -1424,12 +1554,14 @@ const desktopFindImageTool: NativeToolDefinition = {
     if (display === null) return invalidDisplayResult();
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
+    const win = resolveWindow(rawArgs);
     const request: ComputerAction = {
       action: 'find_image',
       template,
       threshold: typeof rawArgs?.threshold === 'number' ? rawArgs.threshold : undefined,
     };
     if (display !== undefined) request.display = display;
+    if (win !== undefined) request.window = win;
     if (region !== undefined) request.region = region;
 
     const result = await runAction(context, request, rawArgs);
@@ -1447,6 +1579,7 @@ const desktopFindImageTool: NativeToolDefinition = {
       clickSpace: result.clickSpace || (result.result as any)?.clickSpace,
       display: display ?? 0,
       region: region ?? null,
+      ...(win ? { window: win } : {}),
     });
   },
 };
@@ -1455,7 +1588,7 @@ const desktopFindImageTool: NativeToolDefinition = {
 
 const desktopWaitForTool: NativeToolDefinition = {
   description:
-    'Poll until text or an image template appears on screen (or disappears, with gone: true). When timeout occurs, returns error evidence screenshot crop.',
+    'Poll until text or an image template appears on screen (or disappears, with gone: true). Supports window targeting. When timeout occurs, returns error evidence screenshot crop.',
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -1468,6 +1601,7 @@ const desktopWaitForTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
       text: { type: 'string', description: 'Text substring to wait for.' },
       regex: { type: 'string', description: 'Regular expression to wait for.' },
       template: { type: 'string', description: 'Base64 image template to wait for.' },
@@ -1484,14 +1618,17 @@ const desktopWaitForTool: NativeToolDefinition = {
       },
       region: {
         type: 'object',
-        description: 'Crop region in click-space coords.',
+        description: 'Crop region in click-space coords ({x,y,w,h} or {nx,ny,nw,nh}).',
         properties: {
           x: { type: 'number' },
           y: { type: 'number' },
           w: { type: 'number' },
           h: { type: 'number' },
+          nx: { type: 'number' },
+          ny: { type: 'number' },
+          nw: { type: 'number' },
+          nh: { type: 'number' },
         },
-        required: ['x', 'y', 'w', 'h'],
       },
     },
     required: ['environmentId'],
@@ -1515,6 +1652,7 @@ const desktopWaitForTool: NativeToolDefinition = {
     if (display === null) return invalidDisplayResult();
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
+    const win = resolveWindow(rawArgs);
     const request: ComputerAction = {
       action: 'wait_for',
       text,
@@ -1526,6 +1664,7 @@ const desktopWaitForTool: NativeToolDefinition = {
       threshold: typeof rawArgs?.threshold === 'number' ? rawArgs.threshold : undefined,
     };
     if (display !== undefined) request.display = display;
+    if (win !== undefined) request.window = win;
     if (region !== undefined) request.region = region;
 
     // Add 5000ms margin to Redis relay timeout so desktop connector can finish and return evidence
@@ -1560,7 +1699,7 @@ const desktopWaitForTool: NativeToolDefinition = {
 
 const desktopHoverTool: NativeToolDefinition = {
   description:
-    'Hover the mouse at coordinates with an optional dwell time (default 300ms) and micro-wiggle (1px) to trigger tooltip/hover effects. Optionally captures a screenshot of the region.',
+    'Hover the mouse at coordinates with an optional dwell time (default 300ms) and micro-wiggle (1px) to trigger tooltip/hover effects. Supports window targeting and normalized coordinates. Optionally captures a screenshot of the region.',
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -1573,8 +1712,11 @@ const desktopHoverTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
-      x: { type: 'number', description: 'X coordinate in click space. Required.' },
-      y: { type: 'number', description: 'Y coordinate in click space. Required.' },
+      window: WINDOW_TARGET_SCHEMA,
+      x: { type: 'number', description: 'X coordinate in click space (optional if nx provided).' },
+      y: { type: 'number', description: 'Y coordinate in click space (optional if ny provided).' },
+      nx: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized horizontal coordinate (0.0 to 1.0) across display or window.' },
+      ny: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized vertical coordinate (0.0 to 1.0) across display or window.' },
       dwellMs: { type: 'integer', description: 'Dwell time in ms (default 300).' },
       wiggle: { type: 'boolean', description: 'Perform 1px wiggle to trigger hover handlers (default true).' },
       display: {
@@ -1584,14 +1726,17 @@ const desktopHoverTool: NativeToolDefinition = {
       },
       region: {
         type: 'object',
-        description: 'Optional crop region in click space to screenshot after dwelling.',
+        description: 'Optional crop region in click space to screenshot after dwelling ({x,y,w,h} or {nx,ny,nw,nh}).',
         properties: {
           x: { type: 'number' },
           y: { type: 'number' },
           w: { type: 'number' },
           h: { type: 'number' },
+          nx: { type: 'number' },
+          ny: { type: 'number' },
+          nw: { type: 'number' },
+          nh: { type: 'number' },
         },
-        required: ['x', 'y', 'w', 'h'],
       },
       screenshot: { type: 'boolean', description: 'Capture and return a screenshot after hovering (default: false)' },
       size: {
@@ -1601,28 +1746,40 @@ const desktopHoverTool: NativeToolDefinition = {
       },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
     },
-    required: ['environmentId', 'x', 'y'],
+    required: ['environmentId'],
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
-    const x = Number(rawArgs?.x);
-    const y = Number(rawArgs?.y);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      return textResult({ ok: false, error: { code: 'computer_failed', message: 'x and y must be finite numbers' } }, true);
+    const x = rawArgs?.x !== undefined ? Number(rawArgs.x) : undefined;
+    const y = rawArgs?.y !== undefined ? Number(rawArgs.y) : undefined;
+    const nx = rawArgs?.nx !== undefined ? Number(rawArgs.nx) : undefined;
+    const ny = rawArgs?.ny !== undefined ? Number(rawArgs.ny) : undefined;
+    const hasAbsolute = x !== undefined && y !== undefined && Number.isFinite(x) && Number.isFinite(y);
+    const hasNormalized = nx !== undefined && ny !== undefined && Number.isFinite(nx) && Number.isFinite(ny);
+    if (!hasAbsolute && !hasNormalized) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'x and y or nx and ny must be finite numbers' } }, true);
     }
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
     const size = resolveSize(rawArgs);
+    const win = resolveWindow(rawArgs);
     const request: ComputerAction = {
       action: 'mouse',
       op: 'hover',
-      x,
-      y,
       dwellMs: typeof rawArgs?.dwellMs === 'number' ? rawArgs.dwellMs : undefined,
       wiggle: rawArgs?.wiggle !== false,
     };
+    if (hasAbsolute) {
+      request.x = x;
+      request.y = y;
+    }
+    if (hasNormalized) {
+      request.nx = nx;
+      request.ny = ny;
+    }
+    if (win !== undefined) request.window = win;
     if (rawArgs?.screenshot === true) request.screenshot = true;
     if (size !== undefined) request.size = size;
     if (display !== undefined) request.display = display;
@@ -1638,7 +1795,7 @@ const desktopHoverTool: NativeToolDefinition = {
 
 const desktopDragTool: NativeToolDefinition = {
   description:
-    'Drag from one position to another in click space. If `from` is omitted, drags from the current mouse position. Returns { ok, result }.',
+    'Drag from one position to another in click space. If `from` is omitted, drags from the current mouse position. Supports window targeting. Returns { ok, result }.',
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -1651,6 +1808,7 @@ const desktopDragTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
       to: {
         type: 'object',
         description: 'Destination coordinates in click space. Required.',
@@ -1694,6 +1852,7 @@ const desktopDragTool: NativeToolDefinition = {
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
     const size = resolveSize(rawArgs);
+    const win = resolveWindow(rawArgs);
 
     const request: ComputerAction = {
       action: 'mouse',
@@ -1704,6 +1863,7 @@ const desktopDragTool: NativeToolDefinition = {
       durationMs: typeof rawArgs?.durationMs === 'number' ? rawArgs.durationMs : undefined,
       smooth: rawArgs?.smooth !== false,
     };
+    if (win !== undefined) request.window = win;
     if (rawArgs?.screenshot === true) request.screenshot = true;
     if (size !== undefined) request.size = size;
     if (display !== undefined) request.display = display;
@@ -1718,7 +1878,7 @@ const desktopDragTool: NativeToolDefinition = {
 
 const desktopBatchTool: NativeToolDefinition = {
   description:
-    'Execute an atomic batch of input actions and perceptual checkpoints in sequence. Returns array of step results. If any step fails and abortOnError is true (default), execution stops.',
+    'Execute an atomic batch of input actions and perceptual checkpoints in sequence. Supports window targeting. Returns array of step results. If any step fails and abortOnError is true (default), execution stops.',
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -1731,6 +1891,7 @@ const desktopBatchTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
       steps: {
         type: 'array',
         description: 'Sequence of batch steps to execute in order. Required, non-empty.',
@@ -1754,6 +1915,9 @@ const desktopBatchTool: NativeToolDefinition = {
                 'screenshot',
               ],
             },
+            window: WINDOW_TARGET_SCHEMA,
+            nx: { type: 'number', description: 'Normalized horizontal coordinate (0.0 to 1.0).' },
+            ny: { type: 'number', description: 'Normalized vertical coordinate (0.0 to 1.0).' },
             label: { type: 'string', description: 'Optional step label for diagnostics.' },
           },
           required: ['op'],
@@ -1777,6 +1941,7 @@ const desktopBatchTool: NativeToolDefinition = {
     }
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
+    const win = resolveWindow(rawArgs);
 
     const steps = rawSteps.map((step) => {
       if (!step || typeof step !== 'object') return step;
@@ -1787,6 +1952,9 @@ const desktopBatchTool: NativeToolDefinition = {
       if (s.template === undefined && s.templateBase64 !== undefined) {
         s.template = s.templateBase64;
       }
+      if (s.window === undefined && win !== undefined) {
+        s.window = win;
+      }
       return s;
     });
 
@@ -1796,6 +1964,8 @@ const desktopBatchTool: NativeToolDefinition = {
       stopOnFail: rawArgs?.abortOnError !== false,
       abortOnError: rawArgs?.abortOnError !== false,
     };
+    if (win !== undefined) request.window = win;
+    if (display !== undefined) request.display = display;
 
     // Batch duration cap on connector is 120s; set relay timeout margin to 125s (125000ms)
     const result = await runAction(context, request, rawArgs, 125000);
@@ -1825,6 +1995,45 @@ const desktopBatchTool: NativeToolDefinition = {
   },
 };
 
+// ─── desktop_list_windows ───────────────────────────────────────────────────
+
+const desktopListWindowsTool: NativeToolDefinition = {
+  description:
+    'List open application windows on the connected desktop (redAgent), including title, id, bounds, display, focused, and minimized states.',
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: {
+        type: 'string',
+        description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
+    },
+    required: ['environmentId'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const result = await runAction(context, { action: 'list_windows' }, rawArgs);
+    if (!result) return noUserResult();
+    if (!result.ok) {
+      return textResult({
+        ok: false,
+        error: result.error || { code: 'computer_failed', message: 'list_windows failed' },
+      }, true);
+    }
+    const windows = result.windows || (result.result as any)?.windows || [];
+    return textResult({
+      ok: true,
+      windows,
+    });
+  },
+};
+
 // ─── Exports ─────────────────────────────────────────────────────────────────
 
 export const desktopScreenshot = desktopScreenshotTool;
@@ -1835,6 +2044,7 @@ export const desktopKey = desktopKeyTool;
 export const desktopScroll = desktopScrollTool;
 export const desktopScreenInfo = desktopScreenInfoTool;
 export const desktopList = desktopListTool;
+export const desktopListWindows = desktopListWindowsTool;
 export const desktopReadText = desktopReadTextTool;
 export const desktopFindText = desktopFindTextTool;
 export const desktopClickText = desktopClickTextTool;
@@ -2101,6 +2311,7 @@ export const desktopPing = desktopPingTool;
   desktopExec: desktopExecTool,
   desktopSettings: desktopSettingsTool,
   desktopList: desktopListTool,
+  desktopListWindows: desktopListWindowsTool,
   desktopPing: desktopPingTool,
   desktopReadText: desktopReadTextTool,
   desktopFindText: desktopFindTextTool,
