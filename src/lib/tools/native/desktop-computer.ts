@@ -362,6 +362,73 @@ async function resolveInstallId(context: NativeToolContext, environmentId?: stri
 }
 
 /**
+ * Resolve target desktop installId from either environmentId OR machine name / prefix / installId.
+ */
+async function resolveTargetInstallId(context: NativeToolContext, args: AnyObject): Promise<string | undefined> {
+  const target = args?.environmentId || args?.machine;
+  if (!target) {
+    throw new Error('environmentId is required to target a desktop instance.');
+  }
+  const userId = resolveUserId(context);
+  if (!userId) return undefined;
+
+  // 1. If explicit environmentId was provided, resolve via loadAndResolveEnvironment
+  if (args.environmentId) {
+    try {
+      const { env } = await loadAndResolveEnvironment(args.environmentId, userId);
+      return env.installId;
+    } catch (err) {
+      if (!args.machine) {
+        throw new Error(`Failed to resolve environment ${args.environmentId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  // 2. If target is a machine name/prefix/installId:
+  const q = String(args.machine || args.environmentId).trim();
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(q)) {
+    return q;
+  }
+
+  try {
+    const mongoose = await import('mongoose');
+    const conn = mongoose.connection;
+    if (conn?.db) {
+      const envCol = conn.db.collection('environments');
+      const docs = await envCol.find({
+        userId,
+        kind: 'desktop-agent',
+        $or: [
+          { environmentId: q },
+          { installId: q },
+          { installId: { $regex: `^${q}`, $options: 'i' } },
+          { name: { $regex: q, $options: 'i' } },
+        ],
+      }).toArray();
+
+      if (docs.length === 1 && docs[0].installId) {
+        return docs[0].installId;
+      }
+      if (docs.length > 1) {
+        const matches = docs.map((d: any) => `${d.name || '(unnamed)'} [${d.installId?.slice(0, 8)}]`).join(', ');
+        throw new Error(`"${q}" matches multiple desktop environments: ${matches}`);
+      }
+    }
+  } catch (err: any) {
+    if (err.message && err.message.includes('matches multiple')) {
+      throw err;
+    }
+  }
+
+  try {
+    const { env } = await loadAndResolveEnvironment(q, userId);
+    return env.installId;
+  } catch {
+    return q;
+  }
+}
+
+/**
  * Run a computer action and map a non-screenshot result to a compact
  * `{ ok, error? }` text block.
  */
@@ -369,11 +436,12 @@ async function runAction(
   context: NativeToolContext,
   request: ComputerAction,
   args: AnyObject,
+  marginMs = 0,
 ): Promise<ComputerResultMessage | null> {
   const userId = resolveUserId(context);
   if (!userId) return null;
 
-  if (!args.environmentId) {
+  if (!args.environmentId && !args.machine) {
     return {
       kind: 'computer_result',
       id: '',
@@ -387,7 +455,7 @@ async function runAction(
 
   let installId: string | undefined = undefined;
   try {
-    installId = await resolveInstallId(context, args.environmentId);
+    installId = await resolveTargetInstallId(context, args);
     if (!installId) {
       return {
         kind: 'computer_result',
@@ -395,7 +463,7 @@ async function runAction(
         ok: false,
         error: {
           code: 'computer_failed',
-          message: `Target environment ${args.environmentId} does not have an active desktop connection (missing installId).`,
+          message: `Target environment ${args.environmentId || args.machine} does not have an active desktop connection (missing installId).`,
         },
       };
     }
@@ -412,7 +480,9 @@ async function runAction(
   }
 
   context?.publisher?.emit?.('log', `desktop_${request.action} → desktop:cmd:${userId}:${installId}`);
-  return requestDesktop({ userId, request, installId, timeoutMs: resolveTimeoutMs(args) });
+  const baseTimeout = resolveTimeoutMs(args);
+  const timeoutMs = baseTimeout !== undefined ? baseTimeout + marginMs : (marginMs > 0 ? 10000 + marginMs : undefined);
+  return requestDesktop({ userId, request, installId, timeoutMs });
 }
 
 // ─── desktop_screenshot ──────────────────────────────────────────────────────
@@ -427,6 +497,10 @@ const desktopScreenshotTool: NativeToolDefinition = {
       environmentId: {
         type: 'string',
         description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       format: {
         type: 'string',
@@ -528,7 +602,7 @@ const desktopScreenshotTool: NativeToolDefinition = {
 
 const desktopClickTool: NativeToolDefinition = {
   description:
-    "Click the mouse in the CLICK SPACE reported by desktop_screenshot on the current user's connected desktop (redAgent). Supports display targeting, left/right/middle button, and double-click. Returns { ok, result } where `result` is the desktop's evidence for what it actually did; if real control is off the desktop synthesizes NOTHING and this comes back as an error, not a success.",
+    "Click the mouse in the CLICK SPACE reported by desktop_screenshot on the current user's connected desktop (redAgent). Supports display targeting, left/right/middle button, double-click, and smooth movement.",
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -536,6 +610,10 @@ const desktopClickTool: NativeToolDefinition = {
       environmentId: {
         type: 'string',
         description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       x: { type: 'number', description: 'Absolute X pixel coordinate. Required.' },
       y: { type: 'number', description: 'Absolute Y pixel coordinate. Required.' },
@@ -551,6 +629,8 @@ const desktopClickTool: NativeToolDefinition = {
         default: 'left',
       },
       double: { type: 'boolean', description: 'Perform a double-click. Default false.' },
+      smooth: { type: 'boolean', description: 'Move the cursor smoothly to coordinates before clicking. Default false.' },
+      speed: { type: 'string', enum: ['normal', 'fast', 'instant'], description: 'Movement speed preset. Default normal.' },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
     required: ['environmentId', 'x', 'y'],
@@ -574,6 +654,8 @@ const desktopClickTool: NativeToolDefinition = {
       button,
       double: rawArgs?.double === true,
     };
+    if (rawArgs?.smooth === true) request.smooth = true;
+    if (rawArgs?.speed !== undefined) request.speed = rawArgs.speed;
     if (display !== undefined) request.display = display;
     const result = await runAction(
       context,
@@ -589,7 +671,7 @@ const desktopClickTool: NativeToolDefinition = {
 
 const desktopMoveTool: NativeToolDefinition = {
   description:
-    "Move the mouse pointer (without clicking) in the CLICK SPACE reported by desktop_screenshot on the current user's connected desktop (redAgent). Returns { ok, result } where `result` is the desktop's evidence for what it actually did; if real control is off the pointer does NOT move and this comes back as an error.",
+    "Move the mouse pointer in the CLICK SPACE reported by desktop_screenshot on the current user's connected desktop (redAgent). Supports absolute or relative moves, virtual-hid or injected transport, smooth interpolation, and speed presets.",
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -598,8 +680,19 @@ const desktopMoveTool: NativeToolDefinition = {
         type: 'string',
         description: 'environmentId of the target desktop agent.',
       },
-      x: { type: 'number', description: 'Absolute X pixel coordinate. Required.' },
-      y: { type: 'number', description: 'Absolute Y pixel coordinate. Required.' },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
+      x: { type: 'number', description: 'Absolute X pixel coordinate in click space.' },
+      y: { type: 'number', description: 'Absolute Y pixel coordinate in click space.' },
+      relative: { type: 'boolean', description: 'Relative movement if true. Default false.' },
+      dx: { type: 'number', description: 'Relative horizontal delta in pixels (for relative moves).' },
+      dy: { type: 'number', description: 'Relative vertical delta in pixels (for relative moves).' },
+      transport: { type: 'string', enum: ['injected', 'virtual-hid'], description: 'Transport to use ("injected" or "virtual-hid").' },
+      smooth: { type: 'boolean', description: 'Smooth movement interpolation. Default true for absolute moves.' },
+      speed: { type: 'string', enum: ['normal', 'fast', 'instant'], description: 'Movement speed preset. Default normal.' },
+      durationMs: { type: 'integer', description: 'Movement duration in ms.' },
       display: {
         type: 'integer',
         minimum: 0,
@@ -611,14 +704,39 @@ const desktopMoveTool: NativeToolDefinition = {
   },
 
   async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const relative = rawArgs?.relative === true;
     const x = Number(rawArgs?.x);
     const y = Number(rawArgs?.y);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      return textResult({ ok: false, error: { code: 'computer_failed', message: 'x and y must be finite numbers' } }, true);
+    const dx = Number(rawArgs?.dx);
+    const dy = Number(rawArgs?.dy);
+
+    if (relative) {
+      if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+        return textResult({ ok: false, error: { code: 'computer_failed', message: 'relative move requires finite dx and dy' } }, true);
+      }
+    } else {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return textResult({ ok: false, error: { code: 'computer_failed', message: 'x and y must be finite numbers' } }, true);
+      }
     }
+
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
-    const request: ComputerAction = { action: 'mouse', op: 'move', x, y };
+    const request: ComputerAction = {
+      action: 'mouse',
+      op: 'move',
+      x: Number.isFinite(x) ? x : undefined,
+      y: Number.isFinite(y) ? y : undefined,
+    };
+    if (relative) {
+      request.relative = true;
+      if (Number.isFinite(dx)) request.dx = dx;
+      if (Number.isFinite(dy)) request.dy = dy;
+    }
+    if (rawArgs?.transport !== undefined) request.transport = rawArgs.transport;
+    if (rawArgs?.smooth !== undefined) request.smooth = rawArgs.smooth;
+    if (rawArgs?.speed !== undefined) request.speed = rawArgs.speed;
+    if (rawArgs?.durationMs !== undefined) request.durationMs = rawArgs.durationMs;
     if (display !== undefined) request.display = display;
     const result = await runAction(context, request, rawArgs);
     if (!result) return noUserResult();
@@ -638,6 +756,10 @@ const desktopTypeTool: NativeToolDefinition = {
       environmentId: {
         type: 'string',
         description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       text: { type: 'string', description: 'Literal text to type. Required.' },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
@@ -660,7 +782,7 @@ const desktopTypeTool: NativeToolDefinition = {
 
 const desktopKeyTool: NativeToolDefinition = {
   description:
-    "Tap a key or key-chord (e.g. ['ctrl','c'], ['enter'], ['alt','tab']) on the current user's connected desktop (redAgent). Keys are pressed together as a chord. Returns { ok, result } reporting which keys were actually pressed (`keys`), any the desktop did not recognise (`unknownKeys`), and the focused window. If real control is off, NO key is synthesized and this comes back as an error.",
+    "Tap a key or key-chord (e.g. ['ctrl','c'], ['enter'], ['alt','tab']) on the current user's connected desktop (redAgent). Supports opMode: tap (default), down (hold), or up (release), and hold durationMs.",
   server: 'system',
   inputSchema: {
     type: 'object',
@@ -669,10 +791,23 @@ const desktopKeyTool: NativeToolDefinition = {
         type: 'string',
         description: 'environmentId of the target desktop agent.',
       },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
       keys: {
         type: 'array',
         items: { type: 'string' },
         description: "Key names forming a chord, e.g. ['ctrl','c'] or ['enter']. Required, non-empty.",
+      },
+      opMode: {
+        type: 'string',
+        enum: ['tap', 'down', 'up'],
+        description: 'Key operation: "tap" (default), "down" (press and hold), or "up" (release hold)',
+      },
+      durationMs: {
+        type: 'integer',
+        description: 'Hold duration in milliseconds before release (when opMode is "tap")',
       },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
@@ -686,7 +821,15 @@ const desktopKeyTool: NativeToolDefinition = {
     if (keys.length === 0) {
       return textResult({ ok: false, error: { code: 'computer_failed', message: 'keys must be a non-empty array of strings' } }, true);
     }
-    const result = await runAction(context, { action: 'keyboard', op: 'tap', keys }, rawArgs);
+    const opMode = rawArgs?.opMode;
+    const request: ComputerAction = {
+      action: 'keyboard',
+      op: opMode === 'down' ? 'down' : opMode === 'up' ? 'up' : 'tap',
+      keys,
+    };
+    if (opMode !== undefined) request.opMode = opMode;
+    if (typeof rawArgs?.durationMs === 'number') request.durationMs = rawArgs.durationMs;
+    const result = await runAction(context, request, rawArgs);
     if (!result) return noUserResult();
     return inputResult(result);
   },
@@ -704,6 +847,10 @@ const desktopScrollTool: NativeToolDefinition = {
       environmentId: {
         type: 'string',
         description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       dx: { type: 'number', description: 'Horizontal wheel delta (positive = right). Default 0.' },
       dy: { type: 'number', description: 'Vertical wheel delta (positive = down). Default 0.' },
@@ -738,6 +885,10 @@ const desktopScreenInfoTool: NativeToolDefinition = {
       environmentId: {
         type: 'string',
         description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
@@ -842,6 +993,678 @@ const desktopListTool: NativeToolDefinition = {
   }
 };
 
+// ─── desktop_read_text ───────────────────────────────────────────────────────
+
+const desktopReadTextTool: NativeToolDefinition = {
+  description:
+    'Read on-screen text using on-device OCR (Windows.Media.Ocr / macOS Vision). Returns detected lines and words with bounding boxes in CLICK SPACE coords.',
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: {
+        type: 'string',
+        description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
+      region: {
+        type: 'object',
+        description: 'Crop region in click-space coords.',
+        properties: {
+          x: { type: 'number', description: 'Left edge in click space.' },
+          y: { type: 'number', description: 'Top edge in click space.' },
+          w: { type: 'number', description: 'Width in click space.' },
+          h: { type: 'number', description: 'Height in click space.' },
+        },
+        required: ['x', 'y', 'w', 'h'],
+      },
+      imageBase64: {
+        type: 'string',
+        description: 'Base64-encoded image to read (offline / testing).',
+      },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
+    },
+    required: ['environmentId'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+    const region = resolveRegion(rawArgs);
+    if (region === null) return invalidRegionResult();
+    const request: ComputerAction = { action: 'ocr', op: 'read' };
+    if (display !== undefined) request.display = display;
+    if (region !== undefined) request.region = region;
+    if (typeof rawArgs?.imageBase64 === 'string') request.imageBase64 = rawArgs.imageBase64;
+
+    const result = await runAction(context, request, rawArgs);
+    if (!result) return noUserResult();
+    if (!result.ok) {
+      return textResult({
+        ok: false,
+        error: result.error || { code: 'computer_failed', message: 'read_text failed' },
+      }, true);
+    }
+    const ocr = result.ocr || {};
+    return textResult({
+      ok: true,
+      text: ocr.text || (result.result as any)?.text || '',
+      lines: ocr.lines || (result.result as any)?.lines || [],
+      words: ocr.words || (result.result as any)?.words || [],
+      clickSpace: result.clickSpace || (result.result as any)?.clickSpace || ocr.clickSpace,
+      display: display ?? 0,
+      region: region ?? null,
+    });
+  },
+};
+
+// ─── desktop_find_text ───────────────────────────────────────────────────────
+
+const desktopFindTextTool: NativeToolDefinition = {
+  description:
+    'Find text on screen using on-device OCR. Returns matching occurrences with bounding boxes and click-center coordinates in CLICK SPACE.',
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: {
+        type: 'string',
+        description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
+      text: { type: 'string', description: 'Text substring to find.' },
+      regex: { type: 'string', description: 'Regular expression pattern to find.' },
+      caseSensitive: { type: 'boolean', description: 'Case-sensitive search (default: false).' },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
+      region: {
+        type: 'object',
+        description: 'Crop region in click-space coords.',
+        properties: {
+          x: { type: 'number' },
+          y: { type: 'number' },
+          w: { type: 'number' },
+          h: { type: 'number' },
+        },
+        required: ['x', 'y', 'w', 'h'],
+      },
+      imageBase64: {
+        type: 'string',
+        description: 'Base64-encoded image to read (offline / testing).',
+      },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
+    },
+    required: ['environmentId'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const text = typeof rawArgs?.text === 'string' ? rawArgs.text : undefined;
+    const regex = typeof rawArgs?.regex === 'string' ? rawArgs.regex : undefined;
+    if (!text && !regex) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'find_text requires text or regex' } }, true);
+    }
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+    const region = resolveRegion(rawArgs);
+    if (region === null) return invalidRegionResult();
+    const request: ComputerAction = {
+      action: 'ocr',
+      op: 'find',
+      text,
+      regex,
+      caseSensitive: rawArgs?.caseSensitive === true,
+    };
+    if (display !== undefined) request.display = display;
+    if (region !== undefined) request.region = region;
+    if (typeof rawArgs?.imageBase64 === 'string') request.imageBase64 = rawArgs.imageBase64;
+
+    const result = await runAction(context, request, rawArgs);
+    if (!result) return noUserResult();
+    if (!result.ok) {
+      return textResult({
+        ok: false,
+        error: result.error || { code: 'computer_failed', message: 'find_text failed' },
+      }, true);
+    }
+    const matches = result.ocr?.matches || (result.result as any)?.matches || [];
+    return textResult({
+      ok: true,
+      query: { text, regex },
+      matches,
+      clickSpace: result.clickSpace || (result.result as any)?.clickSpace || result.ocr?.clickSpace,
+      display: display ?? 0,
+      region: region ?? null,
+    });
+  },
+};
+
+// ─── desktop_click_text ──────────────────────────────────────────────────────
+
+const desktopClickTextTool: NativeToolDefinition = {
+  description:
+    'Find text on screen using OCR and click it. Solves UI automation without hardcoded pixel coordinates.',
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: {
+        type: 'string',
+        description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
+      text: { type: 'string', description: 'Text substring to find and click.' },
+      regex: { type: 'string', description: 'Regular expression pattern to find and click.' },
+      occurrence: { description: 'Which occurrence to click: 1-based index, "first", or "last" (default: 1).' },
+      button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button (default: left).' },
+      double: { type: 'boolean', description: 'Double-click (default: false).' },
+      offset: {
+        type: 'object',
+        description: 'Pixel offset {x, y} from match click-center in click-space coordinates.',
+        properties: { x: { type: 'number' }, y: { type: 'number' } },
+      },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
+      region: {
+        type: 'object',
+        description: 'Crop region in click-space coords.',
+        properties: {
+          x: { type: 'number' },
+          y: { type: 'number' },
+          w: { type: 'number' },
+          h: { type: 'number' },
+        },
+        required: ['x', 'y', 'w', 'h'],
+      },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
+    },
+    required: ['environmentId'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const text = typeof rawArgs?.text === 'string' ? rawArgs.text : undefined;
+    const regex = typeof rawArgs?.regex === 'string' ? rawArgs.regex : undefined;
+    if (!text && !regex) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'click_text requires text or regex' } }, true);
+    }
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+    const region = resolveRegion(rawArgs);
+    if (region === null) return invalidRegionResult();
+    const request: ComputerAction = {
+      action: 'ocr',
+      op: 'click',
+      text,
+      regex,
+      occurrence: rawArgs?.occurrence,
+      button: rawArgs?.button === 'right' ? 'right' : rawArgs?.button === 'middle' ? 'middle' : 'left',
+      double: rawArgs?.double === true,
+      offset: rawArgs?.offset,
+    };
+    if (display !== undefined) request.display = display;
+    if (region !== undefined) request.region = region;
+
+    const result = await runAction(context, request, rawArgs);
+    if (!result) return noUserResult();
+    return inputResult(result);
+  },
+};
+
+// ─── desktop_find_image ──────────────────────────────────────────────────────
+
+const desktopFindImageTool: NativeToolDefinition = {
+  description:
+    'Find a template image on screen using pure TypeScript template matching (NCC). Returns matching occurrences with bounding boxes and click-center coordinates in CLICK SPACE.',
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: {
+        type: 'string',
+        description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
+      template: { type: 'string', description: 'Base64-encoded PNG/JPEG template image to find.' },
+      image: { type: 'string', description: 'Alias for template (base64-encoded PNG/JPEG).' },
+      threshold: { type: 'number', minimum: 0, maximum: 1, description: 'Similarity threshold 0.0–1.0 (default 0.8).' },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
+      region: {
+        type: 'object',
+        description: 'Crop region in click-space coords.',
+        properties: {
+          x: { type: 'number' },
+          y: { type: 'number' },
+          w: { type: 'number' },
+          h: { type: 'number' },
+        },
+        required: ['x', 'y', 'w', 'h'],
+      },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
+    },
+    required: ['environmentId'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const template = typeof rawArgs?.template === 'string' ? rawArgs.template : (typeof rawArgs?.image === 'string' ? rawArgs.image : '');
+    if (!template) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'template (base64 image) is required' } }, true);
+    }
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+    const region = resolveRegion(rawArgs);
+    if (region === null) return invalidRegionResult();
+    const request: ComputerAction = {
+      action: 'find_image',
+      template,
+      threshold: typeof rawArgs?.threshold === 'number' ? rawArgs.threshold : undefined,
+    };
+    if (display !== undefined) request.display = display;
+    if (region !== undefined) request.region = region;
+
+    const result = await runAction(context, request, rawArgs);
+    if (!result) return noUserResult();
+    if (!result.ok) {
+      return textResult({
+        ok: false,
+        error: result.error || { code: 'computer_failed', message: 'find_image failed' },
+      }, true);
+    }
+    const matches = result.matches || (result.result as any)?.matches || [];
+    return textResult({
+      ok: true,
+      matches,
+      clickSpace: result.clickSpace || (result.result as any)?.clickSpace,
+      display: display ?? 0,
+      region: region ?? null,
+    });
+  },
+};
+
+// ─── desktop_wait_for ────────────────────────────────────────────────────────
+
+const desktopWaitForTool: NativeToolDefinition = {
+  description:
+    'Poll until text or an image template appears on screen (or disappears, with gone: true). When timeout occurs, returns error evidence screenshot crop.',
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: {
+        type: 'string',
+        description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
+      text: { type: 'string', description: 'Text substring to wait for.' },
+      regex: { type: 'string', description: 'Regular expression to wait for.' },
+      template: { type: 'string', description: 'Base64 image template to wait for.' },
+      image: { type: 'string', description: 'Alias for template (base64 image).' },
+      gone: { type: 'boolean', description: 'If true, wait for the target to DISAPPEAR. Default false.' },
+      timeoutMs: { type: 'integer', description: 'Max wait time in ms (default 10000, max 60000).' },
+      intervalMs: { type: 'integer', description: 'Poll interval in ms (default 250).' },
+      threshold: { type: 'number', description: 'Image match threshold 0.0–1.0 (default 0.8).' },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
+      region: {
+        type: 'object',
+        description: 'Crop region in click-space coords.',
+        properties: {
+          x: { type: 'number' },
+          y: { type: 'number' },
+          w: { type: 'number' },
+          h: { type: 'number' },
+        },
+        required: ['x', 'y', 'w', 'h'],
+      },
+    },
+    required: ['environmentId'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const text = typeof rawArgs?.text === 'string' ? rawArgs.text : undefined;
+    const regex = typeof rawArgs?.regex === 'string' ? rawArgs.regex : undefined;
+    const template = typeof rawArgs?.template === 'string' ? rawArgs.template : (typeof rawArgs?.image === 'string' ? rawArgs.image : undefined);
+    if (!text && !regex && !template) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'wait_for requires text, regex, or template' } }, true);
+    }
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+    const region = resolveRegion(rawArgs);
+    if (region === null) return invalidRegionResult();
+    const request: ComputerAction = {
+      action: 'wait_for',
+      text,
+      regex,
+      template,
+      gone: rawArgs?.gone === true,
+      timeoutMs: typeof rawArgs?.timeoutMs === 'number' ? rawArgs.timeoutMs : undefined,
+      intervalMs: typeof rawArgs?.intervalMs === 'number' ? rawArgs.intervalMs : undefined,
+      threshold: typeof rawArgs?.threshold === 'number' ? rawArgs.threshold : undefined,
+    };
+    if (display !== undefined) request.display = display;
+    if (region !== undefined) request.region = region;
+
+    // Add 5000ms margin to Redis relay timeout so desktop connector can finish and return evidence
+    const result = await runAction(context, request, rawArgs, 5000);
+    if (!result) return noUserResult();
+
+    const content: Array<Record<string, unknown>> = [];
+    const evidence = (result.result as any)?.evidence || (result.error as any)?.evidence;
+    if (evidence?.imageBase64 || evidence?.base64) {
+      const data = evidence.imageBase64 || evidence.base64;
+      const mime = evidence.format ? `image/${evidence.format}` : 'image/png';
+      content.push({ type: 'image', data, mimeType: mime });
+    }
+    content.push({
+      type: 'text',
+      text: JSON.stringify({
+        ok: result.ok,
+        ...(result.result ? { result: result.result } : {}),
+        ...(result.error ? { error: result.error } : {}),
+      }),
+    });
+    return {
+      content: content as any,
+      ...(result.ok !== true ? { isError: true } : {}),
+    };
+  },
+};
+
+// ─── desktop_hover ───────────────────────────────────────────────────────────
+
+const desktopHoverTool: NativeToolDefinition = {
+  description:
+    'Hover the mouse at coordinates with an optional dwell time (default 300ms) and micro-wiggle (1px) to trigger tooltip/hover effects. Optionally captures a screenshot of the region.',
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: {
+        type: 'string',
+        description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
+      x: { type: 'number', description: 'X coordinate in click space. Required.' },
+      y: { type: 'number', description: 'Y coordinate in click space. Required.' },
+      dwellMs: { type: 'integer', description: 'Dwell time in ms (default 300).' },
+      wiggle: { type: 'boolean', description: 'Perform 1px wiggle to trigger hover handlers (default true).' },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
+      region: {
+        type: 'object',
+        description: 'Optional crop region in click space to screenshot after dwelling.',
+        properties: {
+          x: { type: 'number' },
+          y: { type: 'number' },
+          w: { type: 'number' },
+          h: { type: 'number' },
+        },
+        required: ['x', 'y', 'w', 'h'],
+      },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
+    },
+    required: ['environmentId', 'x', 'y'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const x = Number(rawArgs?.x);
+    const y = Number(rawArgs?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'x and y must be finite numbers' } }, true);
+    }
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+    const region = resolveRegion(rawArgs);
+    if (region === null) return invalidRegionResult();
+    const request: ComputerAction = {
+      action: 'mouse',
+      op: 'hover',
+      x,
+      y,
+      dwellMs: typeof rawArgs?.dwellMs === 'number' ? rawArgs.dwellMs : undefined,
+      wiggle: rawArgs?.wiggle !== false,
+    };
+    if (display !== undefined) request.display = display;
+    if (region !== undefined) request.region = region;
+
+    const result = await runAction(context, request, rawArgs);
+    if (!result) return noUserResult();
+
+    const failure = inputFailure(result);
+    const content: Array<Record<string, unknown>> = [];
+    const evidence = (result.result as any)?.screenshot || (result.result as any)?.evidence || (result.result as any)?.image;
+    if (evidence?.base64 || evidence?.imageBase64) {
+      const data = evidence.base64 || evidence.imageBase64;
+      const mime = evidence.format ? `image/${evidence.format}` : 'image/png';
+      content.push({ type: 'image', data, mimeType: mime });
+    }
+    content.push({
+      type: 'text',
+      text: JSON.stringify({
+        ok: failure === null,
+        ...(result.result ? { result: result.result } : {}),
+        ...(failure ? { error: failure } : {}),
+      }),
+    });
+    return {
+      content: content as any,
+      ...(failure !== null ? { isError: true } : {}),
+    };
+  },
+};
+
+// ─── desktop_drag ────────────────────────────────────────────────────────────
+
+const desktopDragTool: NativeToolDefinition = {
+  description:
+    'Drag from one position to another in click space. If `from` is omitted, drags from the current mouse position. Returns { ok, result }.',
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: {
+        type: 'string',
+        description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
+      to: {
+        type: 'object',
+        description: 'Destination coordinates in click space. Required.',
+        properties: { x: { type: 'number' }, y: { type: 'number' } },
+        required: ['x', 'y'],
+      },
+      from: {
+        type: 'object',
+        description: 'Source starting coordinates in click space (omitted = current position).',
+        properties: { x: { type: 'number' }, y: { type: 'number' } },
+        required: ['x', 'y'],
+      },
+      button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button to hold (default: left).' },
+      durationMs: { type: 'integer', description: 'Drag duration in ms (default 500).' },
+      smooth: { type: 'boolean', description: 'Smooth movement along bezier path (default true).' },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
+    },
+    required: ['environmentId', 'to'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    if (!rawArgs?.to || typeof rawArgs.to !== 'object' || !Number.isFinite(Number(rawArgs.to.x)) || !Number.isFinite(Number(rawArgs.to.y))) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'to {x, y} is required and must be finite numbers' } }, true);
+    }
+    const to = { x: Number(rawArgs.to.x), y: Number(rawArgs.to.y) };
+    let from: { x: number; y: number } | undefined = undefined;
+    if (rawArgs?.from && typeof rawArgs.from === 'object' && Number.isFinite(Number(rawArgs.from.x)) && Number.isFinite(Number(rawArgs.from.y))) {
+      from = { x: Number(rawArgs.from.x), y: Number(rawArgs.from.y) };
+    }
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+
+    const request: ComputerAction = {
+      action: 'mouse',
+      op: 'drag',
+      to,
+      from,
+      button: rawArgs?.button === 'right' ? 'right' : rawArgs?.button === 'middle' ? 'middle' : 'left',
+      durationMs: typeof rawArgs?.durationMs === 'number' ? rawArgs.durationMs : undefined,
+      smooth: rawArgs?.smooth !== false,
+    };
+    if (display !== undefined) request.display = display;
+
+    const result = await runAction(context, request, rawArgs);
+    if (!result) return noUserResult();
+    return inputResult(result);
+  },
+};
+
+// ─── desktop_batch ───────────────────────────────────────────────────────────
+
+const desktopBatchTool: NativeToolDefinition = {
+  description:
+    'Execute an atomic batch of input actions and perceptual checkpoints in sequence. Returns array of step results. If any step fails and abortOnError is true (default), execution stops.',
+  server: 'system',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      environmentId: {
+        type: 'string',
+        description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
+      steps: {
+        type: 'array',
+        description: 'Sequence of batch steps to execute in order. Required, non-empty.',
+        items: {
+          type: 'object',
+          properties: {
+            op: {
+              type: 'string',
+              enum: [
+                'click',
+                'click_text',
+                'key',
+                'type',
+                'move',
+                'hover',
+                'drag',
+                'scroll',
+                'wait',
+                'wait_for',
+                'assert_text',
+                'screenshot',
+              ],
+            },
+            label: { type: 'string', description: 'Optional step label for diagnostics.' },
+          },
+          required: ['op'],
+        },
+      },
+      abortOnError: { type: 'boolean', description: 'Stop execution immediately on first step failure (default true).' },
+      display: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Display index from desktop_screen_info / desktop_screenshot. Omitted means primary.',
+      },
+      timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
+    },
+    required: ['environmentId', 'steps'],
+  },
+
+  async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
+    const steps = Array.isArray(rawArgs?.steps) ? rawArgs.steps : [];
+    if (steps.length === 0) {
+      return textResult({ ok: false, error: { code: 'computer_failed', message: 'steps must be a non-empty array' } }, true);
+    }
+    const display = resolveDisplayIndex(rawArgs);
+    if (display === null) return invalidDisplayResult();
+
+    const request: ComputerAction = {
+      action: 'batch',
+      steps,
+      stopOnFail: rawArgs?.abortOnError !== false,
+      abortOnError: rawArgs?.abortOnError !== false,
+    };
+
+    // Batch duration cap on connector is 120s; set relay timeout margin to 125s (125000ms)
+    const result = await runAction(context, request, rawArgs, 125000);
+    if (!result) return noUserResult();
+
+    const content: Array<Record<string, unknown>> = [];
+    const stepResults = (result.result as any)?.results;
+    if (Array.isArray(stepResults)) {
+      for (let i = 0; i < stepResults.length; i++) {
+        const s = stepResults[i];
+        const res = (s as any)?.result || (s as any);
+        const evidence = res?.evidence || res?.image || res?.screenshot;
+        if (evidence?.base64 || evidence?.imageBase64) {
+          const data = evidence.base64 || evidence.imageBase64;
+          const mime = evidence.format ? `image/${evidence.format}` : 'image/png';
+          content.push({ type: 'image', data, mimeType: mime });
+        }
+      }
+    }
+    content.push({
+      type: 'text',
+      text: JSON.stringify({
+        ok: result.ok,
+        ...(result.result ? { result: result.result } : {}),
+        ...(result.error ? { error: result.error } : {}),
+      }),
+    });
+    return {
+      content: content as any,
+      ...(result.ok !== true ? { isError: true } : {}),
+    };
+  },
+};
+
 // ─── Exports ─────────────────────────────────────────────────────────────────
 
 export const desktopScreenshot = desktopScreenshotTool;
@@ -852,9 +1675,14 @@ export const desktopKey = desktopKeyTool;
 export const desktopScroll = desktopScrollTool;
 export const desktopScreenInfo = desktopScreenInfoTool;
 export const desktopList = desktopListTool;
-
-
-
+export const desktopReadText = desktopReadTextTool;
+export const desktopFindText = desktopFindTextTool;
+export const desktopClickText = desktopClickTextTool;
+export const desktopFindImage = desktopFindImageTool;
+export const desktopWaitFor = desktopWaitForTool;
+export const desktopHover = desktopHoverTool;
+export const desktopDrag = desktopDragTool;
+export const desktopBatch = desktopBatchTool;
 
 // ─── desktop_exec ────────────────────────────────────────────────────────────
 
@@ -868,6 +1696,10 @@ const desktopExecTool: NativeToolDefinition = {
       environmentId: {
         type: 'string',
         description: 'environmentId of the target desktop agent.',
+      },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       command: { type: 'string', description: 'Executable / command to run. Required.' },
       args: { type: 'array', items: { type: 'string' }, description: 'Argument vector (no shell parsing). Optional.' },
@@ -885,7 +1717,7 @@ const desktopExecTool: NativeToolDefinition = {
     if (!command.trim())
       return textResult({ ok: false, error: { code: 'desktop_failed', message: 'command is required' } }, true);
 
-    if (!rawArgs.environmentId) {
+    if (!rawArgs.environmentId && !rawArgs.machine) {
       return textResult({
         ok: false,
         error: {
@@ -897,13 +1729,13 @@ const desktopExecTool: NativeToolDefinition = {
 
     let installId: string | undefined = undefined;
     try {
-      installId = await resolveInstallId(context, rawArgs.environmentId);
+      installId = await resolveTargetInstallId(context, rawArgs);
       if (!installId) {
         return textResult({
           ok: false,
           error: {
             code: 'desktop_failed',
-            message: `Target environment ${rawArgs.environmentId} does not have an active desktop connection (missing installId).`,
+            message: `Target environment ${rawArgs.environmentId || rawArgs.machine} does not have an active desktop connection (missing installId).`,
           },
         }, true);
       }
@@ -942,6 +1774,10 @@ const desktopSettingsTool: NativeToolDefinition = {
         type: 'string',
         description: 'environmentId of the target desktop agent.',
       },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
       op: { type: 'string', enum: ['get', 'set'], description: "'get' to read, 'set' to merge patch. Required." },
       patch: { type: 'object', description: 'Partial settings to shallow-merge (op:set only).' },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms.' },
@@ -954,7 +1790,7 @@ const desktopSettingsTool: NativeToolDefinition = {
     if (!userId) return noUserResult();
     const op: 'get' | 'set' = rawArgs?.op === 'set' ? 'set' : 'get';
 
-    if (!rawArgs.environmentId) {
+    if (!rawArgs.environmentId && !rawArgs.machine) {
       return textResult({
         ok: false,
         error: {
@@ -966,13 +1802,13 @@ const desktopSettingsTool: NativeToolDefinition = {
 
     let installId: string | undefined = undefined;
     try {
-      installId = await resolveInstallId(context, rawArgs.environmentId);
+      installId = await resolveTargetInstallId(context, rawArgs);
       if (!installId) {
         return textResult({
           ok: false,
           error: {
             code: 'desktop_failed',
-            message: `Target environment ${rawArgs.environmentId} does not have an active desktop connection (missing installId).`,
+            message: `Target environment ${rawArgs.environmentId || rawArgs.machine} does not have an active desktop connection (missing installId).`,
           },
         }, true);
       }
@@ -1005,6 +1841,10 @@ const desktopPingTool: NativeToolDefinition = {
         type: 'string',
         description: 'environmentId of the target desktop agent.',
       },
+      machine: {
+        type: 'string',
+        description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
+      },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 10000).' },
     },
     required: ['environmentId'],
@@ -1014,7 +1854,7 @@ const desktopPingTool: NativeToolDefinition = {
     const userId = resolveUserId(context);
     if (!userId) return noUserResult();
 
-    if (!rawArgs.environmentId) {
+    if (!rawArgs.environmentId && !rawArgs.machine) {
       return textResult({
         ok: false,
         error: {
@@ -1026,13 +1866,13 @@ const desktopPingTool: NativeToolDefinition = {
 
     let installId: string | undefined = undefined;
     try {
-      installId = await resolveInstallId(context, rawArgs.environmentId);
+      installId = await resolveTargetInstallId(context, rawArgs);
       if (!installId) {
         return textResult({
           ok: false,
           error: {
             code: 'desktop_failed',
-            message: `Target environment ${rawArgs.environmentId} does not have an active desktop connection (missing installId).`,
+            message: `Target environment ${rawArgs.environmentId || rawArgs.machine} does not have an active desktop connection (missing installId).`,
           },
         }, true);
       }
@@ -1090,4 +1930,24 @@ export const desktopExec = desktopExecTool;
 export const desktopSettings = desktopSettingsTool;
 export const desktopPing = desktopPingTool;
 
-module.exports = { desktopScreenshot: desktopScreenshotTool, desktopClick: desktopClickTool, desktopMove: desktopMoveTool, desktopType: desktopTypeTool, desktopKey: desktopKeyTool, desktopScroll: desktopScrollTool, desktopScreenInfo: desktopScreenInfoTool, desktopExec: desktopExecTool, desktopSettings: desktopSettingsTool, desktopList: desktopListTool, desktopPing: desktopPingTool };
+(module as any).exports = {
+  desktopScreenshot: desktopScreenshotTool,
+  desktopClick: desktopClickTool,
+  desktopMove: desktopMoveTool,
+  desktopType: desktopTypeTool,
+  desktopKey: desktopKeyTool,
+  desktopScroll: desktopScrollTool,
+  desktopScreenInfo: desktopScreenInfoTool,
+  desktopExec: desktopExecTool,
+  desktopSettings: desktopSettingsTool,
+  desktopList: desktopListTool,
+  desktopPing: desktopPingTool,
+  desktopReadText: desktopReadTextTool,
+  desktopFindText: desktopFindTextTool,
+  desktopClickText: desktopClickTextTool,
+  desktopFindImage: desktopFindImageTool,
+  desktopWaitFor: desktopWaitForTool,
+  desktopHover: desktopHoverTool,
+  desktopDrag: desktopDragTool,
+  desktopBatch: desktopBatchTool,
+};

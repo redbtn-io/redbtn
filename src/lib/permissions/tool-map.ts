@@ -112,7 +112,7 @@ function searchDocumentsAddress(args: Record<string, unknown>): ExtractedAddress
  * op with no wildcard grant is denied.
  */
 function envId(args: Record<string, unknown>): ExtractedAddress {
-  const id = str(args.environmentId);
+  const id = str(args.environmentId) || str(args.machine);
   if (!id) return { addresses: [], unscoped: true };
   return { addresses: [id] };
 }
@@ -329,6 +329,14 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   desktop_type: { resource: 'computer', action: 'control', extract: envId },
   desktop_key: { resource: 'computer', action: 'control', extract: envId },
   desktop_scroll: { resource: 'computer', action: 'control', extract: envId },
+  desktop_read_text: { resource: 'computer', action: 'read', extract: envId },
+  desktop_find_text: { resource: 'computer', action: 'read', extract: envId },
+  desktop_find_image: { resource: 'computer', action: 'read', extract: envId },
+  desktop_wait_for: { resource: 'computer', action: 'read', extract: envId },
+  desktop_click_text: { resource: 'computer', action: 'control', extract: envId },
+  desktop_hover: { resource: 'computer', action: 'control', extract: envId },
+  desktop_drag: { resource: 'computer', action: 'control', extract: envId },
+  desktop_batch: { resource: 'computer', action: 'control', extract: envId },
 
   // ── Graph tools ───────────────────────────────────────────────────────────
   invoke_graph: { resource: 'graph', action: 'execute', extract: graphId },

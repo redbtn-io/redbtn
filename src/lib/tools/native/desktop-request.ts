@@ -47,6 +47,20 @@ import Redis from 'ioredis';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
+export type BatchStep =
+  | { op: 'click'; x?: number; y?: number; display?: number; button?: 'left' | 'right' | 'middle'; double?: boolean; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: { x: number; y: number; w: number; h: number }; label?: string }
+  | { op: 'click_text'; text?: string; regex?: string; region?: { x: number; y: number; w: number; h: number }; occurrence?: number | 'first' | 'last'; button?: 'left' | 'right' | 'middle'; double?: boolean; offset?: { x: number; y: number }; display?: number; label?: string }
+  | { op: 'key'; keys: string[]; durationMs?: number; opMode?: 'tap' | 'down' | 'up'; opKind?: 'tap' | 'down' | 'up'; region?: { x: number; y: number; w: number; h: number }; label?: string }
+  | { op: 'type'; text: string; region?: { x: number; y: number; w: number; h: number }; label?: string }
+  | { op: 'move'; x?: number; y?: number; display?: number; dx?: number; dy?: number; relative?: boolean; transport?: 'injected' | 'virtual-hid'; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: { x: number; y: number; w: number; h: number }; label?: string }
+  | { op: 'hover'; x: number; y: number; display?: number; dwellMs?: number; wiggle?: boolean; region?: { x: number; y: number; w: number; h: number }; label?: string }
+  | { op: 'drag'; from?: { x: number; y: number }; to: { x: number; y: number }; display?: number; button?: 'left' | 'right' | 'middle'; durationMs?: number; smooth?: boolean; region?: { x: number; y: number; w: number; h: number }; label?: string }
+  | { op: 'scroll'; dx?: number; dy?: number; display?: number; region?: { x: number; y: number; w: number; h: number }; label?: string }
+  | { op: 'wait'; ms?: number; durationMs?: number; region?: { x: number; y: number; w: number; h: number }; label?: string }
+  | { op: 'wait_for'; text?: string; regex?: string; template?: string; image?: string; gone?: boolean; region?: { x: number; y: number; w: number; h: number }; display?: number; timeoutMs?: number; intervalMs?: number; threshold?: number; label?: string }
+  | { op: 'assert_text'; text?: string; regex?: string; region?: { x: number; y: number; w: number; h: number }; display?: number; label?: string }
+  | { op: 'screenshot'; region?: { x: number; y: number; w: number; h: number }; display?: number; format?: 'png' | 'jpeg'; label?: string };
+
 /**
  * Computer-use action — discriminated union mirroring redAgent
  * `src/shared/protocol.ts` `ComputerAction` EXACTLY.
@@ -69,16 +83,85 @@ export type ComputerAction =
     }
   | {
       action: 'mouse';
-      op: 'move' | 'click' | 'down' | 'up' | 'scroll';
+      op: 'move' | 'click' | 'down' | 'up' | 'scroll' | 'hover' | 'drag';
       x?: number;
       y?: number;
       display?: number;
+      nx?: number;
+      ny?: number;
       button?: 'left' | 'right' | 'middle';
       double?: boolean;
       dx?: number;
       dy?: number;
+      relative?: boolean;
+      transport?: 'injected' | 'virtual-hid';
+      smooth?: boolean;
+      speed?: 'normal' | 'fast' | 'instant';
+      durationMs?: number;
+      dwellMs?: number;
+      wiggle?: boolean;
+      region?: { x: number; y: number; w: number; h: number };
+      to?: { x: number; y: number };
+      from?: { x: number; y: number };
     }
-  | { action: 'keyboard'; op: 'type' | 'tap'; text?: string; keys?: string[] }
+  | {
+      action: 'keyboard';
+      op: 'type' | 'tap' | 'down' | 'up';
+      text?: string;
+      keys?: string[];
+      durationMs?: number;
+      opMode?: 'tap' | 'down' | 'up';
+    }
+  | {
+      action: 'ocr';
+      op: 'read' | 'find' | 'click';
+      text?: string;
+      regex?: string;
+      region?: { x: number; y: number; w: number; h: number };
+      occurrence?: number | 'first' | 'last' | 'all';
+      caseSensitive?: boolean;
+      fuzzy?: boolean | number;
+      button?: 'left' | 'right' | 'middle';
+      double?: boolean;
+      offset?: { x: number; y: number };
+      display?: number;
+      imagePath?: string;
+      imageBase64?: string;
+      scale?: number;
+    }
+  | {
+      action: 'wait_for';
+      text?: string;
+      regex?: string;
+      template?: string;
+      image?: string;
+      gone?: boolean;
+      region?: { x: number; y: number; w: number; h: number };
+      display?: number;
+      timeoutMs?: number;
+      intervalMs?: number;
+      threshold?: number;
+    }
+  | {
+      action: 'find_image';
+      template: string;
+      region?: { x: number; y: number; w: number; h: number };
+      display?: number;
+      threshold?: number;
+      maxResults?: number;
+      scales?: number[];
+      imagePath?: string;
+      imageBase64?: string;
+    }
+  | {
+      action: 'batch';
+      steps: BatchStep[];
+      stopOnFail?: boolean;
+      stopOnError?: boolean;
+      abortOnError?: boolean;
+      maxDurationMs?: number;
+      durationCapMs?: number;
+    }
   | { action: 'screen_info' };
 
 /**
@@ -111,6 +194,30 @@ export interface ComputerResultMessage {
       primary: boolean;
     }>;
   };
+  ocr?: {
+    text?: string;
+    lines?: Array<{
+      text: string;
+      conf?: number;
+      box: { x: number; y: number; w: number; h: number };
+      words?: Array<{ text: string; conf?: number; box: { x: number; y: number; w: number; h: number } }>;
+    }>;
+    words?: Array<{ text: string; conf?: number; box: { x: number; y: number; w: number; h: number } }>;
+    matches?: Array<{
+      text: string;
+      box: { x: number; y: number; w: number; h: number };
+      center: { x: number; y: number };
+    }>;
+    clickSpace?: { w: number; h: number };
+    ms?: number;
+    display?: { index: number; id: number };
+  };
+  matches?: Array<{
+    box: { x: number; y: number; w: number; h: number };
+    center: { x: number; y: number };
+    score: number;
+  }>;
+  clickSpace?: { w: number; h: number };
   result?: Record<string, unknown>;
   error?: { code: string; message: string };
 }
@@ -149,6 +256,9 @@ export function normalizeComputerReply(id: string, parsed: AnyObject): ComputerR
     ok: parsed.ok === true,
     ...(parsed.image ? { image: parsed.image } : {}),
     ...(parsed.screen ? { screen: parsed.screen } : {}),
+    ...(parsed.ocr ? { ocr: parsed.ocr } : {}),
+    ...(parsed.matches ? { matches: parsed.matches } : {}),
+    ...(parsed.clickSpace ? { clickSpace: parsed.clickSpace } : {}),
     ...(parsed.result ? { result: parsed.result } : {}),
     ...(parsed.error ? { error: parsed.error } : {}),
   };
