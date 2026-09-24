@@ -11,6 +11,10 @@ import { Graph } from '../../src/lib/models/Graph';
 import {
   getRunConfigTimeoutMs,
   DEFAULT_MAX_RUN_TIMEOUT_S,
+  DEFAULT_RUN_TIMEOUT_S,
+  getMaxRunTimeoutSeconds,
+  getDefaultRunTimeoutSeconds,
+  RunConfigTimeoutError,
 } from '../../src/functions/run';
 
 describe('recursionLimit helper', () => {
@@ -197,10 +201,12 @@ describe('recursionLimit helper', () => {
 
   describe('getRunConfigTimeoutMs helper', () => {
     const originalMaxEnv = process.env.ENGINE_MAX_RUN_TIMEOUT_S;
+    const originalDefaultEnv = process.env.ENGINE_DEFAULT_RUN_TIMEOUT_S;
     const originalConfigEnv = process.env.RUN_CONFIG_TIMEOUT_MS;
 
     beforeEach(() => {
       delete process.env.ENGINE_MAX_RUN_TIMEOUT_S;
+      delete process.env.ENGINE_DEFAULT_RUN_TIMEOUT_S;
       delete process.env.RUN_CONFIG_TIMEOUT_MS;
     });
 
@@ -210,6 +216,11 @@ describe('recursionLimit helper', () => {
       } else {
         delete process.env.ENGINE_MAX_RUN_TIMEOUT_S;
       }
+      if (originalDefaultEnv !== undefined) {
+        process.env.ENGINE_DEFAULT_RUN_TIMEOUT_S = originalDefaultEnv;
+      } else {
+        delete process.env.ENGINE_DEFAULT_RUN_TIMEOUT_S;
+      }
       if (originalConfigEnv !== undefined) {
         process.env.RUN_CONFIG_TIMEOUT_MS = originalConfigEnv;
       } else {
@@ -217,32 +228,98 @@ describe('recursionLimit helper', () => {
       }
     });
 
-    it('resolves 0 (disabled / engine default) when graph has no timeout configured', () => {
-      expect(getRunConfigTimeoutMs({})).toBe(0);
-      expect(getRunConfigTimeoutMs({ config: {} })).toBe(0);
-      expect(getRunConfigTimeoutMs({ config: { config: {} } })).toBe(0);
+    it('verifies platform defaults: 12h default (43200s) and 24h ceiling (86400s)', () => {
+      expect(DEFAULT_RUN_TIMEOUT_S).toBe(43200);
+      expect(DEFAULT_MAX_RUN_TIMEOUT_S).toBe(86400);
+      expect(getDefaultRunTimeoutSeconds()).toBe(43200);
+      expect(getMaxRunTimeoutSeconds()).toBe(86400);
     });
 
-    it('resolves configured seconds to milliseconds', () => {
+    // Case 1: Unset timeout
+    it('Case 1: resolves default 12h (43200000ms) when graph timeout is unset', () => {
+      expect(getRunConfigTimeoutMs({})).toBe(43_200_000);
+      expect(getRunConfigTimeoutMs({ config: {} })).toBe(43_200_000);
+      expect(getRunConfigTimeoutMs({ config: { config: {} } })).toBe(43_200_000);
+      expect(getRunConfigTimeoutMs({ config: { config: { timeout: undefined } } })).toBe(43_200_000);
+    });
+
+    it('Case 1: honors ENGINE_DEFAULT_RUN_TIMEOUT_S env override for unset timeout', () => {
+      process.env.ENGINE_DEFAULT_RUN_TIMEOUT_S = '3600'; // 1 hour
+      expect(getRunConfigTimeoutMs({})).toBe(3_600_000);
+      expect(getRunConfigTimeoutMs({ config: {} })).toBe(3_600_000);
+    });
+
+    // Case 2: Explicit 0
+    it('Case 2: resolves platform ceiling (86400000ms / 24h) when timeout is explicitly 0 (treated as "no graph limit")', () => {
+      expect(getRunConfigTimeoutMs({ config: { config: { timeout: 0 } } })).toBe(86_400_000);
+      expect(getRunConfigTimeoutMs({ config: { timeout: 0 } })).toBe(86_400_000);
+      // Explicit 0 is never 0: there is NEVER a truly unbounded run
+      expect(getRunConfigTimeoutMs({ config: { config: { timeout: 0 } } })).toBeGreaterThan(0);
+    });
+
+    // Case 3: Explicit positive
+    it('Case 3: honours explicit positive seconds converted to ms', () => {
+      expect(getRunConfigTimeoutMs({ config: { config: { timeout: 5 } } })).toBe(5_000);
       expect(getRunConfigTimeoutMs({ config: { config: { timeout: 60 } } })).toBe(60_000);
       expect(getRunConfigTimeoutMs({ config: { timeout: 120 } })).toBe(120_000);
     });
 
-    it('resolves 0 when timeout is explicitly 0 (disabled)', () => {
-      expect(getRunConfigTimeoutMs({ config: { config: { timeout: 0 } } })).toBe(0);
+    it('Case 3: honours ops graphs with timeout: 86400 (24h) unchanged', () => {
+      expect(getRunConfigTimeoutMs({ config: { config: { timeout: 86400 } } })).toBe(86_400_000);
+      expect(getRunConfigTimeoutMs({ config: { timeout: 86400 } })).toBe(86_400_000);
     });
 
-    it('caps timeout at DEFAULT_MAX_RUN_TIMEOUT_S (43200s / 12h)', () => {
-      expect(DEFAULT_MAX_RUN_TIMEOUT_S).toBe(43200);
-      // Configured 86400s (24h) gets capped at 43200s (12h)
-      expect(getRunConfigTimeoutMs({ config: { config: { timeout: 86400 } } })).toBe(43_200_000);
+    it('Case 3: caps explicit positive timeouts exceeding the platform ceiling (86400s / 24h)', () => {
+      expect(getRunConfigTimeoutMs({ config: { config: { timeout: 100000 } } })).toBe(86_400_000);
     });
 
-    it('honors ENGINE_MAX_RUN_TIMEOUT_S env override ceiling', () => {
-      process.env.ENGINE_MAX_RUN_TIMEOUT_S = '1800'; // 30 min ceiling
+    // Case 4: RUN_CONFIG_TIMEOUT_MS precedence
+    it('Case 4: honors RUN_CONFIG_TIMEOUT_MS when graph timeout is unset, capped at ceiling', () => {
+      process.env.RUN_CONFIG_TIMEOUT_MS = '300000'; // 5 min
+      expect(getRunConfigTimeoutMs({})).toBe(300_000);
+      expect(getRunConfigTimeoutMs({ config: {} })).toBe(300_000);
+
+      // Above ceiling gets capped
+      process.env.RUN_CONFIG_TIMEOUT_MS = '100000000';
+      expect(getRunConfigTimeoutMs({})).toBe(86_400_000);
+    });
+
+    it('Case 4: graph explicit timeout takes precedence over RUN_CONFIG_TIMEOUT_MS', () => {
+      process.env.RUN_CONFIG_TIMEOUT_MS = '300000';
+      // Explicit positive overrides env
+      expect(getRunConfigTimeoutMs({ config: { config: { timeout: 10 } } })).toBe(10_000);
+      // Explicit 0 overrides env and receives platform ceiling
+      expect(getRunConfigTimeoutMs({ config: { config: { timeout: 0 } } })).toBe(86_400_000);
+    });
+
+    // Ceiling: ENGINE_MAX_RUN_TIMEOUT_S override
+    it('honors ENGINE_MAX_RUN_TIMEOUT_S env override ceiling across all cases', () => {
+      process.env.ENGINE_MAX_RUN_TIMEOUT_S = '1800'; // 30 min ceiling (1,800,000 ms)
+
+      // Unset timeout (default 43200s) capped at 1800s
+      expect(getRunConfigTimeoutMs({})).toBe(1_800_000);
+
+      // Explicit 0 capped at 1800s
+      expect(getRunConfigTimeoutMs({ config: { config: { timeout: 0 } } })).toBe(1_800_000);
+
+      // Explicit positive above ceiling capped at 1800s
       expect(getRunConfigTimeoutMs({ config: { config: { timeout: 3600 } } })).toBe(1_800_000);
-      // Timeout below ceiling is honored as-is
+
+      // Explicit positive below ceiling honored as-is
       expect(getRunConfigTimeoutMs({ config: { config: { timeout: 900 } } })).toBe(900_000);
+
+      // RUN_CONFIG_TIMEOUT_MS above ceiling capped at 1800s
+      process.env.RUN_CONFIG_TIMEOUT_MS = '5000000';
+      expect(getRunConfigTimeoutMs({})).toBe(1_800_000);
+    });
+
+    it('verifies RunConfigTimeoutError error message format and guidance', () => {
+      const err = new RunConfigTimeoutError('run-proof-123', 5000);
+      expect(err.name).toBe('RunConfigTimeoutError');
+      expect(err.code).toBe('RUN_CONFIG_TIMEOUT');
+      expect(err.message).toContain('Run run-proof-123 exceeded configured timeout of 5000ms');
+      expect(err.message).toContain('ENGINE_MAX_RUN_TIMEOUT_S');
+      expect(err.message).toContain('ENGINE_DEFAULT_RUN_TIMEOUT_S');
     });
   });
 });
