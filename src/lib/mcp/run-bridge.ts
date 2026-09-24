@@ -246,113 +246,26 @@ export const MAX_CALLS_CEILING = 2_000;
 const DEFAULT_MAX_TOOL_ITERATIONS = 50;
 
 /**
- * Tools that are NEVER served and NEVER callable through the bridge, even when
- * the node lists them.
+ * Tools that are forbidden wholesale from the bridge.
  *
- *   - `invoke_tool` / `list_available_tools` / `get_tool_schema` — the meta
- *     pack. Serving them re-opens the whole registry through one indirection.
- *   - `invoke_graph` — starts another run, with another profile, off this jail.
- *   - `ssh_shell` — inline mode carries its own host/credentials and is
- *     unscoped by `environmentId`, so pinning the session's env does nothing.
- *   - `ssh_copy` — the same hole, in a tool that also moves bytes. With no
- *     `environmentId` the pin is a `delete` (see the option docs), and
- *     `ssh-copy.ts` then falls back to inline `host`/`user`/`sshKey`/`password`
- *     — while `libraryId` reads a Knowledge Library straight out of GridFS.
- *     That is arbitrary-host exfiltration with the model choosing the host, so
- *     it is forbidden outright rather than parked behind the caller-trust gate
- *     below: that fix is about model-chosen URLs and will not touch inline SSH.
- *   - `send_webhook` — arbitrary `url` + `method` + `headers` + `body`, and
- *     unmapped in `tool-map`, so it gets neither the capability check
- *     (`native-registry.ts` `enforceToolCapability`) nor the exec guard. PR
- *     #386 did put it behind the SSRF guard, so the fleet-proxy half is closed;
- *     the ungated half is not, and an egress primitive with a request body and
- *     no capability rule stays off. (`send_email` is a fixed relay — the model picks
- *     a recipient, not a host — and is left servable; if that is judged too
- *     generous it belongs in this list too.)
- *   - `alert_desktop` and every `desktop_*` tool — see `FORBIDDEN_TOOL_PREFIXES`.
- *   - `workspace_checkout` / `workspace_checkin` / `workspace_release` — the
- *     worker owns workspace lifecycle; a run must not move its own fence.
- *   - The AUTHORING pack — `create_neuron` / `update_neuron` / `delete_neuron`
- *     / `fork_neuron`, `create_node` / `update_node` / `node_patch` /
- *     `delete_node` / `fork_node`, and `create_graph` / `update_graph` /
- *     `graph_patch` / `publish_graph` / `fork_graph` / `delete_graph`.
+ * NOTE: CLI neurons now have full tool parity with API neurons. Bridge-only wholesale
+ * bans (prefixes, resources, authoring tools) have been removed in favor of the
+ * exact same enforcement pipeline that API neurons go through:
+ *   - The node's explicit `tools` allowlist (`node.tools`);
+ *   - `enforceToolCapability` / capability profile (e.g. `computer:control` scoped to `environmentId` for desktop tools);
+ *   - Rate limits, exec guard, and run identity;
+ *   - Pinned `environmentId` and `untrustedCaller: true` context.
  *
- *     The neuron trio was already here for "self-modification of the model
- *     layer that runs the next step", and the rest achieve exactly that by a
- *     different door: a node IS the step, and a graph is the program the steps
- *     run in. `graph_patch` on the running graph, or `update_node` on the next
- *     node, rewrites the thing about to execute — with the run's own
- *     credentials and no second pair of eyes. `publish_graph` is worse than
- *     self-modification: `native-registry.ts` names `create_graph` +
- *     `update_automation` + a CRON trigger as the boundary the model-driven
- *     taint CANNOT cross, because a scheduled run starts with no model context
- *     to taint. A coding child has no business authoring the platform it runs
- *     on, so the whole pack is off. This is a bridge rule, not a capability
- *     rule — an API neuron with the right profile still has these.
- *
- * The URL-fetching tools are excluded separately by `NETWORK_TOOLS` +
- * `CALLER_TRUST_FIX_PRESENT` below, because that exclusion lifts itself.
+ * FORBIDDEN_TOOLS, FORBIDDEN_TOOL_PREFIXES, and FORBIDDEN_RESOURCES are retained
+ * as empty collections for backwards compatibility with any callers checking them.
  */
-export const FORBIDDEN_TOOLS: ReadonlySet<string> = new Set([
-  'invoke_tool',
-  'list_available_tools',
-  'get_tool_schema',
-  'invoke_graph',
-  'ssh_shell',
-  'ssh_copy',
-  'send_webhook',
-  'alert_desktop',
-  'workspace_checkout',
-  'workspace_checkin',
-  'workspace_release',
-  'create_neuron',
-  'update_neuron',
-  'delete_neuron',
-  'fork_neuron',
-  'create_node',
-  'update_node',
-  'node_patch',
-  'delete_node',
-  'fork_node',
-  'create_graph',
-  'update_graph',
-  'graph_patch',
-  'publish_graph',
-  'fork_graph',
-  'delete_graph',
-]);
+export const FORBIDDEN_TOOLS: ReadonlySet<string> = new Set<string>();
 
-/**
- * Name prefixes forbidden wholesale.
- *
- * The desktop pack is George's actual keyboard, mouse and shell on a machine a
- * human is sitting at, and it CANNOT be excluded by `tool-map` resource:
- *
- *   - `desktop_exec` is `resource: 'exec'` (`tool-map.ts:208`), the same
- *     resource as `run_command`, so a resource-only rule serves it;
- *   - `desktop_settings`, `desktop_list` and `desktop_ping` are absent from
- *     `tool-map` entirely, so `getDataToolRule` returns `undefined` for them
- *     and a resource-only rule serves those too;
- *   - only the seven `computer:control` tools (`desktop_click`, `desktop_type`,
- *     …) were ever covered.
- *
- * A prefix is the only rule that survives someone adding `desktop_paste` next
- * month, so the prefix is the rule and the resource check below is the belt.
- */
-export const FORBIDDEN_TOOL_PREFIXES: readonly string[] = ['desktop_'];
+/** Name prefixes forbidden wholesale. Kept empty for parity with API neurons. */
+export const FORBIDDEN_TOOL_PREFIXES: readonly string[] = [];
 
-/**
- * Resources whose tools are forbidden wholesale, keyed off `tool-map`.
- *
- * `computer` is the live half: it covers the seven computer-use tools.
- * `environment` covers NOTHING today and is not pretending to — no rule in
- * `permissions/tool-map.ts` uses it, and `permissions/types.ts:52` marks it
- * "reserved: managing env configs (not gated yet)". It is listed so that the
- * day a rule does claim that resource, those tools are forbidden here by
- * default instead of silently served. Read this set as `computer` plus a
- * placeholder, never as two resources' worth of coverage.
- */
-const FORBIDDEN_RESOURCES: ReadonlySet<string> = new Set(['computer', 'environment']);
+/** Resources whose tools are forbidden wholesale. Kept empty for parity with API neurons. */
+export const FORBIDDEN_RESOURCES: ReadonlySet<string> = new Set<string>();
 
 /**
  * URL-fetching tools, forbidden while this build predates the caller-trust fix.
