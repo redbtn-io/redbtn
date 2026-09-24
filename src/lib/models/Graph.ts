@@ -41,7 +41,12 @@ const graphEdgeSchema = new Schema({
 const graphConfigSchema = new Schema({
   maxReplans: { type: Number, default: 3 },
   maxSearchIterations: { type: Number, default: 5 },
-  timeout: { type: Number, default: 300 },
+  timeout: { type: Number },
+  recursionLimit: {
+    type: Number,
+    min: [1, 'recursionLimit must be at least 1'],
+    max: [100000, 'recursionLimit cannot exceed 100000'],
+  },
   enableFastpath: { type: Boolean, default: true },
   defaultNeuronRole: {
     type: String,
