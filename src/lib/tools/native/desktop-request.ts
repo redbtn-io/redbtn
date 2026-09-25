@@ -52,18 +52,18 @@ export type ClickRegion = { x: number; y: number; w: number; h: number };
 export type NormalizedRegion = { nx: number; ny: number; nw: number; nh: number };
 
 export type BatchStep =
-  | { op: 'click'; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; button?: 'left' | 'right' | 'middle'; double?: boolean; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: ClickRegion | NormalizedRegion; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
-  | { op: 'click_text'; text?: string; regex?: string; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; occurrence?: number | 'first' | 'last'; button?: 'left' | 'right' | 'middle'; double?: boolean; offset?: { x: number; y: number }; display?: number; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
-  | { op: 'key'; keys: string[]; durationMs?: number; opMode?: 'tap' | 'down' | 'up'; opKind?: 'tap' | 'down' | 'up'; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; label?: string }
-  | { op: 'type'; text: string; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; label?: string }
-  | { op: 'move'; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; dx?: number; dy?: number; relative?: boolean; transport?: 'injected' | 'virtual-hid'; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: ClickRegion | NormalizedRegion; label?: string }
-  | { op: 'hover'; x: number; y: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; dwellMs?: number; wiggle?: boolean; screenshot?: boolean; region?: ClickRegion | NormalizedRegion; size?: { w: number; h: number }; label?: string }
-  | { op: 'drag'; from?: { x?: number; y?: number; nx?: number; ny?: number }; to: { x?: number; y?: number; nx?: number; ny?: number }; display?: number; window?: WindowTarget; button?: 'left' | 'right' | 'middle'; durationMs?: number; smooth?: boolean; region?: ClickRegion | NormalizedRegion; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
-  | { op: 'scroll'; dx?: number; dy?: number; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; region?: ClickRegion | NormalizedRegion; label?: string }
-  | { op: 'wait'; ms?: number; durationMs?: number; region?: ClickRegion | NormalizedRegion; label?: string }
-  | { op: 'wait_for'; text?: string; regex?: string; template?: string; image?: string; gone?: boolean; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; display?: number; timeoutMs?: number; intervalMs?: number; threshold?: number; label?: string }
-  | { op: 'assert_text'; text?: string; regex?: string; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; display?: number; label?: string }
-  | { op: 'screenshot'; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; around?: { x: number; y: number } | 'cursor'; size?: { w: number; h: number }; display?: number; format?: 'png' | 'jpeg'; label?: string };
+  | { op: 'click'; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; bringToFront?: boolean; button?: 'left' | 'right' | 'middle'; double?: boolean; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: ClickRegion | NormalizedRegion; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
+  | { op: 'click_text'; text?: string; regex?: string; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; bringToFront?: boolean; occurrence?: number | 'first' | 'last'; button?: 'left' | 'right' | 'middle'; double?: boolean; offset?: { x: number; y: number }; display?: number; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
+  | { op: 'key'; keys: string[]; durationMs?: number; opMode?: 'tap' | 'down' | 'up'; opKind?: 'tap' | 'down' | 'up'; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; bringToFront?: boolean; label?: string }
+  | { op: 'type'; text: string; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; bringToFront?: boolean; label?: string }
+  | { op: 'move'; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; bringToFront?: boolean; dx?: number; dy?: number; relative?: boolean; transport?: 'injected' | 'virtual-hid'; smooth?: boolean; speed?: 'normal' | 'fast' | 'instant'; region?: ClickRegion | NormalizedRegion; label?: string }
+  | { op: 'hover'; x: number; y: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; bringToFront?: boolean; dwellMs?: number; wiggle?: boolean; screenshot?: boolean; region?: ClickRegion | NormalizedRegion; size?: { w: number; h: number }; label?: string }
+  | { op: 'drag'; from?: { x?: number; y?: number; nx?: number; ny?: number }; to: { x?: number; y?: number; nx?: number; ny?: number }; display?: number; window?: WindowTarget; bringToFront?: boolean; button?: 'left' | 'right' | 'middle'; durationMs?: number; smooth?: boolean; region?: ClickRegion | NormalizedRegion; screenshot?: boolean; size?: { w: number; h: number }; label?: string }
+  | { op: 'scroll'; dx?: number; dy?: number; x?: number; y?: number; nx?: number; ny?: number; display?: number; window?: WindowTarget; bringToFront?: boolean; region?: ClickRegion | NormalizedRegion; label?: string }
+  | { op: 'wait'; ms?: number; durationMs?: number; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; bringToFront?: boolean; label?: string }
+  | { op: 'wait_for'; text?: string; regex?: string; template?: string; image?: string; gone?: boolean; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; bringToFront?: boolean; display?: number; timeoutMs?: number; intervalMs?: number; threshold?: number; label?: string }
+  | { op: 'assert_text'; text?: string; regex?: string; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; bringToFront?: boolean; display?: number; label?: string }
+  | { op: 'screenshot'; region?: ClickRegion | NormalizedRegion; window?: WindowTarget; bringToFront?: boolean; around?: { x: number; y: number } | 'cursor'; size?: { w: number; h: number }; display?: number; format?: 'png' | 'jpeg'; label?: string };
 
 /**
  * Computer-use action — discriminated union mirroring redAgent
@@ -71,7 +71,7 @@ export type BatchStep =
  */
 export type ComputerAction =
   /**
-   * Capture the screen.
+    Capture the screen.
    *  - default: DOWNSCALED to the click space (~1366px long edge) — good
    *    grounding, but small text is unreadable.
    *  - `region` (CLICK SPACE coords): native-resolution crop of that area —
@@ -83,6 +83,7 @@ export type ComputerAction =
       action: 'screenshot';
       display?: number;
       window?: WindowTarget;
+      bringToFront?: boolean;
       format?: 'png' | 'jpeg';
       region?: ClickRegion | NormalizedRegion;
       fullRes?: boolean;
@@ -96,6 +97,7 @@ export type ComputerAction =
       y?: number;
       display?: number;
       window?: WindowTarget;
+      bringToFront?: boolean;
       nx?: number;
       ny?: number;
       button?: 'left' | 'right' | 'middle';
@@ -122,6 +124,8 @@ export type ComputerAction =
       keys?: string[];
       durationMs?: number;
       opMode?: 'tap' | 'down' | 'up';
+      window?: WindowTarget;
+      bringToFront?: boolean;
     }
   | {
       action: 'ocr';
@@ -130,6 +134,7 @@ export type ComputerAction =
       regex?: string;
       region?: ClickRegion | NormalizedRegion;
       window?: WindowTarget;
+      bringToFront?: boolean;
       occurrence?: number | 'first' | 'last' | 'all';
       caseSensitive?: boolean;
       fuzzy?: boolean | number;
@@ -152,6 +157,7 @@ export type ComputerAction =
       gone?: boolean;
       region?: ClickRegion | NormalizedRegion;
       window?: WindowTarget;
+      bringToFront?: boolean;
       display?: number;
       timeoutMs?: number;
       intervalMs?: number;
@@ -162,6 +168,7 @@ export type ComputerAction =
       template: string;
       region?: ClickRegion | NormalizedRegion;
       window?: WindowTarget;
+      bringToFront?: boolean;
       display?: number;
       threshold?: number;
       maxResults?: number;
@@ -173,6 +180,7 @@ export type ComputerAction =
       action: 'batch';
       steps: BatchStep[];
       window?: WindowTarget;
+      bringToFront?: boolean;
       display?: number;
       stopOnFail?: boolean;
       stopOnError?: boolean;

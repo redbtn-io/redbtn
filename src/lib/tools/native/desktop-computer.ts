@@ -172,6 +172,20 @@ function resolveWindow(args: AnyObject): string | { id: string | number } | unde
   return undefined;
 }
 
+/** Bring-to-front parameter schema shared across perception and input tools. */
+const BRING_TO_FRONT_SCHEMA = {
+  type: 'boolean' as const,
+  description:
+    'Restore window if minimized (without un-maximizing), raise and focus it, and verify it is foreground before acting. Refuses with window_not_foreground if focus cannot be secured.',
+};
+
+function resolveBringToFront(args: AnyObject): boolean | undefined {
+  if (typeof args?.bringToFront === 'boolean') {
+    return args.bringToFront;
+  }
+  return undefined;
+}
+
 /** A screenshot crop rectangle in CLICK SPACE (the coordinate space clicks use) or normalized coords. */
 type ScreenshotRegion =
   | { x: number; y: number; w: number; h: number }
@@ -638,6 +652,7 @@ const desktopScreenshotTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       format: {
         type: 'string',
         enum: ['png', 'jpeg'],
@@ -718,9 +733,11 @@ const desktopScreenshotTool: NativeToolDefinition = {
     const size = resolveSize(rawArgs);
     const fullRes = rawArgs?.fullRes === true;
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const request: ComputerAction = { action: 'screenshot', format };
     if (display !== undefined) request.display = display;
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     // Passed through verbatim; the desktop clamps the rect (computerUse.ts).
     if (region !== undefined) request.region = region;
     if (around !== undefined) request.around = around;
@@ -796,6 +813,7 @@ const desktopClickTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       x: { type: 'number', description: 'Absolute X pixel coordinate in click space (optional if nx provided).' },
       y: { type: 'number', description: 'Absolute Y pixel coordinate in click space (optional if ny provided).' },
       nx: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized horizontal coordinate (0.0 to 1.0) across display or window.' },
@@ -841,6 +859,7 @@ const desktopClickTool: NativeToolDefinition = {
     if (display === null) return invalidDisplayResult();
     const size = resolveSize(rawArgs);
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const request: ComputerAction = {
       action: 'mouse',
       op: 'click',
@@ -856,6 +875,7 @@ const desktopClickTool: NativeToolDefinition = {
       request.ny = ny;
     }
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (rawArgs?.smooth === true) request.smooth = true;
     if (rawArgs?.speed !== undefined) request.speed = rawArgs.speed;
     if (rawArgs?.screenshot === true) request.screenshot = true;
@@ -889,6 +909,7 @@ const desktopMoveTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       x: { type: 'number', description: 'Absolute X pixel coordinate in click space (optional if relative or nx provided).' },
       y: { type: 'number', description: 'Absolute Y pixel coordinate in click space (optional if relative or ny provided).' },
       nx: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized horizontal coordinate (0.0 to 1.0) across display or window.' },
@@ -934,6 +955,7 @@ const desktopMoveTool: NativeToolDefinition = {
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const request: ComputerAction = {
       action: 'mouse',
       op: 'move',
@@ -947,6 +969,7 @@ const desktopMoveTool: NativeToolDefinition = {
       request.ny = ny;
     }
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (relative) {
       request.relative = true;
       if (Number.isFinite(dx)) request.dx = dx;
@@ -980,6 +1003,8 @@ const desktopTypeTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       text: { type: 'string', description: 'Literal text to type. Required.' },
       timeoutMs: { type: 'number', description: 'Optional round-trip timeout in ms (default 30000).' },
     },
@@ -991,7 +1016,12 @@ const desktopTypeTool: NativeToolDefinition = {
     if (!text) {
       return textResult({ ok: false, error: { code: 'computer_failed', message: 'text is required' } }, true);
     }
-    const result = await runAction(context, { action: 'keyboard', op: 'type', text }, rawArgs);
+    const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
+    const request: ComputerAction = { action: 'keyboard', op: 'type', text };
+    if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
+    const result = await runAction(context, request, rawArgs);
     if (!result) return noUserResult();
     return inputResult(result);
   },
@@ -1014,6 +1044,8 @@ const desktopKeyTool: NativeToolDefinition = {
         type: 'string',
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
+      window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       keys: {
         type: 'array',
         items: { type: 'string' },
@@ -1040,12 +1072,16 @@ const desktopKeyTool: NativeToolDefinition = {
     if (keys.length === 0) {
       return textResult({ ok: false, error: { code: 'computer_failed', message: 'keys must be a non-empty array of strings' } }, true);
     }
+    const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const opMode = rawArgs?.opMode;
     const request: ComputerAction = {
       action: 'keyboard',
       op: opMode === 'down' ? 'down' : opMode === 'up' ? 'up' : 'tap',
       keys,
     };
+    if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (opMode !== undefined) request.opMode = opMode;
     if (typeof rawArgs?.durationMs === 'number') request.durationMs = rawArgs.durationMs;
     const result = await runAction(context, request, rawArgs);
@@ -1072,6 +1108,7 @@ const desktopScrollTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       dx: { type: 'number', description: 'Horizontal wheel delta (positive = right). Default 0.' },
       dy: { type: 'number', description: 'Vertical wheel delta (positive = down). Default 0.' },
       x: { type: 'number', description: 'Optional pointer X to scroll at (absolute pixels).' },
@@ -1094,12 +1131,14 @@ const desktopScrollTool: NativeToolDefinition = {
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const req: ComputerAction = { action: 'mouse', op: 'scroll', dx, dy };
     if (Number.isFinite(Number(rawArgs?.x))) req.x = Number(rawArgs.x);
     if (Number.isFinite(Number(rawArgs?.y))) req.y = Number(rawArgs.y);
     if (Number.isFinite(Number(rawArgs?.nx))) req.nx = Number(rawArgs.nx);
     if (Number.isFinite(Number(rawArgs?.ny))) req.ny = Number(rawArgs.ny);
     if (win !== undefined) req.window = win;
+    if (bringToFront !== undefined) req.bringToFront = bringToFront;
     if (display !== undefined) req.display = display;
     const result = await runAction(context, req, rawArgs);
     if (!result) return noUserResult();
@@ -1245,6 +1284,7 @@ const desktopReadTextTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       display: {
         type: 'integer',
         minimum: 0,
@@ -1279,9 +1319,11 @@ const desktopReadTextTool: NativeToolDefinition = {
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const request: ComputerAction = { action: 'ocr', op: 'read' };
     if (display !== undefined) request.display = display;
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (region !== undefined) request.region = region;
     if (typeof rawArgs?.imageBase64 === 'string') request.imageBase64 = rawArgs.imageBase64;
 
@@ -1325,6 +1367,7 @@ const desktopFindTextTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       text: { type: 'string', description: 'Text substring to find.' },
       regex: { type: 'string', description: 'Regular expression pattern to find.' },
       caseSensitive: { type: 'boolean', description: 'Case-sensitive search (default: false).' },
@@ -1367,6 +1410,7 @@ const desktopFindTextTool: NativeToolDefinition = {
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const request: ComputerAction = {
       action: 'ocr',
       op: 'find',
@@ -1376,6 +1420,7 @@ const desktopFindTextTool: NativeToolDefinition = {
     };
     if (display !== undefined) request.display = display;
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (region !== undefined) request.region = region;
     if (typeof rawArgs?.imageBase64 === 'string') request.imageBase64 = rawArgs.imageBase64;
 
@@ -1418,6 +1463,7 @@ const desktopClickTextTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       text: { type: 'string', description: 'Text substring to find and click.' },
       regex: { type: 'string', description: 'Regular expression pattern to find and click.' },
       occurrence: { description: 'Which occurrence to click: 1-based index, "first", or "last" (default: 1).' },
@@ -1470,6 +1516,7 @@ const desktopClickTextTool: NativeToolDefinition = {
     if (region === null) return invalidRegionResult();
     const size = resolveSize(rawArgs);
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const request: ComputerAction = {
       action: 'ocr',
       op: 'click',
@@ -1481,6 +1528,7 @@ const desktopClickTextTool: NativeToolDefinition = {
       offset: rawArgs?.offset,
     };
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (rawArgs?.screenshot === true) request.screenshot = true;
     if (size !== undefined) request.size = size;
     if (display !== undefined) request.display = display;
@@ -1510,6 +1558,7 @@ const desktopFindImageTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       template: { type: 'string', description: 'Base64-encoded PNG/JPEG template image to find.' },
       templateBase64: { type: 'string', description: 'Alias for template (base64-encoded PNG/JPEG).' },
       image: { type: 'string', description: 'Alias for template (base64-encoded PNG/JPEG).' },
@@ -1555,6 +1604,7 @@ const desktopFindImageTool: NativeToolDefinition = {
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const request: ComputerAction = {
       action: 'find_image',
       template,
@@ -1562,6 +1612,7 @@ const desktopFindImageTool: NativeToolDefinition = {
     };
     if (display !== undefined) request.display = display;
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (region !== undefined) request.region = region;
 
     const result = await runAction(context, request, rawArgs);
@@ -1602,6 +1653,7 @@ const desktopWaitForTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       text: { type: 'string', description: 'Text substring to wait for.' },
       regex: { type: 'string', description: 'Regular expression to wait for.' },
       template: { type: 'string', description: 'Base64 image template to wait for.' },
@@ -1653,6 +1705,7 @@ const desktopWaitForTool: NativeToolDefinition = {
     const region = resolveRegion(rawArgs);
     if (region === null) return invalidRegionResult();
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const request: ComputerAction = {
       action: 'wait_for',
       text,
@@ -1665,6 +1718,7 @@ const desktopWaitForTool: NativeToolDefinition = {
     };
     if (display !== undefined) request.display = display;
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (region !== undefined) request.region = region;
 
     // Add 5000ms margin to Redis relay timeout so desktop connector can finish and return evidence
@@ -1713,6 +1767,7 @@ const desktopHoverTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       x: { type: 'number', description: 'X coordinate in click space (optional if nx provided).' },
       y: { type: 'number', description: 'Y coordinate in click space (optional if ny provided).' },
       nx: { type: 'number', minimum: 0, maximum: 1, description: 'Normalized horizontal coordinate (0.0 to 1.0) across display or window.' },
@@ -1765,6 +1820,7 @@ const desktopHoverTool: NativeToolDefinition = {
     if (region === null) return invalidRegionResult();
     const size = resolveSize(rawArgs);
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
     const request: ComputerAction = {
       action: 'mouse',
       op: 'hover',
@@ -1780,6 +1836,7 @@ const desktopHoverTool: NativeToolDefinition = {
       request.ny = ny;
     }
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (rawArgs?.screenshot === true) request.screenshot = true;
     if (size !== undefined) request.size = size;
     if (display !== undefined) request.display = display;
@@ -1809,6 +1866,7 @@ const desktopDragTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       to: {
         type: 'object',
         description: 'Destination coordinates in click space (x, y) or normalized (nx, ny). Required.',
@@ -1867,6 +1925,7 @@ const desktopDragTool: NativeToolDefinition = {
     if (display === null) return invalidDisplayResult();
     const size = resolveSize(rawArgs);
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
 
     const request: ComputerAction = {
       action: 'mouse',
@@ -1878,6 +1937,7 @@ const desktopDragTool: NativeToolDefinition = {
       smooth: rawArgs?.smooth !== false,
     };
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (rawArgs?.screenshot === true) request.screenshot = true;
     if (size !== undefined) request.size = size;
     if (display !== undefined) request.display = display;
@@ -1906,6 +1966,7 @@ const desktopBatchTool: NativeToolDefinition = {
         description: 'Target computer: installId, id prefix, or part of its name (e.g. "mac", "alphaSystem").',
       },
       window: WINDOW_TARGET_SCHEMA,
+      bringToFront: BRING_TO_FRONT_SCHEMA,
       steps: {
         type: 'array',
         description: 'Sequence of batch steps to execute in order. Required, non-empty.',
@@ -1930,6 +1991,7 @@ const desktopBatchTool: NativeToolDefinition = {
               ],
             },
             window: WINDOW_TARGET_SCHEMA,
+            bringToFront: BRING_TO_FRONT_SCHEMA,
             nx: { type: 'number', description: 'Normalized horizontal coordinate (0.0 to 1.0).' },
             ny: { type: 'number', description: 'Normalized vertical coordinate (0.0 to 1.0).' },
             label: { type: 'string', description: 'Optional step label for diagnostics.' },
@@ -1956,6 +2018,7 @@ const desktopBatchTool: NativeToolDefinition = {
     const display = resolveDisplayIndex(rawArgs);
     if (display === null) return invalidDisplayResult();
     const win = resolveWindow(rawArgs);
+    const bringToFront = resolveBringToFront(rawArgs);
 
     const steps = rawSteps.map((step) => {
       if (!step || typeof step !== 'object') return step;
@@ -1969,6 +2032,9 @@ const desktopBatchTool: NativeToolDefinition = {
       if (s.window === undefined && win !== undefined) {
         s.window = win;
       }
+      if (s.bringToFront === undefined && bringToFront !== undefined) {
+        s.bringToFront = bringToFront;
+      }
       return s;
     });
 
@@ -1979,6 +2045,7 @@ const desktopBatchTool: NativeToolDefinition = {
       abortOnError: rawArgs?.abortOnError !== false,
     };
     if (win !== undefined) request.window = win;
+    if (bringToFront !== undefined) request.bringToFront = bringToFront;
     if (display !== undefined) request.display = display;
 
     // Batch duration cap on connector is 120s; set relay timeout margin to 125s (125000ms)

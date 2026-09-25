@@ -18,7 +18,9 @@ import {
   desktopScreenshot,
   desktopClick,
   desktopMove,
+  desktopType,
   desktopKey,
+  desktopScroll,
   desktopReadText,
   desktopFindText,
   desktopClickText,
@@ -975,4 +977,111 @@ describe('desktop screenshot around and action screenshot parity (Addendum 2)', 
       }),
     );
   });
+
+  test('desktop tools forward bringToFront and window targeting', async () => {
+    await desktopClick.handler(
+      { environmentId: 'env_desktop', x: 10, y: 20, window: 'Editor', bringToFront: true },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'click',
+          window: 'Editor',
+          bringToFront: true,
+        }),
+      }),
+    );
+
+    await desktopType.handler(
+      { environmentId: 'env_desktop', text: 'Hello', window: 'Editor', bringToFront: true },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'keyboard',
+          op: 'type',
+          text: 'Hello',
+          window: 'Editor',
+          bringToFront: true,
+        }),
+      }),
+    );
+
+    await desktopKey.handler(
+      { environmentId: 'env_desktop', keys: ['enter'], window: 'Editor', bringToFront: true },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'keyboard',
+          keys: ['enter'],
+          window: 'Editor',
+          bringToFront: true,
+        }),
+      }),
+    );
+
+    await desktopScroll.handler(
+      { environmentId: 'env_desktop', dy: 100, window: 'Editor', bringToFront: true },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'scroll',
+          window: 'Editor',
+          bringToFront: true,
+        }),
+      }),
+    );
+
+    await desktopDrag.handler(
+      { environmentId: 'env_desktop', to: { x: 50, y: 50 }, window: 'Editor', bringToFront: true },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'mouse',
+          op: 'drag',
+          window: 'Editor',
+          bringToFront: true,
+        }),
+      }),
+    );
+  });
+
+  test('desktop_batch forwards bringToFront at batch level and defaults to steps', async () => {
+    await desktopBatch.handler(
+      {
+        environmentId: 'env_desktop',
+        window: 'AppWindow',
+        bringToFront: true,
+        steps: [
+          { action: 'click', nx: 0.1, ny: 0.2 },
+          { action: 'type', text: 'abc', bringToFront: false },
+        ],
+      },
+      makeContext(),
+    );
+    expect(requestDesktopMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          action: 'batch',
+          window: 'AppWindow',
+          bringToFront: true,
+          steps: [
+            expect.objectContaining({ op: 'click', nx: 0.1, ny: 0.2, window: 'AppWindow', bringToFront: true }),
+            expect.objectContaining({ op: 'type', text: 'abc', window: 'AppWindow', bringToFront: false }),
+          ],
+        }),
+      }),
+    );
+  });
 });
+
