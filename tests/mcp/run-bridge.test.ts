@@ -520,6 +520,17 @@ describe('tools/list — allowlist intersection', () => {
     const dup: RunBridgeToolRef = { name: 'run_command', description: 'x', inputSchema: RUN_COMMAND_SCHEMA, source: 'native' };
     expect(buildBridgeToolTable([dup, dup]).length).toBe(1);
   });
+
+  it('serves graph-sourced tools declared by the node', () => {
+    const graphTool: RunBridgeToolRef = {
+      name: 'bdo_recon',
+      description: 'Recon macro',
+      inputSchema: { type: 'object' },
+      source: 'graph',
+    };
+    const table = buildBridgeToolTable([graphTool]);
+    expect(table.map((t) => t.name)).toEqual(['bdo_recon']);
+  });
 });
 
 describe('CLI neuron tool parity', () => {
