@@ -1083,5 +1083,63 @@ describe('desktop screenshot around and action screenshot parity (Addendum 2)', 
       }),
     );
   });
+
+  test('desktop perception tools forward captureMode and windowRect', async () => {
+    const windowRect = { x: 50, y: 100, width: 640, height: 480 };
+    const captureMode = 'display-crop';
+
+    // read_text
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_read_1',
+      ok: true,
+      ocr: { lines: [], text: 'some text', clickSpace: { w: 640, h: 480 } },
+      windowRect,
+      captureMode,
+    });
+    const readRes = await desktopReadText.handler(
+      { environmentId: 'env_desktop', window: 'TestWin' },
+      makeContext(),
+    );
+    const readParsed = JSON.parse(readRes.content[0].text);
+    expect(readParsed.captureMode).toBe('display-crop');
+    expect(readParsed.windowRect).toEqual(windowRect);
+
+    // find_text
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_find_1',
+      ok: true,
+      ocr: { matches: [{ text: 'target', box: { x: 1, y: 1, w: 10, h: 10 }, center: { x: 5, y: 5 } }] },
+      windowRect,
+      captureMode,
+    });
+    const findRes = await desktopFindText.handler(
+      { environmentId: 'env_desktop', text: 'target', window: 'TestWin' },
+      makeContext(),
+    );
+    const findParsed = JSON.parse(findRes.content[0].text);
+    expect(findParsed.captureMode).toBe('display-crop');
+    expect(findParsed.windowRect).toEqual(windowRect);
+
+    // find_image
+    requestDesktopMock.mockResolvedValueOnce({
+      kind: 'computer_result',
+      id: 'req_img_1',
+      ok: true,
+      matches: [{ box: { x: 2, y: 2, w: 20, h: 20 }, center: { x: 12, y: 12 }, score: 0.99 }],
+      clickSpace: { w: 640, h: 480 },
+      windowRect,
+      captureMode,
+    });
+    const imgRes = await desktopFindImage.handler(
+      { environmentId: 'env_desktop', templateBase64: 'abc', window: 'TestWin' },
+      makeContext(),
+    );
+    const imgParsed = JSON.parse(imgRes.content[0].text);
+    expect(imgParsed.captureMode).toBe('display-crop');
+    expect(imgParsed.windowRect).toEqual(windowRect);
+  });
 });
+
 

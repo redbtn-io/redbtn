@@ -405,11 +405,15 @@ function inputFailure(result: ComputerResultMessage): DesktopFailure | null {
  */
 function inputResult(result: ComputerResultMessage): NativeMcpResult {
   const failure = inputFailure(result);
+  const captureMode = result.captureMode ?? (result.result as any)?.captureMode ?? null;
+  const windowRect = result.windowRect ?? (result.result as any)?.windowRect ?? null;
   const payload: AnyObject = {
     // A dry run claims ok:true. It did nothing, so it is not ok.
     ok: failure === null,
     ...(result.result ? { result: result.result } : {}),
     ...(result.image ? { image: result.image } : {}),
+    ...(captureMode ? { captureMode } : {}),
+    ...(windowRect ? { windowRect } : {}),
     ...(failure ? { error: failure } : {}),
   };
   const { cleaned, images } = extractImagesAndStrip(payload);
@@ -1336,6 +1340,8 @@ const desktopReadTextTool: NativeToolDefinition = {
       }, true);
     }
     const ocr = result.ocr || {};
+    const captureMode = result.captureMode ?? (result.result as any)?.captureMode ?? null;
+    const windowRect = result.windowRect ?? (result.result as any)?.windowRect ?? null;
     return textResult({
       ok: true,
       text: ocr.text || (result.result as any)?.text || '',
@@ -1345,6 +1351,8 @@ const desktopReadTextTool: NativeToolDefinition = {
       display: display ?? 0,
       region: region ?? null,
       ...(win ? { window: win } : {}),
+      ...(captureMode ? { captureMode } : {}),
+      ...(windowRect ? { windowRect } : {}),
     });
   },
 };
@@ -1433,6 +1441,8 @@ const desktopFindTextTool: NativeToolDefinition = {
       }, true);
     }
     const matches = result.ocr?.matches || (result.result as any)?.matches || [];
+    const captureMode = result.captureMode ?? (result.result as any)?.captureMode ?? null;
+    const windowRect = result.windowRect ?? (result.result as any)?.windowRect ?? null;
     return textResult({
       ok: true,
       query: { text, regex },
@@ -1441,6 +1451,8 @@ const desktopFindTextTool: NativeToolDefinition = {
       display: display ?? 0,
       region: region ?? null,
       ...(win ? { window: win } : {}),
+      ...(captureMode ? { captureMode } : {}),
+      ...(windowRect ? { windowRect } : {}),
     });
   },
 };
@@ -1624,6 +1636,8 @@ const desktopFindImageTool: NativeToolDefinition = {
       }, true);
     }
     const matches = result.matches || (result.result as any)?.matches || [];
+    const captureMode = result.captureMode ?? (result.result as any)?.captureMode ?? null;
+    const windowRect = result.windowRect ?? (result.result as any)?.windowRect ?? null;
     return textResult({
       ok: true,
       matches,
@@ -1631,6 +1645,8 @@ const desktopFindImageTool: NativeToolDefinition = {
       display: display ?? 0,
       region: region ?? null,
       ...(win ? { window: win } : {}),
+      ...(captureMode ? { captureMode } : {}),
+      ...(windowRect ? { windowRect } : {}),
     });
   },
 };
@@ -1725,9 +1741,13 @@ const desktopWaitForTool: NativeToolDefinition = {
     const result = await runAction(context, request, rawArgs, 5000);
     if (!result) return noUserResult();
 
+    const captureMode = result.captureMode ?? (result.result as any)?.captureMode ?? null;
+    const windowRect = result.windowRect ?? (result.result as any)?.windowRect ?? null;
     const payload: AnyObject = {
       ok: result.ok,
       ...(result.result ? { result: result.result } : {}),
+      ...(captureMode ? { captureMode } : {}),
+      ...(windowRect ? { windowRect } : {}),
       ...(result.error ? { error: result.error } : {}),
     };
     const { cleaned, images } = extractImagesAndStrip(payload);
