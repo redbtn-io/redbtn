@@ -109,6 +109,7 @@ import { coerceArgsToSchema } from '../tools/coerce-args';
 import { getDataToolRule } from '../permissions/tool-map';
 import { runControlRegistry } from '../run/RunControlRegistry';
 import { callerIsTrusted } from '../tools/native/_outbound-url';
+import type { ToolInvocationContext } from '../tools/tool-resolver';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -396,6 +397,7 @@ export interface RunBridgeToolRef {
   description: string;
   inputSchema: Record<string, unknown>;
   source?: 'native' | 'mcp' | 'graph';
+  invoke?: (args: Record<string, unknown>, ctx: ToolInvocationContext) => Promise<unknown>;
 }
 
 export interface StartRunToolBridgeOptions {
@@ -578,6 +580,15 @@ export function buildBridgeToolTable(resolvedTools: RunBridgeToolRef[]): Tool[] 
     const name = tool?.name;
     if (typeof name !== 'string' || !name) continue;
     if (seen.has(name)) continue;
+    if (tool.source === 'graph') {
+      seen.add(name);
+      out.push({
+        name,
+        description: tool.description ?? '',
+        inputSchema: stripEnvironmentIdFromSchema(tool.inputSchema),
+      });
+      continue;
+    }
     if (tool.source && tool.source !== 'native') continue;
     if (!registered.has(name)) continue;
     if (isForbiddenForBridge(name)) continue;
@@ -1187,11 +1198,14 @@ export async function startRunToolBridge(
 
     const toolId = generateBridgeToolId(name, ++seq);
 
+    const graphTool = resolvedTools?.find((t) => t.name === name && t.source === 'graph');
+    const toolType = graphTool ? 'graph' : 'native';
+
     try {
       if (publisher) {
         await publishBounded(
           'toolStart',
-          publisher.toolStart(toolId, name, 'native', {
+          publisher.toolStart(toolId, name, toolType, {
             // Scrubbed and bounded, exactly like the result at `toolComplete`:
             // an API key handed to a tool as an argument is the same secret in
             // the same archive as one that comes back in a result.
@@ -1203,31 +1217,42 @@ export async function startRunToolBridge(
         );
       }
 
-      // `untrustedCaller` is the property `lib/tools/caller-trust`,
-      // `_outbound-url` and every URL-taking tool read. It is now a declared
-      // member of `NativeToolContext` (PR #378 landed), so this is typed as the
-      // plain interface — the intersection this file used to carry would have
-      // let a RENAME of the property typecheck while silently making every
-      // bridge call a trusted one.
-      const context: NativeToolContext = {
-        publisher: null,
-        state: state as AnyObject,
-        runId,
-        nodeId: null,
-        toolId,
-        abortSignal: abortSignal ?? null,
-        credentials: (credentials ?? null) as NativeToolContext['credentials'],
-        untrustedCaller: true,
-      };
-      // Belt: read the flag back through the predicate the tools use.
-      assertUntrustedContext(context);
+      let result: unknown;
+      if (graphTool && typeof graphTool.invoke === 'function') {
+        result = await graphTool.invoke(args, {
+          state: state as AnyObject,
+          credentials: (credentials ?? null) as any,
+          runId,
+          toolId,
+          abortSignal: abortSignal ?? null,
+        });
+      } else {
+        // `untrustedCaller` is the property `lib/tools/caller-trust`,
+        // `_outbound-url` and every URL-taking tool read. It is now a declared
+        // member of `NativeToolContext` (PR #378 landed), so this is typed as the
+        // plain interface — the intersection this file used to carry would have
+        // let a RENAME of the property typecheck while silently making every
+        // bridge call a trusted one.
+        const context: NativeToolContext = {
+          publisher: null,
+          state: state as AnyObject,
+          runId,
+          nodeId: null,
+          toolId,
+          abortSignal: abortSignal ?? null,
+          credentials: (credentials ?? null) as NativeToolContext['credentials'],
+          untrustedCaller: true,
+        };
+        // Belt: read the flag back through the predicate the tools use.
+        assertUntrustedContext(context);
 
-      // Deliberately NOT wrapped in a timeout. A tool owns its own deadline
-      // (`run_command` reads `RUN_COMMAND_DEFAULT_TIMEOUT_MS` for itself since
-      // PR #379), it is handed the run's `abortSignal`, and a hung tool costs one of
-      // `MAX_INFLIGHT_CALLS` slots rather than the session. A blanket deadline
-      // here would kill legitimate long work with no way for a node to opt out.
-      const result = await getNativeRegistry().callTool(name, args, context);
+        // Deliberately NOT wrapped in a timeout. A tool owns its own deadline
+        // (`run_command` reads `RUN_COMMAND_DEFAULT_TIMEOUT_MS` for itself since
+        // PR #379), it is handed the run's `abortSignal`, and a hung tool costs one of
+        // `MAX_INFLIGHT_CALLS` slots rather than the session. A blanket deadline
+        // here would kill legitimate long work with no way for a node to opt out.
+        result = await getNativeRegistry().callTool(name, args, context);
+      }
 
       if (publisher) {
         await publishBounded(
@@ -1242,10 +1267,24 @@ export async function startRunToolBridge(
             // argument, and it was the one half of the call the module contract
             // claimed to bound but did not.
             boundPublishedInput(scrubResultForPublish(result), MAX_PUBLISHED_RESULT_BYTES),
-            { neuronStep: neuronStepId, bridge: true },
+            { neuronStep: neuronStepId, bridge: true, source: toolType },
             { triggeredBy: 'neuron', neuronStepId },
           ),
         );
+      }
+      if (graphTool) {
+        if (result && Array.isArray((result as any).content)) {
+          return result as CallToolResult;
+        }
+        return {
+          content: [
+            {
+              type: 'text',
+              text: result === undefined ? '' : typeof result === 'string' ? result : JSON.stringify(result),
+            },
+          ],
+          ...(result && typeof result === 'object' && (result as any).isError ? { isError: true } : {}),
+        };
       }
       return result as CallToolResult;
     } catch (err) {
