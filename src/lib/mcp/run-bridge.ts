@@ -1198,25 +1198,6 @@ export async function startRunToolBridge(
 
     const toolId = generateBridgeToolId(name, ++seq);
 
-    // Hands-off safety enforcement: block dangerous text targets in code
-    const handsOffPattern = /\b(fire|box|boxes|equip|unequip|enhance|enhancement|claim|abyssal\s+well|currency\s+exchange)\b/i;
-    if (typeof args.text === 'string' && handsOffPattern.test(args.text)) {
-      return {
-        content: [{ type: 'text', text: `Error: [Hands-Off Protection] Action blocked: target text "${args.text}" is prohibited by safety rules` }],
-        isError: true,
-      };
-    }
-    if (Array.isArray(args.steps)) {
-      for (const step of args.steps) {
-        if (step && typeof step === 'object' && typeof (step as any).text === 'string' && handsOffPattern.test((step as any).text)) {
-          return {
-            content: [{ type: 'text', text: `Error: [Hands-Off Protection] Action blocked: batch step text "${(step as any).text}" is prohibited by safety rules` }],
-            isError: true,
-          };
-        }
-      }
-    }
-
     const graphTool = resolvedTools?.find((t) => t.name === name && t.source === 'graph');
     const toolType = graphTool ? 'graph' : 'native';
 
