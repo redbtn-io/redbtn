@@ -255,6 +255,8 @@ export interface ComputerResultMessage {
     score: number;
   }>;
   clickSpace?: { w: number; h: number };
+  captureMode?: 'window' | 'display-crop';
+  windowRect?: { x: number; y: number; width: number; height: number };
   result?: Record<string, unknown>;
   error?: { code: string; message: string };
 }
