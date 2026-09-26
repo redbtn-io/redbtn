@@ -66,8 +66,8 @@ beforeEach(() => {
 describe('desktop tools — schema targeting', () => {
   test('all desktop action tools require environmentId', () => {
     expect(desktopScreenshot.inputSchema.required).toEqual(['environmentId']);
-    expect(desktopClick.inputSchema.required).toEqual(['environmentId', 'x', 'y']);
-    expect(desktopMove.inputSchema.required).toEqual(['environmentId', 'x', 'y']);
+    expect(desktopClick.inputSchema.required).toEqual(['environmentId']);
+    expect(desktopMove.inputSchema.required).toEqual(['environmentId']);
     expect(desktopType.inputSchema.required).toEqual(['environmentId', 'text']);
     expect(desktopKey.inputSchema.required).toEqual(['environmentId', 'keys']);
     expect(desktopScroll.inputSchema.required).toEqual(['environmentId']);
@@ -85,6 +85,13 @@ describe('desktop tools — schema targeting', () => {
         minimum: 0,
       });
       expect(tool.inputSchema.required).not.toContain('display');
+    }
+  });
+
+  test('click and move treat x and y as optional in schema', () => {
+    for (const tool of [desktopClick, desktopMove]) {
+      expect(tool.inputSchema.required).not.toContain('x');
+      expect(tool.inputSchema.required).not.toContain('y');
     }
   });
 });
@@ -145,6 +152,59 @@ describe('desktop computer-use tools — strict target handling', () => {
         double: false,
       },
     });
+  });
+
+  test('window-targeted click without x/y is valid with normalized coordinates', async () => {
+    await desktopClick.handler(
+      { environmentId: 'env_desktop', window: 'my_window', nx: 0.5, ny: 0.5 },
+      makeContext(),
+    );
+
+    expect(loadAndResolveEnvironmentMock).toHaveBeenCalledWith('env_desktop', 'user_a');
+    expect(requestDesktopMock).toHaveBeenCalledWith({
+      userId: 'user_a',
+      installId: 'install_123',
+      timeoutMs: undefined,
+      request: {
+        action: 'mouse',
+        op: 'click',
+        button: 'left',
+        double: false,
+        nx: 0.5,
+        ny: 0.5,
+        window: 'my_window',
+      },
+    });
+    const lastCall = requestDesktopMock.mock.calls.at(-1)?.[0];
+    expect(lastCall.request.x).toBeUndefined();
+    expect(lastCall.request.y).toBeUndefined();
+  });
+
+  test('click and move fail when neither absolute nor normalized coordinates are provided', async () => {
+    const clickResult = await desktopClick.handler(
+      { environmentId: 'env_desktop' },
+      makeContext(),
+    );
+    expect(textBody(clickResult)).toEqual({
+      ok: false,
+      error: {
+        code: 'computer_failed',
+        message: 'x and y or nx and ny must be finite numbers',
+      },
+    });
+
+    const moveResult = await desktopMove.handler(
+      { environmentId: 'env_desktop' },
+      makeContext(),
+    );
+    expect(textBody(moveResult)).toEqual({
+      ok: false,
+      error: {
+        code: 'computer_failed',
+        message: 'x and y or nx and ny must be finite numbers',
+      },
+    });
+    expect(requestDesktopMock).not.toHaveBeenCalled();
   });
 
   test('click and move forward the selected display index', async () => {
