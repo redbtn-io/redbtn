@@ -500,8 +500,8 @@ describe('tools/list — allowlist intersection', () => {
     // native tools allowlisted by node are served (no wholesale bans)
     expect(names).toContain('create_neuron');
     expect(names).toContain('desktop_exec');
-    // not a native tool
-    expect(names).not.toContain('server.remoteThing');
+    // MCP tool declared by node is served
+    expect(names).toContain('server.remoteThing');
     // declared but not registered
     expect(names).not.toContain('not_a_registered_tool');
     expect(b.toolNames.sort()).toEqual(names);
@@ -530,6 +530,88 @@ describe('tools/list — allowlist intersection', () => {
     };
     const table = buildBridgeToolTable([graphTool]);
     expect(table.map((t) => t.name)).toEqual(['bdo_recon']);
+  });
+
+  it('serves MCP-sourced tools declared by the node', () => {
+    const mcpTool: RunBridgeToolRef = {
+      name: 'redboard__cards_list',
+      description: 'List cards on board',
+      inputSchema: { type: 'object', properties: { boardId: { type: 'string' } } },
+      source: 'mcp',
+    };
+    const table = buildBridgeToolTable([mcpTool]);
+    expect(table.map((t) => t.name)).toEqual(['redboard__cards_list']);
+    expect(table[0].description).toBe('List cards on board');
+  });
+
+  it('dispatches tools/call to MCP tool via invoke and wraps result in CallToolResult', async () => {
+    let invokedArgs: any;
+    const mcpTool: RunBridgeToolRef = {
+      name: 'redboard__card_create',
+      description: 'Create a card',
+      inputSchema: { type: 'object', properties: { title: { type: 'string' } } },
+      source: 'mcp',
+      invoke: async (args) => {
+        invokedArgs = args;
+        return { id: 'card-123', title: args.title };
+      },
+    };
+    const { bridge: b, published } = await start({ resolvedTools: [mcpTool] });
+    const c = await client(b);
+    const res = await c.send('tools/call', { name: 'redboard__card_create', arguments: { title: 'Test Card' } });
+    expect(res.result.isError).toBeUndefined();
+    expect(invokedArgs.title).toBe('Test Card');
+    expect(invokedArgs.environmentId).toBe(ENV_ID);
+    expect(res.result.content[0].text).toBe(JSON.stringify({ id: 'card-123', title: 'Test Card' }));
+    expect(published.starts[0].name).toBe('redboard__card_create');
+    expect(published.completes[0].result).toEqual({ id: 'card-123', title: 'Test Card' });
+  });
+
+  it('dispatches tools/call for MCP tool to mcpClient.callTool when invoke is not provided', async () => {
+    let calledTool: string | undefined;
+    let calledArgs: any;
+    const fakeMcpClient = {
+      callTool: async (toolName: string, args: any) => {
+        calledTool = toolName;
+        calledArgs = args;
+        return { content: [{ type: 'text', text: `Called ${toolName}` }] };
+      },
+    };
+    const mcpTool: RunBridgeToolRef = {
+      name: 'redboard__card_get',
+      description: 'Get a card',
+      inputSchema: { type: 'object', properties: { cardId: { type: 'string' } } },
+      source: 'mcp',
+    };
+    const { bridge: b } = await start({
+      resolvedTools: [mcpTool],
+      state: { runId: RUN_ID, mcpClient: fakeMcpClient, data: {} },
+    });
+    const c = await client(b);
+    const res = await c.send('tools/call', { name: 'redboard__card_get', arguments: { cardId: 'c1' } });
+    expect(res.result.isError).toBeUndefined();
+    expect(calledTool).toBe('card_get');
+    expect(calledArgs.cardId).toBe('c1');
+    expect(calledArgs.environmentId).toBe(ENV_ID);
+    expect(res.result.content[0].text).toBe('Called card_get');
+  });
+
+  it('handles MCP tool errors cleanly and returns CallToolResult with isError: true', async () => {
+    const mcpTool: RunBridgeToolRef = {
+      name: 'redboard__failing_tool',
+      description: 'Fail',
+      inputSchema: { type: 'object', properties: {} },
+      source: 'mcp',
+      invoke: async () => {
+        throw new Error('MCP backend connection failed');
+      },
+    };
+    const { bridge: b, published } = await start({ resolvedTools: [mcpTool] });
+    const c = await client(b);
+    const res = await c.send('tools/call', { name: 'redboard__failing_tool', arguments: {} });
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toContain('Error: MCP backend connection failed');
+    expect(published.errors[0].error).toBe('MCP backend connection failed');
   });
 });
 
