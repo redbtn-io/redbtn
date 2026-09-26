@@ -110,6 +110,7 @@ import { getDataToolRule } from '../permissions/tool-map';
 import { runControlRegistry } from '../run/RunControlRegistry';
 import { callerIsTrusted } from '../tools/native/_outbound-url';
 import type { ToolInvocationContext } from '../tools/tool-resolver';
+import { getMcpClient } from '../run/contextLookup';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -567,8 +568,7 @@ export function isForbiddenForBridge(name: string): boolean {
 
 /**
  * Build the served tool table: what the node declared, intersected with the
- * native registry, minus everything forbidden. MCP- and graph-sourced tools are
- * not bridged: their own transports have their own trust stories.
+ * native registry or provided as graph- or MCP-sourced tools, minus anything forbidden.
  */
 export function buildBridgeToolTable(resolvedTools: RunBridgeToolRef[]): Tool[] {
   const registry = getNativeRegistry();
@@ -580,7 +580,7 @@ export function buildBridgeToolTable(resolvedTools: RunBridgeToolRef[]): Tool[] 
     const name = tool?.name;
     if (typeof name !== 'string' || !name) continue;
     if (seen.has(name)) continue;
-    if (tool.source === 'graph') {
+    if (tool.source === 'graph' || tool.source === 'mcp') {
       seen.add(name);
       out.push({
         name,
@@ -1199,10 +1199,12 @@ export async function startRunToolBridge(
     const toolId = generateBridgeToolId(name, ++seq);
 
     const graphTool = resolvedTools?.find((t) => t.name === name && t.source === 'graph');
-    const toolType = graphTool ? 'graph' : 'native';
+    const mcpTool = resolvedTools?.find((t) => t.name === name && t.source === 'mcp');
+    const customTool = graphTool || mcpTool;
+    const toolType = graphTool ? 'graph' : mcpTool ? 'mcp' : 'native';
 
     try {
-      if (publisher) {
+      if (publisher && typeof publisher.toolStart === 'function') {
         await publishBounded(
           'toolStart',
           publisher.toolStart(toolId, name, toolType, {
@@ -1218,14 +1220,31 @@ export async function startRunToolBridge(
       }
 
       let result: unknown;
-      if (graphTool && typeof graphTool.invoke === 'function') {
-        result = await graphTool.invoke(args, {
+      if (customTool && typeof customTool.invoke === 'function') {
+        result = await customTool.invoke(args, {
           state: state as AnyObject,
           credentials: (credentials ?? null) as any,
           runId,
           toolId,
           abortSignal: abortSignal ?? null,
         });
+      } else if (mcpTool) {
+        const mcpClient = getMcpClient(state);
+        if (!mcpClient) {
+          throw new Error(`MCP client not available in run context for tool '${name}'`);
+        }
+        const dotIdx = name.indexOf('__');
+        const toolName = dotIdx >= 0 ? name.slice(dotIdx + 2) : name;
+        result = await mcpClient.callTool(
+          toolName,
+          args,
+          {
+            conversationId: (state as any).options?.conversationId
+              ?? (state as any).data?.options?.conversationId,
+            credentials,
+          },
+          abortSignal ?? undefined,
+        );
       } else {
         // `untrustedCaller` is the property `lib/tools/caller-trust`,
         // `_outbound-url` and every URL-taking tool read. It is now a declared
@@ -1254,7 +1273,7 @@ export async function startRunToolBridge(
         result = await getNativeRegistry().callTool(name, args, context);
       }
 
-      if (publisher) {
+      if (publisher && typeof publisher.toolComplete === 'function') {
         await publishBounded(
           'toolComplete',
           publisher.toolComplete(
@@ -1272,7 +1291,7 @@ export async function startRunToolBridge(
           ),
         );
       }
-      if (graphTool) {
+      if (customTool) {
         if (result && Array.isArray((result as any).content)) {
           return result as CallToolResult;
         }
@@ -1289,10 +1308,16 @@ export async function startRunToolBridge(
       return result as CallToolResult;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (publisher) {
+      if (publisher && typeof publisher.toolError === 'function') {
         await publishBounded(
           'toolError',
-          publisher.toolError(toolId, message, { triggeredBy: 'neuron', neuronStepId }),
+          publisher.toolError(toolId, message, {
+            triggeredBy: 'neuron',
+            neuronStepId,
+            neuronStep: neuronStepId,
+            bridge: true,
+            source: toolType,
+          }),
         );
       }
       return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
