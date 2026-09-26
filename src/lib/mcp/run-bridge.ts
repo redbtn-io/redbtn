@@ -1272,14 +1272,18 @@ export async function startRunToolBridge(
           ),
         );
       }
-      if (graphTool && result && !(result as any).content) {
+      if (graphTool) {
+        if (result && Array.isArray((result as any).content)) {
+          return result as CallToolResult;
+        }
         return {
           content: [
             {
               type: 'text',
-              text: typeof result === 'string' ? result : JSON.stringify(result),
+              text: result === undefined ? '' : typeof result === 'string' ? result : JSON.stringify(result),
             },
           ],
+          ...(result && typeof result === 'object' && (result as any).isError ? { isError: true } : {}),
         };
       }
       return result as CallToolResult;
