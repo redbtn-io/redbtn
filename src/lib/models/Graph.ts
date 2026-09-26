@@ -92,6 +92,8 @@ const graphSchema = new Schema({
   parentGraphId: { type: String, default: null, index: true },
   name: { type: String, required: true },
   description: { type: String },
+  publishAsTool: { type: Boolean, default: false, index: true },
+  toolDescription: { type: String },
   tier: {
     type: Number,
     required: true,
