@@ -1164,6 +1164,61 @@ describe('lifecycle', () => {
     }
   });
 
+  it.each(['callback-error', 'sync-throw'] as const)(
+    'keeps bridge files registered when server.close has an unconfirmed %s',
+    async (failureMode) => {
+      const stepDir = path.join(tmpDir, `close-unconfirmed-${failureMode}`, 'step');
+      let listening = false;
+      const fake = new EventEmitter() as EventEmitter & {
+        maxConnections: number;
+        listening: boolean;
+        listen: ReturnType<typeof vi.fn>;
+        close: ReturnType<typeof vi.fn>;
+      };
+      Object.defineProperty(fake, 'listening', { get: () => listening });
+      fake.maxConnections = 0;
+      fake.listen = vi.fn((socketPath: string) => {
+        fs.writeFileSync(socketPath, '');
+        listening = true;
+        fake.emit('listening');
+        return fake;
+      });
+      fake.close = vi.fn((callback?: (error?: Error) => void) => {
+        if (failureMode === 'sync-throw') throw new Error('fixture close throw');
+        listening = false;
+        queueMicrotask(() => callback?.(new Error('fixture close callback error')));
+        return fake;
+      });
+      bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+
+      try {
+        const started = await startRunToolBridge({
+          runId: RUN_ID,
+          state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+          publisher: null,
+          resolvedTools: [],
+          environmentId: ENV_ID,
+          workingDir: WORKING_DIR,
+          abortSignal: null,
+          neuronStepId: `bridge-unconfirmed-${failureMode}`,
+          dir: stepDir,
+        });
+        await expect(started.close()).rejects.toMatchObject({ code: 'run_bridge_shutdown_unconfirmed' });
+        expect(fs.existsSync(stepDir)).toBe(true);
+        expect(fs.existsSync(started.socketPath)).toBe(true);
+
+        // The process-exit reaper remains registered and can perform its
+        // synchronous cleanup when the owning worker is fail-stopped.
+        cleanupOrphanedBridges();
+        expect(fs.existsSync(stepDir)).toBe(false);
+      } finally {
+        cleanupOrphanedBridges();
+        bridgeNetMock.createServer.mockReset();
+        bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+      }
+    },
+  );
+
   it('revokes when the run aborts', async () => {
     const controller = new AbortController();
     const { bridge: b } = await start({ abortSignal: controller.signal });

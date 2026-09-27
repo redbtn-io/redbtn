@@ -28,6 +28,9 @@ function makeHarness(options: {
   denyTool?: boolean;
   bridgeStartup?: (bridgeOptions: any) => Promise<unknown>;
   bridgeClose?: () => Promise<void>;
+  bridgeShutdownTimeoutMs?: number;
+  bridgeShutdownAttempts?: number;
+  failStopWorker?: (error: Error) => void;
   leaseOwned?: () => Promise<boolean>;
 } = {}) {
   const handlers = new Map<string, (event: any) => void>();
@@ -85,6 +88,9 @@ function makeHarness(options: {
       return client as never;
     }) as never,
     acquireLease: vi.fn(async () => lease) as never,
+    ...(options.bridgeShutdownTimeoutMs !== undefined ? { bridgeShutdownTimeoutMs: options.bridgeShutdownTimeoutMs } : {}),
+    ...(options.bridgeShutdownAttempts !== undefined ? { bridgeShutdownAttempts: options.bridgeShutdownAttempts } : {}),
+    ...(options.failStopWorker ? { failStopWorker: options.failStopWorker } : {}),
     startBridge: vi.fn(async (bridgeOptions) => {
       captured.bridgeOptions = bridgeOptions;
       if (options.bridgeStartup) return options.bridgeStartup(bridgeOptions) as never;
@@ -120,6 +126,11 @@ function stepHarness(args: {
   denyTool?: boolean;
   deltas?: string[];
   finalText?: string;
+  bridgeStartup?: (bridgeOptions: any) => Promise<unknown>;
+  bridgeClose?: () => Promise<void>;
+  bridgeShutdownTimeoutMs?: number;
+  bridgeShutdownAttempts?: number;
+  failStopWorker?: (error: Error) => void;
 } = {}) {
   const root = runRoot();
   const harness = makeHarness({
@@ -127,6 +138,11 @@ function stepHarness(args: {
     denyTool: args.denyTool,
     deltas: args.deltas,
     finalText: args.finalText,
+    bridgeStartup: args.bridgeStartup,
+    bridgeClose: args.bridgeClose,
+    bridgeShutdownTimeoutMs: args.bridgeShutdownTimeoutMs,
+    bridgeShutdownAttempts: args.bridgeShutdownAttempts,
+    failStopWorker: args.failStopWorker,
   });
   const usage = vi.fn();
   const chunks: string[] = [];
@@ -385,6 +401,44 @@ describe('Copilot SDK typed events, usage, and lifecycle', () => {
       await promise.catch(() => undefined);
     }
   }, 10_000);
+
+  it('fail-stops and retains the lease when bridge listen startup never settles after abort', async () => {
+    let startupSignalAborted = false;
+    const failStopWorker = vi.fn();
+    const run = stepHarness({
+      timeoutMs: 100,
+      bridgeStartup: (bridgeOptions) => new Promise<never>(() => {
+        bridgeOptions.abortSignal.addEventListener('abort', () => { startupSignalAborted = true; }, { once: true });
+      }),
+      bridgeShutdownTimeoutMs: 10,
+      bridgeShutdownAttempts: 2,
+      failStopWorker,
+    });
+
+    await expect(run.promise).rejects.toMatchObject({ code: 'copilot_sdk_timeout' });
+    expect(startupSignalAborted).toBe(true);
+    expect(failStopWorker).toHaveBeenCalledOnce();
+    expect(failStopWorker.mock.calls[0][0]).toMatchObject({ code: 'copilot_sdk_bridge_shutdown_unconfirmed' });
+    expect(run.harness.lease.release).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(run.root, 'copilot-sdk-test-run'))).toBe(true);
+  });
+
+  it('fail-stops and retains the lease when bridge.close never acknowledges its server callback', async () => {
+    const failStopWorker = vi.fn();
+    const run = stepHarness({
+      bridgeClose: () => new Promise<void>(() => undefined),
+      bridgeShutdownTimeoutMs: 10,
+      bridgeShutdownAttempts: 2,
+      failStopWorker,
+    });
+
+    await expect(run.promise).resolves.toMatchObject({ 'data.answer': 'fixture answer' });
+    expect(run.harness.bridge.close).toHaveBeenCalledTimes(2);
+    expect(failStopWorker).toHaveBeenCalledOnce();
+    expect(failStopWorker.mock.calls[0][0]).toMatchObject({ code: 'copilot_sdk_bridge_shutdown_unconfirmed' });
+    expect(run.harness.lease.release).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(run.root, 'copilot-sdk-test-run'))).toBe(true);
+  });
 
   it('classifies only explicit operational SDK failures for possible fallback', () => {
     const cases: Array<[unknown, string]> = [

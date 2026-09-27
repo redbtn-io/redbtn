@@ -182,6 +182,17 @@ export const MAX_CONNECTIONS = 4;
 /** How long a peer may hold a socket without a valid auth frame. */
 export const AUTH_DEADLINE_MS = 5_000;
 
+/** Close failed without proving that the run-bridge server is no longer live. */
+export class RunBridgeShutdownUnconfirmedError extends Error {
+  readonly code = 'run_bridge_shutdown_unconfirmed';
+
+  constructor(runId: string, cause?: unknown) {
+    super(`run-bridge shutdown could not be confirmed for run ${runId}`);
+    this.name = 'RunBridgeShutdownUnconfirmedError';
+    if (cause !== undefined) Object.defineProperty(this, 'cause', { value: cause, configurable: true });
+  }
+}
+
 /** Bytes an UNAUTHENTICATED peer may buffer. The real auth frame is ~90. */
 export const MAX_PREAUTH_BYTES = 4 * 1024;
 
@@ -929,8 +940,10 @@ export async function startRunToolBridge(
   let closed = false;
   let serverClosePromise: Promise<void> | null = null;
   let resolveServerClose: (() => void) | null = null;
+  let rejectServerClose: ((error: Error) => void) | null = null;
   let serverShutdownRequested = false;
   let serverShutdownComplete = false;
+  let serverShutdownFailed = false;
   let serverCloseAttemptPending = false;
   let listenAttemptPending = false;
   let unregisterCancel: () => void = () => {};
@@ -943,15 +956,25 @@ export async function startRunToolBridge(
   server.maxConnections = MAX_CONNECTIONS;
 
   function finishServerShutdown(): void {
-    if (serverShutdownComplete) return;
+    if (serverShutdownComplete || serverShutdownFailed) return;
     serverShutdownComplete = true;
     const resolve = resolveServerClose;
     resolveServerClose = null;
+    rejectServerClose = null;
     resolve?.();
   }
 
+  function failServerShutdown(cause: unknown): void {
+    if (serverShutdownComplete || serverShutdownFailed) return;
+    serverShutdownFailed = true;
+    const reject = rejectServerClose;
+    resolveServerClose = null;
+    rejectServerClose = null;
+    reject?.(new RunBridgeShutdownUnconfirmedError(runId, cause));
+  }
+
   function attemptServerClose(): void {
-    if (!serverShutdownRequested || serverShutdownComplete || serverCloseAttemptPending) return;
+    if (!serverShutdownRequested || serverShutdownComplete || serverShutdownFailed || serverCloseAttemptPending) return;
     // A listen() call can still complete after an abort. Keep the shared
     // shutdown promise pending until that attempt emits `listening` or `error`.
     if (!server.listening && !listenAttemptPending) {
@@ -969,7 +992,10 @@ export async function startRunToolBridge(
         else if (!listenAttemptPending) finishServerShutdown();
         return;
       }
-      if (error) console.warn(`[RunBridge] server close callback failed for run ${runId}:`, error);
+      if (error) {
+        failServerShutdown(error);
+        return;
+      }
       if (server.listening) attemptServerClose();
       else if (!listenAttemptPending) finishServerShutdown();
     };
@@ -982,6 +1008,8 @@ export async function startRunToolBridge(
       serverCloseAttemptPending = false;
       if ((error as NodeJS.ErrnoException)?.code !== 'ERR_SERVER_NOT_RUNNING') {
         console.warn(`[RunBridge] server close initiation failed for run ${runId}:`, error);
+        failServerShutdown(error);
+        return;
       }
       if (server.listening) attemptServerClose();
       else if (!listenAttemptPending) finishServerShutdown();
@@ -991,9 +1019,13 @@ export async function startRunToolBridge(
   function initiateServerClose(): Promise<void> {
     if (serverClosePromise) return serverClosePromise;
     serverShutdownRequested = true;
-    serverClosePromise = new Promise<void>((resolve) => {
+    serverClosePromise = new Promise<void>((resolve, reject) => {
       resolveServerClose = resolve;
+      rejectServerClose = reject;
     });
+    // revoke() initiates shutdown without awaiting. Keep a rejection handler on
+    // the shared promise; close() still observes and propagates the rejection.
+    void serverClosePromise.catch(() => undefined);
     attemptServerClose();
     return serverClosePromise;
   }
@@ -1044,28 +1076,23 @@ export async function startRunToolBridge(
         abortHandler = null;
       }
     }
+    // Do not remove the socket/directory or unregister exit cleanup unless the
+    // server-close callback positively acknowledged shutdown.
+    await initiateServerClose();
     try {
-      // revoke() starts server.close() and retains its completion promise. Wait
-      // for the callback even when Node has already flipped `listening` false.
-      // Retry if an earlier close happened before listen() or after listen error.
-      await initiateServerClose();
-    } finally {
-      try {
-        fs.unlinkSync(socketPath);
-      } catch {
-        /* already gone */
-      }
-      if (removeDir) {
-        try {
-          fs.rmSync(stepDir, { recursive: true, force: true });
-        } catch (err) {
-          console.warn(`[RunBridge] failed to remove step dir ${stepDir}:`, err);
-        }
-      }
-      // Whatever `removeDir` said, this bridge no longer needs the exit sweep:
-      // either the directory is gone, or the caller asked to keep it.
-      ACTIVE_BRIDGE_PATHS.delete(socketPath);
+      fs.unlinkSync(socketPath);
+    } catch {
+      /* already gone */
     }
+    if (removeDir) {
+      try {
+        fs.rmSync(stepDir, { recursive: true, force: true });
+      } catch (err) {
+        console.warn(`[RunBridge] failed to remove step dir ${stepDir}:`, err);
+      }
+    }
+    // Shutdown is confirmed, so the exit sweep no longer needs this bridge.
+    ACTIVE_BRIDGE_PATHS.delete(socketPath);
   }
 
   // ── JSON-RPC plumbing ──────────────────────────────────────────────────────
@@ -1769,46 +1796,51 @@ export async function startRunToolBridge(
       }
     });
   } catch (error) {
-    await close({ removeDir: true }).catch(() => undefined);
+    await close({ removeDir: true });
     throw error;
   }
   if (revoked || abortSignal?.aborted) {
-    await close({ removeDir: true }).catch(() => undefined);
+    await close({ removeDir: true });
     throw startupAbort();
   }
-  fs.chmodSync(socketPath, 0o600);
+  try {
+    fs.chmodSync(socketPath, 0o600);
 
-  const shimPath = resolveShimPath();
-  const mcpConfig = {
-    mcpServers: {
-      [BRIDGE_SERVER_NAME]: {
-        type: 'stdio',
-        command: process.execPath,
-        args: [shimPath],
-        env: {
-          REDBTN_BRIDGE_SOCK: socketPath,
-          REDBTN_BRIDGE_NONCE: nonce,
+    const shimPath = resolveShimPath();
+    const mcpConfig = {
+      mcpServers: {
+        [BRIDGE_SERVER_NAME]: {
+          type: 'stdio',
+          command: process.execPath,
+          args: [shimPath],
+          env: {
+            REDBTN_BRIDGE_SOCK: socketPath,
+            REDBTN_BRIDGE_NONCE: nonce,
+          },
         },
       },
-    },
-  };
+    };
 
-  return {
-    socketPath,
-    nonce,
-    shimPath,
-    mcpConfig,
-    toolNames: tools.map((t) => t.name),
-    tools,
-    stats,
-    get revoked() {
-      return revoked;
-    },
-    get revokedReason() {
-      return revokedReason;
-    },
-    maxCalls,
-    revoke,
-    close,
-  };
+    return {
+      socketPath,
+      nonce,
+      shimPath,
+      mcpConfig,
+      toolNames: tools.map((t) => t.name),
+      tools,
+      stats,
+      get revoked() {
+        return revoked;
+      },
+      get revokedReason() {
+        return revokedReason;
+      },
+      maxCalls,
+      revoke,
+      close,
+    };
+  } catch (error) {
+    await close({ removeDir: true });
+    throw error;
+  }
 }

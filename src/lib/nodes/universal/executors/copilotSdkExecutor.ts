@@ -24,6 +24,7 @@ import type { NeuronStepConfig } from '../types';
 import { renderTemplate, getNestedProperty } from '../templateRenderer';
 import {
   startRunToolBridge,
+  cleanupOrphanedBridges,
   isForbiddenForBridge,
   BRIDGE_SERVER_NAME,
   type RunToolBridge,
@@ -47,6 +48,8 @@ export const MAX_USAGE_MODELS = 32;
 export const STDERR_TAIL_BYTES = 2048;
 const RUN_POLL_INTERVAL_MS = 60_000;
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'error', 'interrupted']);
+const BRIDGE_SHUTDOWN_TIMEOUT_MS = 5_000;
+const BRIDGE_SHUTDOWN_VERIFY_ATTEMPTS = 2;
 
 export class CopilotSdkError extends Error {
   readonly code: string;
@@ -408,6 +411,46 @@ export interface CopilotSdkDependencies {
   createClient?: (options: CopilotClientOptions) => CopilotClient;
   startBridge?: typeof startRunToolBridge;
   acquireLease?: typeof acquireCopilotLease;
+  /** Internal-only fail-stop seam; never configurable from neuron documents. */
+  failStopWorker?: (error: Error) => void;
+  /** Internal-only bounded shutdown test seams; production defaults stay fixed. */
+  bridgeShutdownTimeoutMs?: number;
+  bridgeShutdownAttempts?: number;
+}
+
+function failStopCopilotWorker(error: Error): void {
+  console.error('[CopilotSdk] fail-stopping worker because bridge shutdown is unconfirmed:', error);
+  // The bridge's exit sweep is synchronous and runs before process termination;
+  // Redis lease renewal stops with the process and the lease expires by TTL.
+  cleanupOrphanedBridges();
+  process.exit(1);
+}
+
+async function verifyBridgeShutdown(
+  closeBridge: () => Promise<void>,
+  timeoutMs: number,
+  attempts: number,
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let closePromise: Promise<void>;
+    try {
+      closePromise = closeBridge();
+    } catch {
+      return false;
+    }
+    try {
+      const acknowledged = await withDeadline(closePromise.then(() => true), timeoutMs, () => false);
+      if (acknowledged) return true;
+    } catch {
+      // A rejection is not proof of shutdown. Do not delete run state or release
+      // the lease; the caller will fail-stop the worker after this verification.
+      return false;
+    }
+    if (attempt < attempts) {
+      console.warn(`[CopilotSdk] bridge shutdown not yet acknowledged (verification ${attempt}/${attempts}); retrying idempotent close`);
+    }
+  }
+  return false;
 }
 
 export interface RunCopilotSdkStepOptions {
@@ -861,28 +904,39 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
         try { await client.forceStop(); } catch { /* best effort: the runtime is already gone */ }
       }
     }
+    const configuredShutdownTimeout = options.dependencies?.bridgeShutdownTimeoutMs;
+    const shutdownTimeoutMs = typeof configuredShutdownTimeout === 'number' && Number.isFinite(configuredShutdownTimeout) && configuredShutdownTimeout > 0
+      ? configuredShutdownTimeout : BRIDGE_SHUTDOWN_TIMEOUT_MS;
+    const configuredShutdownAttempts = options.dependencies?.bridgeShutdownAttempts;
+    const shutdownAttempts = typeof configuredShutdownAttempts === 'number' && Number.isFinite(configuredShutdownAttempts) && configuredShutdownAttempts > 0
+      ? Math.max(1, Math.floor(configuredShutdownAttempts)) : BRIDGE_SHUTDOWN_VERIFY_ATTEMPTS;
     let bridgeShutdownConfirmed = true;
     if (bridge) {
-      try {
-        // The lease protects this bridge's listening server too. Never continue
-        // into directory deletion or lease release on a close timeout/failure.
-        await bridge.close({ removeDir: false });
-      } catch (error) {
-        console.error('[CopilotSdk] run bridge close failed; retaining the lease and private state:', redactSecret(String(error), token));
-        bridgeShutdownConfirmed = false;
-      }
+      // The lease protects this bridge's listening server too. Retry the
+      // idempotent close only for bounded verification windows; a timeout is
+      // never interpreted as closure.
+      bridgeShutdownConfirmed = await verifyBridgeShutdown(
+        () => bridge!.close({ removeDir: false }),
+        shutdownTimeoutMs,
+        shutdownAttempts,
+      );
     } else if (bridgeStartupPromise) {
       // The controlled race may return before startup settles. Wait for startup
       // to clean itself up on failure, or close a bridge that resolves late.
-      // Do not time out: the lease stays held until closure is acknowledged.
+      // Shutdown verification is bounded below; uncertainty fail-stops the
+      // worker rather than freeing a potentially-live fleet slot.
       const lateBridgeCleanup = bridgeStartupPromise.then(async (lateBridge) => {
         await lateBridge.close({ removeDir: false });
-      }, () => undefined);
-      try { await lateBridgeCleanup; }
-      catch (error) {
-        console.error('[CopilotSdk] late run bridge close failed; retaining the lease and private state:', redactSecret(String(error), token));
-        bridgeShutdownConfirmed = false;
-      }
+      }, (error: unknown) => {
+        if ((error as Error & { code?: string })?.code === 'run_bridge_shutdown_unconfirmed') throw error;
+        // startRunToolBridge rejects startup failures only after awaiting its
+        // own close path, so a non-shutdown startup error is already settled.
+      });
+      bridgeShutdownConfirmed = await verifyBridgeShutdown(
+        () => lateBridgeCleanup,
+        shutdownTimeoutMs,
+        shutdownAttempts,
+      );
     }
     if (bridgeShutdownConfirmed) {
       try { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -893,8 +947,17 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
         catch (error) { console.error('[CopilotSdk] distributed lease release failed:', redactSecret(String(error), token)); }
       }
     } else {
-      // startRenewal stays active; retaining this slot prevents another worker
-      // from entering while a bridge whose close failed may still be serving.
+      // Keep renewal active until process termination. The fail-stop performs
+      // the synchronous bridge exit sweep, then Redis expires this lease by TTL.
+      const shutdownError = new CopilotSdkError(
+        'copilot_sdk_bridge_shutdown_unconfirmed',
+        'Copilot SDK run bridge shutdown was not confirmed within the bounded verification policy.',
+      );
+      try {
+        (options.dependencies?.failStopWorker ?? failStopCopilotWorker)(shutdownError);
+      } catch (error) {
+        console.error('[CopilotSdk] fail-stop hook threw; retaining lease and private run state:', redactSecret(String(error), token));
+      }
       console.error('[CopilotSdk] Copilot slot retained because bridge shutdown was not acknowledged.');
     }
   }
