@@ -7,6 +7,7 @@ import {
   buildCopilotSdkSessionConfig,
   buildCopilotSdkRuntimeEnv,
   makeCopilotPermissionHandler,
+  classifyCopilotSdkFailure,
   runCopilotSdkStep,
   type CopilotSdkDependencies,
 } from '../../src/lib/nodes/universal/executors/copilotSdkExecutor';
@@ -214,9 +215,60 @@ describe('Copilot SDK isolation and authorization', () => {
     expect(run.harness.dependencies.acquireLease).not.toHaveBeenCalled();
     expect(run.harness.dependencies.createClient).not.toHaveBeenCalled();
   });
+
+  it('rejects multimodal flags, image attachments, audio data, and non-text parts before lease acquisition', async () => {
+    const cases = [
+      {
+        config: { imageInput: true },
+        state: { data: {} },
+      },
+      {
+        config: {},
+        state: { data: { input: { attachments: [{ kind: 'image', mimeType: 'image/png' }] } } },
+      },
+      {
+        config: {},
+        state: { data: { input: { audioData: 'fixture-audio-data' } } },
+      },
+      {
+        config: { userPrompt: '{{state.data.messages}}' },
+        state: { data: { messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'fixture://image' } }] }] } },
+      },
+    ];
+    for (const input of cases) {
+      const harness = makeHarness();
+      const config = { ...input.config, outputField: 'data.answer', tools: [], timeoutMs: 1000 };
+      const promise = runCopilotSdkStep({
+        config: config as never,
+        state: { runId: 'modality-test', data: input.state.data },
+        neuronCfg: { model: 'gpt-5', apiKey: 'placeholder-token', secretName: 'COPILOT_GITHUB_TOKEN' },
+        neuronId: 'copilot-test', callRunId: 'modality-test', emitUsage: vi.fn(),
+        dependencies: harness.dependencies,
+      });
+      await expect(promise).rejects.toMatchObject({ code: 'copilot_sdk_unsupported_input_modality' });
+      expect(harness.dependencies.acquireLease).not.toHaveBeenCalled();
+    }
+  });
 });
 
 describe('Copilot SDK typed events, usage, and lifecycle', () => {
+  it('classifies only explicit operational SDK failures for possible fallback', () => {
+    const cases: Array<[unknown, string]> = [
+      [{ status: 429, message: 'quota exhausted' }, 'copilot_sdk_rate_limited'],
+      [{ status: 503, message: 'service unavailable' }, 'copilot_sdk_http_5xx'],
+      [{ code: 'ECONNRESET', message: 'network reset' }, 'copilot_sdk_network'],
+      [new Error('Copilot runtime not found'), 'copilot_sdk_runtime_unavailable'],
+      [new Error('request timed out'), 'copilot_sdk_timeout'],
+      [new Error('service overloaded'), 'copilot_sdk_capacity'],
+    ];
+    for (const [error, code] of cases) {
+      expect(classifyCopilotSdkFailure(error).code).toBe(code);
+    }
+    expect(classifyCopilotSdkFailure({ status: 400, message: 'bad request' }).code).toBe('copilot_sdk_http_4xx');
+    expect(classifyCopilotSdkFailure({ status: 401, message: 'invalid token' }).code).toBe('copilot_sdk_http_4xx');
+    expect(classifyCopilotSdkFailure(new Error('opaque failure')).code).toBe('copilot_sdk_failed');
+  });
+
   it('maps typed usage events into bounded Redbtn usage metadata', async () => {
     const run = stepHarness();
     await run.promise;

@@ -10,6 +10,8 @@ import * as crypto from 'crypto';
 export const COPILOT_LEASE_TTL_MS = 60_000;
 export const COPILOT_LEASE_RENEW_MS = 15_000;
 export const COPILOT_LEASE_POLL_MS = 500;
+/** Fixed shared-account session ceiling. Never vary per worker/replica. */
+export const COPILOT_MAX_CONCURRENT = 10;
 
 export interface CopilotRedisLeaseClient {
   eval(script: string, numberOfKeys: number, ...args: (string | number)[]): Promise<unknown>;
@@ -26,7 +28,6 @@ export interface AcquireCopilotLeaseOptions {
   credential: string;
   signal?: AbortSignal;
   maxWaitMs: number;
-  maxConcurrent?: number;
   onWaiting?: (reason: string) => void;
   redisFactory?: (options?: { signal?: AbortSignal; timeoutMs: number }) => Promise<CopilotRedisLeaseClient>;
   ttlMs?: number;
@@ -60,11 +61,17 @@ function abortError(): Error {
 }
 
 async function defaultRedisFactory(options: { signal?: AbortSignal; timeoutMs: number }): Promise<CopilotRedisLeaseClient> {
+  const redisUrl = process.env.REDIS_URL;
+  if (typeof redisUrl !== 'string' || redisUrl.trim() === '') {
+    const error = new Error('REDIS_URL is required for the fleet-wide Copilot SDK lease');
+    (error as Error & { code?: string }).code = 'copilot_sdk_redis_url_missing';
+    throw error;
+  }
   // Keep Redis an optional peer dependency for engine consumers that do not
   // start workers, matching the rest of the engine's Redis integrations.
   // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
   const Redis = require('ioredis');
-  const client = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+  const client = new Redis(redisUrl, {
     lazyConnect: true,
     connectTimeout: Math.max(1, Math.min(2_000, options.timeoutMs)),
     commandTimeout: 2_000,
@@ -136,7 +143,6 @@ export async function acquireCopilotLease(
   const ttlMs = options.ttlMs ?? COPILOT_LEASE_TTL_MS;
   const renewMs = options.renewMs ?? COPILOT_LEASE_RENEW_MS;
   const pollMs = options.pollMs ?? COPILOT_LEASE_POLL_MS;
-  const maxConcurrent = Math.max(1, Math.floor(options.maxConcurrent ?? 1));
   let acquired = false;
 
   try {
@@ -154,7 +160,7 @@ export async function acquireCopilotLease(
         key,
         now,
         now + ttlMs,
-        maxConcurrent,
+        COPILOT_MAX_CONCURRENT,
         token,
         ttlMs * 2,
       );

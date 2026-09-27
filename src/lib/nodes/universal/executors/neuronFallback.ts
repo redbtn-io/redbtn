@@ -97,7 +97,7 @@ export const CLAUDE_CODE_FALLBACK_CODES: ReadonlySet<string> = new Set([
 /**
  * `agy-cli` executor error codes that justify trying a different neuron.
  *
- * The motivating case for this whole module now has a second provider: an
+ * The motivating case for this whole module includes two providers: an
  * `agy-cli` neuron running Gemini Flash on a flat-rate Antigravity
  * subscription, with a metered `sonnet-5` behind it for when the subscription
  * is capped. `agy_rate_limited` is the code that hop exists for.
@@ -142,10 +142,11 @@ export const AGY_FALLBACK_CODES: ReadonlySet<string> = new Set([
 export const COPILOT_SDK_FALLBACK_CODES: ReadonlySet<string> = new Set([
   'copilot_sdk_runtime_unavailable',
   'copilot_sdk_rate_limited',
+  'copilot_sdk_capacity',
+  'copilot_sdk_http_5xx',
+  'copilot_sdk_network',
   'copilot_sdk_queue_timeout',
   'copilot_sdk_timeout',
-  'copilot_sdk_failed',
-  'copilot_sdk_empty_result',
 ]);
 
 /** Node / undici / provider-SDK connection error codes. */
@@ -225,7 +226,8 @@ function networkCodeOf(err: unknown): string | undefined {
  * The three hard NOs come first and are absolute:
  *   1. Run interrupt / abort — the user or the platform stopped this run. A
  *      fallback would restart work the run has already been told to abandon.
- *   2. Anything already classified as a `claude-code` or `agy-cli` code that is
+ *   2. Anything already classified as a `claude-code`, `agy-cli`, or
+ *      `copilot-sdk` code that is
  *      not in that provider's trigger set (config defects, a tripped security
  *      guard, a missing token, an expired subscription login).
  *   3. Provider 4xx — a request defect. Includes 401/403: unlike the shared
@@ -240,11 +242,11 @@ export function classifyFallbackTrigger(err: unknown): FallbackTriggerCode | nul
     if (typeof name === 'string' && ABORT_ERROR_NAMES.has(name)) return null;
   }
 
-  // (2) The CLI providers: closed, enumerated sets. A `claude_code_*` or
-  // `agy_*` code that is not in its set is a decision, not an oversight —
+  // (2) The subscription-backed providers: closed, enumerated sets. A provider
+  // error code that is not in its set is a decision, not an oversight —
   // never fall through to the generic heuristics below for it. That matters
-  // most for the codes deliberately excluded: `agy_auth_required`'s message
-  // mentions a login and `agy_rate_limited`'s mentions a rate limit, so a
+  // most for the codes deliberately excluded: authentication/configuration
+  // messages may also match generic network/rate-limit text, so a
   // text-matching fallthrough would classify BOTH as `http_429` and hop around
   // the one that must not be hopped around.
   for (const node of errorChain(err)) {

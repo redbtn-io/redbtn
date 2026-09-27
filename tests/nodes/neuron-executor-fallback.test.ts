@@ -247,7 +247,21 @@ describe('classifyFallbackTrigger — agy-cli codes', () => {
 });
 
 describe('classifyFallbackTrigger — copilot-sdk codes', () => {
-  it('falls back only for operational subscription CLI failures', () => {
+  const triggering = [
+    'copilot_sdk_runtime_unavailable',
+    'copilot_sdk_rate_limited',
+    'copilot_sdk_capacity',
+    'copilot_sdk_http_5xx',
+    'copilot_sdk_network',
+    'copilot_sdk_queue_timeout',
+    'copilot_sdk_timeout',
+  ];
+
+  it('keeps the Copilot fallback allowlist explicit and operational-only', () => {
+    expect([...COPILOT_SDK_FALLBACK_CODES].sort()).toEqual([...triggering].sort());
+  });
+
+  it('falls back only for operational subscription SDK failures', () => {
     for (const code of COPILOT_SDK_FALLBACK_CODES) {
       expect(classifyFallbackTrigger(codedError(code))).toBe(code);
     }
@@ -258,9 +272,14 @@ describe('classifyFallbackTrigger — copilot-sdk codes', () => {
     'copilot_sdk_bad_secret_name',
     'copilot_sdk_bad_model',
     'copilot_sdk_structured_output_unsupported',
+    'copilot_sdk_unsupported_input_modality',
     'copilot_sdk_bridge_invalid',
     'copilot_sdk_lease_lost',
     'copilot_sdk_tool_denied',
+    'copilot_sdk_http_4xx',
+    'copilot_sdk_auth_failed',
+    'copilot_sdk_empty_result',
+    'copilot_sdk_failed',
   ])('does not route around %s', (code) => {
     expect(classifyFallbackTrigger(codedError(code))).toBeNull();
   });

@@ -283,6 +283,54 @@ function buildPrompts(config: NeuronStepConfig, state: AnyObject, tree: string):
   return { system: system.join('\n\n'), user };
 }
 
+function containsNonTextPart(value: unknown, seen = new Set<object>(), depth = 0): boolean {
+  if (depth > 12 || value === null || typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((entry) => containsNonTextPart(entry, seen, depth + 1));
+  const object = value as AnyObject;
+  const type = typeof object.type === 'string' ? object.type.toLowerCase() : '';
+  if (type && !['text', 'output_text', 'human', 'user', 'assistant'].includes(type)) return true;
+  if (['image', 'image_url', 'input_audio', 'audio', 'media', 'video', 'file_data', 'inline_data'].some((key) => key in object)) return true;
+  if (typeof object.mimeType === 'string' && /^(image|audio|video)\//i.test(object.mimeType)) return true;
+  if (typeof object.mime_type === 'string' && /^(image|audio|video)\//i.test(object.mime_type)) return true;
+  if ('content' in object && containsNonTextPart(object.content, seen, depth + 1)) return true;
+  return false;
+}
+
+/** Reject multimedia before any message parts are flattened into plain text. */
+export function assertCopilotTextOnlyInput(config: NeuronStepConfig, state: AnyObject): void {
+  const cfg = config as AnyObject;
+  const input = state?.data?.input ?? {};
+  const attachments = Array.isArray(input.attachments) && input.attachments.length
+    ? input.attachments
+    : state?.data?._trigger?.metadata?.attachments;
+  const hasMediaAttachment = Array.isArray(attachments) && attachments.some((attachment: AnyObject) => {
+    const kind = typeof attachment?.kind === 'string' ? attachment.kind.toLowerCase() : '';
+    const mime = typeof attachment?.mimeType === 'string' ? attachment.mimeType : attachment?.mime_type;
+    return ['image', 'audio', 'video', 'document', 'file'].includes(kind) ||
+      (typeof mime === 'string' && !/^text\/plain(?:;|$)/i.test(mime));
+  });
+  const hasPromptMediaPart = [cfg.userPrompt, cfg.systemPrompt]
+    .filter((prompt): prompt is string => typeof prompt === 'string')
+    .some((prompt) => {
+      const refs = prompt.matchAll(/\{\{state\.([\w.]+)\}\}/g);
+      for (const match of refs) {
+        if (containsNonTextPart(getNestedProperty(state, match[1]))) return true;
+      }
+      return false;
+    });
+  if (
+    cfg.multimodal === true || cfg.imageInput === true || cfg.audioInput === true ||
+    Boolean(input.audioData) || hasMediaAttachment || hasPromptMediaPart
+  ) {
+    throw new CopilotSdkError(
+      'copilot_sdk_unsupported_input_modality',
+      'copilot-sdk V1 accepts text input only; image, audio, and other multimodal message parts are not supported. Remove the media input or use a vision/audio-capable neuron.',
+    );
+  }
+}
+
 function ensurePrivateCwd(dir: string): string {
   const cwd = path.join(dir, 'cwd');
   fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
@@ -290,16 +338,52 @@ function ensurePrivateCwd(dir: string): string {
   return cwd;
 }
 
-function collectSdkError(error: unknown, token: string): CopilotSdkError {
-  const message = redactSecret(error instanceof Error ? error.message : String(error), token).slice(0, STDERR_TAIL_BYTES);
+export function classifyCopilotSdkFailure(error: unknown, token = ''): CopilotSdkError {
+  const chain: AnyObject[] = [];
+  let current: unknown = error;
+  for (let i = 0; i < 5 && current && typeof current === 'object'; i += 1) {
+    chain.push(current as AnyObject);
+    current = (current as AnyObject).cause;
+  }
+  const status = chain.map((entry) => entry.status ?? entry.statusCode ?? entry.response?.status)
+    .map((value) => typeof value === 'number' ? value : Number(value))
+    .find((value) => Number.isInteger(value) && value >= 100 && value < 600);
+  const codes = chain.map((entry) => typeof entry.code === 'string' ? entry.code.toUpperCase() : '');
+  const message = redactSecret(
+    chain.map((entry) => typeof entry.message === 'string' ? entry.message : '').filter(Boolean).join(' | ') || String(error),
+    token,
+  ).slice(0, STDERR_TAIL_BYTES);
+  const text = message.toLowerCase();
+  if (status === 429) {
+    return new CopilotSdkError('copilot_sdk_rate_limited', `GitHub Copilot subscription rate limited: ${message}`);
+  }
+  if (typeof status === 'number' && status >= 400 && status < 500) {
+    return new CopilotSdkError('copilot_sdk_http_4xx', `GitHub Copilot SDK rejected the request (HTTP ${status}): ${message}`);
+  }
+  if (typeof status === 'number' && status >= 500 && status < 600) {
+    return new CopilotSdkError('copilot_sdk_http_5xx', `GitHub Copilot service failed (HTTP ${status}): ${message}`);
+  }
   if (/\b429\b|rate.?limit|quota|too many requests|resource_exhausted/i.test(message)) {
     return new CopilotSdkError('copilot_sdk_rate_limited', `GitHub Copilot subscription rate limited: ${message}`);
   }
+  if (codes.some((code) => ['ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)) ||
+      /fetch failed|socket hang up|network error|connection (?:reset|refused|aborted)|econnreset|enotfound/i.test(message)) {
+    return new CopilotSdkError('copilot_sdk_network', `Copilot SDK network failure: ${message}`);
+  }
+  if (typeof status !== 'number' && /\b(500|502|503|504)\b|internal server error|bad gateway|service unavailable|gateway timeout/i.test(message)) {
+    return new CopilotSdkError('copilot_sdk_http_5xx', `GitHub Copilot service failed: ${message}`);
+  }
+  if (/overloaded|at capacity|capacity exceeded|temporarily unavailable|server busy/i.test(text)) {
+    return new CopilotSdkError('copilot_sdk_capacity', `GitHub Copilot service is at capacity: ${message}`);
+  }
+  if (/timed out|timeout|etimedout/i.test(message) || codes.includes('ETIMEDOUT')) {
+    return new CopilotSdkError('copilot_sdk_timeout', `Copilot SDK request timed out: ${message}`);
+  }
+  if (/enoent|no such file or directory|could not find.*runtime|runtime (?:not found|unavailable)|failed to spawn|unable to start.*(cli|runtime)/i.test(message)) {
+    return new CopilotSdkError('copilot_sdk_runtime_unavailable', `Copilot SDK runtime could not start: ${message}`);
+  }
   if (/\b401\b|\b403\b|unauthori[sz]ed|authentication|invalid.{0,15}token/i.test(message)) {
     return new CopilotSdkError('copilot_sdk_auth_failed', `GitHub Copilot SDK authentication failed: ${message}`);
-  }
-  if (/enoent|not found|could not find.*runtime|failed to spawn|unable to start.*(cli|runtime)/i.test(message)) {
-    return new CopilotSdkError('copilot_sdk_runtime_unavailable', `Copilot SDK runtime could not start: ${message}`);
   }
   return new CopilotSdkError('copilot_sdk_failed', `Copilot SDK request failed: ${message || 'unknown SDK error'}`);
 }
@@ -347,6 +431,7 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       'copilot-sdk structuredOutput remains disabled until Redbtn pins and validates the runtime response-schema contract; parse JSON in a later graph step.',
     );
   }
+  assertCopilotTextOnlyInput(config, state);
 
   const model = resolveCopilotSdkModel(neuronCfg.model);
   const mount = resolveWorkspaceMount(state);
@@ -429,14 +514,11 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
     const servable: RunBridgeToolRef[] = resolved.filter((tool) => !isForbiddenForBridge(tool.name));
     const rawWait = Number.parseInt(process.env.COPILOT_SDK_QUEUE_WAIT_MS || '', 10);
     const maxWaitMs = Number.isFinite(rawWait) && rawWait > 0 ? Math.min(timeoutMs, rawWait) : timeoutMs;
-    const rawMax = Number.parseInt(process.env.COPILOT_SDK_MAX_CONCURRENT || '', 10);
-    const maxConcurrent = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : 1;
     try {
       lease = await (options.dependencies?.acquireLease ?? acquireCopilotLease)({
         credential: token,
         signal: abortSignal,
         maxWaitMs,
-        maxConcurrent,
         onWaiting: (reason) => {
           if (publisher?.nodeProgress) {
             void Promise.resolve(publisher.nodeProgress(
@@ -452,6 +534,9 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       if (failure.name === 'AbortError') throw failure;
       if (failure.code === 'copilot_sdk_queue_timeout') {
         throw new CopilotSdkError('copilot_sdk_queue_timeout', failure.message);
+      }
+      if (failure.code === 'copilot_sdk_redis_url_missing') {
+        throw new CopilotSdkError('copilot_sdk_redis_url_missing', 'REDIS_URL is required for the fleet-wide Copilot SDK lease; the SDK session was not started.');
       }
       throw new CopilotSdkError(
         'copilot_sdk_lease_unavailable',
@@ -656,7 +741,7 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       if (stoppedError.name === 'AbortError') throw stoppedError;
     }
     if (error instanceof CopilotSdkError || (error as Error)?.name === 'AbortError') throw error;
-    throw collectSdkError(error, token);
+    throw classifyCopilotSdkFailure(error, token);
   } finally {
     if (wallTimer) clearTimeout(wallTimer);
     if (pollTimer) clearInterval(pollTimer);

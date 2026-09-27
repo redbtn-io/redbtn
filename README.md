@@ -158,8 +158,11 @@ Unix-socket MCP bridge (`lib/mcp/run-bridge.ts`) rather than `bindTools()`.
 `copilot-sdk` uses the supported TypeScript SDK (`@github/copilot-sdk@1.0.14`),
 which bundles Copilot runtime `1.0.85`; it does not shell out to `copilot -p` or
 call private Copilot HTTP endpoints. It takes a Redis-backed fleet-wide lease
-keyed by a hash of the resolved credential (default concurrency 1), so workers
-sharing a subscription do not each run an uncoordinated local turn.
+keyed by a hash of the resolved credential with a fixed fleet-wide ceiling of
+10 concurrent sessions. The limit is enforced centrally in Redis and cannot be
+raised independently by a worker/container environment override. `REDIS_URL`
+must be set explicitly; missing configuration fails closed instead of falling
+back to localhost.
 
 ```ts
 // A neuron document for the Antigravity CLI.
@@ -214,11 +217,25 @@ an allowlist with logged-in-user fallback disabled, so ambient `GH_TOKEN`,
 `GITHUB_TOKEN`, and direct LLM keys cannot authenticate it. Typed SDK delta and
 usage events are mapped to run streaming and usage records. V1 rejects
 `structuredOutput` pending a pinned and validated response-schema contract.
+V1 also rejects image, audio, and other non-text message parts with
+`copilot_sdk_unsupported_input_modality` rather than flattening or dropping them.
 
 **Worker runtime requirement.** SDK 1.0.14 bundles Copilot runtime 1.0.85 in
 platform packages. The worker needs Node.js `^20.19.0` or `>=22.12.0` and must
 install the matching optional runtime package (Linux x64 in the current worker
-image); no separately installed `copilot` executable is required.
+image); no separately installed `copilot` executable is required. `REDIS_URL`
+must be configured on every participating worker so all ten leases coordinate
+through the same fleet Redis.
+The engine package currently targets `0.0.274-alpha`; worker/webapp release
+wiring must be bumped to that new engine version when the release is prepared.
+
+**Runtime readiness gate.** Regular CI deterministically checks the pinned SDK
+and platform runtime package versions plus the bundled executable/native runtime
+files. On the final worker image, run
+`COPILOT_SDK_RUNTIME_SMOKE=1 npx vitest run tests/neurons/copilot-sdk-runtime.test.ts -t "starts and stops the bundled runtime"`.
+That gate starts and stops the bundled runtime with an isolated home, no auth
+variables, `useLoggedInUser: false`, and no session or model prompt; it validates
+packaging/process lifecycle without consuming a Copilot request.
 
 **Falling back.** A step may name `fallbackNeuronId` to re-run once against a
 metered neuron when a subscription runtime cannot run. See `neuronFallback.ts`:

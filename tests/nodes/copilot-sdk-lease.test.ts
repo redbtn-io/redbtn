@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   acquireCopilotLease,
+  COPILOT_MAX_CONCURRENT,
   COPILOT_LEASE_ACQUIRE_SCRIPT,
   COPILOT_LEASE_RELEASE_SCRIPT,
   COPILOT_LEASE_RENEW_SCRIPT,
@@ -32,23 +33,59 @@ class SharedRedis implements CopilotRedisLeaseClient {
 }
 
 describe('copilot-sdk distributed subscription lease', () => {
+  it('enforces a hard ten-session fleet-wide limit, even if the removed env override is set', async () => {
+    const original = process.env.COPILOT_SDK_MAX_CONCURRENT;
+    process.env.COPILOT_SDK_MAX_CONCURRENT = '99';
+    const shared = new SharedRedis();
+    const redisFactory = async () => shared;
+    try {
+      expect(COPILOT_MAX_CONCURRENT).toBe(10);
+      const leases = [];
+      for (let index = 0; index < 10; index += 1) {
+        leases.push(await acquireCopilotLease({ credential: 'hard-limit-token', maxWaitMs: 100, redisFactory }));
+      }
+      expect(shared.entries.values().next().value?.size).toBe(10);
+      await expect(acquireCopilotLease({
+        credential: 'hard-limit-token', maxWaitMs: 12, pollMs: 3, redisFactory,
+      })).rejects.toMatchObject({ code: 'copilot_sdk_queue_timeout' });
+      await Promise.all(leases.map((lease) => lease.release()));
+      const releasedCapacity = await acquireCopilotLease({ credential: 'hard-limit-token', maxWaitMs: 100, redisFactory });
+      await releasedCapacity.release();
+    } finally {
+      if (original === undefined) delete process.env.COPILOT_SDK_MAX_CONCURRENT;
+      else process.env.COPILOT_SDK_MAX_CONCURRENT = original;
+    }
+  });
+
+  it('fails with a stable error when REDIS_URL is absent and never targets localhost', async () => {
+    const original = process.env.REDIS_URL;
+    delete process.env.REDIS_URL;
+    try {
+      await expect(acquireCopilotLease({ credential: 'placeholder', maxWaitMs: 100 }))
+        .rejects.toMatchObject({ code: 'copilot_sdk_redis_url_missing' });
+    } finally {
+      if (original === undefined) delete process.env.REDIS_URL;
+      else process.env.REDIS_URL = original;
+    }
+  });
+
   it('serializes independent worker clients fleet-wide by credential and releases safely', async () => {
     const shared = new SharedRedis();
     const redisFactory = async () => shared;
     const first = await acquireCopilotLease({ credential: 'same-placeholder-token', maxWaitMs: 100, redisFactory });
-    await expect(acquireCopilotLease({
-      credential: 'same-placeholder-token', maxWaitMs: 12, pollMs: 3, redisFactory,
-    })).rejects.toMatchObject({ code: 'copilot_sdk_queue_timeout' });
+    const second = await acquireCopilotLease({ credential: 'same-placeholder-token', maxWaitMs: 100, redisFactory });
 
     // A different subscription has an independent capacity bucket.
     const other = await acquireCopilotLease({ credential: 'other-placeholder-token', maxWaitMs: 100, redisFactory });
+    expect([...shared.entries.values()].map((members) => members.size).sort()).toEqual([1, 2]);
     await other.release();
     await first.release();
+    await second.release();
     const next = await acquireCopilotLease({ credential: 'same-placeholder-token', maxWaitMs: 100, redisFactory });
     await next.release();
   });
 
-  it('defaults to one shared slot and refuses to degrade to process-local admission', async () => {
+  it('observes cancellation before consuming one of the shared session slots', async () => {
     const shared = new SharedRedis();
     const redisFactory = async () => shared;
     const one = await acquireCopilotLease({ credential: 'token', maxWaitMs: 100, redisFactory });
