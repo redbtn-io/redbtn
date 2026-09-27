@@ -166,6 +166,8 @@ export interface NeuronConfig {
   role: NeuronRole;
   tier: number;
   userId?: string;
+  /** When true, any user may load this neuron (non-system sharing). */
+  isPublic?: boolean;
   /** When true, the worker generates TTS audio server-side during streaming */
   audioOptimized?: boolean;
   /**
@@ -194,6 +196,7 @@ export interface NeuronDocument {
   isDefault: boolean;
   isSystem?: boolean;
   isImmutable?: boolean;
+  isPublic?: boolean;
   parentNeuronId?: string;
   name: string;
   description?: string;

@@ -60,6 +60,7 @@ const neuronSchema = new mongoose.Schema<NeuronDocument>({
     type: Boolean,
     default: false,
   },
+  isPublic: { type: Boolean, default: false, index: true },
   parentNeuronId: {
     type: String,
     default: null,
