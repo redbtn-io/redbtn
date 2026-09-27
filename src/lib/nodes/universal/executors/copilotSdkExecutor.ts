@@ -99,7 +99,7 @@ async function withDeadline<T>(operation: Promise<T>, timeoutMs: number, onTimeo
 }
 
 function redactSecret(text: string, secret: string): string {
-  return secret.length >= 8 ? text.split(secret).join('[REDACTED:COPILOT_GITHUB_TOKEN]') : text;
+  return secret ? text.split(secret).join('[REDACTED:COPILOT_GITHUB_TOKEN]') : text;
 }
 
 /** Child runtime environment; the SDK uses this as-is instead of inheriting process.env. */
@@ -354,14 +354,25 @@ export function classifyCopilotSdkFailure(error: unknown, token = ''): CopilotSd
     token,
   ).slice(0, STDERR_TAIL_BYTES);
   const text = message.toLowerCase();
-  if (status === 429) {
+  // Authentication/authorization evidence is terminal even when an upstream
+  // message also happens to contain rate-limit or quota wording.
+  if (/\b401\b|\b403\b|unauthori[sz]ed|authori[sz]ation|forbidden|authentication|invalid.{0,15}token/i.test(message)) {
+    return new CopilotSdkError('copilot_sdk_auth_failed', `GitHub Copilot SDK authentication failed: ${message}`);
+  }
+  const textualStatusMatch = message.match(/\b(?:http(?:\s+status)?|status(?:\s+code)?)\s*[:=]?\s*(\d{3})\b/i);
+  const textualStatus = textualStatusMatch ? Number(textualStatusMatch[1]) : undefined;
+  const effectiveStatus = status ?? textualStatus;
+  if (effectiveStatus === 429) {
     return new CopilotSdkError('copilot_sdk_rate_limited', `GitHub Copilot subscription rate limited: ${message}`);
   }
-  if (typeof status === 'number' && status >= 400 && status < 500) {
-    return new CopilotSdkError('copilot_sdk_http_4xx', `GitHub Copilot SDK rejected the request (HTTP ${status}): ${message}`);
+  if (typeof effectiveStatus === 'number' && effectiveStatus >= 400 && effectiveStatus < 500) {
+    return new CopilotSdkError('copilot_sdk_http_4xx', `GitHub Copilot SDK rejected the request (HTTP ${effectiveStatus}): ${message}`);
   }
-  if (typeof status === 'number' && status >= 500 && status < 600) {
-    return new CopilotSdkError('copilot_sdk_http_5xx', `GitHub Copilot service failed (HTTP ${status}): ${message}`);
+  if (/\bHTTP\s*4xx\b/i.test(message)) {
+    return new CopilotSdkError('copilot_sdk_http_4xx', `GitHub Copilot SDK rejected the request: ${message}`);
+  }
+  if (typeof effectiveStatus === 'number' && effectiveStatus >= 500 && effectiveStatus < 600) {
+    return new CopilotSdkError('copilot_sdk_http_5xx', `GitHub Copilot service failed (HTTP ${effectiveStatus}): ${message}`);
   }
   if (/\b429\b|rate.?limit|quota|too many requests|resource_exhausted/i.test(message)) {
     return new CopilotSdkError('copilot_sdk_rate_limited', `GitHub Copilot subscription rate limited: ${message}`);
@@ -370,7 +381,7 @@ export function classifyCopilotSdkFailure(error: unknown, token = ''): CopilotSd
       /fetch failed|socket hang up|network error|connection (?:reset|refused|aborted)|econnreset|enotfound/i.test(message)) {
     return new CopilotSdkError('copilot_sdk_network', `Copilot SDK network failure: ${message}`);
   }
-  if (typeof status !== 'number' && /\b(500|502|503|504)\b|internal server error|bad gateway|service unavailable|gateway timeout/i.test(message)) {
+  if (typeof effectiveStatus !== 'number' && /\b(500|502|503|504)\b|internal server error|bad gateway|service unavailable|gateway timeout/i.test(message)) {
     return new CopilotSdkError('copilot_sdk_http_5xx', `GitHub Copilot service failed: ${message}`);
   }
   if (/overloaded|at capacity|capacity exceeded|temporarily unavailable|server busy/i.test(text)) {
@@ -381,9 +392,6 @@ export function classifyCopilotSdkFailure(error: unknown, token = ''): CopilotSd
   }
   if (/enoent|no such file or directory|could not find.*runtime|runtime (?:not found|unavailable)|failed to spawn|unable to start.*(cli|runtime)/i.test(message)) {
     return new CopilotSdkError('copilot_sdk_runtime_unavailable', `Copilot SDK runtime could not start: ${message}`);
-  }
-  if (/\b401\b|\b403\b|unauthori[sz]ed|authentication|invalid.{0,15}token/i.test(message)) {
-    return new CopilotSdkError('copilot_sdk_auth_failed', `GitHub Copilot SDK authentication failed: ${message}`);
   }
   return new CopilotSdkError('copilot_sdk_failed', `Copilot SDK request failed: ${message || 'unknown SDK error'}`);
 }
@@ -460,6 +468,8 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
   let publishChain: Promise<void> = Promise.resolve();
   let finalText = '';
   let streamedText = '';
+  let streamRedactionBuffer = '';
+  let streamToUser = false;
   let streamedBytes = 0;
   let usageEventCount = 0;
   let droppedUsageEvents = 0;
@@ -477,6 +487,40 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
     stopReject(error);
     try { void session?.abort().catch(() => undefined); } catch { /* runtime may already be stopping */ }
     try { void client?.forceStop().catch(() => undefined); } catch { /* best effort child cleanup */ }
+  };
+
+  const flushRedactedStream = (final = false): void => {
+    if (!streamToUser || !streamRedactionBuffer) return;
+    let safeBoundary = final
+      ? streamRedactionBuffer.length
+      : Math.max(0, streamRedactionBuffer.length - Math.max(0, token.length - 1));
+    if (!final && token.length > 1 && safeBoundary > 0) {
+      // A full token occurrence can straddle the proposed boundary even when
+      // the final token.length-1 suffix is retained. Move the boundary back to
+      // the occurrence's start; the next event will let the complete token be
+      // redacted before any of its characters can be published.
+      let changed = true;
+      while (changed) {
+        changed = false;
+        let index = streamRedactionBuffer.indexOf(token);
+        while (index !== -1) {
+          if (index < safeBoundary && index + token.length > safeBoundary) {
+            safeBoundary = index;
+            changed = true;
+          }
+          index = streamRedactionBuffer.indexOf(token, index + 1);
+        }
+      }
+    }
+    if (safeBoundary <= 0) return;
+    const safeRaw = streamRedactionBuffer.slice(0, safeBoundary);
+    streamRedactionBuffer = streamRedactionBuffer.slice(safeBoundary);
+    const safeText = redactSecret(safeRaw, token);
+    if (!safeText) return;
+    streamedText += safeText;
+    publishChain = publishChain.then(async () => { await publisher!.chunk(safeText); }).catch((error) => {
+      console.warn('[CopilotSdk] text chunk publish failed:', redactSecret(String(error), token));
+    });
   };
 
   const queueStartedAt = Date.now();
@@ -516,7 +560,6 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
     const maxWaitMs = Number.isFinite(rawWait) && rawWait > 0 ? Math.min(timeoutMs, rawWait) : timeoutMs;
     try {
       lease = await (options.dependencies?.acquireLease ?? acquireCopilotLease)({
-        credential: token,
         signal: abortSignal,
         maxWaitMs,
         onWaiting: (reason) => {
@@ -568,7 +611,7 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       throw new CopilotSdkError('copilot_sdk_prompt_too_large', `Copilot SDK prompt is ${promptBytes} bytes; maximum is ${MAX_PROMPT_BYTES}`);
     }
     const allowedNames = new Set(bridge.toolNames);
-    const streamToUser = config.stream === true && typeof publisher?.chunk === 'function';
+    streamToUser = config.stream === true && typeof publisher?.chunk === 'function';
     const clientOptions = buildCopilotSdkClientOptions({ home, cwd, dir });
     client = (options.dependencies?.createClient ?? ((opts) => new CopilotClient(opts)))(clientOptions);
     const startedAt = Date.now();
@@ -654,11 +697,9 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
         ));
         return;
       }
-      streamedText += delta;
       if (streamToUser && publisher?.chunk) {
-        publishChain = publishChain.then(async () => { await publisher.chunk(delta); }).catch((error) => {
-          console.warn('[CopilotSdk] text chunk publish failed:', redactSecret(String(error), token));
-        });
+        streamRedactionBuffer += delta;
+        flushRedactedStream();
       }
     }));
     unsubscribe.push(session.on('assistant.usage', (event) => {
@@ -686,7 +727,6 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
     }));
 
     const response = await controlled(session.sendAndWait({ prompt: prompts.user }, remainingMs));
-    await publishChain;
     if (ctl.leaseLost) throw new CopilotSdkError('copilot_sdk_lease_lost', 'Copilot SDK stopped because its fleet-wide subscription lease was lost');
     if (ctl.timedOut) throw timeoutError;
     if (ctl.stopReason) throw abortError(`Copilot SDK step stopped: ${ctl.stopReason}`);
@@ -695,6 +735,23 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       : finalEventText || streamedText;
     if (Buffer.byteLength(finalText, 'utf8') > MAX_ASSISTANT_OUTPUT_BYTES) {
       throw new CopilotSdkError('copilot_sdk_output_too_large', `Copilot SDK response exceeded ${MAX_ASSISTANT_OUTPUT_BYTES} bytes`);
+    }
+    if (streamToUser) {
+      // Flush only after the final event is known so a token fragmented across
+      // any number of SDK deltas can never escape through RunPublisher.chunk.
+      // Rebuild the buffered suffix from the authoritative final response to
+      // account for SDK stream corrections before publishing it.
+      if (streamedText.length <= finalText.length && finalText.startsWith(streamedText)) {
+        streamRedactionBuffer = finalText.slice(streamedText.length);
+      } else {
+        streamRedactionBuffer = finalText;
+        streamedText = '';
+        if (publisher?.replaceOutputContent) {
+          try { await publisher.replaceOutputContent(''); } catch { /* best effort before corrected chunks */ }
+        }
+      }
+      flushRedactedStream(true);
+      await publishChain;
     }
     if (deniedToolNames.length) await auditPermissionDenials(publisher, stepId, deniedToolNames);
     if (!finalText.trim() && deniedToolNames.length) {

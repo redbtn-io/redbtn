@@ -157,12 +157,12 @@ Unix-socket MCP bridge (`lib/mcp/run-bridge.ts`) rather than `bindTools()`.
 
 `copilot-sdk` uses the supported TypeScript SDK (`@github/copilot-sdk@1.0.14`),
 which bundles Copilot runtime `1.0.85`; it does not shell out to `copilot -p` or
-call private Copilot HTTP endpoints. It takes a Redis-backed fleet-wide lease
-keyed by a hash of the resolved credential with a fixed fleet-wide ceiling of
-10 concurrent sessions. The limit is enforced centrally in Redis and cannot be
-raised independently by a worker/container environment override. `REDIS_URL`
-must be set explicitly; missing configuration fails closed instead of falling
-back to localhost.
+call private Copilot HTTP endpoints. Every Copilot SDK turn on every worker,
+account, and credential takes a lease from the same Redis-backed global pool.
+The pool has a fixed capacity of 10 concurrent sessions, enforced centrally in
+Redis and not independently configurable per worker/container. Its key contains
+no credential material. `REDIS_URL` must be set explicitly; missing
+configuration fails closed instead of falling back to localhost.
 
 ```ts
 // A neuron document for the Antigravity CLI.
@@ -226,7 +226,7 @@ install the matching optional runtime package (Linux x64 in the current worker
 image); no separately installed `copilot` executable is required. `REDIS_URL`
 must be configured on every participating worker so all ten leases coordinate
 through the same fleet Redis.
-The engine package currently targets `0.0.274-alpha`; worker/webapp release
+The engine package currently targets `0.0.275-alpha`; worker/webapp release
 wiring must be bumped to that new engine version when the release is prepared.
 
 **Runtime readiness gate.** Regular CI deterministically checks the pinned SDK

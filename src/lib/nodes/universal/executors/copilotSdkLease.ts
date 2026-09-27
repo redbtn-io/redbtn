@@ -1,7 +1,8 @@
 /**
  * Fleet-wide leases for the shared GitHub Copilot SDK subscription.
  *
- * A lease is stored in a Redis sorted set per credential fingerprint. Entries
+ * All Copilot SDK sessions share one Redis sorted set, irrespective of user or
+ * credential. Entries
  * expire by score and are renewed while held. Workers fail closed when Redis is
  * unavailable; a local semaphore would not protect the shared subscription.
  */
@@ -25,7 +26,6 @@ export interface CopilotLeaseHandle {
 }
 
 export interface AcquireCopilotLeaseOptions {
-  credential: string;
   signal?: AbortSignal;
   maxWaitMs: number;
   onWaiting?: (reason: string) => void;
@@ -137,8 +137,9 @@ export async function acquireCopilotLease(
     }
     throw error;
   }
-  const fingerprint = crypto.createHash('sha256').update(options.credential).digest('hex');
-  const key = `redbtn:copilot-sdk:leases:${fingerprint}`;
+  // This single key is the globally shared pool across credentials, accounts,
+  // workers, and containers. Never include authentication material in Redis.
+  const key = 'redbtn:copilot-sdk:leases';
   const token = crypto.randomUUID();
   const ttlMs = options.ttlMs ?? COPILOT_LEASE_TTL_MS;
   const renewMs = options.renewMs ?? COPILOT_LEASE_RENEW_MS;

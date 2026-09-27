@@ -3,14 +3,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  buildCopilotSdkClientOptions,
-  buildCopilotSdkSessionConfig,
   buildCopilotSdkRuntimeEnv,
   makeCopilotPermissionHandler,
   classifyCopilotSdkFailure,
   runCopilotSdkStep,
   type CopilotSdkDependencies,
 } from '../../src/lib/nodes/universal/executors/copilotSdkExecutor';
+import { classifyFallbackTrigger } from '../../src/lib/nodes/universal/executors/neuronFallback';
 
 const originalEnv = { ...process.env };
 const temporaryRoots: string[] = [];
@@ -21,7 +20,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function makeHarness(options: { hang?: boolean; usageCount?: number } = {}) {
+function makeHarness(options: { hang?: boolean; usageCount?: number; deltas?: string[]; finalText?: string } = {}) {
   const handlers = new Map<string, (event: any) => void>();
   const session = {
     sessionId: 'fixture-session',
@@ -31,16 +30,18 @@ function makeHarness(options: { hang?: boolean; usageCount?: number } = {}) {
     }),
     sendAndWait: vi.fn(async () => {
       if (options.hang) return new Promise<never>(() => undefined);
-      handlers.get('assistant.message_delta')?.({ agentId: undefined, data: { deltaContent: 'fixture ' } });
-      handlers.get('assistant.message_delta')?.({ agentId: undefined, data: { deltaContent: 'answer' } });
-      handlers.get('assistant.message')?.({ agentId: undefined, data: { content: 'fixture answer' } });
+      const content = options.finalText ?? 'fixture answer';
+      for (const deltaContent of options.deltas ?? ['fixture ', 'answer']) {
+        handlers.get('assistant.message_delta')?.({ agentId: undefined, data: { deltaContent } });
+      }
+      handlers.get('assistant.message')?.({ agentId: undefined, data: { content } });
       for (let index = 0; index < (options.usageCount ?? 1); index += 1) {
         handlers.get('assistant.usage')?.({
           agentId: undefined,
           data: { model: 'gpt-5', inputTokens: 10, outputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 1 },
         });
       }
-      return { data: { content: 'fixture answer', model: 'gpt-5' } };
+      return { data: { content, model: 'gpt-5' } };
     }),
     abort: vi.fn(async () => undefined),
     disconnect: vi.fn(async () => undefined),
@@ -265,8 +266,17 @@ describe('Copilot SDK typed events, usage, and lifecycle', () => {
       expect(classifyCopilotSdkFailure(error).code).toBe(code);
     }
     expect(classifyCopilotSdkFailure({ status: 400, message: 'bad request' }).code).toBe('copilot_sdk_http_4xx');
-    expect(classifyCopilotSdkFailure({ status: 401, message: 'invalid token' }).code).toBe('copilot_sdk_http_4xx');
+    expect(classifyCopilotSdkFailure({ status: 401, message: 'invalid token' }).code).toBe('copilot_sdk_auth_failed');
     expect(classifyCopilotSdkFailure(new Error('opaque failure')).code).toBe('copilot_sdk_failed');
+    for (const [message, code] of [
+      ['HTTP 403 rate limit exceeded', 'copilot_sdk_auth_failed'],
+      ['HTTP 401 unauthorized rate limit', 'copilot_sdk_auth_failed'],
+      ['HTTP 400 quota exceeded', 'copilot_sdk_http_4xx'],
+    ] as const) {
+      const classified = classifyCopilotSdkFailure(new Error(message));
+      expect(classified.code).toBe(code);
+      expect(classifyFallbackTrigger(classified)).toBeNull();
+    }
   });
 
   it('maps typed usage events into bounded Redbtn usage metadata', async () => {
@@ -282,6 +292,39 @@ describe('Copilot SDK typed events, usage, and lifecycle', () => {
     });
     expect(run.usage.mock.calls[0][1]).toBe('copilot-sdk/gpt-5');
     expect((run.state.data as { _cli: Record<string, { provider: string }> })._cli['data.answer'].provider).toBe('copilot-sdk');
+  });
+
+  it('never publishes a token split across multiple assistant delta events', async () => {
+    const token = 'placeholder-test-token';
+    const visibleText = `before ${token} after`;
+    const harness = makeHarness({
+      finalText: visibleText,
+      deltas: ['before place', 'holder-', 'test-', 'token after'],
+    });
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-sdk-redaction-'));
+    temporaryRoots.push(root);
+    process.env.REDBTN_RUN_DIR_ROOT = root;
+    const chunks: string[] = [];
+    const replacements: string[] = [];
+    const state = {
+      runId: 'copilot-sdk-redaction',
+      data: {},
+      runPublisher: {
+        chunk: vi.fn(async (chunk: string) => { chunks.push(chunk); }),
+        replaceOutputContent: vi.fn(async (content: string) => { replacements.push(content); }),
+      },
+    };
+    const result = await runCopilotSdkStep({
+      config: { outputField: 'data.answer', userPrompt: 'hello', stream: true, tools: [], timeoutMs: 5_000 } as never,
+      state,
+      neuronCfg: { provider: 'copilot-sdk', model: 'gpt-5', apiKey: token, secretName: 'COPILOT_GITHUB_TOKEN' },
+      neuronId: 'copilot-test', callRunId: state.runId, emitUsage: vi.fn(),
+      dependencies: harness.dependencies,
+    });
+    expect(chunks.join('')).not.toContain(token);
+    expect(replacements.join('')).not.toContain(token);
+    expect(result['data.answer']).not.toContain(token);
+    expect(result['data.answer']).toContain('[REDACTED:COPILOT_GITHUB_TOKEN]');
   });
 
   it('bounds captured usage events while retaining exact aggregate accounting', async () => {
