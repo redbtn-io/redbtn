@@ -27,6 +27,7 @@ function makeHarness(options: {
   finalText?: string;
   denyTool?: boolean;
   bridgeStartup?: (bridgeOptions: any) => Promise<unknown>;
+  bridgeClose?: () => Promise<void>;
   leaseOwned?: () => Promise<boolean>;
 } = {}) {
   const handlers = new Map<string, (event: any) => void>();
@@ -75,7 +76,7 @@ function makeHarness(options: {
       },
     },
     toolNames: ['workspace_read'],
-    close: vi.fn(async () => undefined),
+    close: vi.fn(async () => { await options.bridgeClose?.(); }),
   };
   const captured: { clientOptions?: any; sessionConfig?: any; bridgeOptions?: any } = {};
   const dependencies: CopilotSdkDependencies = {
@@ -354,6 +355,37 @@ describe('Copilot SDK isolation and authorization', () => {
 });
 
 describe('Copilot SDK typed events, usage, and lifecycle', () => {
+  it('retains the lease and private run state until bridge.close acknowledges completion', async () => {
+    let acknowledgeBridgeClose!: () => void;
+    const bridgeCloseGate = new Promise<void>((resolve) => { acknowledgeBridgeClose = resolve; });
+    const harness = makeHarness({ bridgeClose: () => bridgeCloseGate });
+    const root = runRoot();
+    const runId = 'copilot-sdk-deferred-bridge-close';
+    const promise = runCopilotSdkStep({
+      config: { outputField: 'data.answer', userPrompt: 'hello', stream: false, tools: [], timeoutMs: 5_000 } as never,
+      state: { runId, data: {} },
+      neuronCfg: { provider: 'copilot-sdk', model: 'gpt-5', apiKey: 'placeholder-test-token', secretName: 'COPILOT_GITHUB_TOKEN' },
+      neuronId: 'copilot-test', callRunId: runId, emitUsage: vi.fn(), dependencies: harness.dependencies,
+    });
+
+    try {
+      await vi.waitFor(() => expect(harness.bridge.close).toHaveBeenCalledOnce());
+      // The pre-Cycle-6 cleanup deadline was 3 seconds. Hold close beyond it
+      // and verify cleanup cannot free the fleet slot or erase its state.
+      await new Promise((resolve) => setTimeout(resolve, 3_100));
+      expect(harness.lease.release).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(root, runId))).toBe(true);
+
+      acknowledgeBridgeClose();
+      await expect(promise).resolves.toMatchObject({ 'data.answer': 'fixture answer' });
+      expect(harness.lease.release).toHaveBeenCalledOnce();
+      expect(fs.existsSync(path.join(root, runId))).toBe(false);
+    } finally {
+      acknowledgeBridgeClose();
+      await promise.catch(() => undefined);
+    }
+  }, 10_000);
+
   it('classifies only explicit operational SDK failures for possible fallback', () => {
     const cases: Array<[unknown, string]> = [
       [{ status: 429, message: 'quota exhausted' }, 'copilot_sdk_rate_limited'],

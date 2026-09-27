@@ -995,10 +995,12 @@ describe('nonce gate', () => {
 // =============================================================================
 
 describe('lifecycle', () => {
-  it('aborts a pending server.listen and cleans up even if a late listening event arrives', async () => {
+  it('retries shutdown when late listening beats the pending not-running close callback', async () => {
     const controller = new AbortController();
     const stepDir = path.join(tmpDir, 'pending-listen', 'step');
     let listening = false;
+    let firstCloseCallback: ((error?: Error) => void) | undefined;
+    let secondCloseCallback: ((error?: Error) => void) | undefined;
     const fake = new EventEmitter() as EventEmitter & {
       maxConnections: number;
       listening: boolean;
@@ -1010,13 +1012,11 @@ describe('lifecycle', () => {
     fake.listen = vi.fn(() => fake); // deliberately never emits 'listening'
     fake.close = vi.fn((callback?: (error?: Error) => void) => {
       if (!listening) {
-        const error = Object.assign(new Error('server is not listening'), { code: 'ERR_SERVER_NOT_RUNNING' });
-        if (callback) queueMicrotask(() => callback(error));
-        else throw error;
+        firstCloseCallback = callback;
         return fake;
       }
       listening = false;
-      callback?.();
+      secondCloseCallback = callback;
       return fake;
     });
     bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
@@ -1036,16 +1036,29 @@ describe('lifecycle', () => {
       await vi.waitFor(() => expect(fake.listen).toHaveBeenCalledOnce());
       expect(fs.existsSync(stepDir)).toBe(true);
       controller.abort();
-      await expect(startPromise).rejects.toMatchObject({ name: 'AbortError' });
-      expect(fs.existsSync(stepDir)).toBe(false);
+      await vi.waitFor(() => expect(firstCloseCallback).toBeDefined());
 
-      // Simulate libuv delivering listen completion after cancellation. The
-      // late-listening guard must close it and repeat socket/dir cleanup.
+      // The listen event wins the race, but the first close callback has not
+      // yet reported ERR_SERVER_NOT_RUNNING. The shutdown promise must remain
+      // pending, then initiate and await a second close for the live server.
       listening = true;
       fake.emit('listening');
+      firstCloseCallback!(Object.assign(new Error('server is not running'), { code: 'ERR_SERVER_NOT_RUNNING' }));
       await vi.waitFor(() => expect(fake.close).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(secondCloseCallback).toBeDefined());
+      expect(fs.existsSync(stepDir)).toBe(true);
+      let startupSettled = false;
+      void startPromise.finally(() => { startupSettled = true; }).catch(() => undefined);
+      await Promise.resolve();
+      expect(startupSettled).toBe(false);
+
+      secondCloseCallback!();
+      await expect(startPromise).rejects.toMatchObject({ name: 'AbortError' });
       expect(fs.existsSync(stepDir)).toBe(false);
     } finally {
+      firstCloseCallback?.(Object.assign(new Error('server is not running'), { code: 'ERR_SERVER_NOT_RUNNING' }));
+      secondCloseCallback?.();
+      await startPromise.catch(() => undefined);
       bridgeNetMock.createServer.mockReset();
       bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
     }
@@ -1114,7 +1127,6 @@ describe('lifecycle', () => {
   it('cleans up a failed listen when close reports that no server was listening', async () => {
     const stepDir = path.join(tmpDir, 'listen-failure', 'step');
     const listenError = new Error('fixture listen failure');
-    const notRunningError = Object.assign(new Error('server is not running'), { code: 'ERR_SERVER_NOT_RUNNING' });
     const fake = new EventEmitter() as EventEmitter & {
       maxConnections: number;
       listening: boolean;
@@ -1127,10 +1139,7 @@ describe('lifecycle', () => {
       queueMicrotask(() => fake.emit('error', listenError));
       return fake;
     });
-    fake.close = vi.fn((callback?: (error?: Error) => void) => {
-      queueMicrotask(() => callback?.(notRunningError));
-      return fake;
-    });
+    fake.close = vi.fn();
     bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
 
     try {
@@ -1145,7 +1154,9 @@ describe('lifecycle', () => {
         neuronStepId: 'bridge-listen-failure',
         dir: stepDir,
       })).rejects.toThrow('fixture listen failure');
-      expect(fake.close).toHaveBeenCalledOnce();
+      // No close callback is needed after listen failed without creating a
+      // listening server; the failure path must still complete cleanup.
+      expect(fake.close).not.toHaveBeenCalled();
       expect(fs.existsSync(stepDir)).toBe(false);
     } finally {
       bridgeNetMock.createServer.mockReset();

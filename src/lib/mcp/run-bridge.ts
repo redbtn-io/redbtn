@@ -928,7 +928,11 @@ export async function startRunToolBridge(
   let revokedReason: string | null = null;
   let closed = false;
   let serverClosePromise: Promise<void> | null = null;
-  let serverCloseFoundNoListener = false;
+  let resolveServerClose: (() => void) | null = null;
+  let serverShutdownRequested = false;
+  let serverShutdownComplete = false;
+  let serverCloseAttemptPending = false;
+  let listenAttemptPending = false;
   let unregisterCancel: () => void = () => {};
   let abortHandler: (() => void) | null = null;
   let abortStartupWait: (() => void) | null = null;
@@ -938,50 +942,66 @@ export async function startRunToolBridge(
   // ceiling holds whether or not the handler below ever runs.
   server.maxConnections = MAX_CONNECTIONS;
 
-  function initiateServerClose(): Promise<void> {
-    if (serverClosePromise) return serverClosePromise;
-    if (serverCloseFoundNoListener && !server.listening) return Promise.resolve();
-    serverCloseFoundNoListener = false;
+  function finishServerShutdown(): void {
+    if (serverShutdownComplete) return;
+    serverShutdownComplete = true;
+    const resolve = resolveServerClose;
+    resolveServerClose = null;
+    resolve?.();
+  }
 
-    let resolveCompletion!: () => void;
-    let settled = false;
-    const completion = new Promise<void>((resolve) => {
-      resolveCompletion = resolve;
-    });
-    serverClosePromise = completion;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      resolveCompletion();
+  function attemptServerClose(): void {
+    if (!serverShutdownRequested || serverShutdownComplete || serverCloseAttemptPending) return;
+    // A listen() call can still complete after an abort. Keep the shared
+    // shutdown promise pending until that attempt emits `listening` or `error`.
+    if (!server.listening && !listenAttemptPending) {
+      finishServerShutdown();
+      return;
+    }
+
+    serverCloseAttemptPending = true;
+    const onCloseComplete = (error?: Error): void => {
+      serverCloseAttemptPending = false;
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ERR_SERVER_NOT_RUNNING') {
+        // The server may have started between close() being issued and this
+        // callback. Re-check its live state and close again before resolving.
+        if (server.listening) attemptServerClose();
+        else if (!listenAttemptPending) finishServerShutdown();
+        return;
+      }
+      if (error) console.warn(`[RunBridge] server close callback failed for run ${runId}:`, error);
+      if (server.listening) attemptServerClose();
+      else if (!listenAttemptPending) finishServerShutdown();
     };
 
     try {
-      // Do not inspect `server.listening` here: Node flips it to false as soon
-      // as close starts, while this callback still waits for sockets/handles to
-      // finish draining. Keep this promise so close() can await that completion.
-      server.close((error) => {
-        if ((error as NodeJS.ErrnoException | undefined)?.code === 'ERR_SERVER_NOT_RUNNING') {
-          serverCloseFoundNoListener = true;
-          if (serverClosePromise === completion) serverClosePromise = null;
-        } else if (error) {
-          console.warn(`[RunBridge] server close callback failed for run ${runId}:`, error);
-        }
-        finish();
-      });
+      // Do not infer completion from `server.listening`: Node clears it as soon
+      // as close starts, before the callback confirms socket/handle drainage.
+      server.close(onCloseComplete);
     } catch (error) {
-      // Some Node versions throw ERR_SERVER_NOT_RUNNING here; others deliver
-      // it to the callback. Either way there is no active handle to await, and
-      // a late `listening` event must be able to initiate a fresh close.
-      if ((error as NodeJS.ErrnoException)?.code === 'ERR_SERVER_NOT_RUNNING') {
-        serverCloseFoundNoListener = true;
-      }
-      if (serverClosePromise === completion) serverClosePromise = null;
+      serverCloseAttemptPending = false;
       if ((error as NodeJS.ErrnoException)?.code !== 'ERR_SERVER_NOT_RUNNING') {
         console.warn(`[RunBridge] server close initiation failed for run ${runId}:`, error);
       }
-      finish();
+      if (server.listening) attemptServerClose();
+      else if (!listenAttemptPending) finishServerShutdown();
     }
-    return completion;
+  }
+
+  function initiateServerClose(): Promise<void> {
+    if (serverClosePromise) return serverClosePromise;
+    serverShutdownRequested = true;
+    serverClosePromise = new Promise<void>((resolve) => {
+      resolveServerClose = resolve;
+    });
+    attemptServerClose();
+    return serverClosePromise;
+  }
+
+  function settleListenAttempt(): void {
+    if (!listenAttemptPending) return;
+    listenAttemptPending = false;
+    if (serverShutdownRequested) attemptServerClose();
   }
 
   function revoke(reason: string): void {
@@ -1655,6 +1675,7 @@ export async function startRunToolBridge(
   });
 
   server.on('error', (err) => {
+    settleListenAttempt();
     console.warn(`[RunBridge] server error for run ${runId}:`, err);
   });
 
@@ -1705,7 +1726,7 @@ export async function startRunToolBridge(
         reject(error);
       };
       const onListening = () => {
-        serverCloseFoundNoListener = false;
+        settleListenAttempt();
         if (settled) {
           // Abort may win while listen is pending. Close a late-bound server and
           // repeat filesystem cleanup in case the first pass preceded creation.
@@ -1739,7 +1760,13 @@ export async function startRunToolBridge(
         return;
       }
       abortSignal?.addEventListener('abort', onAbort, { once: true });
-      server.listen(socketPath);
+      listenAttemptPending = true;
+      try {
+        server.listen(socketPath);
+      } catch (error) {
+        settleListenAttempt();
+        reject(error);
+      }
     });
   } catch (error) {
     await close({ removeDir: true }).catch(() => undefined);

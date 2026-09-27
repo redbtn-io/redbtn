@@ -861,26 +861,41 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
         try { await client.forceStop(); } catch { /* best effort: the runtime is already gone */ }
       }
     }
+    let bridgeShutdownConfirmed = true;
     if (bridge) {
-      try { await withDeadline(bridge.close({ removeDir: false }), 3000, () => undefined); }
-      catch (error) { console.warn('[CopilotSdk] run bridge close failed:', redactSecret(String(error), token)); }
+      try {
+        // The lease protects this bridge's listening server too. Never continue
+        // into directory deletion or lease release on a close timeout/failure.
+        await bridge.close({ removeDir: false });
+      } catch (error) {
+        console.error('[CopilotSdk] run bridge close failed; retaining the lease and private state:', redactSecret(String(error), token));
+        bridgeShutdownConfirmed = false;
+      }
     } else if (bridgeStartupPromise) {
-      // The controlled race may return before a startup implementation settles.
-      // Give the real abortable bridge time to finish its listen/socket cleanup;
-      // if it resolves late, close it here rather than leaking the server.
+      // The controlled race may return before startup settles. Wait for startup
+      // to clean itself up on failure, or close a bridge that resolves late.
+      // Do not time out: the lease stays held until closure is acknowledged.
       const lateBridgeCleanup = bridgeStartupPromise.then(async (lateBridge) => {
-        try { await lateBridge.close({ removeDir: false }); }
-        catch (error) { console.warn('[CopilotSdk] late run bridge close failed:', redactSecret(String(error), token)); }
-      }).catch(() => undefined);
-      try { await withDeadline(lateBridgeCleanup, 3000, () => undefined); }
-      catch { /* bounded cleanup: abort signal remains the bridge's hard stop */ }
+        await lateBridge.close({ removeDir: false });
+      }, () => undefined);
+      try { await lateBridgeCleanup; }
+      catch (error) {
+        console.error('[CopilotSdk] late run bridge close failed; retaining the lease and private state:', redactSecret(String(error), token));
+        bridgeShutdownConfirmed = false;
+      }
     }
-    try { fs.rmSync(dir, { recursive: true, force: true }); }
-    catch (error) { console.warn(`[CopilotSdk] private run-state cleanup failed: ${redactSecret(String(error), token)}`); }
-    try { fs.rmdirSync(path.dirname(dir)); } catch { /* sibling step still owns the run directory */ }
-    if (lease) {
-      try { await withDeadline(lease.release(), 3000, () => undefined); }
-      catch (error) { console.error('[CopilotSdk] distributed lease release failed:', redactSecret(String(error), token)); }
+    if (bridgeShutdownConfirmed) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); }
+      catch (error) { console.warn(`[CopilotSdk] private run-state cleanup failed: ${redactSecret(String(error), token)}`); }
+      try { fs.rmdirSync(path.dirname(dir)); } catch { /* sibling step still owns the run directory */ }
+      if (lease) {
+        try { await withDeadline(lease.release(), 3000, () => undefined); }
+        catch (error) { console.error('[CopilotSdk] distributed lease release failed:', redactSecret(String(error), token)); }
+      }
+    } else {
+      // startRenewal stays active; retaining this slot prevents another worker
+      // from entering while a bridge whose close failed may still be serving.
+      console.error('[CopilotSdk] Copilot slot retained because bridge shutdown was not acknowledged.');
     }
   }
 }
