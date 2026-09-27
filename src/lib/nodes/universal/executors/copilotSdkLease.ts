@@ -36,17 +36,23 @@ export interface AcquireCopilotLeaseOptions {
 }
 
 export const COPILOT_LEASE_ACQUIRE_SCRIPT = `
-  redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-  if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end
-  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
-  redis.call('PEXPIRE', KEYS[1], ARGV[5])
+  local time = redis.call('TIME')
+  local now = (tonumber(time[1]) * 1000) + math.floor(tonumber(time[2]) / 1000)
+  local ttl = tonumber(ARGV[1])
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+  if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then return 0 end
+  redis.call('ZADD', KEYS[1], now + ttl, ARGV[3])
+  redis.call('PEXPIRE', KEYS[1], ttl * 2)
   return 1
 `;
 
 export const COPILOT_LEASE_RENEW_SCRIPT = `
+  local time = redis.call('TIME')
+  local now = (tonumber(time[1]) * 1000) + math.floor(tonumber(time[2]) / 1000)
   if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
-  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
-  redis.call('PEXPIRE', KEYS[1], ARGV[3])
+  local ttl = tonumber(ARGV[2])
+  redis.call('ZADD', KEYS[1], now + ttl, ARGV[1])
+  redis.call('PEXPIRE', KEYS[1], ttl * 2)
   return 1
 `;
 
@@ -123,7 +129,7 @@ const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
 export async function acquireCopilotLease(
   options: AcquireCopilotLeaseOptions,
 ): Promise<CopilotLeaseHandle> {
-  const startedAt = Date.now();
+  const startedAt = Date.now(); // queue deadline only; never sent to Redis or used for lease expiry.
   const factory = options.redisFactory ?? defaultRedisFactory;
   let client: CopilotRedisLeaseClient;
   try {
@@ -159,11 +165,9 @@ export async function acquireCopilotLease(
         COPILOT_LEASE_ACQUIRE_SCRIPT,
         1,
         key,
-        now,
-        now + ttlMs,
+        ttlMs,
         COPILOT_MAX_CONCURRENT,
         token,
-        ttlMs * 2,
       );
       acquired = Number(result) === 1;
       if (!acquired) {
@@ -189,8 +193,7 @@ export async function acquireCopilotLease(
           1,
           key,
           token,
-          Date.now() + ttlMs,
-          ttlMs * 2,
+          ttlMs,
         ).then((result) => {
           if (Number(result) !== 1 && !lossReported) {
             lossReported = true;

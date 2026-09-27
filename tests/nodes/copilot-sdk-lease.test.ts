@@ -5,6 +5,7 @@ import * as path from 'path';
 import {
   acquireCopilotLease,
   COPILOT_MAX_CONCURRENT,
+  COPILOT_LEASE_TTL_MS,
   COPILOT_LEASE_ACQUIRE_SCRIPT,
   COPILOT_LEASE_RELEASE_SCRIPT,
   COPILOT_LEASE_RENEW_SCRIPT,
@@ -14,20 +15,23 @@ import { runCopilotSdkStep, type CopilotSdkDependencies } from '../../src/lib/no
 
 class SharedRedis implements CopilotRedisLeaseClient {
   readonly entries = new Map<string, Map<string, number>>();
+  readonly calls: Array<{ script: string; args: Array<string | number> }> = [];
+  serverTimeMs = 1_700_000_000_000;
   async eval(script: string, _keys: number, key: string, ...args: (string | number)[]): Promise<number> {
+    this.calls.push({ script, args: [key, ...args] });
     const set = this.entries.get(key) ?? new Map<string, number>();
     this.entries.set(key, set);
     if (script === COPILOT_LEASE_ACQUIRE_SCRIPT) {
-      const now = Number(args[0]);
+      const now = this.serverTimeMs;
       for (const [token, expires] of set) if (expires <= now) set.delete(token);
-      if (set.size >= Number(args[2])) return 0;
-      set.set(String(args[3]), Number(args[1]));
+      if (set.size >= Number(args[1])) return 0;
+      set.set(String(args[2]), now + Number(args[0]));
       return 1;
     }
     if (script === COPILOT_LEASE_RENEW_SCRIPT) {
       const token = String(args[0]);
       if (!set.has(token)) return 0;
-      set.set(token, Number(args[1]));
+      set.set(token, this.serverTimeMs + Number(args[1]));
       return 1;
     }
     if (script === COPILOT_LEASE_RELEASE_SCRIPT) return set.delete(String(args[0])) ? 1 : 0;
@@ -58,6 +62,33 @@ describe('copilot-sdk distributed subscription lease', () => {
     } finally {
       if (original === undefined) delete process.env.COPILOT_SDK_MAX_CONCURRENT;
       else process.env.COPILOT_SDK_MAX_CONCURRENT = original;
+    }
+  });
+
+  it('does not trust a forward-jumped worker clock to prune a live lease', async () => {
+    const shared = new SharedRedis();
+    const redisFactory = async () => shared;
+    const leases = [];
+    for (let index = 0; index < COPILOT_MAX_CONCURRENT; index += 1) {
+      leases.push(await acquireCopilotLease({ maxWaitMs: 100, redisFactory }));
+    }
+    const controller = new AbortController();
+    const realNow = Date.now;
+    const clockSpy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 10 * 365 * 24 * 60 * 60 * 1000);
+    try {
+      const waitingLease = acquireCopilotLease({ maxWaitMs: 10_000, signal: controller.signal, redisFactory });
+      setTimeout(() => controller.abort(), 25);
+      await expect(waitingLease).rejects.toMatchObject({ name: 'AbortError' });
+      expect([...shared.entries.values()][0].size).toBe(COPILOT_MAX_CONCURRENT);
+      expect(COPILOT_LEASE_ACQUIRE_SCRIPT).toContain("redis.call('TIME')");
+      expect(COPILOT_LEASE_RENEW_SCRIPT).toContain("redis.call('TIME')");
+      const lastAcquire = shared.calls.filter((call) => call.script === COPILOT_LEASE_ACQUIRE_SCRIPT).slice(-1)[0];
+      expect(lastAcquire.args).toHaveLength(4); // key + ttl + cap + opaque lease ID; no worker timestamp
+      expect(lastAcquire.args[1]).toBe(COPILOT_LEASE_TTL_MS);
+      expect(lastAcquire.args[2]).toBe(COPILOT_MAX_CONCURRENT);
+    } finally {
+      clockSpy.mockRestore();
+      await Promise.all(leases.map((lease) => lease.release()));
     }
   });
 
@@ -93,7 +124,7 @@ describe('copilot-sdk distributed subscription lease', () => {
     const previousRoot = process.env.REDBTN_RUN_DIR_ROOT;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-sdk-global-pool-'));
     process.env.REDBTN_RUN_DIR_ROOT = root;
-    const controllers = [new AbortController(), new AbortController()];
+    const controllers = Array.from({ length: 10 }, () => new AbortController());
     const clients: Array<{ forceStop: ReturnType<typeof vi.fn> }> = [];
     const dependenciesFor = (): CopilotSdkDependencies => {
       const session = {
@@ -137,9 +168,14 @@ describe('copilot-sdk distributed subscription lease', () => {
     try {
       await vi.waitFor(() => {
         expect(shared.entries.size).toBe(1);
-        expect([...shared.entries.values()][0].size).toBe(2);
+        expect([...shared.entries.values()][0].size).toBe(10);
       });
       expect([...shared.entries.keys()]).toEqual(['redbtn:copilot-sdk:leases']);
+      await expect(acquireCopilotLease({
+        maxWaitMs: 12,
+        pollMs: 3,
+        redisFactory: async () => shared,
+      })).rejects.toMatchObject({ code: 'copilot_sdk_queue_timeout' });
     } finally {
       controllers.forEach((controller) => controller.abort());
       await Promise.all(runs.map((run) => expect(run).rejects.toMatchObject({ name: 'AbortError' })));

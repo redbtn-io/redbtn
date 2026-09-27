@@ -242,19 +242,22 @@ async function auditPermissionDenials(
   publisher: AnyObject | undefined,
   stepId: string,
   names: string[],
+  controlled: <T>(operation: Promise<T>) => Promise<T>,
 ): Promise<void> {
   if (!publisher?.toolStart || !publisher?.toolError) return;
   for (const [index, name] of names.slice(0, 20).entries()) {
     const id = `tool_copilot_sdk_denied_${Date.now()}_${index}`;
     try {
-      await publisher.toolStart(id, name, 'native', {
+      await controlled(Promise.resolve(publisher.toolStart(id, name, 'native', {
         triggeredBy: 'neuron', neuronStepId: stepId, copilotSdk: true, denied: true,
-      });
-      await publisher.toolError(id, `copilot-sdk permission denial: ${name}`, {
+      })));
+      await controlled(Promise.resolve(publisher.toolError(id, `copilot-sdk permission denial: ${name}`, {
         triggeredBy: 'neuron', neuronStepId: stepId,
-      });
+      })));
     } catch (error) {
       console.warn('[CopilotSdk] permission denial audit failed:', error);
+      if (error instanceof Error && error.name === 'AbortError') return;
+      if ((error as Error & { code?: string })?.code === 'copilot_sdk_timeout') return;
     }
   }
 }
@@ -420,6 +423,7 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
   const stepId = config.outputField;
   const runId = callRunId || state?.runId || state?.data?.runId || 'norun';
   const publisher: AnyObject | undefined = getRunPublisher(state);
+  const publishChunk = typeof publisher?.chunk === 'function' ? publisher.chunk.bind(publisher) as (text: string) => Promise<unknown> : undefined;
   if (neuronCfg?.secretName !== 'COPILOT_GITHUB_TOKEN') {
     throw new CopilotSdkError(
       'copilot_sdk_bad_secret_name',
@@ -481,6 +485,7 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
   let stopReject!: (error: Error) => void;
   const stopped = new Promise<never>((_resolve, reject) => { stopReject = reject; });
   void stopped.catch(() => undefined);
+  const controlled = <T>(promise: Promise<T>): Promise<T> => Promise.race([promise, stopped]);
   const requestStop = (reason: string, error: Error): void => {
     if (ctl.stopReason) return;
     ctl.stopReason = reason;
@@ -518,7 +523,7 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
     const safeText = redactSecret(safeRaw, token);
     if (!safeText) return;
     streamedText += safeText;
-    publishChain = publishChain.then(async () => { await publisher!.chunk(safeText); }).catch((error) => {
+    publishChain = publishChain.then(async () => { await publishChunk!(safeText); }).catch((error) => {
       console.warn('[CopilotSdk] text chunk publish failed:', redactSecret(String(error), token));
     });
   };
@@ -611,7 +616,7 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       throw new CopilotSdkError('copilot_sdk_prompt_too_large', `Copilot SDK prompt is ${promptBytes} bytes; maximum is ${MAX_PROMPT_BYTES}`);
     }
     const allowedNames = new Set(bridge.toolNames);
-    streamToUser = config.stream === true && typeof publisher?.chunk === 'function';
+    streamToUser = config.stream === true && publishChunk !== undefined;
     const clientOptions = buildCopilotSdkClientOptions({ home, cwd, dir });
     client = (options.dependencies?.createClient ?? ((opts) => new CopilotClient(opts)))(clientOptions);
     const startedAt = Date.now();
@@ -674,7 +679,6 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
         console.error(`[CopilotSdk][security] denied non-bridge tool request in run ${runId}, step ${stepId}: ${name.slice(0, 160)}`);
       }),
     });
-    const controlled = <T>(promise: Promise<T>): Promise<T> => Promise.race([promise, stopped]);
     await controlled(client.start());
     if (abortSignal?.aborted || runControlRegistry.wasCancelled(runId)) throw abortError('Copilot SDK step cancelled before session creation');
     session = await controlled(client.createSession(sessionConfig));
@@ -747,13 +751,19 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
         streamRedactionBuffer = finalText;
         streamedText = '';
         if (publisher?.replaceOutputContent) {
-          try { await publisher.replaceOutputContent(''); } catch { /* best effort before corrected chunks */ }
+          try { await controlled(Promise.resolve(publisher.replaceOutputContent(''))); }
+          catch (error) {
+            if (ctl.stopReason) throw error;
+            /* best effort before corrected chunks */
+          }
         }
       }
       flushRedactedStream(true);
-      await publishChain;
+      await controlled(publishChain);
     }
-    if (deniedToolNames.length) await auditPermissionDenials(publisher, stepId, deniedToolNames);
+    if (deniedToolNames.length) await auditPermissionDenials(publisher, stepId, deniedToolNames, controlled);
+    if (ctl.timedOut) throw timeoutError;
+    if (ctl.stopReason) throw abortError(`Copilot SDK step stopped: ${ctl.stopReason}`);
     if (!finalText.trim() && deniedToolNames.length) {
       throw new CopilotSdkError(
         'copilot_sdk_tool_denied',
@@ -762,7 +772,8 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
     }
     if (!finalText.trim()) throw new CopilotSdkError('copilot_sdk_empty_result', 'Copilot SDK completed without a root assistant message');
     if (streamToUser && streamedText !== finalText && publisher?.replaceOutputContent) {
-      try { await publisher.replaceOutputContent(finalText); } catch (error) {
+      try { await controlled(Promise.resolve(publisher.replaceOutputContent(finalText))); } catch (error) {
+        if (ctl.stopReason) throw error;
         console.warn('[CopilotSdk] final stream reconciliation failed:', redactSecret(String(error), token));
       }
     }
@@ -820,14 +831,14 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       }
     }
     if (bridge) {
-      try { await bridge.close({ removeDir: false }); }
+      try { await withDeadline(bridge.close({ removeDir: false }), 3000, () => undefined); }
       catch (error) { console.warn('[CopilotSdk] run bridge close failed:', redactSecret(String(error), token)); }
     }
     try { fs.rmSync(dir, { recursive: true, force: true }); }
     catch (error) { console.warn(`[CopilotSdk] private run-state cleanup failed: ${redactSecret(String(error), token)}`); }
     try { fs.rmdirSync(path.dirname(dir)); } catch { /* sibling step still owns the run directory */ }
     if (lease) {
-      try { await lease.release(); }
+      try { await withDeadline(lease.release(), 3000, () => undefined); }
       catch (error) { console.error('[CopilotSdk] distributed lease release failed:', redactSecret(String(error), token)); }
     }
   }

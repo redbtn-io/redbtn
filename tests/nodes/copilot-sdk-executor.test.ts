@@ -20,7 +20,13 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function makeHarness(options: { hang?: boolean; usageCount?: number; deltas?: string[]; finalText?: string } = {}) {
+function makeHarness(options: {
+  hang?: boolean;
+  usageCount?: number;
+  deltas?: string[];
+  finalText?: string;
+  denyTool?: boolean;
+} = {}) {
   const handlers = new Map<string, (event: any) => void>();
   const session = {
     sessionId: 'fixture-session',
@@ -79,6 +85,9 @@ function makeHarness(options: { hang?: boolean; usageCount?: number; deltas?: st
   };
   client.createSession.mockImplementation(async (sessionConfig: any) => {
     captured.sessionConfig = sessionConfig;
+    if (options.denyTool) {
+      sessionConfig.onPermissionRequest({ kind: 'shell', commands: [] }, { sessionId: 'fixture-session' });
+    }
     return session as never;
   });
   return { client, session, lease, bridge, handlers, captured, dependencies };
@@ -97,17 +106,37 @@ function stepHarness(args: {
   structuredOutput?: unknown;
   secretName?: string;
   hang?: boolean;
+  hangChunk?: boolean;
+  hangReplace?: boolean;
+  hangAudit?: boolean;
+  denyTool?: boolean;
+  deltas?: string[];
+  finalText?: string;
 } = {}) {
   const root = runRoot();
-  const harness = makeHarness({ hang: args.hang });
+  const harness = makeHarness({
+    hang: args.hang,
+    denyTool: args.denyTool,
+    deltas: args.deltas,
+    finalText: args.finalText,
+  });
   const usage = vi.fn();
   const chunks: string[] = [];
   const state = {
     runId: 'copilot-sdk-test-run',
     data: {},
     runPublisher: {
-      chunk: vi.fn(async (text: string) => { chunks.push(text); }),
-      replaceOutputContent: vi.fn(async () => undefined),
+      chunk: vi.fn(async (text: string) => {
+        if (args.hangChunk) return new Promise<never>(() => undefined);
+        chunks.push(text);
+      }),
+      replaceOutputContent: vi.fn(async () => {
+        if (args.hangReplace) return new Promise<never>(() => undefined);
+      }),
+      toolStart: vi.fn(async () => {
+        if (args.hangAudit) return new Promise<never>(() => undefined);
+      }),
+      toolError: vi.fn(async () => undefined),
       nodeProgress: vi.fn(async () => undefined),
     },
   };
@@ -359,6 +388,36 @@ describe('Copilot SDK typed events, usage, and lifecycle', () => {
     expect(run.harness.bridge.close).toHaveBeenCalledOnce();
     expect(run.harness.lease.release).toHaveBeenCalledOnce();
     expect(fs.existsSync(path.join(run.root, 'copilot-sdk-test-run'))).toBe(false);
+  });
+
+  it('cancellation cannot be blocked by a publisher chunk promise', async () => {
+    const controller = new AbortController();
+    const run = stepHarness({ abortSignal: controller.signal, hangChunk: true });
+    setTimeout(() => controller.abort(), 50);
+    await expect(run.promise).rejects.toMatchObject({ name: 'AbortError' });
+    expect(run.harness.lease.release).toHaveBeenCalledOnce();
+    expect(run.harness.bridge.close).toHaveBeenCalledOnce();
+    expect(fs.existsSync(path.join(run.root, 'copilot-sdk-test-run'))).toBe(false);
+  });
+
+  it('timeout cannot be blocked by streamed-output reconciliation or denial audit', async () => {
+    const reconciliation = stepHarness({
+      timeoutMs: 120,
+      hangReplace: true,
+      deltas: ['x'.repeat(64)],
+      finalText: 'corrected final response',
+    });
+    await expect(reconciliation.promise).rejects.toMatchObject({ code: 'copilot_sdk_timeout' });
+    expect(reconciliation.harness.lease.release).toHaveBeenCalledOnce();
+    expect(reconciliation.harness.bridge.close).toHaveBeenCalledOnce();
+    expect(fs.existsSync(path.join(reconciliation.root, 'copilot-sdk-test-run'))).toBe(false);
+
+    const denialAudit = stepHarness({ timeoutMs: 120, hangAudit: true, denyTool: true });
+    await expect(denialAudit.promise).rejects.toMatchObject({ code: 'copilot_sdk_timeout' });
+    expect(denialAudit.state.runPublisher.toolStart).toHaveBeenCalledOnce();
+    expect(denialAudit.harness.lease.release).toHaveBeenCalledOnce();
+    expect(denialAudit.harness.bridge.close).toHaveBeenCalledOnce();
+    expect(fs.existsSync(path.join(denialAudit.root, 'copilot-sdk-test-run'))).toBe(false);
   });
 
   it('enforces the turn timeout and force-stops the SDK runtime', async () => {
