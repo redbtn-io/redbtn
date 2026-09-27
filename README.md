@@ -226,8 +226,8 @@ install the matching optional runtime package (Linux x64 in the current worker
 image); no separately installed `copilot` executable is required. `REDIS_URL`
 must be configured on every participating worker so all ten leases coordinate
 through the same fleet Redis.
-The engine package currently targets `0.0.276-alpha`; worker/webapp release
-wiring must be bumped to that new engine version when the release is prepared.
+The engine package release target is `0.0.280-alpha`. Worker/webapp pin changes
+remain a separate rollout step and must target this engine version when prepared.
 
 **Runtime readiness gate.** Regular CI deterministically checks the pinned SDK
 and platform runtime package versions plus the bundled executable/native runtime
