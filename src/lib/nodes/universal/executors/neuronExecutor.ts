@@ -34,6 +34,7 @@ import { resolveTools, toBindToolsPayload, partitionToolRefs, type ResolvedTool 
 import { coerceArgsToSchema } from '../../../tools/coerce-args';
 import { runClaudeCodeStep } from './claudeCodeExecutor';
 import { runAgyCliStep } from './agyCliExecutor';
+import { runCopilotSdkStep } from './copilotSdkExecutor';
 import {
   classifyFallbackTrigger,
   resolveFallbackNeuronId,
@@ -767,6 +768,15 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // `config.tools` before the CLI could be offered them over the run bridge.
     if (early?.provider === 'agy-cli') {
       return await runAgyCliStep({
+        config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
+      });
+    }
+
+    // ── `copilot-sdk`: a GitHub Copilot SDK session, not a BaseChatModel ──────
+    // Its agent loop receives only the run-scoped bridge tools and must never
+    // fall through to an API model implementation.
+    if (early?.provider === 'copilot-sdk') {
+      return await runCopilotSdkStep({
         config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
       });
     }

@@ -102,6 +102,10 @@ const MATRIX: Record<NeuronProvider, MatrixEntry[]> = {
   'agy-cli': [
     { patterns: ['*'], hasVision: false },
   ],
+  // The SDK executor sends a text-only prompt in V1.
+  'copilot-sdk': [
+    { patterns: ['*'], hasVision: false },
+  ],
 };
 
 const PROVIDER_DEFAULTS: Record<NeuronProvider, boolean> = {
@@ -112,6 +116,7 @@ const PROVIDER_DEFAULTS: Record<NeuronProvider, boolean> = {
   custom: false,
   'claude-code': false,
   'agy-cli': false,
+  'copilot-sdk': false,
 };
 
 /**

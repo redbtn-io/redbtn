@@ -139,22 +139,27 @@ const neuron = await engine.neuronRegistry.getNeuronForUser(userId, role);
 
 Tier-based access (levels 0–4) controls which models and graphs a user can access.
 
-#### Subscription CLI neurons (`claude-code`, `agy-cli`)
+#### Subscription-backed coding-agent neurons (`claude-code`, `agy-cli`, `copilot-sdk`)
 
-Two providers are not HTTP model endpoints. They spawn a coding-agent CLI as a
-child of the neuron step and authenticate it with a flat-rate **subscription**
-instead of a metered API key, so a graph can spend a seat rather than a token
-budget:
+These providers are not HTTP model endpoints. They run a subscription-backed
+coding agent within the neuron step instead of using a metered API key, so a
+graph can spend a seat rather than a token budget:
 
-| provider | binary | executor | models |
+| provider | runtime | executor | models |
 |---|---|---|---|
 | `claude-code` | `claude` | `claudeCodeExecutor.ts` | `opus`, `fable`, `sonnet`, `claude-opus-5`, … |
 | `agy-cli` | `agy` (Antigravity) | `agyCliExecutor.ts` | `gemini-3.8-flash` (and `-3.7-`/`-3.6-`), optionally suffixed `-low`/`-medium`/`-high`; `gemini-3.1-pro`; `claude-sonnet-4-6`; `claude-opus-4-6-thinking`; `gpt-oss-120b-medium` |
+| `copilot-sdk` | `@github/copilot-sdk` | `copilotSdkExecutor.ts` | Models available to the user's Copilot subscription, e.g. `gpt-5` |
 
-Both are dispatched before `NeuronRegistry.getModel()` — `createModel` throws
-for them on purpose — and both are handed the run's tools over the same per-run
-Unix-socket MCP bridge (`lib/mcp/run-bridge.ts`) rather than through
-`bindTools()`, because each CLI runs its own agent loop.
+These providers are dispatched before `NeuronRegistry.getModel()` — `createModel`
+throws for them on purpose — and receive run-scoped tools through the per-run
+Unix-socket MCP bridge (`lib/mcp/run-bridge.ts`) rather than `bindTools()`.
+
+`copilot-sdk` uses the supported TypeScript SDK (`@github/copilot-sdk@1.0.14`),
+which bundles Copilot runtime `1.0.85`; it does not shell out to `copilot -p` or
+call private Copilot HTTP endpoints. It takes a Redis-backed fleet-wide lease
+keyed by a hash of the resolved credential (default concurrency 1), so workers
+sharing a subscription do not each run an uncoordinated local turn.
 
 ```ts
 // A neuron document for the Antigravity CLI.
@@ -168,6 +173,17 @@ Unix-socket MCP bridge (`lib/mcp/run-bridge.ts`) rather than through
 }
 ```
 
+```ts
+// A regular (not admin-only) GitHub Copilot subscription neuron.
+{
+  neuronId: 'copilot-gpt-5',
+  provider: 'copilot-sdk',
+  endpoint: 'copilot-sdk://worker',
+  model: 'gpt-5',
+  secretName: 'COPILOT_GITHUB_TOKEN', // RedSecrets -> per-session gitHubToken
+}
+```
+
 **Credentials.** `secretName` resolves through redsecrets into `apiKey`, as for
 every other provider. `claude-code` passes it to the child as
 `CLAUDE_CODE_OAUTH_TOKEN`; `agy-cli` cannot, because that CLI reads its
@@ -175,7 +191,7 @@ credential from a FILE and rewrites it on refresh, so the executor materialises
 it into a per-run private `HOME` and copies a refreshed token back into a
 per-worker cache (`AGY_STATE_DIR`, default `/var/lib/redbtn/agy`).
 
-**The tool surface is the whole security model.** Both executors build the
+**The tool surface is the whole security model.** CLI-backed executors build the
 child's environment as an allowlist from nothing — the worker's `MONGODB_URI`,
 `REDIS_URL` and `INTERNAL_SERVICE_KEY` never reach a process the model can read
 `/proc/self/environ` from, and `agy-cli` additionally excludes `GEMINI_API_KEY`
@@ -188,8 +204,24 @@ ends — and grants exactly one thing, `mcp(redbtn/*)`. A turn that produced no
 text because a tool was denied fails the step with `agy_tool_denied` rather than
 writing `""` into graph state.
 
+`copilot-sdk` creates a fresh private runtime home and working directory per run
+with SDK `mode: "empty"`, disables config discovery and custom instructions,
+skills, memory, and session persistence, and configures only the Redbtn run
+bridge. Its SDK `ToolSet` is an exact MCP-tool allowlist, and the permission
+handler rejects every non-bridge request. The resolved RedSecrets value is
+passed as the session's explicit `gitHubToken`; the SDK runtime environment is
+an allowlist with logged-in-user fallback disabled, so ambient `GH_TOKEN`,
+`GITHUB_TOKEN`, and direct LLM keys cannot authenticate it. Typed SDK delta and
+usage events are mapped to run streaming and usage records. V1 rejects
+`structuredOutput` pending a pinned and validated response-schema contract.
+
+**Worker runtime requirement.** SDK 1.0.14 bundles Copilot runtime 1.0.85 in
+platform packages. The worker needs Node.js `^20.19.0` or `>=22.12.0` and must
+install the matching optional runtime package (Linux x64 in the current worker
+image); no separately installed `copilot` executable is required.
+
 **Falling back.** A step may name `fallbackNeuronId` to re-run once against a
-metered neuron when the CLI itself could not run. See `neuronFallback.ts`:
+metered neuron when a subscription runtime cannot run. See `neuronFallback.ts`:
 `agy_rate_limited` (subscription capped), `agy_timeout`, `agy_spawn_failed`,
 `agy_queue_timeout`, `agy_failed` and `agy_error_result` hop;
 `agy_auth_required` (a human must redo the Google login) and `agy_tool_denied`

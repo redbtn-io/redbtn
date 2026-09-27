@@ -27,6 +27,7 @@ import {
   resolveFallbackNeuronId,
   CLAUDE_CODE_FALLBACK_CODES,
   AGY_FALLBACK_CODES,
+  COPILOT_SDK_FALLBACK_CODES,
 } from '../../src/lib/nodes/universal/executors/neuronFallback';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -242,6 +243,26 @@ describe('classifyFallbackTrigger — agy-cli codes', () => {
     const wrapped = new Error('step failed');
     (wrapped as Any).cause = agyError('agy_rate_limited');
     expect(classifyFallbackTrigger(wrapped)).toBe('agy_rate_limited');
+  });
+});
+
+describe('classifyFallbackTrigger — copilot-sdk codes', () => {
+  it('falls back only for operational subscription CLI failures', () => {
+    for (const code of COPILOT_SDK_FALLBACK_CODES) {
+      expect(classifyFallbackTrigger(codedError(code))).toBe(code);
+    }
+  });
+
+  it.each([
+    'copilot_sdk_no_token',
+    'copilot_sdk_bad_secret_name',
+    'copilot_sdk_bad_model',
+    'copilot_sdk_structured_output_unsupported',
+    'copilot_sdk_bridge_invalid',
+    'copilot_sdk_lease_lost',
+    'copilot_sdk_tool_denied',
+  ])('does not route around %s', (code) => {
+    expect(classifyFallbackTrigger(codedError(code))).toBeNull();
   });
 });
 

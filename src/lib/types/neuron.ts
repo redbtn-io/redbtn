@@ -18,6 +18,8 @@
  *   - `'agy-cli'`     — an Antigravity CLI (`agy`) child on a Google
  *     Antigravity subscription (`agyCliExecutor`), so a graph can run Gemini
  *     Flash without paying the Gemini API per token.
+ *   - `'copilot-sdk'` — a GitHub Copilot SDK runtime on a Copilot subscription
+ *     (`copilotSdkExecutor`), scoped to the per-run MCP bridge.
  *
  * Both are first-class provider values so they are accepted by the Mongoose
  * schema, the neurons API and the capability matrices.
@@ -29,7 +31,8 @@ export type NeuronProvider =
   | 'google'
   | 'custom'
   | 'claude-code'
-  | 'agy-cli';
+  | 'agy-cli'
+  | 'copilot-sdk';
 
 /**
  * Neuron role categorization (for UI organization)

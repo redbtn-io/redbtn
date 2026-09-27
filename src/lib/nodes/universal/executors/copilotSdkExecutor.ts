@@ -1,0 +1,692 @@
+/**
+ * GitHub Copilot SDK subscription-backed neuron.
+ *
+ * Each turn owns a `@github/copilot-sdk` client in `mode: "empty"`, a private
+ * COPILOT_HOME/base directory, a private working directory, and one per-run
+ * Redbtn MCP bridge. The SDK gets the resolved RedSecrets credential as the
+ * session's explicit `gitHubToken`; its runtime environment is an allowlist
+ * and never inherits GH_TOKEN, GITHUB_TOKEN, or direct model API keys.
+ */
+import {
+  CopilotClient,
+  ToolSet,
+  type CopilotClientOptions,
+  type CopilotSession,
+  type MCPStdioServerConfig,
+  type PermissionRequest,
+  type SessionConfig,
+} from '@github/copilot-sdk';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+
+import type { NeuronStepConfig } from '../types';
+import { renderTemplate, getNestedProperty } from '../templateRenderer';
+import {
+  startRunToolBridge,
+  isForbiddenForBridge,
+  BRIDGE_SERVER_NAME,
+  type RunToolBridge,
+  type RunBridgeToolRef,
+  type RunBridgePublisher,
+} from '../../../mcp/run-bridge';
+import { getRunPublisher } from '../../../run/contextLookup';
+import { runControlRegistry } from '../../../run/RunControlRegistry';
+import { resolveTools, partitionToolRefs } from '../../../tools/tool-resolver';
+import { runDirRoot, sanitizeSegment, resolveWorkspaceMount } from './claudeCodeExecutor';
+import { acquireCopilotLease, type CopilotLeaseHandle } from './copilotSdkLease';
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyObject = Record<string, any>;
+
+export const DEFAULT_TIMEOUT_MS = 1_800_000;
+export const MAX_PROMPT_BYTES = 4 * 1024 * 1024;
+export const MAX_ASSISTANT_OUTPUT_BYTES = 16 * 1024 * 1024;
+export const MAX_USAGE_EVENTS = 256;
+export const MAX_USAGE_MODELS = 32;
+export const STDERR_TAIL_BYTES = 2048;
+const RUN_POLL_INTERVAL_MS = 60_000;
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'error', 'interrupted']);
+
+export class CopilotSdkError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = 'CopilotSdkError';
+    this.code = code;
+  }
+}
+
+export interface CopilotSdkUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  uncached_input_tokens: number;
+  input_token_details: { cache_creation: number; cache_read: number };
+}
+
+interface UsageBucket {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  calls: number;
+}
+
+function abortError(message: string): Error {
+  const error = new Error(message);
+  error.name = 'AbortError';
+  return error;
+}
+
+function safeNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+async function withDeadline<T>(operation: Promise<T>, timeoutMs: number, onTimeout: () => T): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(onTimeout()), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function redactSecret(text: string, secret: string): string {
+  return secret.length >= 8 ? text.split(secret).join('[REDACTED:COPILOT_GITHUB_TOKEN]') : text;
+}
+
+/** Child runtime environment; the SDK uses this as-is instead of inheriting process.env. */
+export function buildCopilotSdkRuntimeEnv(params: {
+  home: string;
+  dir: string;
+  parentEnv?: NodeJS.ProcessEnv;
+}): Record<string, string> {
+  const parent = params.parentEnv ?? process.env;
+  return {
+    PATH: parent.PATH || '/usr/local/bin:/usr/bin:/bin',
+    HOME: params.home,
+    TMPDIR: params.dir,
+    XDG_CONFIG_HOME: path.join(params.home, '.config'),
+    XDG_CACHE_HOME: path.join(params.home, '.cache'),
+    LANG: parent.LANG || 'C.UTF-8',
+    TZ: 'UTC',
+    TERM: 'dumb',
+    NO_COLOR: '1',
+  };
+}
+
+export function resolveCopilotSdkModel(value: unknown): string {
+  if (value === undefined || value === null || value === '') return 'gpt-5';
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(value)) {
+    throw new CopilotSdkError('copilot_sdk_bad_model', `Invalid Copilot SDK model identifier: ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+export function resolveCopilotToolFilter(serverName: string, toolNames: string[]): ToolSet {
+  const tools = new ToolSet();
+  for (const name of toolNames) {
+    if (!/^[A-Za-z0-9_.-]{1,128}$/.test(name)) {
+      throw new CopilotSdkError('copilot_sdk_bridge_invalid', `Invalid MCP bridge tool name: ${JSON.stringify(name)}`);
+    }
+    // The SDK's canonical MCP tool id is `${serverKey}-${toolName}`.
+    tools.addMcp(`${serverName}-${name}`);
+  }
+  return tools;
+}
+
+function buildBridgeServer(bridge: RunToolBridge): Record<string, unknown> {
+  const map = bridge.mcpConfig?.mcpServers;
+  if (!map || typeof map !== 'object' || Array.isArray(map)) {
+    throw new CopilotSdkError('copilot_sdk_bridge_invalid', 'Run bridge did not provide an MCP server map');
+  }
+  const entries = Object.entries(map as AnyObject);
+  if (entries.length !== 1 || entries[0][0] !== BRIDGE_SERVER_NAME) {
+    throw new CopilotSdkError('copilot_sdk_bridge_invalid', 'Refusing to configure anything except the private Redbtn run bridge');
+  }
+  const config = entries[0][1] as AnyObject;
+  if (!config || typeof config.command !== 'string' || !Array.isArray(config.args) || !config.env || typeof config.env !== 'object') {
+    throw new CopilotSdkError('copilot_sdk_bridge_invalid', 'Private Redbtn MCP bridge configuration is incomplete');
+  }
+  return {
+    type: 'local',
+    command: config.command,
+    args: config.args,
+    env: config.env,
+    tools: bridge.toolNames.slice(),
+    timeout: 30_000,
+  };
+}
+
+export function buildCopilotSdkClientOptions(params: {
+  home: string;
+  cwd: string;
+  dir: string;
+  parentEnv?: NodeJS.ProcessEnv;
+}): CopilotClientOptions {
+  return {
+    mode: 'empty',
+    baseDirectory: params.home,
+    workingDirectory: params.cwd,
+    env: buildCopilotSdkRuntimeEnv(params),
+    // Prevent fallback to a local Copilot/gh login. The actual credential is
+    // scoped to createSession({ gitHubToken }) for this one run only.
+    useLoggedInUser: false,
+    enableRemoteSessions: false,
+    logLevel: 'none',
+  };
+}
+
+export function buildCopilotSdkSessionConfig(params: {
+  token: string;
+  model: string;
+  systemPrompt: string;
+  cwd: string;
+  toolNames: string[];
+  bridgeServer: Record<string, unknown>;
+  streaming: boolean;
+  permissionHandler: NonNullable<SessionConfig['onPermissionRequest']>;
+}): SessionConfig {
+  return {
+    model: params.model,
+    gitHubToken: params.token,
+    workingDirectory: params.cwd,
+    systemMessage: { content: params.systemPrompt },
+    streaming: params.streaming,
+    mcpServers: { [BRIDGE_SERVER_NAME]: params.bridgeServer as unknown as MCPStdioServerConfig },
+    availableTools: resolveCopilotToolFilter(BRIDGE_SERVER_NAME, params.toolNames),
+    // Defense in depth: availableTools is the positive allowlist; these broad
+    // source exclusions explicitly rule out built-in shell/filesystem/network
+    // tools and custom tools while leaving the individually-listed MCP tools.
+    excludedTools: new ToolSet().addBuiltIn('*').addCustom('*'),
+    skipCustomInstructions: true,
+    enableConfigDiscovery: false,
+    skillDirectories: [],
+    pluginDirectories: [],
+    instructionDirectories: [],
+    includedBuiltinSkills: [],
+    disabledMcpServers: [],
+    mcpOAuthTokenStorage: 'in-memory',
+    memory: { enabled: false },
+    enableSessionStore: false,
+    infiniteSessions: { enabled: false },
+    enableFileChangeTracking: false,
+    enableSessionTelemetry: false,
+    onPermissionRequest: params.permissionHandler,
+  };
+}
+
+export function makeCopilotPermissionHandler(
+  allowedNames: ReadonlySet<string>,
+  onDenied: (request: PermissionRequest) => void = () => undefined,
+): NonNullable<SessionConfig['onPermissionRequest']> {
+  return (request: PermissionRequest) => {
+    if (request.kind === 'mcp' && request.serverName === BRIDGE_SERVER_NAME) {
+      const rawName = request.toolName;
+      const canonicalName = `${BRIDGE_SERVER_NAME}-${rawName}`;
+      if (allowedNames.has(rawName) || allowedNames.has(canonicalName)) return { kind: 'approve-once' };
+    }
+    onDenied(request);
+    return { kind: 'reject', feedback: 'This session may use only the current run’s explicitly configured Redbtn MCP tools.' };
+  };
+}
+
+async function auditPermissionDenials(
+  publisher: AnyObject | undefined,
+  stepId: string,
+  names: string[],
+): Promise<void> {
+  if (!publisher?.toolStart || !publisher?.toolError) return;
+  for (const [index, name] of names.slice(0, 20).entries()) {
+    const id = `tool_copilot_sdk_denied_${Date.now()}_${index}`;
+    try {
+      await publisher.toolStart(id, name, 'native', {
+        triggeredBy: 'neuron', neuronStepId: stepId, copilotSdk: true, denied: true,
+      });
+      await publisher.toolError(id, `copilot-sdk permission denial: ${name}`, {
+        triggeredBy: 'neuron', neuronStepId: stepId,
+      });
+    } catch (error) {
+      console.warn('[CopilotSdk] permission denial audit failed:', error);
+    }
+  }
+}
+
+function buildPrompts(config: NeuronStepConfig, state: AnyObject, tree: string): { system: string; user: string } {
+  const system = [
+    `Your only tools are the explicitly enabled '${BRIDGE_SERVER_NAME}' MCP tools. They act on the run workspace at ${tree}. You have no shell, host filesystem, built-in tools, or general network access.`,
+  ];
+  if (typeof state?.systemPrefix === 'string' && state.systemPrefix) system.push(state.systemPrefix);
+  if (config.systemPrompt) system.push(renderTemplate(config.systemPrompt, state));
+  if (typeof state?.data?.workspaceInstructions === 'string' && state.data.workspaceInstructions.trim()) {
+    system.push(state.data.workspaceInstructions);
+  }
+  const match = config.userPrompt?.match(/^\{\{state\.([\w.]+)\}\}$/);
+  const messages = match ? getNestedProperty(state, match[1]) : undefined;
+  const user = Array.isArray(messages)
+    ? messages.map((message: AnyObject) => {
+        const content = typeof message?.content === 'string'
+          ? message.content
+          : Array.isArray(message?.content)
+            ? message.content.map((part: AnyObject) => typeof part === 'string' ? part : part?.type === 'text' ? part.text ?? '' : '').join('')
+            : String(message?.content ?? '');
+        return `${message?.role || 'user'}: ${content}`;
+      }).join('\n\n')
+    : renderTemplate(config.userPrompt, state);
+  return { system: system.join('\n\n'), user };
+}
+
+function ensurePrivateCwd(dir: string): string {
+  const cwd = path.join(dir, 'cwd');
+  fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
+  fs.chmodSync(cwd, 0o700);
+  return cwd;
+}
+
+function collectSdkError(error: unknown, token: string): CopilotSdkError {
+  const message = redactSecret(error instanceof Error ? error.message : String(error), token).slice(0, STDERR_TAIL_BYTES);
+  if (/\b429\b|rate.?limit|quota|too many requests|resource_exhausted/i.test(message)) {
+    return new CopilotSdkError('copilot_sdk_rate_limited', `GitHub Copilot subscription rate limited: ${message}`);
+  }
+  if (/\b401\b|\b403\b|unauthori[sz]ed|authentication|invalid.{0,15}token/i.test(message)) {
+    return new CopilotSdkError('copilot_sdk_auth_failed', `GitHub Copilot SDK authentication failed: ${message}`);
+  }
+  if (/enoent|not found|could not find.*runtime|failed to spawn|unable to start.*(cli|runtime)/i.test(message)) {
+    return new CopilotSdkError('copilot_sdk_runtime_unavailable', `Copilot SDK runtime could not start: ${message}`);
+  }
+  return new CopilotSdkError('copilot_sdk_failed', `Copilot SDK request failed: ${message || 'unknown SDK error'}`);
+}
+
+export interface CopilotSdkDependencies {
+  createClient?: (options: CopilotClientOptions) => CopilotClient;
+  startBridge?: typeof startRunToolBridge;
+  acquireLease?: typeof acquireCopilotLease;
+}
+
+export interface RunCopilotSdkStepOptions {
+  config: NeuronStepConfig;
+  state: AnyObject;
+  neuronCfg: AnyObject;
+  neuronId: string;
+  userId?: string;
+  callRunId?: string;
+  abortSignal?: AbortSignal;
+  emitUsage: (providerResponse: unknown, modelHint?: string, stepIdOverride?: string) => void;
+  /** Internal dependency seams for tests; not configurable from neuron documents. */
+  dependencies?: CopilotSdkDependencies;
+}
+
+export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Promise<Record<string, unknown>> {
+  const { config, state, neuronCfg, neuronId, callRunId, abortSignal, emitUsage } = options;
+  const stepId = config.outputField;
+  const runId = callRunId || state?.runId || state?.data?.runId || 'norun';
+  const publisher: AnyObject | undefined = getRunPublisher(state);
+  if (neuronCfg?.secretName !== 'COPILOT_GITHUB_TOKEN') {
+    throw new CopilotSdkError(
+      'copilot_sdk_bad_secret_name',
+      `Neuron '${neuronId}' must resolve the RedSecrets entry named 'COPILOT_GITHUB_TOKEN'.`,
+    );
+  }
+  const token = typeof neuronCfg?.apiKey === 'string' ? neuronCfg.apiKey : '';
+  if (!token) {
+    throw new CopilotSdkError(
+      'copilot_sdk_no_token',
+      `Neuron '${neuronId}' uses 'copilot-sdk' but the COPILOT_GITHUB_TOKEN secretName did not resolve through RedSecrets.`,
+    );
+  }
+  if (config.structuredOutput) {
+    throw new CopilotSdkError(
+      'copilot_sdk_structured_output_unsupported',
+      'copilot-sdk structuredOutput remains disabled until Redbtn pins and validates the runtime response-schema contract; parse JSON in a later graph step.',
+    );
+  }
+
+  const model = resolveCopilotSdkModel(neuronCfg.model);
+  const mount = resolveWorkspaceMount(state);
+  const timeoutMs = typeof (config as AnyObject).timeoutMs === 'number' && (config as AnyObject).timeoutMs > 0
+    ? (config as AnyObject).timeoutMs : DEFAULT_TIMEOUT_MS;
+  const dir = path.join(
+    runDirRoot(),
+    sanitizeSegment(runId, 'norun'),
+    `copilot-sdk-${sanitizeSegment(stepId, 'step')}-${crypto.randomBytes(4).toString('hex')}`,
+  );
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  const home = path.join(dir, 'home');
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  const cwd = ensurePrivateCwd(dir);
+
+  let bridge: RunToolBridge | null = null;
+  let client: CopilotClient | null = null;
+  let session: CopilotSession | null = null;
+  let lease: CopilotLeaseHandle | null = null;
+  let unregisterCancel: (() => void) | null = null;
+  let onAbort: (() => void) | null = null;
+  let wallTimer: NodeJS.Timeout | null = null;
+  let pollTimer: NodeJS.Timeout | null = null;
+  const unsubscribe: Array<() => void> = [];
+  let publishChain: Promise<void> = Promise.resolve();
+  let finalText = '';
+  let streamedText = '';
+  let streamedBytes = 0;
+  let usageEventCount = 0;
+  let droppedUsageEvents = 0;
+  const usageByModel = new Map<string, UsageBucket>();
+  const deniedToolNames: string[] = [];
+  const ctl: { stopReason: string | null; timedOut: boolean; leaseLost: boolean } = {
+    stopReason: null, timedOut: false, leaseLost: false,
+  };
+  let stopReject!: (error: Error) => void;
+  const stopped = new Promise<never>((_resolve, reject) => { stopReject = reject; });
+  void stopped.catch(() => undefined);
+  const requestStop = (reason: string, error: Error): void => {
+    if (ctl.stopReason) return;
+    ctl.stopReason = reason;
+    stopReject(error);
+    try { void session?.abort().catch(() => undefined); } catch { /* runtime may already be stopping */ }
+    try { void client?.forceStop().catch(() => undefined); } catch { /* best effort child cleanup */ }
+  };
+
+  const queueStartedAt = Date.now();
+  let usageEmitted = false;
+  const emitCollectedUsage = (): void => {
+    if (usageEmitted) return;
+    usageEmitted = true;
+    for (const [entryModel, bucket] of usageByModel) {
+      // `assistant.usage.inputTokens` is the SDK's normalized input total;
+      // cache read/write counts are breakdowns within that total (as in the
+      // other engine provider usage metadata), not additional prompt tokens.
+      const input = bucket.input;
+      const usage: CopilotSdkUsage = {
+        input_tokens: input,
+        output_tokens: bucket.output,
+        total_tokens: input + bucket.output,
+        uncached_input_tokens: Math.max(0, input - bucket.cacheRead - bucket.cacheWrite),
+        input_token_details: { cache_creation: bucket.cacheWrite, cache_read: bucket.cacheRead },
+      };
+      try {
+        emitUsage({ usage_metadata: usage }, `copilot-sdk/${entryModel}`, `${stepId}:sdk:${entryModel}`);
+      } catch (error) {
+        console.warn('[CopilotSdk] usage emission failed:', error);
+      }
+    }
+  };
+
+  try {
+    if (abortSignal?.aborted || runControlRegistry.wasCancelled(runId)) throw abortError('Copilot SDK step cancelled before start');
+    const { clientRefs, hostedCapabilities } = partitionToolRefs(Array.isArray(config.tools) ? config.tools : []);
+    if (hostedCapabilities.length) {
+      console.warn(`[CopilotSdk] provider-hosted tools ignored (${hostedCapabilities.join(', ')}); only attached Redbtn MCP tools are available to this agent.`);
+    }
+    const resolved = await resolveTools(clientRefs, state);
+    const servable: RunBridgeToolRef[] = resolved.filter((tool) => !isForbiddenForBridge(tool.name));
+    const rawWait = Number.parseInt(process.env.COPILOT_SDK_QUEUE_WAIT_MS || '', 10);
+    const maxWaitMs = Number.isFinite(rawWait) && rawWait > 0 ? Math.min(timeoutMs, rawWait) : timeoutMs;
+    const rawMax = Number.parseInt(process.env.COPILOT_SDK_MAX_CONCURRENT || '', 10);
+    const maxConcurrent = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : 1;
+    try {
+      lease = await (options.dependencies?.acquireLease ?? acquireCopilotLease)({
+        credential: token,
+        signal: abortSignal,
+        maxWaitMs,
+        maxConcurrent,
+        onWaiting: (reason) => {
+          if (publisher?.nodeProgress) {
+            void Promise.resolve(publisher.nodeProgress(
+              runControlRegistry.get(runId)?.currentNodeId || stepId,
+              reason,
+              { data: { stepId, phase: 'queued' } },
+            )).catch(() => undefined);
+          }
+        },
+      });
+    } catch (error) {
+      const failure = error as Error & { code?: string };
+      if (failure.name === 'AbortError') throw failure;
+      if (failure.code === 'copilot_sdk_queue_timeout') {
+        throw new CopilotSdkError('copilot_sdk_queue_timeout', failure.message);
+      }
+      throw new CopilotSdkError(
+        'copilot_sdk_lease_unavailable',
+        'Redis could not provide the required fleet-wide Copilot subscription lease; the SDK session was not started.',
+      );
+    }
+    const queuedMs = Date.now() - queueStartedAt;
+    let remainingMs = timeoutMs - queuedMs;
+    if (remainingMs <= 0) throw new CopilotSdkError('copilot_sdk_queue_timeout', 'Copilot subscription lease consumed the step timeout');
+    if (abortSignal?.aborted || runControlRegistry.wasCancelled(runId)) throw abortError('Copilot SDK step cancelled while queued');
+
+    bridge = await (options.dependencies?.startBridge ?? startRunToolBridge)({
+      runId,
+      state,
+      publisher: (publisher as RunBridgePublisher | undefined) ?? null,
+      resolvedTools: servable,
+      environmentId: typeof state?.data?.environmentId === 'string' ? state.data.environmentId : '',
+      workingDir: typeof state?.data?.workingDir === 'string' && state.data.workingDir ? state.data.workingDir : mount.tree,
+      abortSignal: abortSignal ?? null,
+      neuronStepId: stepId,
+      dir,
+      maxToolIterations: typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0 ? config.maxToolIterations : undefined,
+      onCancel: () => requestStop('run cancelled', abortError('Copilot SDK run cancelled')),
+    });
+
+    const prompts = buildPrompts(config, state, mount.tree);
+    const promptBytes = Buffer.byteLength(prompts.system, 'utf8') + Buffer.byteLength(prompts.user, 'utf8');
+    if (promptBytes > MAX_PROMPT_BYTES) {
+      throw new CopilotSdkError('copilot_sdk_prompt_too_large', `Copilot SDK prompt is ${promptBytes} bytes; maximum is ${MAX_PROMPT_BYTES}`);
+    }
+    const allowedNames = new Set(bridge.toolNames);
+    const streamToUser = config.stream === true && typeof publisher?.chunk === 'function';
+    const clientOptions = buildCopilotSdkClientOptions({ home, cwd, dir });
+    client = (options.dependencies?.createClient ?? ((opts) => new CopilotClient(opts)))(clientOptions);
+    const startedAt = Date.now();
+    const timeoutError = new CopilotSdkError('copilot_sdk_timeout', `Copilot SDK step '${stepId}' exceeded its ${timeoutMs} ms budget`);
+    const onTimeout = () => {
+      ctl.timedOut = true;
+      requestStop('wall-clock timeout', timeoutError);
+    };
+    const startWallClock = () => {
+      remainingMs = timeoutMs - (Date.now() - queueStartedAt);
+      if (remainingMs <= 0) {
+        onTimeout();
+        return;
+      }
+      wallTimer = setTimeout(onTimeout, remainingMs);
+      wallTimer.unref?.();
+    };
+    startWallClock();
+    if (ctl.timedOut) throw timeoutError;
+
+    unregisterCancel = runControlRegistry.registerOnCancel(runId, () =>
+      requestStop('run cancelled', abortError('Copilot SDK run cancelled')),
+    );
+    if (abortSignal) {
+      onAbort = () => requestStop('run aborted', abortError('Copilot SDK run aborted'));
+      abortSignal.addEventListener('abort', onAbort, { once: true });
+      if (abortSignal.aborted) onAbort();
+    }
+    lease.startRenewal((error) => {
+      ctl.leaseLost = true;
+      requestStop('subscription lease lost', new CopilotSdkError('copilot_sdk_lease_lost', `Copilot subscription lease renewal failed: ${redactSecret(error.message, token)}`));
+    });
+    if (publisher?.getState) {
+      pollTimer = setInterval(() => {
+        void publisher.getState().then((run: AnyObject) => {
+          if (typeof run?.status === 'string' && TERMINAL_RUN_STATUSES.has(run.status)) {
+            requestStop(`run is terminal (${run.status})`, abortError(`Copilot SDK run is terminal (${run.status})`));
+          }
+        }).catch(() => undefined);
+      }, RUN_POLL_INTERVAL_MS);
+      pollTimer.unref?.();
+    }
+
+    // Only this bridge's exact tool names are permitted. The SDK's own
+    // permission callback independently rejects every shell/read/write/url,
+    // built-in, or unknown MCP request.
+    const sessionConfig = buildCopilotSdkSessionConfig({
+      token,
+      model,
+      systemPrompt: prompts.system,
+      cwd,
+      toolNames: bridge.toolNames,
+      bridgeServer: buildBridgeServer(bridge),
+      streaming: streamToUser,
+      permissionHandler: makeCopilotPermissionHandler(allowedNames, (request) => {
+        const name = request.kind === 'mcp'
+          ? `${request.serverName}/${request.toolName}`
+          : `${request.kind}/${'toolName' in request ? String(request.toolName) : 'unknown'}`;
+        deniedToolNames.push(name.slice(0, 160));
+        console.error(`[CopilotSdk][security] denied non-bridge tool request in run ${runId}, step ${stepId}: ${name.slice(0, 160)}`);
+      }),
+    });
+    const controlled = <T>(promise: Promise<T>): Promise<T> => Promise.race([promise, stopped]);
+    await controlled(client.start());
+    if (abortSignal?.aborted || runControlRegistry.wasCancelled(runId)) throw abortError('Copilot SDK step cancelled before session creation');
+    session = await controlled(client.createSession(sessionConfig));
+    const sessionId = session.sessionId;
+
+    let finalEventText = '';
+    unsubscribe.push(session.on('assistant.message', (event) => {
+      if (event.agentId == null && typeof event.data?.content === 'string') {
+        finalEventText = redactSecret(event.data.content, token);
+      }
+    }));
+    unsubscribe.push(session.on('assistant.message_delta', (event) => {
+      if (event.agentId != null || typeof event.data?.deltaContent !== 'string') return;
+      const delta = redactSecret(event.data.deltaContent, token);
+      streamedBytes += Buffer.byteLength(delta, 'utf8');
+      if (streamedBytes > MAX_ASSISTANT_OUTPUT_BYTES) {
+        requestStop('assistant output limit exceeded', new CopilotSdkError(
+          'copilot_sdk_output_too_large',
+          `Copilot SDK response exceeded ${MAX_ASSISTANT_OUTPUT_BYTES} bytes`,
+        ));
+        return;
+      }
+      streamedText += delta;
+      if (streamToUser && publisher?.chunk) {
+        publishChain = publishChain.then(async () => { await publisher.chunk(delta); }).catch((error) => {
+          console.warn('[CopilotSdk] text chunk publish failed:', redactSecret(String(error), token));
+        });
+      }
+    }));
+    unsubscribe.push(session.on('assistant.usage', (event) => {
+      usageEventCount += 1;
+      if (usageEventCount > MAX_USAGE_EVENTS) {
+        droppedUsageEvents += 1;
+        return;
+      }
+      const usage = event.data;
+      const entryModel = typeof usage?.model === 'string' ? usage.model : model;
+      let bucket = usageByModel.get(entryModel);
+      if (!bucket) {
+        if (usageByModel.size >= MAX_USAGE_MODELS) {
+          droppedUsageEvents += 1;
+          return;
+        }
+        bucket = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 0 };
+        usageByModel.set(entryModel, bucket);
+      }
+      bucket.input += safeNumber(usage.inputTokens);
+      bucket.output += safeNumber(usage.outputTokens);
+      bucket.cacheRead += safeNumber(usage.cacheReadTokens);
+      bucket.cacheWrite += safeNumber(usage.cacheWriteTokens);
+      bucket.calls += 1;
+    }));
+
+    const response = await controlled(session.sendAndWait({ prompt: prompts.user }, remainingMs));
+    await publishChain;
+    if (ctl.leaseLost) throw new CopilotSdkError('copilot_sdk_lease_lost', 'Copilot SDK stopped because its fleet-wide subscription lease was lost');
+    if (ctl.timedOut) throw timeoutError;
+    if (ctl.stopReason) throw abortError(`Copilot SDK step stopped: ${ctl.stopReason}`);
+    finalText = typeof response?.data?.content === 'string'
+      ? redactSecret(response.data.content, token)
+      : finalEventText || streamedText;
+    if (Buffer.byteLength(finalText, 'utf8') > MAX_ASSISTANT_OUTPUT_BYTES) {
+      throw new CopilotSdkError('copilot_sdk_output_too_large', `Copilot SDK response exceeded ${MAX_ASSISTANT_OUTPUT_BYTES} bytes`);
+    }
+    if (deniedToolNames.length) await auditPermissionDenials(publisher, stepId, deniedToolNames);
+    if (!finalText.trim() && deniedToolNames.length) {
+      throw new CopilotSdkError(
+        'copilot_sdk_tool_denied',
+        `Copilot SDK returned no answer after requesting ${deniedToolNames.length} tool(s) denied by the run policy.`,
+      );
+    }
+    if (!finalText.trim()) throw new CopilotSdkError('copilot_sdk_empty_result', 'Copilot SDK completed without a root assistant message');
+    if (streamToUser && streamedText !== finalText && publisher?.replaceOutputContent) {
+      try { await publisher.replaceOutputContent(finalText); } catch (error) {
+        console.warn('[CopilotSdk] final stream reconciliation failed:', redactSecret(String(error), token));
+      }
+    }
+    emitCollectedUsage();
+    const cli = {
+      provider: 'copilot-sdk',
+      model: response?.data?.model || [...usageByModel.keys()].slice(-1)[0] || model,
+      sessionId,
+      durationMs: Date.now() - startedAt,
+      queuedMs,
+      usage: [...usageByModel.entries()].map(([usageModel, bucket]) => ({
+        model: usageModel,
+        calls: bucket.calls,
+        inputTokens: bucket.input,
+        outputTokens: bucket.output,
+        cacheReadTokens: bucket.cacheRead,
+        cacheWriteTokens: bucket.cacheWrite,
+      })),
+      usageEventsDropped: droppedUsageEvents,
+      permissionDenials: deniedToolNames.length,
+      permissionDenialNames: deniedToolNames.slice(0, 20),
+      totalCostUsdEstimate: 0,
+    };
+    const cliBag = { ...(state?.data?._cli ?? {}), [stepId]: cli };
+    if (state?.data && typeof state.data === 'object') state.data._cli = cliBag;
+    return { [stepId]: finalText, 'data._cli': cliBag };
+  } catch (error) {
+    emitCollectedUsage();
+    if (ctl.timedOut) throw new CopilotSdkError('copilot_sdk_timeout', `Copilot SDK step '${stepId}' exceeded its ${timeoutMs} ms budget`);
+    if (ctl.leaseLost) throw new CopilotSdkError('copilot_sdk_lease_lost', 'Copilot SDK stopped because its fleet-wide subscription lease was lost');
+    if (ctl.stopReason && !ctl.timedOut) {
+      const stoppedError = error instanceof Error ? error : abortError(`Copilot SDK stopped: ${ctl.stopReason}`);
+      if (stoppedError.name === 'AbortError') throw stoppedError;
+    }
+    if (error instanceof CopilotSdkError || (error as Error)?.name === 'AbortError') throw error;
+    throw collectSdkError(error, token);
+  } finally {
+    if (wallTimer) clearTimeout(wallTimer);
+    if (pollTimer) clearInterval(pollTimer);
+    if (unregisterCancel) unregisterCancel();
+    if (onAbort && abortSignal) abortSignal.removeEventListener('abort', onAbort);
+    for (const off of unsubscribe) {
+      try { off(); } catch { /* SDK already disconnected */ }
+    }
+    if (session) {
+      try { await withDeadline(session.disconnect(), 3000, () => undefined); }
+      catch { /* stop/forceStop below also tears down the session */ }
+    }
+    if (client) {
+      try {
+        const errors = await withDeadline(client.stop(), 5000, () => [new Error('Copilot runtime shutdown timed out')]);
+        if (errors.length) await client.forceStop();
+      } catch {
+        try { await client.forceStop(); } catch { /* best effort: the runtime is already gone */ }
+      }
+    }
+    if (bridge) {
+      try { await bridge.close({ removeDir: false }); }
+      catch (error) { console.warn('[CopilotSdk] run bridge close failed:', redactSecret(String(error), token)); }
+    }
+    try { fs.rmSync(dir, { recursive: true, force: true }); }
+    catch (error) { console.warn(`[CopilotSdk] private run-state cleanup failed: ${redactSecret(String(error), token)}`); }
+    try { fs.rmdirSync(path.dirname(dir)); } catch { /* sibling step still owns the run directory */ }
+    if (lease) {
+      try { await lease.release(); }
+      catch (error) { console.error('[CopilotSdk] distributed lease release failed:', redactSecret(String(error), token)); }
+    }
+  }
+}

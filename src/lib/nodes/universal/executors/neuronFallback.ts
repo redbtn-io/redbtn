@@ -138,6 +138,16 @@ export const AGY_FALLBACK_CODES: ReadonlySet<string> = new Set([
   'agy_error_result',
 ]);
 
+/** Operational Copilot SDK failures that can be survived by another neuron. */
+export const COPILOT_SDK_FALLBACK_CODES: ReadonlySet<string> = new Set([
+  'copilot_sdk_runtime_unavailable',
+  'copilot_sdk_rate_limited',
+  'copilot_sdk_queue_timeout',
+  'copilot_sdk_timeout',
+  'copilot_sdk_failed',
+  'copilot_sdk_empty_result',
+]);
+
 /** Node / undici / provider-SDK connection error codes. */
 const NETWORK_ERROR_CODES: ReadonlySet<string> = new Set([
   'ECONNRESET',
@@ -244,6 +254,9 @@ export function classifyFallbackTrigger(err: unknown): FallbackTriggerCode | nul
     }
     if (typeof code === 'string' && code.startsWith('agy_')) {
       return AGY_FALLBACK_CODES.has(code) ? code : null;
+    }
+    if (typeof code === 'string' && code.startsWith('copilot_sdk_')) {
+      return COPILOT_SDK_FALLBACK_CODES.has(code) ? code : null;
     }
   }
 
