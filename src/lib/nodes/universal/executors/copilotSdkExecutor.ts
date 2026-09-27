@@ -363,7 +363,12 @@ export function classifyCopilotSdkFailure(error: unknown, token = ''): CopilotSd
     return new CopilotSdkError('copilot_sdk_auth_failed', `GitHub Copilot SDK authentication failed: ${message}`);
   }
   const textualStatusMatch = message.match(/\b(?:http(?:\s+status)?|status(?:\s+code)?)\s*[:=]?\s*(\d{3})\b/i);
-  const textualStatus = textualStatusMatch ? Number(textualStatusMatch[1]) : undefined;
+  const genericClientStatus = message.match(/\b(4\d{2})\b/);
+  const textualStatus = textualStatusMatch
+    ? Number(textualStatusMatch[1])
+    : genericClientStatus
+      ? Number(genericClientStatus[1])
+      : undefined;
   const effectiveStatus = status ?? textualStatus;
   if (effectiveStatus === 429) {
     return new CopilotSdkError('copilot_sdk_rate_limited', `GitHub Copilot subscription rate limited: ${message}`);

@@ -301,6 +301,7 @@ describe('Copilot SDK typed events, usage, and lifecycle', () => {
       ['HTTP 403 rate limit exceeded', 'copilot_sdk_auth_failed'],
       ['HTTP 401 unauthorized rate limit', 'copilot_sdk_auth_failed'],
       ['HTTP 400 quota exceeded', 'copilot_sdk_http_4xx'],
+      ['400 quota exceeded', 'copilot_sdk_http_4xx'],
     ] as const) {
       const classified = classifyCopilotSdkFailure(new Error(message));
       expect(classified.code).toBe(code);
