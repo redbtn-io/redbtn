@@ -35,6 +35,7 @@ import { coerceArgsToSchema } from '../../../tools/coerce-args';
 import { runClaudeCodeStep } from './claudeCodeExecutor';
 import { runAgyCliStep } from './agyCliExecutor';
 import { runCopilotSdkStep } from './copilotSdkExecutor';
+import { runOpencodeStep } from './opencodeExecutor';
 import {
   classifyFallbackTrigger,
   resolveFallbackNeuronId,
@@ -777,6 +778,13 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // fall through to an API model implementation.
     if (early?.provider === 'copilot-sdk') {
       return await runCopilotSdkStep({
+        config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
+      });
+    }
+
+    // ── `opencode`: an OpenCode CLI runner, not a BaseChatModel ───────────────
+    if (early?.provider === 'opencode') {
+      return await runOpencodeStep({
         config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
       });
     }

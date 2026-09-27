@@ -532,6 +532,29 @@ export class NeuronRegistry {
         throw new NeuronProviderError(
           'copilot-sdk neurons run via copilotSdkExecutor, not createModel',
         );
+      case 'opencode':
+        // Not a chat model. `opencode` neurons drive the OpenCode CLI
+        // process through a dedicated executor (opencodeExecutor), which is
+        // entered before `getModel()` is ever reached.
+        throw new NeuronProviderError(
+          'opencode neurons run via opencodeExecutor, not createModel',
+        );
+      case 'opencode-zen':
+      case 'zen':
+        return new ChatOpenAI({
+          modelName: config.model,
+          temperature: config.temperature ?? 0.0,
+          maxTokens: config.maxTokens,
+          topP: config.topP,
+          apiKey:
+            config.apiKey ||
+            process.env.OPENCODE_ZEN_API_KEY ||
+            process.env.OPENCODE_API_KEY ||
+            process.env.ZEN_API_KEY ||
+            'not-needed',
+          configuration: { baseURL: config.endpoint || 'https://opencode.ai/zen/v1' },
+          streamUsage: true,
+        });
       default:
         throw new NeuronProviderError(`Unknown provider: ${(config as NeuronConfig).provider}`);
     }
