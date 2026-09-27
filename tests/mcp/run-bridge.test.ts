@@ -1011,7 +1011,7 @@ describe('lifecycle', () => {
     fake.close = vi.fn((callback?: (error?: Error) => void) => {
       if (!listening) {
         const error = Object.assign(new Error('server is not listening'), { code: 'ERR_SERVER_NOT_RUNNING' });
-        if (callback) callback(error);
+        if (callback) queueMicrotask(() => callback(error));
         else throw error;
         return fake;
       }
@@ -1044,6 +1044,108 @@ describe('lifecycle', () => {
       listening = true;
       fake.emit('listening');
       await vi.waitFor(() => expect(fake.close).toHaveBeenCalledTimes(2));
+      expect(fs.existsSync(stepDir)).toBe(false);
+    } finally {
+      bridgeNetMock.createServer.mockReset();
+      bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+    }
+  });
+
+  it('waits for the server.close callback after listening becomes false before removing bridge files', async () => {
+    const stepDir = path.join(tmpDir, 'delayed-close', 'step');
+    let listening = false;
+    let finishServerClose: (() => void) | undefined;
+    const fake = new EventEmitter() as EventEmitter & {
+      maxConnections: number;
+      listening: boolean;
+      listen: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    Object.defineProperty(fake, 'listening', { get: () => listening });
+    fake.maxConnections = 0;
+    fake.listen = vi.fn((socketPath: string) => {
+      fs.writeFileSync(socketPath, '');
+      listening = true;
+      fake.emit('listening');
+      return fake;
+    });
+    fake.close = vi.fn((callback?: () => void) => {
+      listening = false; // Node clears this before all handles have drained.
+      if (callback) finishServerClose = callback;
+      return fake;
+    });
+    bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+
+    let bridgeClose: Promise<void> | undefined;
+    try {
+      const started = await startRunToolBridge({
+        runId: RUN_ID,
+        state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+        publisher: null,
+        resolvedTools: [],
+        environmentId: ENV_ID,
+        workingDir: WORKING_DIR,
+        abortSignal: null,
+        neuronStepId: 'bridge-delayed-close',
+        dir: stepDir,
+      });
+      let cleanupResolved = false;
+      bridgeClose = started.close().then(() => { cleanupResolved = true; });
+
+      await Promise.resolve();
+      expect(fake.listening).toBe(false);
+      expect(fake.close).toHaveBeenCalledOnce();
+      expect(finishServerClose).toBeDefined();
+      expect(cleanupResolved).toBe(false);
+      expect(fs.existsSync(stepDir)).toBe(true);
+
+      finishServerClose!();
+      await bridgeClose;
+      expect(cleanupResolved).toBe(true);
+      expect(fs.existsSync(stepDir)).toBe(false);
+    } finally {
+      finishServerClose?.();
+      await bridgeClose?.catch(() => undefined);
+      bridgeNetMock.createServer.mockReset();
+      bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+    }
+  });
+
+  it('cleans up a failed listen when close reports that no server was listening', async () => {
+    const stepDir = path.join(tmpDir, 'listen-failure', 'step');
+    const listenError = new Error('fixture listen failure');
+    const notRunningError = Object.assign(new Error('server is not running'), { code: 'ERR_SERVER_NOT_RUNNING' });
+    const fake = new EventEmitter() as EventEmitter & {
+      maxConnections: number;
+      listening: boolean;
+      listen: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    Object.defineProperty(fake, 'listening', { value: false });
+    fake.maxConnections = 0;
+    fake.listen = vi.fn(() => {
+      queueMicrotask(() => fake.emit('error', listenError));
+      return fake;
+    });
+    fake.close = vi.fn((callback?: (error?: Error) => void) => {
+      queueMicrotask(() => callback?.(notRunningError));
+      return fake;
+    });
+    bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+
+    try {
+      await expect(startRunToolBridge({
+        runId: RUN_ID,
+        state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+        publisher: null,
+        resolvedTools: [],
+        environmentId: ENV_ID,
+        workingDir: WORKING_DIR,
+        abortSignal: null,
+        neuronStepId: 'bridge-listen-failure',
+        dir: stepDir,
+      })).rejects.toThrow('fixture listen failure');
+      expect(fake.close).toHaveBeenCalledOnce();
       expect(fs.existsSync(stepDir)).toBe(false);
     } finally {
       bridgeNetMock.createServer.mockReset();
