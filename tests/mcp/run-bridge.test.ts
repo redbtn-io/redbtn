@@ -26,10 +26,22 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn } from 'child_process';
+import { EventEmitter } from 'events';
 import * as net from 'net';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+
+const bridgeNetMock = vi.hoisted(() => ({
+  createServer: vi.fn(),
+  realCreateServer: undefined as ((...args: any[]) => unknown) | undefined,
+}));
+vi.mock('net', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('net')>();
+  bridgeNetMock.realCreateServer = actual.createServer as (...args: any[]) => unknown;
+  bridgeNetMock.createServer.mockImplementation(actual.createServer);
+  return { ...actual, createServer: bridgeNetMock.createServer };
+});
 
 import {
   startRunToolBridge,
@@ -60,7 +72,6 @@ import {
   type RunBridgeToolRef,
 } from '../../src/lib/mcp/run-bridge';
 import { getNativeRegistry } from '../../src/lib/tools/native-registry';
-import { DATA_TOOL_RULES, getDataToolRule } from '../../src/lib/permissions/tool-map';
 import { runControlRegistry } from '../../src/lib/run/RunControlRegistry';
 import { __setRedisForTest } from '../../src/lib/permissions/exec-guard';
 import type { CapabilityProfile } from '../../src/lib/permissions/types';
@@ -984,6 +995,62 @@ describe('nonce gate', () => {
 // =============================================================================
 
 describe('lifecycle', () => {
+  it('aborts a pending server.listen and cleans up even if a late listening event arrives', async () => {
+    const controller = new AbortController();
+    const stepDir = path.join(tmpDir, 'pending-listen', 'step');
+    let listening = false;
+    const fake = new EventEmitter() as EventEmitter & {
+      maxConnections: number;
+      listening: boolean;
+      listen: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    Object.defineProperty(fake, 'listening', { get: () => listening });
+    fake.maxConnections = 0;
+    fake.listen = vi.fn(() => fake); // deliberately never emits 'listening'
+    fake.close = vi.fn((callback?: (error?: Error) => void) => {
+      if (!listening) {
+        const error = Object.assign(new Error('server is not listening'), { code: 'ERR_SERVER_NOT_RUNNING' });
+        if (callback) callback(error);
+        else throw error;
+        return fake;
+      }
+      listening = false;
+      callback?.();
+      return fake;
+    });
+    bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+    const startPromise = startRunToolBridge({
+      runId: RUN_ID,
+      state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+      publisher: null,
+      resolvedTools: [],
+      environmentId: ENV_ID,
+      workingDir: WORKING_DIR,
+      abortSignal: controller.signal,
+      neuronStepId: 'bridge-startup-abort',
+      dir: stepDir,
+    });
+
+    try {
+      await vi.waitFor(() => expect(fake.listen).toHaveBeenCalledOnce());
+      expect(fs.existsSync(stepDir)).toBe(true);
+      controller.abort();
+      await expect(startPromise).rejects.toMatchObject({ name: 'AbortError' });
+      expect(fs.existsSync(stepDir)).toBe(false);
+
+      // Simulate libuv delivering listen completion after cancellation. The
+      // late-listening guard must close it and repeat socket/dir cleanup.
+      listening = true;
+      fake.emit('listening');
+      await vi.waitFor(() => expect(fake.close).toHaveBeenCalledTimes(2));
+      expect(fs.existsSync(stepDir)).toBe(false);
+    } finally {
+      bridgeNetMock.createServer.mockReset();
+      bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+    }
+  });
+
   it('revokes when the run aborts', async () => {
     const controller = new AbortController();
     const { bridge: b } = await start({ abortSignal: controller.signal });
@@ -996,11 +1063,11 @@ describe('lifecycle', () => {
     expect(b.revokedReason).toMatch(/aborted/);
   });
 
-  it('starts already-revoked when handed an aborted signal', async () => {
+  it('refuses startup and cleans up when handed an already-aborted signal', async () => {
     const controller = new AbortController();
     controller.abort();
-    const { bridge: b } = await start({ abortSignal: controller.signal });
-    expect(b.revoked).toBe(true);
+    await expect(start({ abortSignal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fs.existsSync(path.join(tmpDir, 'step'))).toBe(false);
   });
 
   it('kills the child, revokes and closes on run cancellation', async () => {

@@ -26,6 +26,8 @@ function makeHarness(options: {
   deltas?: string[];
   finalText?: string;
   denyTool?: boolean;
+  bridgeStartup?: (bridgeOptions: any) => Promise<unknown>;
+  leaseOwned?: () => Promise<boolean>;
 } = {}) {
   const handlers = new Map<string, (event: any) => void>();
   const session = {
@@ -58,7 +60,11 @@ function makeHarness(options: {
     stop: vi.fn(async () => []),
     forceStop: vi.fn(async () => undefined),
   };
-  const lease = { startRenewal: vi.fn(), release: vi.fn(async () => undefined) };
+  const lease = {
+    startRenewal: vi.fn(),
+    assertOwned: vi.fn(options.leaseOwned ?? (async () => true)),
+    release: vi.fn(async () => undefined),
+  };
   const bridge = {
     mcpConfig: {
       mcpServers: {
@@ -80,6 +86,7 @@ function makeHarness(options: {
     acquireLease: vi.fn(async () => lease) as never,
     startBridge: vi.fn(async (bridgeOptions) => {
       captured.bridgeOptions = bridgeOptions;
+      if (options.bridgeStartup) return options.bridgeStartup(bridgeOptions) as never;
       return bridge as never;
     }) as never,
   };
@@ -237,6 +244,71 @@ describe('Copilot SDK isolation and authorization', () => {
     expect(run.harness.client.start).not.toHaveBeenCalled();
     expect(run.harness.bridge.close).toHaveBeenCalledOnce();
     expect(run.harness.lease.release).toHaveBeenCalledOnce();
+  });
+
+  it('renews before bridge startup and refuses to create a client if the lease expires while it is pending', async () => {
+    const leaseExpiresAt = Date.now() + 150;
+    const harness = makeHarness({
+      leaseOwned: async () => Date.now() < leaseExpiresAt,
+      // Renewal is deliberately ineffective here: bridge readiness occurs
+      // after the mock lease TTL, so the final Redis ownership check must fail.
+      bridgeStartup: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        return harness.bridge as never;
+      },
+    });
+    const root = runRoot();
+    const runId = 'copilot-sdk-delayed-bridge';
+    const promise = runCopilotSdkStep({
+      config: { outputField: 'data.answer', userPrompt: 'hello', stream: false, tools: [], timeoutMs: 5_000 } as never,
+      state: { runId, data: {} },
+      neuronCfg: { provider: 'copilot-sdk', model: 'gpt-5', apiKey: 'placeholder-test-token', secretName: 'COPILOT_GITHUB_TOKEN' },
+      neuronId: 'copilot-test', callRunId: runId, emitUsage: vi.fn(), dependencies: harness.dependencies,
+    });
+    await vi.waitFor(() => expect(harness.dependencies.startBridge).toHaveBeenCalledOnce());
+    expect(harness.lease.startRenewal).toHaveBeenCalledOnce();
+    await expect(promise).rejects.toMatchObject({ code: 'copilot_sdk_lease_lost' });
+    expect(harness.lease.assertOwned).toHaveBeenCalledOnce();
+    expect(harness.client.start).not.toHaveBeenCalled();
+    expect(harness.client.createSession).not.toHaveBeenCalled();
+    expect(harness.lease.release).toHaveBeenCalledOnce();
+    expect(fs.existsSync(path.join(root, runId))).toBe(false);
+  });
+
+  it.each([
+    ['cancellation', (controller: AbortController) => controller.abort(), 5_000, 'AbortError'],
+    ['timeout', (_controller: AbortController) => undefined, 80, 'copilot_sdk_timeout'],
+  ] as const)('returns and releases its lease on %s during pending bridge startup', async (_name, stop, timeoutMs, expected) => {
+    let startupCleaned = false;
+    const harness = makeHarness({
+      bridgeStartup: (bridgeOptions) => new Promise((_resolve, reject) => {
+        const abort = () => {
+          startupCleaned = true;
+          const error = new Error('pending bridge startup aborted');
+          error.name = 'AbortError';
+          reject(error);
+        };
+        if (bridgeOptions.abortSignal.aborted) abort();
+        else bridgeOptions.abortSignal.addEventListener('abort', abort, { once: true });
+      }),
+    });
+    const root = runRoot();
+    const controller = new AbortController();
+    const runId = `copilot-sdk-bridge-${_name}`;
+    const promise = runCopilotSdkStep({
+      config: { outputField: 'data.answer', userPrompt: 'hello', stream: false, tools: [], timeoutMs } as never,
+      state: { runId, data: {} },
+      neuronCfg: { provider: 'copilot-sdk', model: 'gpt-5', apiKey: 'placeholder-test-token', secretName: 'COPILOT_GITHUB_TOKEN' },
+      neuronId: 'copilot-test', callRunId: runId, abortSignal: controller.signal,
+      emitUsage: vi.fn(), dependencies: harness.dependencies,
+    });
+    await vi.waitFor(() => expect(harness.dependencies.startBridge).toHaveBeenCalledOnce());
+    stop(controller);
+    await expect(promise).rejects.toMatchObject(expected === 'AbortError' ? { name: expected } : { code: expected });
+    expect(harness.dependencies.createClient).not.toHaveBeenCalled();
+    expect(startupCleaned).toBe(true);
+    expect(harness.lease.release).toHaveBeenCalledOnce();
+    expect(fs.existsSync(path.join(root, runId))).toBe(false);
   });
 
   it('rejects structured output before acquiring a lease or creating an SDK client', async () => {

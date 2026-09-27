@@ -466,6 +466,8 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
   const cwd = ensurePrivateCwd(dir);
 
   let bridge: RunToolBridge | null = null;
+  let bridgeStartupPromise: Promise<RunToolBridge> | null = null;
+  const bridgeAbortController = new AbortController();
   let client: CopilotClient | null = null;
   let session: CopilotSession | null = null;
   let lease: CopilotLeaseHandle | null = null;
@@ -495,6 +497,7 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
     if (ctl.stopReason) return;
     ctl.stopReason = reason;
     stopReject(error);
+    if (!bridgeAbortController.signal.aborted) bridgeAbortController.abort();
     try { void session?.abort().catch(() => undefined); } catch { /* runtime may already be stopping */ }
     try { void client?.forceStop().catch(() => undefined); } catch { /* best effort child cleanup */ }
   };
@@ -596,52 +599,48 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
         'Redis could not provide the required fleet-wide Copilot subscription lease; the SDK session was not started.',
       );
     }
+    // Start renewing as soon as Redis admits this turn. Bridge startup can
+    // involve a Unix-socket listen and must not consume the original lease TTL.
+    lease.startRenewal((error) => {
+      ctl.leaseLost = true;
+      requestStop('subscription lease lost', new CopilotSdkError('copilot_sdk_lease_lost', `Copilot subscription lease renewal failed: ${redactSecret(error.message, token)}`));
+    });
     const queuedMs = Date.now() - queueStartedAt;
     let remainingMs = timeoutMs - queuedMs;
     if (remainingMs <= 0) throw new CopilotSdkError('copilot_sdk_queue_timeout', 'Copilot subscription lease consumed the step timeout');
     if (abortSignal?.aborted || runControlRegistry.wasCancelled(runId)) throw abortError('Copilot SDK step cancelled while queued');
+    const assertLeaseOwned = async (phase: string): Promise<void> => {
+      const error = new CopilotSdkError(
+        'copilot_sdk_lease_lost',
+        `Copilot SDK subscription lease could not be verified ${phase}; refusing to start or continue the session.`,
+      );
+      try {
+        if (!lease || !(await controlled(lease.assertOwned()))) throw error;
+      } catch (verifyError) {
+        if (ctl.timedOut || ctl.stopReason) throw verifyError;
+        ctl.leaseLost = true;
+        requestStop('subscription lease ownership check failed', error);
+        throw error;
+      }
+    };
 
-    bridge = await (options.dependencies?.startBridge ?? startRunToolBridge)({
-      runId,
-      state,
-      publisher: (publisher as RunBridgePublisher | undefined) ?? null,
-      resolvedTools: servable,
-      environmentId: typeof state?.data?.environmentId === 'string' ? state.data.environmentId : '',
-      workingDir: typeof state?.data?.workingDir === 'string' && state.data.workingDir ? state.data.workingDir : mount.tree,
-      abortSignal: abortSignal ?? null,
-      neuronStepId: stepId,
-      dir,
-      maxToolIterations: typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0 ? config.maxToolIterations : undefined,
-      onCancel: () => requestStop('run cancelled', abortError('Copilot SDK run cancelled')),
-    });
-
-    const prompts = buildPrompts(config, state, mount.tree);
-    const promptBytes = Buffer.byteLength(prompts.system, 'utf8') + Buffer.byteLength(prompts.user, 'utf8');
-    if (promptBytes > MAX_PROMPT_BYTES) {
-      throw new CopilotSdkError('copilot_sdk_prompt_too_large', `Copilot SDK prompt is ${promptBytes} bytes; maximum is ${MAX_PROMPT_BYTES}`);
-    }
-    const allowedNames = new Set(bridge.toolNames);
-    streamToUser = config.stream === true && publishChunk !== undefined;
-    const clientOptions = buildCopilotSdkClientOptions({ home, cwd, dir });
-    client = (options.dependencies?.createClient ?? ((opts) => new CopilotClient(opts)))(clientOptions);
     const startedAt = Date.now();
     const timeoutError = new CopilotSdkError('copilot_sdk_timeout', `Copilot SDK step '${stepId}' exceeded its ${timeoutMs} ms budget`);
     const onTimeout = () => {
       ctl.timedOut = true;
       requestStop('wall-clock timeout', timeoutError);
     };
-    const startWallClock = () => {
-      remainingMs = timeoutMs - (Date.now() - queueStartedAt);
-      if (remainingMs <= 0) {
-        onTimeout();
-        return;
-      }
-      wallTimer = setTimeout(onTimeout, remainingMs);
-      wallTimer.unref?.();
-    };
-    startWallClock();
-    if (ctl.timedOut) throw timeoutError;
+    remainingMs = timeoutMs - (Date.now() - queueStartedAt);
+    if (remainingMs <= 0) {
+      onTimeout();
+      throw timeoutError;
+    }
+    wallTimer = setTimeout(onTimeout, remainingMs);
+    wallTimer.unref?.();
 
+    // The cancel registry and caller signal must cover bridge startup as well
+    // as the SDK turn. requestStop aborts bridgeAbortController, which the
+    // server.listen startup path observes and cleans up.
     unregisterCancel = runControlRegistry.registerOnCancel(runId, () =>
       requestStop('run cancelled', abortError('Copilot SDK run cancelled')),
     );
@@ -650,10 +649,6 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       abortSignal.addEventListener('abort', onAbort, { once: true });
       if (abortSignal.aborted) onAbort();
     }
-    lease.startRenewal((error) => {
-      ctl.leaseLost = true;
-      requestStop('subscription lease lost', new CopilotSdkError('copilot_sdk_lease_lost', `Copilot subscription lease renewal failed: ${redactSecret(error.message, token)}`));
-    });
     if (publisher?.getState) {
       pollTimer = setInterval(() => {
         void publisher.getState().then((run: AnyObject) => {
@@ -665,6 +660,35 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       pollTimer.unref?.();
     }
 
+    bridgeStartupPromise = (options.dependencies?.startBridge ?? startRunToolBridge)({
+      runId,
+      state,
+      publisher: (publisher as RunBridgePublisher | undefined) ?? null,
+      resolvedTools: servable,
+      environmentId: typeof state?.data?.environmentId === 'string' ? state.data.environmentId : '',
+      workingDir: typeof state?.data?.workingDir === 'string' && state.data.workingDir ? state.data.workingDir : mount.tree,
+      abortSignal: bridgeAbortController.signal,
+      neuronStepId: stepId,
+      dir,
+      maxToolIterations: typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0 ? config.maxToolIterations : undefined,
+      onCancel: () => requestStop('run cancelled', abortError('Copilot SDK run cancelled')),
+    });
+    bridge = await controlled(bridgeStartupPromise);
+    if (ctl.timedOut) throw timeoutError;
+    if (ctl.leaseLost) throw new CopilotSdkError('copilot_sdk_lease_lost', 'Copilot SDK lease was lost while the run bridge was starting');
+    if (ctl.stopReason) throw abortError(`Copilot SDK bridge startup stopped: ${ctl.stopReason}`);
+    if (abortSignal?.aborted || runControlRegistry.wasCancelled(runId)) throw abortError('Copilot SDK step cancelled during bridge startup');
+    await assertLeaseOwned('after bridge startup');
+
+    const prompts = buildPrompts(config, state, mount.tree);
+    const promptBytes = Buffer.byteLength(prompts.system, 'utf8') + Buffer.byteLength(prompts.user, 'utf8');
+    if (promptBytes > MAX_PROMPT_BYTES) {
+      throw new CopilotSdkError('copilot_sdk_prompt_too_large', `Copilot SDK prompt is ${promptBytes} bytes; maximum is ${MAX_PROMPT_BYTES}`);
+    }
+    const allowedNames = new Set(bridge.toolNames);
+    streamToUser = config.stream === true && publishChunk !== undefined;
+    const clientOptions = buildCopilotSdkClientOptions({ home, cwd, dir });
+    client = (options.dependencies?.createClient ?? ((opts) => new CopilotClient(opts)))(clientOptions);
     // Only this bridge's exact tool names are permitted. The SDK's own
     // permission callback independently rejects every shell/read/write/url,
     // built-in, or unknown MCP request.
@@ -684,8 +708,10 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
         console.error(`[CopilotSdk][security] denied non-bridge tool request in run ${runId}, step ${stepId}: ${name.slice(0, 160)}`);
       }),
     });
+    await assertLeaseOwned('before SDK runtime start');
     await controlled(client.start());
     if (abortSignal?.aborted || runControlRegistry.wasCancelled(runId)) throw abortError('Copilot SDK step cancelled before session creation');
+    await assertLeaseOwned('before SDK session creation');
     session = await controlled(client.createSession(sessionConfig));
     const sessionId = session.sessionId;
 
@@ -838,6 +864,16 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
     if (bridge) {
       try { await withDeadline(bridge.close({ removeDir: false }), 3000, () => undefined); }
       catch (error) { console.warn('[CopilotSdk] run bridge close failed:', redactSecret(String(error), token)); }
+    } else if (bridgeStartupPromise) {
+      // The controlled race may return before a startup implementation settles.
+      // Give the real abortable bridge time to finish its listen/socket cleanup;
+      // if it resolves late, close it here rather than leaking the server.
+      const lateBridgeCleanup = bridgeStartupPromise.then(async (lateBridge) => {
+        try { await lateBridge.close({ removeDir: false }); }
+        catch (error) { console.warn('[CopilotSdk] late run bridge close failed:', redactSecret(String(error), token)); }
+      }).catch(() => undefined);
+      try { await withDeadline(lateBridgeCleanup, 3000, () => undefined); }
+      catch { /* bounded cleanup: abort signal remains the bridge's hard stop */ }
     }
     try { fs.rmSync(dir, { recursive: true, force: true }); }
     catch (error) { console.warn(`[CopilotSdk] private run-state cleanup failed: ${redactSecret(String(error), token)}`); }

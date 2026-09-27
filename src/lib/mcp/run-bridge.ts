@@ -929,6 +929,7 @@ export async function startRunToolBridge(
   let closed = false;
   let unregisterCancel: () => void = () => {};
   let abortHandler: (() => void) | null = null;
+  let abortStartupWait: (() => void) | null = null;
 
   const server = net.createServer();
   // Node destroys anything past this before `connection` even fires, so the
@@ -964,6 +965,17 @@ export async function startRunToolBridge(
     }
   }
 
+  async function closeListeningServer(): Promise<void> {
+    if (!server.listening) return;
+    await new Promise<void>((resolve) => {
+      try {
+        server.close(() => resolve());
+      } catch {
+        resolve();
+      }
+    });
+  }
+
   async function close(opts?: { removeDir?: boolean }): Promise<void> {
     const removeDir = opts?.removeDir !== false;
     if (!closed) {
@@ -978,23 +990,28 @@ export async function startRunToolBridge(
         }
         abortHandler = null;
       }
-      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
     try {
-      fs.unlinkSync(socketPath);
-    } catch {
-      /* already gone */
-    }
-    if (removeDir) {
+      // A close during pending listen may have already initiated shutdown;
+      // conversely, a late `listening` event after abort must still be closed.
+      await closeListeningServer();
+    } finally {
       try {
-        fs.rmSync(stepDir, { recursive: true, force: true });
-      } catch (err) {
-        console.warn(`[RunBridge] failed to remove step dir ${stepDir}:`, err);
+        fs.unlinkSync(socketPath);
+      } catch {
+        /* already gone */
       }
+      if (removeDir) {
+        try {
+          fs.rmSync(stepDir, { recursive: true, force: true });
+        } catch (err) {
+          console.warn(`[RunBridge] failed to remove step dir ${stepDir}:`, err);
+        }
+      }
+      // Whatever `removeDir` said, this bridge no longer needs the exit sweep:
+      // either the directory is gone, or the caller asked to keep it.
+      ACTIVE_BRIDGE_PATHS.delete(socketPath);
     }
-    // Whatever `removeDir` said, this bridge no longer needs the exit sweep:
-    // either the directory is gone, or the caller asked to keep it.
-    ACTIVE_BRIDGE_PATHS.delete(socketPath);
   }
 
   // ── JSON-RPC plumbing ──────────────────────────────────────────────────────
@@ -1607,20 +1624,10 @@ export async function startRunToolBridge(
     console.warn(`[RunBridge] server error for run ${runId}:`, err);
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(socketPath, () => {
-      server.removeListener('error', reject);
-      resolve();
-    });
-  });
-  fs.chmodSync(socketPath, 0o600);
-  // From here on the socket and the step directory exist on disk. `close()`
-  // removes both; this covers the paths where `close()` never runs.
+  // Register cleanup and cancellation BEFORE listen. `net.Server.listen()` may
+  // remain pending; rejecting the caller's race alone is not sufficient because
+  // a late listening event could otherwise leave the Unix socket behind.
   registerForExitCleanup(socketPath, stepDir);
-
-  // Cancellation: one registration does all three jobs — kill the CLI child
-  // (the executor's callback), revoke the session, close the server.
   unregisterCancel = runControlRegistry.registerOnCancel(runId, () => {
     try {
       onCancel?.();
@@ -1628,16 +1635,86 @@ export async function startRunToolBridge(
       console.warn('[RunBridge] onCancel hook threw:', err);
     }
     revoke('run cancelled');
+    abortStartupWait?.();
+    void close({ removeDir: true }).catch((err) => {
+      console.warn('[RunBridge] cleanup after run cancellation failed:', err);
+    });
   });
-
+  const startupAbort = (): Error => {
+    const error = new Error('Run aborted while starting the tool bridge');
+    error.name = 'AbortError';
+    return error;
+  };
+  const abortStartup = () => {
+    if (revoked) return;
+    revoke('run aborted');
+    void close({ removeDir: true }).catch((err) => {
+      console.warn('[RunBridge] cleanup after startup abort failed:', err);
+    });
+  };
   if (abortSignal) {
-    if (abortSignal.aborted) {
-      revoke('run aborted');
-    } else {
-      abortHandler = () => revoke('run aborted');
-      abortSignal.addEventListener('abort', abortHandler, { once: true });
-    }
+    abortHandler = abortStartup;
+    if (abortSignal.aborted) abortStartup();
+    else abortSignal.addEventListener('abort', abortHandler, { once: true });
   }
+  try {
+    if (revoked) throw startupAbort();
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const onStartupError = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        server.removeListener('listening', onListening);
+        if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+        abortStartupWait = null;
+        void close({ removeDir: true }).catch(() => undefined);
+        reject(error);
+      };
+      const onListening = () => {
+        if (settled) {
+          // Abort may win while listen is pending. Close a late-bound server and
+          // repeat filesystem cleanup in case the first pass preceded creation.
+          void close({ removeDir: true }).catch((err) => {
+            console.warn('[RunBridge] late-listen cleanup failed:', err);
+          });
+          return;
+        }
+        settled = true;
+        if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+        abortStartupWait = null;
+        server.removeListener('error', onStartupError);
+        resolve();
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+        abortStartupWait = null;
+        server.removeListener('error', onStartupError);
+        // Keep onListening installed so a listen callback that arrives after
+        // this rejection still closes the server and removes its socket.
+        abortStartup();
+        reject(startupAbort());
+      };
+      abortStartupWait = onAbort;
+      server.once('error', onStartupError);
+      server.once('listening', onListening);
+      if (abortSignal?.aborted || revoked) {
+        onAbort();
+        return;
+      }
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+      server.listen(socketPath);
+    });
+  } catch (error) {
+    await close({ removeDir: true }).catch(() => undefined);
+    throw error;
+  }
+  if (revoked || abortSignal?.aborted) {
+    await close({ removeDir: true }).catch(() => undefined);
+    throw startupAbort();
+  }
+  fs.chmodSync(socketPath, 0o600);
 
   const shimPath = resolveShimPath();
   const mcpConfig = {

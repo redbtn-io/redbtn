@@ -7,6 +7,7 @@ import {
   COPILOT_MAX_CONCURRENT,
   COPILOT_LEASE_TTL_MS,
   COPILOT_LEASE_ACQUIRE_SCRIPT,
+  COPILOT_LEASE_ASSERT_SCRIPT,
   COPILOT_LEASE_RELEASE_SCRIPT,
   COPILOT_LEASE_RENEW_SCRIPT,
   type CopilotRedisLeaseClient,
@@ -30,8 +31,21 @@ class SharedRedis implements CopilotRedisLeaseClient {
     }
     if (script === COPILOT_LEASE_RENEW_SCRIPT) {
       const token = String(args[0]);
-      if (!set.has(token)) return 0;
+      const expires = set.get(token);
+      if (expires === undefined || expires <= this.serverTimeMs) {
+        set.delete(token);
+        return 0;
+      }
       set.set(token, this.serverTimeMs + Number(args[1]));
+      return 1;
+    }
+    if (script === COPILOT_LEASE_ASSERT_SCRIPT) {
+      const token = String(args[0]);
+      const expires = set.get(token);
+      if (expires === undefined || expires <= this.serverTimeMs) {
+        set.delete(token);
+        return 0;
+      }
       return 1;
     }
     if (script === COPILOT_LEASE_RELEASE_SCRIPT) return set.delete(String(args[0])) ? 1 : 0;
@@ -90,6 +104,24 @@ describe('copilot-sdk distributed subscription lease', () => {
       clockSpy.mockRestore();
       await Promise.all(leases.map((lease) => lease.release()));
     }
+  });
+
+  it('uses Redis time to reject ownership after expiry and does not resurrect an expired lease on renewal', async () => {
+    const shared = new SharedRedis();
+    const lease = await acquireCopilotLease({
+      maxWaitMs: 100,
+      ttlMs: 50,
+      renewMs: 5,
+      redisFactory: async () => shared,
+    });
+    const onLost = vi.fn();
+    lease.startRenewal(onLost);
+    shared.serverTimeMs += 51;
+    await vi.waitFor(() => expect(onLost).toHaveBeenCalledOnce());
+    await expect(lease.assertOwned()).resolves.toBe(false);
+    expect([...shared.entries.values()][0].size).toBe(0);
+    expect(shared.calls.some((call) => call.script === COPILOT_LEASE_RENEW_SCRIPT)).toBe(true);
+    await lease.release();
   });
 
   it('fails with a stable error when REDIS_URL is absent and never targets localhost', async () => {

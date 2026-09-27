@@ -22,6 +22,8 @@ export interface CopilotRedisLeaseClient {
 
 export interface CopilotLeaseHandle {
   startRenewal(onLost: (error: Error) => void): void;
+  /** Verify Redis still considers this lease live using Redis TIME. */
+  assertOwned(): Promise<boolean>;
   release(): Promise<void>;
 }
 
@@ -49,10 +51,25 @@ export const COPILOT_LEASE_ACQUIRE_SCRIPT = `
 export const COPILOT_LEASE_RENEW_SCRIPT = `
   local time = redis.call('TIME')
   local now = (tonumber(time[1]) * 1000) + math.floor(tonumber(time[2]) / 1000)
-  if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
+  local expires = redis.call('ZSCORE', KEYS[1], ARGV[1])
+  if not expires or tonumber(expires) <= now then
+    redis.call('ZREM', KEYS[1], ARGV[1])
+    return 0
+  end
   local ttl = tonumber(ARGV[2])
   redis.call('ZADD', KEYS[1], now + ttl, ARGV[1])
   redis.call('PEXPIRE', KEYS[1], ttl * 2)
+  return 1
+`;
+
+export const COPILOT_LEASE_ASSERT_SCRIPT = `
+  local time = redis.call('TIME')
+  local now = (tonumber(time[1]) * 1000) + math.floor(tonumber(time[2]) / 1000)
+  local expires = redis.call('ZSCORE', KEYS[1], ARGV[1])
+  if not expires or tonumber(expires) <= now then
+    redis.call('ZREM', KEYS[1], ARGV[1])
+    return 0
+  end
   return 1
 `;
 
@@ -184,6 +201,10 @@ export async function acquireCopilotLease(
   let renewalTimer: NodeJS.Timeout | null = null;
   let released = false;
   const handle: CopilotLeaseHandle = {
+    async assertOwned() {
+      const result = await client.eval(COPILOT_LEASE_ASSERT_SCRIPT, 1, key, token);
+      return Number(result) === 1;
+    },
     startRenewal(onLost) {
       if (renewalTimer || released) return;
       let lossReported = false;
