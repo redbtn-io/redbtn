@@ -60,11 +60,49 @@ describe('opencodeExecutor', () => {
         userId: 'u-test',
         emitUsage: () => {},
       });
-
       expect(result).toBeDefined();
       expect(result.reply).toBeDefined();
       expect(typeof result.reply).toBe('string');
       expect((result.reply as string).length).toBeGreaterThan(0);
     }
+  });
+
+  it('dispatches through executeNeuron when provider is opencode', async () => {
+    const { executeNeuron } = await import('../../src/lib/nodes/universal/executors/neuronExecutor');
+    const neuronRegistry = {
+      getConfig: async (id: string) => ({
+        id,
+        name: 'OpenCode Test',
+        provider: 'opencode',
+        endpoint: 'opencode://worker',
+        model: 'big-pickle',
+        role: 'worker',
+        tier: 0,
+      }),
+      getModel: async () => {
+        throw new Error('should not call getModel for opencode');
+      },
+      callNeuron: async () => {
+        throw new Error('should not call callNeuron for opencode');
+      },
+    };
+
+    const state = {
+      neuronRegistry,
+      runId: 'run-e2e-opencode',
+      data: {},
+    };
+
+    const config = {
+      stepId: 'step-1',
+      type: 'neuron' as const,
+      outputField: 'answer',
+      neuronId: 'opencode-neuron-1',
+      userPrompt: 'Reply with the single word PONG',
+    };
+
+    const result = await executeNeuron(config, state);
+    expect(result.answer).toBeDefined();
+    expect(typeof result.answer).toBe('string');
   });
 });
