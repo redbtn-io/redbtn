@@ -525,6 +525,13 @@ export class NeuronRegistry {
         throw new NeuronProviderError(
           'agy-cli neurons run via agyCliExecutor, not createModel',
         );
+      case 'copilot-sdk':
+        // Subscription-backed programmatic SDK, intentionally not an API-key
+        // LangChain model. Falling through would silently change the
+        // credential/billing path, so execution must go through the SDK executor.
+        throw new NeuronProviderError(
+          'copilot-sdk neurons run via copilotSdkExecutor, not createModel',
+        );
       default:
         throw new NeuronProviderError(`Unknown provider: ${(config as NeuronConfig).provider}`);
     }

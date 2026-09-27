@@ -26,10 +26,22 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn } from 'child_process';
+import { EventEmitter } from 'events';
 import * as net from 'net';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+
+const bridgeNetMock = vi.hoisted(() => ({
+  createServer: vi.fn(),
+  realCreateServer: undefined as ((...args: any[]) => unknown) | undefined,
+}));
+vi.mock('net', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('net')>();
+  bridgeNetMock.realCreateServer = actual.createServer as (...args: any[]) => unknown;
+  bridgeNetMock.createServer.mockImplementation(actual.createServer);
+  return { ...actual, createServer: bridgeNetMock.createServer };
+});
 
 import {
   startRunToolBridge,
@@ -60,7 +72,6 @@ import {
   type RunBridgeToolRef,
 } from '../../src/lib/mcp/run-bridge';
 import { getNativeRegistry } from '../../src/lib/tools/native-registry';
-import { DATA_TOOL_RULES, getDataToolRule } from '../../src/lib/permissions/tool-map';
 import { runControlRegistry } from '../../src/lib/run/RunControlRegistry';
 import { __setRedisForTest } from '../../src/lib/permissions/exec-guard';
 import type { CapabilityProfile } from '../../src/lib/permissions/types';
@@ -984,6 +995,230 @@ describe('nonce gate', () => {
 // =============================================================================
 
 describe('lifecycle', () => {
+  it('retries shutdown when late listening beats the pending not-running close callback', async () => {
+    const controller = new AbortController();
+    const stepDir = path.join(tmpDir, 'pending-listen', 'step');
+    let listening = false;
+    let firstCloseCallback: ((error?: Error) => void) | undefined;
+    let secondCloseCallback: ((error?: Error) => void) | undefined;
+    const fake = new EventEmitter() as EventEmitter & {
+      maxConnections: number;
+      listening: boolean;
+      listen: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    Object.defineProperty(fake, 'listening', { get: () => listening });
+    fake.maxConnections = 0;
+    fake.listen = vi.fn(() => fake); // deliberately never emits 'listening'
+    fake.close = vi.fn((callback?: (error?: Error) => void) => {
+      if (!listening) {
+        firstCloseCallback = callback;
+        return fake;
+      }
+      listening = false;
+      secondCloseCallback = callback;
+      return fake;
+    });
+    bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+    const startPromise = startRunToolBridge({
+      runId: RUN_ID,
+      state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+      publisher: null,
+      resolvedTools: [],
+      environmentId: ENV_ID,
+      workingDir: WORKING_DIR,
+      abortSignal: controller.signal,
+      neuronStepId: 'bridge-startup-abort',
+      dir: stepDir,
+    });
+
+    try {
+      await vi.waitFor(() => expect(fake.listen).toHaveBeenCalledOnce());
+      expect(fs.existsSync(stepDir)).toBe(true);
+      controller.abort();
+      await vi.waitFor(() => expect(firstCloseCallback).toBeDefined());
+
+      // The listen event wins the race, but the first close callback has not
+      // yet reported ERR_SERVER_NOT_RUNNING. The shutdown promise must remain
+      // pending, then initiate and await a second close for the live server.
+      listening = true;
+      fake.emit('listening');
+      firstCloseCallback!(Object.assign(new Error('server is not running'), { code: 'ERR_SERVER_NOT_RUNNING' }));
+      await vi.waitFor(() => expect(fake.close).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(secondCloseCallback).toBeDefined());
+      expect(fs.existsSync(stepDir)).toBe(true);
+      let startupSettled = false;
+      void startPromise.finally(() => { startupSettled = true; }).catch(() => undefined);
+      await Promise.resolve();
+      expect(startupSettled).toBe(false);
+
+      secondCloseCallback!();
+      await expect(startPromise).rejects.toMatchObject({ name: 'AbortError' });
+      expect(fs.existsSync(stepDir)).toBe(false);
+    } finally {
+      firstCloseCallback?.(Object.assign(new Error('server is not running'), { code: 'ERR_SERVER_NOT_RUNNING' }));
+      secondCloseCallback?.();
+      await startPromise.catch(() => undefined);
+      bridgeNetMock.createServer.mockReset();
+      bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+    }
+  });
+
+  it('waits for the server.close callback after listening becomes false before removing bridge files', async () => {
+    const stepDir = path.join(tmpDir, 'delayed-close', 'step');
+    let listening = false;
+    let finishServerClose: (() => void) | undefined;
+    const fake = new EventEmitter() as EventEmitter & {
+      maxConnections: number;
+      listening: boolean;
+      listen: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    Object.defineProperty(fake, 'listening', { get: () => listening });
+    fake.maxConnections = 0;
+    fake.listen = vi.fn((socketPath: string) => {
+      fs.writeFileSync(socketPath, '');
+      listening = true;
+      fake.emit('listening');
+      return fake;
+    });
+    fake.close = vi.fn((callback?: () => void) => {
+      listening = false; // Node clears this before all handles have drained.
+      if (callback) finishServerClose = callback;
+      return fake;
+    });
+    bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+
+    let bridgeClose: Promise<void> | undefined;
+    try {
+      const started = await startRunToolBridge({
+        runId: RUN_ID,
+        state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+        publisher: null,
+        resolvedTools: [],
+        environmentId: ENV_ID,
+        workingDir: WORKING_DIR,
+        abortSignal: null,
+        neuronStepId: 'bridge-delayed-close',
+        dir: stepDir,
+      });
+      let cleanupResolved = false;
+      bridgeClose = started.close().then(() => { cleanupResolved = true; });
+
+      await Promise.resolve();
+      expect(fake.listening).toBe(false);
+      expect(fake.close).toHaveBeenCalledOnce();
+      expect(finishServerClose).toBeDefined();
+      expect(cleanupResolved).toBe(false);
+      expect(fs.existsSync(stepDir)).toBe(true);
+
+      finishServerClose!();
+      await bridgeClose;
+      expect(cleanupResolved).toBe(true);
+      expect(fs.existsSync(stepDir)).toBe(false);
+    } finally {
+      finishServerClose?.();
+      await bridgeClose?.catch(() => undefined);
+      bridgeNetMock.createServer.mockReset();
+      bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+    }
+  });
+
+  it('cleans up a failed listen when close reports that no server was listening', async () => {
+    const stepDir = path.join(tmpDir, 'listen-failure', 'step');
+    const listenError = new Error('fixture listen failure');
+    const fake = new EventEmitter() as EventEmitter & {
+      maxConnections: number;
+      listening: boolean;
+      listen: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    Object.defineProperty(fake, 'listening', { value: false });
+    fake.maxConnections = 0;
+    fake.listen = vi.fn(() => {
+      queueMicrotask(() => fake.emit('error', listenError));
+      return fake;
+    });
+    fake.close = vi.fn();
+    bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+
+    try {
+      await expect(startRunToolBridge({
+        runId: RUN_ID,
+        state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+        publisher: null,
+        resolvedTools: [],
+        environmentId: ENV_ID,
+        workingDir: WORKING_DIR,
+        abortSignal: null,
+        neuronStepId: 'bridge-listen-failure',
+        dir: stepDir,
+      })).rejects.toThrow('fixture listen failure');
+      // No close callback is needed after listen failed without creating a
+      // listening server; the failure path must still complete cleanup.
+      expect(fake.close).not.toHaveBeenCalled();
+      expect(fs.existsSync(stepDir)).toBe(false);
+    } finally {
+      bridgeNetMock.createServer.mockReset();
+      bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+    }
+  });
+
+  it.each(['callback-error', 'sync-throw'] as const)(
+    'keeps bridge files registered when server.close has an unconfirmed %s',
+    async (failureMode) => {
+      const stepDir = path.join(tmpDir, `close-unconfirmed-${failureMode}`, 'step');
+      let listening = false;
+      const fake = new EventEmitter() as EventEmitter & {
+        maxConnections: number;
+        listening: boolean;
+        listen: ReturnType<typeof vi.fn>;
+        close: ReturnType<typeof vi.fn>;
+      };
+      Object.defineProperty(fake, 'listening', { get: () => listening });
+      fake.maxConnections = 0;
+      fake.listen = vi.fn((socketPath: string) => {
+        fs.writeFileSync(socketPath, '');
+        listening = true;
+        fake.emit('listening');
+        return fake;
+      });
+      fake.close = vi.fn((callback?: (error?: Error) => void) => {
+        if (failureMode === 'sync-throw') throw new Error('fixture close throw');
+        listening = false;
+        queueMicrotask(() => callback?.(new Error('fixture close callback error')));
+        return fake;
+      });
+      bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+
+      try {
+        const started = await startRunToolBridge({
+          runId: RUN_ID,
+          state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+          publisher: null,
+          resolvedTools: [],
+          environmentId: ENV_ID,
+          workingDir: WORKING_DIR,
+          abortSignal: null,
+          neuronStepId: `bridge-unconfirmed-${failureMode}`,
+          dir: stepDir,
+        });
+        await expect(started.close()).rejects.toMatchObject({ code: 'run_bridge_shutdown_unconfirmed' });
+        expect(fs.existsSync(stepDir)).toBe(true);
+        expect(fs.existsSync(started.socketPath)).toBe(true);
+
+        // The process-exit reaper remains registered and can perform its
+        // synchronous cleanup when the owning worker is fail-stopped.
+        cleanupOrphanedBridges();
+        expect(fs.existsSync(stepDir)).toBe(false);
+      } finally {
+        cleanupOrphanedBridges();
+        bridgeNetMock.createServer.mockReset();
+        bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+      }
+    },
+  );
+
   it('revokes when the run aborts', async () => {
     const controller = new AbortController();
     const { bridge: b } = await start({ abortSignal: controller.signal });
@@ -996,11 +1231,11 @@ describe('lifecycle', () => {
     expect(b.revokedReason).toMatch(/aborted/);
   });
 
-  it('starts already-revoked when handed an aborted signal', async () => {
+  it('refuses startup and cleans up when handed an already-aborted signal', async () => {
     const controller = new AbortController();
     controller.abort();
-    const { bridge: b } = await start({ abortSignal: controller.signal });
-    expect(b.revoked).toBe(true);
+    await expect(start({ abortSignal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fs.existsSync(path.join(tmpDir, 'step'))).toBe(false);
   });
 
   it('kills the child, revokes and closes on run cancellation', async () => {

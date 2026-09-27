@@ -23,6 +23,13 @@ describe('create_neuron — schema', () => {
     expect(createNeuronTool.server).toBe('platform');
     expect(createNeuronTool.inputSchema.required).toEqual(['config']);
   });
+
+  test('documents copilot-sdk as a regular subscription neuron with a RedSecrets credential', () => {
+    const configSchema = createNeuronTool.inputSchema.properties?.config as { description?: string };
+    expect(configSchema.description).toContain('copilot-sdk');
+    expect(configSchema.description).toContain('secretName');
+    expect(configSchema.description).toContain('structuredOutput is not supported');
+  });
 });
 
 describe('create_neuron — happy path', () => {
