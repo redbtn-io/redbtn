@@ -26,8 +26,14 @@ import type { NeuronProvider } from '../types/neuron';
 function matchesGlob(value: string, pattern: string): boolean {
   const lowered = value.toLowerCase();
   const p = pattern.toLowerCase();
+  if (p.startsWith('*') && p.endsWith('*')) {
+    return lowered.includes(p.slice(1, -1));
+  }
   if (p.endsWith('*')) {
     return lowered.startsWith(p.slice(0, -1));
+  }
+  if (p.startsWith('*')) {
+    return lowered.endsWith(p.slice(1));
   }
   return lowered === p;
 }
@@ -106,6 +112,23 @@ const MATRIX: Record<NeuronProvider, MatrixEntry[]> = {
   'copilot-sdk': [
     { patterns: ['*'], hasVision: false },
   ],
+  // OpenCode CLI runner — text-only in V1.
+  opencode: [
+    { patterns: ['*'], hasVision: false },
+  ],
+  // OpenCode Zen models (multimodal models match patterns like *vision*, *vl*, etc.)
+  'opencode-zen': [
+    {
+      patterns: ['*vision*', '*vl*', 'gpt-4o*', 'gpt-5*', 'gpt-6*', 'claude-*', 'gemini-*'],
+      hasVision: true,
+    },
+  ],
+  zen: [
+    {
+      patterns: ['*vision*', '*vl*', 'gpt-4o*', 'gpt-5*', 'gpt-6*', 'claude-*', 'gemini-*'],
+      hasVision: true,
+    },
+  ],
 };
 
 const PROVIDER_DEFAULTS: Record<NeuronProvider, boolean> = {
@@ -117,6 +140,9 @@ const PROVIDER_DEFAULTS: Record<NeuronProvider, boolean> = {
   'claude-code': false,
   'agy-cli': false,
   'copilot-sdk': false,
+  opencode: false,
+  'opencode-zen': false,
+  zen: false,
 };
 
 /**

@@ -127,6 +127,17 @@ const MATRIX: Record<NeuronProvider, MatrixEntry[]> = {
   'copilot-sdk': [
     { patterns: ['*'], strategy: 'none' },
   ],
+  // OpenCode CLI runner owns its own loop.
+  opencode: [
+    { patterns: ['*'], strategy: 'none' },
+  ],
+  // OpenCode Zen (OpenAI-compatible hosted API gateway) — supports native tool calling.
+  'opencode-zen': [
+    { patterns: ['*'], strategy: 'native' },
+  ],
+  zen: [
+    { patterns: ['*'], strategy: 'native' },
+  ],
 };
 
 /**
@@ -147,6 +158,9 @@ const PROVIDER_DEFAULTS: Record<NeuronProvider, ToolStrategy> = {
   'claude-code': 'none',
   'agy-cli': 'none',
   'copilot-sdk': 'none',
+  opencode: 'none',
+  'opencode-zen': 'native',
+  zen: 'native',
 };
 
 /**
@@ -279,6 +293,9 @@ const HOSTED_MATRIX: Record<NeuronProvider, HostedMatrixEntry[]> = {
   'claude-code': [],
   'agy-cli': [],
   'copilot-sdk': [],
+  opencode: [],
+  'opencode-zen': [],
+  zen: [],
 };
 
 /**
