@@ -782,8 +782,15 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       });
     }
 
-    // ── `opencode`: an OpenCode CLI runner, not a BaseChatModel ───────────────
-    if (early?.provider === 'opencode') {
+    // ── `opencode` / `opencode-zen`: OpenCode CLI runner or Zen API gateway ──
+    if (
+      early?.provider === 'opencode' ||
+      ((early?.provider === 'opencode-zen' || early?.provider === 'zen') &&
+        !early?.apiKey &&
+        !process.env.OPENCODE_ZEN_API_KEY &&
+        !process.env.OPENCODE_API_KEY &&
+        !process.env.ZEN_API_KEY)
+    ) {
       return await runOpencodeStep({
         config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
       });

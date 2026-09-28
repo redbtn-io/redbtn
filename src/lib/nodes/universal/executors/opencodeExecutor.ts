@@ -48,6 +48,15 @@ export function resolveOpencodeModel(model?: string): string {
     return 'opencode/big-pickle';
   }
   const trimmed = model.trim();
+  if (
+    trimmed === 'muse-spark-1.3' ||
+    trimmed === 'muse-spark' ||
+    trimmed === 'muse' ||
+    trimmed === 'opencode/muse-spark-1.3' ||
+    trimmed === 'opencode/muse-spark'
+  ) {
+    return 'opencode/muse-spark-1.3-contributor-free';
+  }
   return trimmed.includes('/') ? trimmed : `opencode/${trimmed}`;
 }
 
