@@ -149,6 +149,15 @@ export const COPILOT_SDK_FALLBACK_CODES: ReadonlySet<string> = new Set([
   'copilot_sdk_timeout',
 ]);
 
+/** Operational OpenCode CLI failures that can be survived by another neuron. */
+export const OPENCODE_FALLBACK_CODES: ReadonlySet<string> = new Set([
+  'opencode_spawn_failed',
+  'opencode_rate_limited',
+  'opencode_timeout',
+  'opencode_failed',
+  'opencode_error_result',
+]);
+
 /** Node / undici / provider-SDK connection error codes. */
 const NETWORK_ERROR_CODES: ReadonlySet<string> = new Set([
   'ECONNRESET',
@@ -259,6 +268,9 @@ export function classifyFallbackTrigger(err: unknown): FallbackTriggerCode | nul
     }
     if (typeof code === 'string' && code.startsWith('copilot_sdk_')) {
       return COPILOT_SDK_FALLBACK_CODES.has(code) ? code : null;
+    }
+    if (typeof code === 'string' && code.startsWith('opencode_')) {
+      return OPENCODE_FALLBACK_CODES.has(code) ? code : null;
     }
   }
 

@@ -55,7 +55,7 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
 
 const createNeuronTool: NativeToolDefinition = {
   description:
-    'Create a new neuron (LLM endpoint config). Wraps an LLM provider (Ollama/OpenAI/Anthropic/Google/custom, or a subscription-backed coding agent: claude-code for Claude, agy-cli for Antigravity/Gemini, copilot-sdk for GitHub Copilot) with model selection and inference parameters. Used by graph nodes via neuron step type.',
+    'Create a new neuron (LLM endpoint config). Wraps an LLM provider (Ollama/OpenAI/Anthropic/Google/custom, OpenCode Zen: opencode-zen/zen, or a subscription-backed coding agent: claude-code for Claude, agy-cli for Antigravity/Gemini, copilot-sdk for GitHub Copilot, opencode for OpenCode) with model selection and inference parameters. Used by graph nodes via neuron step type.',
   server: 'platform',
   inputSchema: {
     type: 'object',
@@ -68,7 +68,7 @@ const createNeuronTool: NativeToolDefinition = {
       config: {
         type: 'object',
         description:
-          'NeuronConfig: { name (required), provider (required: ollama|openai|anthropic|google|custom|claude-code|agy-cli|copilot-sdk), model (required; for agy-cli use a supported Gemini/Claude/GPT-OSS model; for copilot-sdk use a model id available to the Copilot subscription, e.g. gpt-5), endpoint? (use claude-code://worker, agy-cli://worker, or copilot-sdk://worker for subscription providers), secretName? (required for subscription providers; use COPILOT_GITHUB_TOKEN for copilot-sdk; resolves via RedSecrets), temperature? (default 0.7), maxTokens? (default 4096), topP?, audioOptimized?, parameters? ({ effort } — claude-code low|medium|high|xhigh|max, agy-cli low|medium|high), role? (chat|worker|specialist), description?, tags? }. copilot-sdk structuredOutput is not supported in V1.',
+          'NeuronConfig: { name (required), provider (required: ollama|openai|anthropic|google|custom|claude-code|agy-cli|copilot-sdk|opencode|opencode-zen|zen), model (required; for agy-cli use a supported Gemini/Claude/GPT-OSS model; for copilot-sdk use a model id available to the Copilot subscription; for opencode use model like opencode/big-pickle; for opencode-zen use zen model name), endpoint? (use claude-code://worker, agy-cli://worker, copilot-sdk://worker, or opencode://worker for CLI providers; https://opencode.ai/zen/v1 for opencode-zen), secretName? (resolves via RedSecrets), temperature? (default 0.7), maxTokens? (default 4096), topP?, audioOptimized?, parameters? ({ effort } — claude-code low|medium|high|xhigh|max, agy-cli low|medium|high), role? (chat|worker|specialist), description?, tags? }.',
       },
     },
     required: ['config'],

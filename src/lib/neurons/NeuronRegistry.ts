@@ -371,7 +371,7 @@ export class NeuronRegistry {
     if (config) return config;
     const doc = await Neuron.findOne({
       neuronId,
-      $or: [{ userId }, ...SYSTEM_OWNER_BRANCHES],
+      $or: [{ userId }, { isPublic: true }, ...SYSTEM_OWNER_BRANCHES],
     });
     if (!doc) throw new NeuronNotFoundError(`Neuron '${neuronId}' not found`);
 
@@ -403,6 +403,7 @@ export class NeuronRegistry {
       role: doc.role,
       tier: doc.tier,
       userId: doc.userId,
+      isPublic: doc.isPublic ?? false,
       audioOptimized: (doc as any).audioOptimized ?? false,
       // Both are optional subdocuments. `toObject` strips the Mongoose
       // document wrapper so the cached config is a plain value — it is handed
@@ -532,6 +533,29 @@ export class NeuronRegistry {
         throw new NeuronProviderError(
           'copilot-sdk neurons run via copilotSdkExecutor, not createModel',
         );
+      case 'opencode':
+        // Not a chat model. `opencode` neurons drive the OpenCode CLI
+        // process through a dedicated executor (opencodeExecutor), which is
+        // entered before `getModel()` is ever reached.
+        throw new NeuronProviderError(
+          'opencode neurons run via opencodeExecutor, not createModel',
+        );
+      case 'opencode-zen':
+      case 'zen':
+        return new ChatOpenAI({
+          modelName: config.model,
+          temperature: config.temperature ?? 0.0,
+          maxTokens: config.maxTokens,
+          topP: config.topP,
+          apiKey:
+            config.apiKey ||
+            process.env.OPENCODE_ZEN_API_KEY ||
+            process.env.OPENCODE_API_KEY ||
+            process.env.ZEN_API_KEY ||
+            'not-needed',
+          configuration: { baseURL: config.endpoint || 'https://opencode.ai/zen/v1' },
+          streamUsage: true,
+        });
       default:
         throw new NeuronProviderError(`Unknown provider: ${(config as NeuronConfig).provider}`);
     }
@@ -551,11 +575,30 @@ export class NeuronRegistry {
       }
       return;
     }
+    if (config.isPublic === true) {
+      return;
+    }
     throw new NeuronAccessDeniedError(`Neuron '${config.id}' is private`);
   }
 
-  private async getUserTier(_userId: string): Promise<number> {
-    return 4; // FREE tier - grants access to system neurons
+  private async getUserTier(userId: string): Promise<number> {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const mongoose = require('mongoose');
+      let User: any;
+      if (mongoose.models['User']) {
+        User = mongoose.models['User'];
+      } else {
+        const userSchema = new mongoose.Schema({}, { collection: 'users', strict: false });
+        User = mongoose.model('User', userSchema);
+      }
+      const user = await User.findById(userId).lean();
+      if (user && typeof user.accountLevel === 'number') return user.accountLevel;
+      return 4;
+    } catch (error) {
+      log.error('Error loading user tier:', error);
+      return 4;
+    }
   }
 
   async getUserNeurons(userId: string): Promise<NeuronConfig[]> {
@@ -563,7 +606,7 @@ export class NeuronRegistry {
     const docs = await Neuron.find({
       $or: [
         { userId },
-        // System neurons are tier-gated; match all system-owner forms.
+        { isPublic: true },
         ...SYSTEM_OWNER_BRANCHES.map((branch) => ({ ...branch, tier: { $gte: userTier } })),
       ],
     }).sort({ tier: 1, neuronId: 1 });
@@ -580,6 +623,7 @@ export class NeuronRegistry {
       role: doc.role,
       tier: doc.tier,
       userId: doc.userId,
+      isPublic: doc.isPublic,
     }));
   }
 
