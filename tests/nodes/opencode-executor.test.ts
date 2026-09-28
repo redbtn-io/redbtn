@@ -105,4 +105,50 @@ describe('opencodeExecutor', () => {
     expect(result.answer).toBeDefined();
     expect(typeof result.answer).toBe('string');
   });
+
+  it('maps muse-spark aliases to opencode/muse-spark-1.3-contributor-free', () => {
+    expect(resolveOpencodeModel('muse-spark-1.3')).toBe('opencode/muse-spark-1.3-contributor-free');
+    expect(resolveOpencodeModel('muse-spark')).toBe('opencode/muse-spark-1.3-contributor-free');
+    expect(resolveOpencodeModel('muse')).toBe('opencode/muse-spark-1.3-contributor-free');
+    expect(resolveOpencodeModel('opencode/muse-spark-1.3')).toBe('opencode/muse-spark-1.3-contributor-free');
+  });
+
+  it('dispatches keyless opencode-zen neuron through runOpencodeStep', async () => {
+    const { executeNeuron } = await import('../../src/lib/nodes/universal/executors/neuronExecutor');
+    const neuronRegistry = {
+      getConfig: async (id: string) => ({
+        id,
+        name: 'Muse Spark Zen',
+        provider: 'opencode-zen' as const,
+        endpoint: 'https://opencode.ai/zen/v1',
+        model: 'muse-spark-1.3',
+        role: 'worker' as const,
+        tier: 4,
+      }),
+      getModel: async () => {
+        throw new Error('should not call getModel for keyless opencode-zen');
+      },
+      callNeuron: async () => {
+        throw new Error('should not call callNeuron for keyless opencode-zen');
+      },
+    };
+
+    const state = {
+      neuronRegistry,
+      runId: 'run-e2e-zen-keyless',
+      data: {},
+    };
+
+    const config = {
+      stepId: 'step-zen',
+      type: 'neuron' as const,
+      outputField: 'answer',
+      neuronId: 'muse-spark-zen',
+      userPrompt: 'Reply with the single word PONG',
+    };
+
+    const result = await executeNeuron(config, state);
+    expect(result.answer).toBeDefined();
+    expect(typeof result.answer).toBe('string');
+  });
 });
