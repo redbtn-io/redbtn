@@ -222,6 +222,9 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   // ── State: writes ─────────────────────────────────────────────────────────
   set_global_state: { resource: 'state', action: 'write', extract: stateNamespace },
   state_patch: { resource: 'state', action: 'write', extract: stateNamespace },
+  // state_atomic's `read` op is a read, but the tool as a whole mutates
+  // (claims, releases, CAS, increments), so it is gated as a write.
+  state_atomic: { resource: 'state', action: 'write', extract: stateNamespace },
   create_state_record: { resource: 'state', action: 'write', extract: stateNamespace },
   update_state_record: { resource: 'state', action: 'write', extract: stateNamespace },
 
