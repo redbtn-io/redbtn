@@ -1,52 +1,82 @@
 /**
  * MCP Server Registry
- * Tracks available MCP servers and their capabilities
+ * Tracks available MCP servers and their capabilities.
+ *
+ * Every server belongs to exactly one ACCOUNT (`ownerUserId`) — a user's MCP
+ * connection is that user's, and a run can only reach the servers of the
+ * account it executes as ({@link McpToolScope}). There is no "global" user
+ * connection: adding an MCP server to an account never makes its tools
+ * available to anyone else on the platform.
+ *
+ * Servers are keyed by (ownerUserId, name), so two accounts can each have a
+ * connection called e.g. "RedRun" and both load, neither shadowing the other.
+ *
+ * The only exception is an explicitly PLATFORM-level server (`platform: true`)
+ * — one configured by the platform itself, not by a user account. Those are
+ * visible to every run. None are registered today; the flag exists so such a
+ * server has to be declared deliberately rather than by omitting an owner.
  */
 
 import { McpClientSSE } from './client-sse';
 import { Tool } from './types';
 
 export interface ServerRegistration {
+  /** Server-reported name (handshake) or the connection name (static). */
   name: string;
+  /** Connection name the server was registered under. */
+  connectionName: string;
   version: string;
   tools: Tool[];
   capabilities: Record<string, unknown> | { tools?: { listChanged?: boolean } };
   url: string;
-  /**
-   * Account that owns this server. When set, the server's tools are only
-   * resolvable by runs whose graph belongs to this account (see
-   * {@link McpToolScope}). Unset = legacy global registration, visible to every
-   * run on the worker.
-   */
+  /** Owning account. Undefined only for `platform` servers. */
   ownerUserId?: string;
+  /** True for platform-level servers (visible to every run). */
+  platform?: boolean;
 }
 
 /**
- * Which account is asking for a tool. Runs pass the owner of the graph being
- * executed, so a user-owned MCP connection is only reachable from graphs on
- * that account.
+ * The account a lookup is made for — the account the run EXECUTES AS
+ * (see lib/mcp/run-scope). An unscoped lookup sees platform servers only.
  */
 export interface McpToolScope {
-  /** Owner of the graph being executed. */
   userId?: string;
 }
 
 export interface ServerConfig {
+  /** Connection name (unique per owner). */
   name: string;
   url: string;  // e.g., 'http://localhost:3001/mcp'
   /** Optional HTTP headers forwarded on every request to this server (e.g. Authorization). */
   headers?: Record<string, string>;
-  /**
-   * Restrict this server to one account's runs. Omit for a global
-   * registration (the pre-existing behaviour).
-   */
+  /** Account that owns the connection. Required unless `platform` is true. */
   ownerUserId?: string;
+  /** Platform-level server configured by the platform, not by a user account. */
+  platform?: boolean;
+}
+
+/** A tool match. `server` is the connection name. */
+export interface FoundTool {
+  server: string;
+  tool: Tool;
+  ownerUserId?: string;
+}
+
+const PLATFORM = '\u0000platform';
+
+function ownerKey(ownerUserId: string | undefined, platform?: boolean): string {
+  return platform ? PLATFORM : String(ownerUserId);
+}
+
+function serverKey(owner: string, name: string): string {
+  return `${owner}\u0000${name}`;
 }
 
 /**
  * MCP Registry for discovering and managing server connections
  */
 export class McpRegistry {
+  /** Keyed by serverKey(owner, name). */
   private clients: Map<string, McpClientSSE> = new Map();
   private servers: Map<string, ServerRegistration> = new Map();
 
@@ -60,13 +90,34 @@ export class McpRegistry {
   ) {}
 
   /**
+   * Resolve the storage key for a registration, failing closed when the
+   * caller forgot to say who owns it: an unowned server would otherwise be
+   * reachable by nobody (or, historically, by everybody).
+   */
+  private keyFor(config: ServerConfig): { key: string; owner: string } {
+    if (!config.platform && !config.ownerUserId) {
+      throw new Error(
+        `[Registry] MCP server '${config.name}' has no ownerUserId — every MCP connection belongs to an account ` +
+        `(pass platform: true only for a platform-configured server)`,
+      );
+    }
+    const owner = ownerKey(config.ownerUserId, config.platform);
+    return { key: serverKey(owner, config.name), owner };
+  }
+
+  private ownership(config: ServerConfig): Pick<ServerRegistration, 'ownerUserId' | 'platform'> {
+    return config.platform ? { platform: true } : { ownerUserId: String(config.ownerUserId) };
+  }
+
+  /**
    * Register a server and connect to it
    */
   async registerServer(config: ServerConfig): Promise<void> {
     const { name, url, headers } = config;
+    const { key } = this.keyFor(config);
 
-    if (this.clients.has(name)) {
-      console.log(`[Registry] Server ${name} already registered`);
+    if (this.clients.has(key)) {
+      console.log(`[Registry] Server ${name} already registered for this account`);
       return;
     }
 
@@ -86,15 +137,16 @@ export class McpRegistry {
       // Store registration
       const registration: ServerRegistration = {
         name: initResult.serverInfo.name,
+        connectionName: name,
         version: initResult.serverInfo.version,
         tools: toolsList.tools,
         capabilities: initResult.capabilities,
         url,
-        ...(config.ownerUserId ? { ownerUserId: String(config.ownerUserId) } : {}),
+        ...this.ownership(config),
       };
 
-      this.clients.set(name, client);
-      this.servers.set(name, registration);
+      this.clients.set(key, client);
+      this.servers.set(key, registration);
 
       console.log(`[Registry] Registered ${name} with ${toolsList.tools.length} tools`);
 
@@ -122,9 +174,10 @@ export class McpRegistry {
    */
   async registerStaticServer(config: ServerConfig & { tools?: string[]; messagePath?: string }): Promise<void> {
     const { name, url, headers } = config;
+    const { key } = this.keyFor(config);
 
-    if (this.clients.has(name)) {
-      console.log(`[Registry] Static server ${name} already registered`);
+    if (this.clients.has(key)) {
+      console.log(`[Registry] Static server ${name} already registered for this account`);
       return;
     }
 
@@ -164,112 +217,115 @@ export class McpRegistry {
     });
     const registration: ServerRegistration = {
       name,
+      connectionName: name,
       version: '1.0.0',
       tools,
       capabilities: { tools: { listChanged: false } },
       url,
-      ...(config.ownerUserId ? { ownerUserId: String(config.ownerUserId) } : {}),
+      ...this.ownership(config),
     };
 
-    this.clients.set(name, client);
-    this.servers.set(name, registration);
+    this.clients.set(key, client);
+    this.servers.set(key, registration);
     console.log(`[Registry] Statically registered ${name} with ${tools.length} tools (no handshake)`);
   }
 
   /**
-   * Unregister a server
+   * Unregister one account's server (or a platform server with
+   * `{ platform: true }`).
    */
-  async unregisterServer(serverName: string): Promise<void> {
-    const client = this.clients.get(serverName);
+  async unregisterServer(serverName: string, ownerUserId?: string, opts?: { platform?: boolean }): Promise<void> {
+    if (!ownerUserId && !opts?.platform) return;
+    const key = serverKey(ownerKey(ownerUserId, opts?.platform), serverName);
+    const client = this.clients.get(key);
 
     if (client) {
       await client.disconnect();
-      this.clients.delete(serverName);
-      this.servers.delete(serverName);
+      this.clients.delete(key);
+      this.servers.delete(key);
     }
   }
 
-  /**
-   * Get client for a server
-   */
-  getClient(serverName: string): McpClientSSE | undefined {
-    return this.clients.get(serverName);
+  /** Get the client for one account's server. */
+  getClient(serverName: string, ownerUserId?: string, opts?: { platform?: boolean }): McpClientSSE | undefined {
+    if (!ownerUserId && !opts?.platform) return undefined;
+    return this.clients.get(serverKey(ownerKey(ownerUserId, opts?.platform), serverName));
+  }
+
+  /** Get one account's server registration. */
+  getServer(serverName: string, ownerUserId?: string, opts?: { platform?: boolean }): ServerRegistration | undefined {
+    if (!ownerUserId && !opts?.platform) return undefined;
+    return this.servers.get(serverKey(ownerKey(ownerUserId, opts?.platform), serverName));
   }
 
   /**
-   * Get server registration info
+   * Whether a registration is visible to a scope: platform servers always,
+   * account servers only to that account.
    */
-  getServer(serverName: string): ServerRegistration | undefined {
-    return this.servers.get(serverName);
+  private isVisible(registration: ServerRegistration, scope?: McpToolScope): boolean {
+    if (registration.platform) return true;
+    return !!scope?.userId && String(scope.userId) === registration.ownerUserId;
   }
 
-  /**
-   * Get all registered servers
-   */
+  /** Registrations visible to `scope` (the account's own first, then platform). */
+  private *visible(scope?: McpToolScope): Iterable<[string, ServerRegistration]> {
+    const platform: Array<[string, ServerRegistration]> = [];
+    for (const entry of this.servers.entries()) {
+      if (!this.isVisible(entry[1], scope)) continue;
+      if (entry[1].platform) platform.push(entry);
+      else yield entry;
+    }
+    yield* platform;
+  }
+
+  /** Every registration (admin/diagnostic view — do not expose to runs). */
   getAllServers(): ServerRegistration[] {
     return Array.from(this.servers.values());
   }
 
-  /**
-   * Get all server names
-   */
-  getAllServerNames(): string[] {
-    return Array.from(this.servers.keys());
+  /** Connection names visible to `scope`. */
+  getAllServerNames(scope?: McpToolScope): string[] {
+    return Array.from(this.visible(scope), ([, r]) => r.connectionName);
   }
 
   /**
-   * Whether a registration is visible to the given scope. Global (unowned)
-   * servers are visible to everyone; owned servers only to runs of their
-   * owner's graphs. An owned server is never visible to an unscoped lookup.
+   * Find a tool among the servers visible to `scope`: the executing account's
+   * own connections, then platform servers. Other accounts' connections are
+   * never searched.
    */
-  private isVisible(registration: ServerRegistration, scope?: McpToolScope): boolean {
-    if (!registration.ownerUserId) return true;
-    return !!scope?.userId && String(scope.userId) === registration.ownerUserId;
-  }
-
-  /**
-   * Find tool by name across all servers visible to `scope`.
-   *
-   * The caller's own (account-owned) servers win over global ones when both
-   * expose the same tool name, so an account can shadow a global tool.
-   */
-  findTool(toolName: string, scope?: McpToolScope): { server: string; tool: Tool } | undefined {
-    let globalMatch: { server: string; tool: Tool } | undefined;
-    for (const [serverName, registration] of this.servers.entries()) {
-      if (!this.isVisible(registration, scope)) continue;
+  findTool(toolName: string, scope?: McpToolScope): FoundTool | undefined {
+    for (const [, registration] of this.visible(scope)) {
       const tool = registration.tools.find(t => t.name === toolName);
-      if (!tool) continue;
-      if (registration.ownerUserId) return { server: serverName, tool };
-      globalMatch ??= { server: serverName, tool };
-    }
-    return globalMatch;
-  }
-
-  /**
-   * Get all tools from all servers visible to `scope` (every server when
-   * `scope` is omitted — this is the admin/diagnostic view).
-   */
-  getAllTools(scope?: McpToolScope): Array<{ server: string; tool: Tool }> {
-    const allTools: Array<{ server: string; tool: Tool }> = [];
-
-    for (const [serverName, registration] of this.servers.entries()) {
-      if (scope && !this.isVisible(registration, scope)) continue;
-      for (const tool of registration.tools) {
-        allTools.push({ server: serverName, tool });
+      if (tool) {
+        return {
+          server: registration.connectionName,
+          tool,
+          ...(registration.ownerUserId ? { ownerUserId: registration.ownerUserId } : {}),
+        };
       }
     }
+    return undefined;
+  }
 
+  /** All tools visible to `scope`. */
+  getAllTools(scope?: McpToolScope): Array<{ server: string; tool: Tool }> {
+    const allTools: Array<{ server: string; tool: Tool }> = [];
+    for (const [, registration] of this.visible(scope)) {
+      for (const tool of registration.tools) {
+        allTools.push({ server: registration.connectionName, tool });
+      }
+    }
     return allTools;
   }
 
   /**
-   * Call a tool (automatically finds the right server)
+   * Call a tool on a server visible to `scope`.
    *
    * @param signal Optional AbortSignal — passed through to the underlying
    *   client.callTool so mid-step interrupt cancels the in-flight HTTP/SSE
    *   request immediately. Required for the run-level abort path.
-   * @param scope Account asking for the tool (the graph owner). Account-owned
-   *   servers are only reachable when it matches; global servers always are.
+   * @param scope The account the run executes as. Only that account's
+   *   connections (plus platform servers) are searched.
    */
   async callTool(
     toolName: string,
@@ -289,29 +345,32 @@ export class McpRegistry {
     signal?: AbortSignal,
     scope?: McpToolScope
   ): Promise<any> {
-    const found = this.findTool(toolName, scope);
+    let foundKey: string | undefined;
+    for (const [key, registration] of this.visible(scope)) {
+      if (registration.tools.some(t => t.name === toolName)) {
+        foundKey = key;
+        break;
+      }
+    }
 
-    if (!found) {
+    if (!foundKey) {
       throw new Error(`Tool not found: ${toolName}`);
     }
 
-    console.log(`[Registry] Calling tool: ${toolName} on server: ${found.server}, role: ${args.role}`);
-    const client = this.clients.get(found.server);
+    const registration = this.servers.get(foundKey)!;
+    console.log(`[Registry] Calling tool: ${toolName} on server: ${registration.connectionName}, role: ${args.role}`);
+    const client = this.clients.get(foundKey);
 
     if (!client) {
-      throw new Error(`Client not found for server: ${found.server}`);
+      throw new Error(`Client not found for server: ${registration.connectionName}`);
     }
 
     const startTime = Date.now();
-    try {
-      const result = await client.callTool(toolName, args, meta, signal);
-      const duration = Date.now() - startTime;
+    const result = await client.callTool(toolName, args, meta, signal);
+    const duration = Date.now() - startTime;
 
-      console.log(`[Registry] Tool ${toolName} returned in ${duration}ms, isError: ${result?.isError}`);
-      return result;
-    } catch (error) {
-      throw error;
-    }
+    console.log(`[Registry] Tool ${toolName} returned in ${duration}ms, isError: ${result?.isError}`);
+    return result;
   }
 
   /**
@@ -320,12 +379,12 @@ export class McpRegistry {
   async disconnectAll(): Promise<void> {
     console.log('[Registry] Disconnecting all clients');
 
-    for (const [serverName, client] of this.clients.entries()) {
+    for (const [key, client] of this.clients.entries()) {
       try {
         await client.disconnect();
-        console.log(`[Registry] Disconnected from ${serverName}`);
+        console.log(`[Registry] Disconnected from ${this.servers.get(key)?.connectionName ?? key}`);
       } catch (error) {
-        console.error(`[Registry] Error disconnecting from ${serverName}:`, error);
+        console.error(`[Registry] Error disconnecting:`, error);
       }
     }
 

@@ -1708,12 +1708,12 @@ export async function run(
       refreshConnection: options.connectionFetcher.refreshConnection,
     });
   }
-  // MCP tools are scoped to the account that owns the graph (see
-  // lib/mcp/run-scope): an account-owned MCP connection is only reachable from
-  // that account's graphs; global registrations stay visible to every run.
+  // MCP connections are scoped to the account the run EXECUTES AS (see
+  // lib/mcp/run-scope) — never another account's, and there are no global
+  // user connections.
   const runCtxMcpClient = createRunMcpClient(
     (toolName, args, meta, signal, scope) => red.callMcpTool(toolName, args, meta, signal, scope),
-    resolveRunMcpScope(compiledGraph?.config, options.userId),
+    resolveRunMcpScope(options),
   );
   // Data-permissions: resolve the agent's capability profile from the graph
   // config (if any). `null` when the graph declares no profile → the run is

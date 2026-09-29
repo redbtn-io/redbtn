@@ -644,8 +644,8 @@ export class Red {
    * @param args The arguments to pass to the tool
    * @param context Optional logging context (conversationId, generationId, messageId)
    * @param signal Optional AbortSignal for mid-step interrupt
-   * @param scope Account the call is made for (the graph owner). Account-owned
-   *   MCP connections are only reachable when it matches.
+   * @param scope The account the call is made as. Only that account's MCP
+   *   connections (plus platform-level servers) are searched.
    * @returns The tool execution result
    */
   public async callMcpTool(
@@ -671,8 +671,8 @@ export class Red {
    * Get all available MCP tools
    * @returns Array of available tools with their server info
    */
-  public getMcpTools(): Array<{ server: string; tool: any }> {
-    return this.mcpRegistry.getAllTools();
+  public getMcpTools(scope?: McpToolScope): Array<{ server: string; tool: any }> {
+    return this.mcpRegistry.getAllTools(scope);
   }
 
 }

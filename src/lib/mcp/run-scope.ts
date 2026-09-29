@@ -1,10 +1,12 @@
 /**
  * Run-scoped MCP client.
  *
- * MCP tools are scoped to the account that OWNS THE GRAPH being run: an
- * account-owned MCP connection (registered with `ownerUserId`) is reachable
- * only from that account's graphs, whoever invoked them. Global registrations
- * stay visible to every run.
+ * A run may only use MCP connections owned by the account the run EXECUTES
+ * AS. That is the run's `userId` — for a user's own graph the owner, for a
+ * system graph or a graph shared to someone else the invoking user — or, on a
+ * run-as-caller delegated run, the caller (`connectionIdentityUserId`), the
+ * same identity the ConnectionManager's ownership gate keys on. Other
+ * accounts' connections are never reachable; there are no global ones.
  *
  * Step executors reach MCP through the object built here (registered on the
  * run context as `mcpClient`), so this is the single place the scope is fixed.
@@ -23,15 +25,17 @@ export type CallMcpTool = (
 ) => Promise<unknown>;
 
 /**
- * Resolve the MCP scope for a run: the graph owner, falling back to the run
- * user when the compiled config carries no owner (in-memory/test graphs).
+ * Resolve the MCP scope for a run: the account it executes as. Mirrors
+ * `ConnectionManager({ userId: connectionIdentityUserId ?? userId })` in
+ * functions/run.ts so MCP connections and OAuth connections resolve against
+ * the same identity.
  */
-export function resolveRunMcpScope(
-  graphConfig: { userId?: unknown } | null | undefined,
-  runUserId: unknown,
-): McpToolScope {
-  const owner = graphConfig?.userId ?? runUserId;
-  return owner ? { userId: String(owner) } : {};
+export function resolveRunMcpScope(options: {
+  userId?: unknown;
+  connectionIdentityUserId?: unknown;
+} | null | undefined): McpToolScope {
+  const who = options?.connectionIdentityUserId || options?.userId;
+  return who ? { userId: String(who) } : {};
 }
 
 /** Build the run-context `mcpClient`, bound to one account scope. */
