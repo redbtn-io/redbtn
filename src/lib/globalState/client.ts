@@ -89,6 +89,60 @@ export class GlobalStateClient {
     }
   }
 
+  /**
+   * Atomically add `by` to a whole-key number via the webapp's
+   * `POST .../values/:key/atomic` (`op: 'increment'`). One conditional Mongo
+   * update server-side, so concurrent callers never lose increments — unlike
+   * a getValue + setValue pair, which also reads through this client's 5s
+   * cache.
+   *
+   * Never retried: an increment is not idempotent, so a blind retry after an
+   * ambiguous failure could double-count.
+   *
+   * Returns `{ supported: false }` when the webapp predates the endpoint (a
+   * 404/405 without a JSON error code), so callers can fall back.
+   */
+  async increment(
+    namespace: string,
+    key: string,
+    by: number,
+    options?: { initial?: number; onNonNumber?: 'error' | 'reset'; ttlSeconds?: number; description?: string },
+  ): Promise<{ supported: false } | { supported: true; ok: true; value: number } | { supported: true; ok: false; error: string }> {
+    const modifiedBy = this.workflowId ? `workflow:${this.workflowId}` : 'system';
+    try {
+      const response = await fetch(
+        `${this.baseUrl}/api/v1/state/namespaces/${encodeURIComponent(namespace)}/values/${encodeURIComponent(key)}/atomic`,
+        {
+          method: 'POST',
+          headers: this.getHeaders(),
+          body: JSON.stringify({
+            op: 'increment',
+            by,
+            ...(options?.initial !== undefined ? { initial: options.initial } : {}),
+            ...(options?.onNonNumber ? { onNonNumber: options.onNonNumber } : {}),
+            ...(options?.ttlSeconds ? { ttlMs: options.ttlSeconds * 1000 } : {}),
+            ...(options?.description ? { description: options.description } : {}),
+            // Writer attribution for the state-change trigger's loop guard.
+            modifiedBy,
+          }),
+        },
+      );
+      const data: any = await response.json().catch(() => null);
+      if (!response.ok) {
+        if ((response.status === 404 || response.status === 405) && !(data && typeof data === 'object' && 'code' in data)) {
+          return { supported: false };
+        }
+        return { supported: true, ok: false, error: (data && (data.error || data.message)) || `Failed: ${response.status} ${response.statusText}` };
+      }
+      const value = data?.value as number;
+      this.cache.set(`${namespace}.${key}`, { value, timestamp: Date.now() });
+      return { supported: true, ok: true, value };
+    } catch (error: any) {
+      console.error(`[GlobalStateClient] Error incrementing ${namespace}.${key}:`, error);
+      return { supported: true, ok: false, error: error?.message ?? String(error) };
+    }
+  }
+
   async deleteValue(namespace: string, key: string): Promise<boolean> {
     try {
       const response = await fetch(`${this.baseUrl}/api/v1/state/namespaces/${namespace}/values/${key}`, { method: 'DELETE', headers: this.getHeaders() });

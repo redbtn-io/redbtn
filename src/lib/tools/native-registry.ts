@@ -276,6 +276,7 @@ export const MCP_EXPOSED_TOOLS: ReadonlySet<string> = new Set([
   'get_global_schema',
   'set_global_state',
   'state_patch',
+  'state_atomic',
   'delete_global_state',
   'delete_namespace',
 
@@ -854,6 +855,18 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[NativeRegistry] Failed to register state_patch:', msg);
+  }
+
+  try {
+    // State Atomic — race-free setIfAbsent / heartbeat / release /
+    // compareAndSet / increment on one key (locks, claims, counters, caps)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const stateAtomic = require('./native/state-atomic.js');
+    registry.register('state_atomic', stateAtomic.default || stateAtomic);
+    console.log('[NativeRegistry] Registered built-in tool: state_atomic');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register state_atomic:', msg);
   }
 
   try {
