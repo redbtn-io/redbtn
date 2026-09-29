@@ -140,7 +140,13 @@ describe('native tool idle watchdog integration', () => {
         },
         { runId: 'run-native-error-fallback', runPublisher },
       ),
-    ).resolves.toEqual({ recovered: true });
+    ).resolves.toEqual({
+      recovered: true,
+      // The fallback value is merged unchanged; the error rides beside it.
+      'data._stepErrors': {
+        result: expect.objectContaining({ stepType: 'tool', toolName, message: expect.stringContaining('denied') }),
+      },
+    });
 
     expect(runPublisher.toolComplete).not.toHaveBeenCalled();
     expect(runPublisher.toolError).toHaveBeenCalledTimes(1);
@@ -263,6 +269,11 @@ describe('native tool idle watchdog integration', () => {
     );
 
     await vi.advanceTimersByTimeAsync(100);
-    await expect(promise).resolves.toEqual({ fallback: true });
+    await expect(promise).resolves.toEqual({
+      fallback: true,
+      'data._stepErrors': {
+        result: expect.objectContaining({ stepType: 'tool', toolName, code: 'TOOL_IDLE_TIMEOUT' }),
+      },
+    });
   });
 });

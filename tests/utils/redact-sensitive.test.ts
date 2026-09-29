@@ -9,6 +9,14 @@ describe('redactSensitive — extended credential patterns', () => {
     expect(result).not.toContain('rpat_');
   });
 
+  it('redacts rreg_ workspace registration tokens, signature included', () => {
+    const token = 'rreg_eyJzdWIiOiJ3b3Jrc3BhY2UtY29ubmVjdG9yIn0.Zm9vYmFyX3NpZ25hdHVyZS12YWx1ZQ';
+    const result = redactSensitive(`spawn failed: REDBTN_REGISTRATION_TOKEN=${token}. Container exited.`);
+    expect(result).toBe(`spawn failed: REDBTN_REGISTRATION_TOKEN=${REDACTED}. Container exited.`);
+    expect(result).not.toContain('rreg_');
+    expect(result).not.toContain('Zm9vYmFy');
+  });
+
   it('redacts sk- API keys (OpenAI-style)', () => {
     const input = 'Key is sk-proj-1234567890abcdef123456';
     const result = redactSensitive(input);
