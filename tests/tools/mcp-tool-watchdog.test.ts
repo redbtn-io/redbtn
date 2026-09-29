@@ -160,6 +160,11 @@ describe('MCP tool idle watchdog integration', () => {
     );
 
     await vi.advanceTimersByTimeAsync(100);
-    await expect(promise).resolves.toEqual({ fallback: true });
+    await expect(promise).resolves.toEqual({
+      fallback: true,
+      'data._stepErrors': {
+        result: expect.objectContaining({ stepType: 'tool', code: 'TOOL_IDLE_TIMEOUT' }),
+      },
+    });
   });
 });
