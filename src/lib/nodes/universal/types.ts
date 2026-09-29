@@ -37,6 +37,11 @@ export interface ErrorHandlingConfig {
      * - 'throw': Throw error and stop execution (default)
      * - 'fallback': Use fallbackValue and continue
      * - 'skip': Skip this step and continue (outputField will be undefined)
+     *
+     * On neuron and tool steps, 'fallback' and 'skip' also record the error at
+     * `state.data._stepErrors[<outputField>]` (see `StepErrorRecord` in
+     * executors/errorHandler.ts). A later successful neuron or tool step that
+     * writes the same outputField clears it.
      */
     onError?: 'throw' | 'fallback' | 'skip';
 }

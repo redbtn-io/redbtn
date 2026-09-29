@@ -302,6 +302,7 @@ function dumpLine(dumpPath: string): string {
 
 interface FakePublisher {
   toolStart: Any;
+  toolComplete: Any;
   toolError: Any;
   events: Array<{ kind: string; name?: string }>;
 }
@@ -313,6 +314,9 @@ function makePublisher(): FakePublisher {
     toolStart: async (_id: string, name: string) => {
       events.push({ kind: 'toolStart', name });
     },
+    toolComplete: async () => {
+      events.push({ kind: 'toolComplete' });
+    },
     toolError: async () => {
       events.push({ kind: 'toolError' });
     },
@@ -320,12 +324,14 @@ function makePublisher(): FakePublisher {
 }
 
 function baseState(runId: string, publisher?: FakePublisher, extra: Record<string, unknown> = {}) {
+  const { mcpClient, ...rest } = extra;
   return {
     runId,
     userId: 'user_test',
     runPublisher: publisher,
+    mcpClient,
     systemPrefix: 'NODE PREFIX',
-    data: { runId, userId: 'user_test', ...extra },
+    data: { runId, userId: 'user_test', ...rest },
   } as Record<string, unknown>;
 }
 
@@ -1004,6 +1010,105 @@ describe('runAgyCliStep', () => {
       deny: [],
       ask: [],
     });
+  });
+
+  it('bridges MCP tools to agy-cli child process via run-bridge', async () => {
+    const dump = path.join(tmpRoot, 'mcp-dump.json');
+    const fakeAgyScript = `
+const net = require('net');
+const path = require('path');
+
+const mcpConfigPath = path.join(process.env.HOME, '.gemini/config/mcp_config.json');
+if (!fs.existsSync(mcpConfigPath)) {
+  fs.writeFileSync(${JSON.stringify(dump)}, JSON.stringify({ error: 'mcp_config.json not found: ' + mcpConfigPath }));
+  out(${JSON.stringify(SUCCESS_ENVELOPE)});
+  return;
+}
+const mcpConfig = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf8'));
+const redbtnServer = mcpConfig.mcpServers && mcpConfig.mcpServers.redbtn;
+if (!redbtnServer || !redbtnServer.env || !redbtnServer.env.REDBTN_BRIDGE_SOCK) {
+  fs.writeFileSync(${JSON.stringify(dump)}, JSON.stringify({ error: 'redbtn server config not found in mcp_config.json', mcpConfig }));
+  out(${JSON.stringify(SUCCESS_ENVELOPE)});
+  return;
+}
+const socketPath = redbtnServer.env.REDBTN_BRIDGE_SOCK;
+const nonce = redbtnServer.env.REDBTN_BRIDGE_NONCE;
+
+const socket = net.connect(socketPath, () => {
+  socket.write(JSON.stringify({ redbtn: 'auth', nonce }) + '\\n');
+  socket.write(JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2025-06-18' },
+  }) + '\\n');
+});
+
+socket.on('error', (err) => {
+  fs.writeFileSync(${JSON.stringify(dump)}, JSON.stringify({ error: 'socket error: ' + err.message }));
+  out(${JSON.stringify(SUCCESS_ENVELOPE)});
+});
+
+let buffer = '';
+const responses = [];
+socket.on('data', (chunk) => {
+  buffer += chunk.toString();
+  let idx = buffer.indexOf('\\n');
+  while (idx !== -1) {
+    const line = buffer.slice(0, idx);
+    buffer = buffer.slice(idx + 1);
+    idx = buffer.indexOf('\\n');
+    if (!line.trim()) continue;
+    const msg = JSON.parse(line);
+    responses.push(msg);
+    if (msg.id === 1) {
+      socket.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) + '\\n');
+    } else if (msg.id === 2) {
+      socket.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: { name: 'my_mcp__query_card', arguments: { cardId: 'c-99' } }
+      }) + '\\n');
+    } else if (msg.id === 3) {
+      fs.writeFileSync(${JSON.stringify(dump)}, JSON.stringify({ responses }));
+      socket.end();
+      out(${JSON.stringify(SUCCESS_ENVELOPE)});
+    }
+  }
+});
+`;
+    process.env.AGY_CLI_BIN = writeFakeAgy(fakeAgyScript);
+
+    let mcpToolInvoked = false;
+    const fakeMcpClient = {
+      findTool: (name: string) => ({
+        tool: { name, description: 'Query card details', inputSchema: { type: 'object' } },
+      }),
+      callTool: async (toolName: string, args: any) => {
+        mcpToolInvoked = true;
+        return { content: [{ type: 'text', text: JSON.stringify({ cardId: args.cardId, title: 'Card 99' }) }] };
+      },
+    };
+
+    await runStep(
+      { tools: ['mcp:my_mcp.query_card'] },
+      { mcpClient: fakeMcpClient },
+    );
+
+    expect(fs.existsSync(dump)).toBe(true);
+    const dumpData = JSON.parse(fs.readFileSync(dump, 'utf8'));
+    expect(dumpData.error).toBeUndefined();
+    const listResp = dumpData.responses.find((r: any) => r.id === 2);
+    expect(listResp).toBeDefined();
+    const toolNames = listResp.result.tools.map((t: any) => t.name);
+    expect(toolNames).toContain('my_mcp__query_card');
+
+    const callResp = dumpData.responses.find((r: any) => r.id === 3);
+    expect(callResp).toBeDefined();
+    expect(callResp.result.isError).toBeUndefined();
+    expect(callResp.result.content[0].text).toContain('Card 99');
+    expect(mcpToolInvoked).toBe(true);
   });
 
   it('classifies a capped subscription as agy_rate_limited', async () => {

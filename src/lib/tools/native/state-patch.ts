@@ -24,8 +24,13 @@
  * Auth: same Bearer / X-Internal-Key fallback pattern as other state tools.
  *
  * Notes:
- *   - Atomicity: the webapp reads the existing value, applies ops in
- *     memory, then writes back in a single `$set` — atomic at doc level.
+ *   - Atomicity: race-free. The webapp applies each op as its own atomic
+ *     Mongo update on its own field path (`inc` -> `$inc`, `append` /
+ *     `prepend` -> `$push`, `set` / `merge` -> `$set`, `remove` -> `$unset`),
+ *     so concurrent patches to the same key (parallel branches, concurrent
+ *     runs, other graphs) never lose each other's changes. Ops without a safe
+ *     native form fall back to a revision-checked compare-and-set server-side.
+ *     For locks / claims / whole-key counters see `state_atomic`.
  *   - Path syntax: RFC 6901 JSON Pointer; `/` separates segments and the
  *     escapes `~0` (`~`) and `~1` (`/`) apply.
  *   - Returns 404 if the key doesn't exist (use `set_global_state` first).
@@ -99,7 +104,8 @@ const statePatchTool: NativeToolDefinition = {
     'element 0 of `foo`, then its `bar` field). Supported ops: ' +
     '`set` (replace at path), `append` (push to array at path), `prepend` (unshift to array at path), ' +
     '`merge` (shallow-merge object into existing object at path), `remove` (delete element/key at path), ' +
-    '`inc` (numeric increment). Returns the full updated value on success so the caller can verify. ' +
+    '`inc` (numeric increment). Ops are atomic: concurrent patches to the same key never lose each other\'s ' +
+    'changes. Returns the full updated value on success so the caller can verify. ' +
     'If the namespace has a schema, validation errors (422) include expectedSchema and validationErrors fields.',
   server: 'state',
   inputSchema: {

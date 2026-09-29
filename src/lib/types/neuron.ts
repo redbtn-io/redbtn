@@ -18,8 +18,14 @@
  *   - `'agy-cli'`     — an Antigravity CLI (`agy`) child on a Google
  *     Antigravity subscription (`agyCliExecutor`), so a graph can run Gemini
  *     Flash without paying the Gemini API per token.
+ *   - `'copilot-sdk'` — a GitHub Copilot SDK runtime on a Copilot subscription
+ *     (`copilotSdkExecutor`), scoped to the per-run MCP bridge.
+ *   - `'opencode'`    — an OpenCode CLI child on the worker (`opencodeExecutor`),
+ *     running local agent turns via `opencode run`.
+ *   - `'opencode-zen'` / `'zen'` — OpenCode Zen hosted model provider, an
+ *     OpenAI-compatible HTTP endpoint (`https://opencode.ai/zen/v1`).
  *
- * Both are first-class provider values so they are accepted by the Mongoose
+ * All are first-class provider values so they are accepted by the Mongoose
  * schema, the neurons API and the capability matrices.
  */
 export type NeuronProvider =
@@ -29,7 +35,11 @@ export type NeuronProvider =
   | 'google'
   | 'custom'
   | 'claude-code'
-  | 'agy-cli';
+  | 'agy-cli'
+  | 'copilot-sdk'
+  | 'opencode'
+  | 'opencode-zen'
+  | 'zen';
 
 /**
  * Neuron role categorization (for UI organization)
@@ -163,6 +173,8 @@ export interface NeuronConfig {
   role: NeuronRole;
   tier: number;
   userId?: string;
+  /** When true, any user may load this neuron (non-system sharing). */
+  isPublic?: boolean;
   /** When true, the worker generates TTS audio server-side during streaming */
   audioOptimized?: boolean;
   /**
@@ -191,6 +203,7 @@ export interface NeuronDocument {
   isDefault: boolean;
   isSystem?: boolean;
   isImmutable?: boolean;
+  isPublic?: boolean;
   parentNeuronId?: string;
   name: string;
   description?: string;

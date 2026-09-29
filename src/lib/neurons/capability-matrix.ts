@@ -122,6 +122,22 @@ const MATRIX: Record<NeuronProvider, MatrixEntry[]> = {
   'agy-cli': [
     { patterns: ['*'], strategy: 'none' },
   ],
+  // Copilot SDK owns its tool loop. The executor exposes only the per-run MCP
+  // bridge through an explicit SDK ToolSet; no LangChain binding is involved.
+  'copilot-sdk': [
+    { patterns: ['*'], strategy: 'none' },
+  ],
+  // OpenCode CLI runner owns its own loop.
+  opencode: [
+    { patterns: ['*'], strategy: 'none' },
+  ],
+  // OpenCode Zen (OpenAI-compatible hosted API gateway) — supports native tool calling.
+  'opencode-zen': [
+    { patterns: ['*'], strategy: 'native' },
+  ],
+  zen: [
+    { patterns: ['*'], strategy: 'native' },
+  ],
 };
 
 /**
@@ -141,6 +157,10 @@ const PROVIDER_DEFAULTS: Record<NeuronProvider, ToolStrategy> = {
   // See the MATRIX comment: tools are offered over the run bridge, never bound.
   'claude-code': 'none',
   'agy-cli': 'none',
+  'copilot-sdk': 'none',
+  opencode: 'none',
+  'opencode-zen': 'native',
+  zen: 'native',
 };
 
 /**
@@ -272,6 +292,10 @@ const HOSTED_MATRIX: Record<NeuronProvider, HostedMatrixEntry[]> = {
   // through `bindTools()`. Nothing to map here.
   'claude-code': [],
   'agy-cli': [],
+  'copilot-sdk': [],
+  opencode: [],
+  'opencode-zen': [],
+  zen: [],
 };
 
 /**

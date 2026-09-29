@@ -14,7 +14,7 @@
 
 import type { NeuronStepConfig } from '../types';
 import { renderTemplate, getNestedProperty } from '../templateRenderer';
-import { executeWithErrorHandling } from './errorHandler';
+import { executeWithErrorHandlingDetailed, recordStepError, clearStepError } from './errorHandler';
 import { AudioStreamPipeline } from '../../../tts/audio-stream';
 import { ParserExecutor, type ParserToolExecutor } from './parserExecutor';
 import { getParserRegistry } from './parserRegistry';
@@ -34,6 +34,8 @@ import { resolveTools, toBindToolsPayload, partitionToolRefs, type ResolvedTool 
 import { coerceArgsToSchema } from '../../../tools/coerce-args';
 import { runClaudeCodeStep } from './claudeCodeExecutor';
 import { runAgyCliStep } from './agyCliExecutor';
+import { runCopilotSdkStep } from './copilotSdkExecutor';
+import { runOpencodeStep } from './opencodeExecutor';
 import {
   classifyFallbackTrigger,
   resolveFallbackNeuronId,
@@ -454,7 +456,7 @@ function setWorkspaceWorkingDir(state: any, defaultCwd = '/workspace'): void {
 export async function executeNeuron(config: NeuronStepConfig, state: any): Promise<Partial<any>> {
   // If error handling configured, wrap execution
   if (config.errorHandling) {
-    const result = await executeWithErrorHandling(
+    const { value: result, recovered } = await executeWithErrorHandlingDetailed(
       // The fallback neuron sits INSIDE the error-handling wrapper on purpose:
       // `retry` / `onError` / `fallbackValue` must only see a failure once the
       // primary AND its fallback have both failed. See neuronFallback.ts.
@@ -469,9 +471,10 @@ export async function executeNeuron(config: NeuronStepConfig, state: any): Promi
     // If fallback was used, the result will be the raw fallback value (e.g., a string)
     // We need to wrap it in the expected format: { [outputField]: value }
     // Check if result is already in the correct format (has outputField as a key)
+    let partial: Partial<any>;
     if (result && typeof result === 'object' && config.outputField in result) {
       // Already in correct format (normal execution succeeded)
-      return result;
+      partial = result;
     } else if (result !== undefined) {
       // Fallback was used - wrap the raw value in the expected format
       const resultStr = typeof result === 'string' ? result : String(result);
@@ -480,16 +483,29 @@ export async function executeNeuron(config: NeuronStepConfig, state: any): Promi
         fallbackType: typeof result,
         fallbackPreview: resultStr.substring(0, 50)
       });
-      return {
+      partial = {
         [config.outputField]: result
       };
+    } else {
+      partial = result;
     }
 
-    return result;
+    if (recovered) {
+      // The step carries on with its fallbackValue (or nothing, for 'skip').
+      // Keep the error where later steps can read it instead of only in the log.
+      let neuronId: string | null = null;
+      try {
+        neuronId = resolveEffectiveNeuronId(config, state) ?? null;
+      } catch {
+        /* the record is still worth writing without it */
+      }
+      return recordStepError(state, config.outputField, recovered, { stepType: 'neuron', neuronId }, partial);
+    }
+    return clearStepError(state, config.outputField, partial);
   }
 
   // Otherwise execute directly
-  return executeNeuronWithFallback(config, state);
+  return clearStepError(state, config.outputField, await executeNeuronWithFallback(config, state));
 }
 
 /**
@@ -767,6 +783,29 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // `config.tools` before the CLI could be offered them over the run bridge.
     if (early?.provider === 'agy-cli') {
       return await runAgyCliStep({
+        config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
+      });
+    }
+
+    // ── `copilot-sdk`: a GitHub Copilot SDK session, not a BaseChatModel ──────
+    // Its agent loop receives only the run-scoped bridge tools and must never
+    // fall through to an API model implementation.
+    if (early?.provider === 'copilot-sdk') {
+      return await runCopilotSdkStep({
+        config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
+      });
+    }
+
+    // ── `opencode` / `opencode-zen`: OpenCode CLI runner or Zen API gateway ──
+    if (
+      early?.provider === 'opencode' ||
+      ((early?.provider === 'opencode-zen' || early?.provider === 'zen') &&
+        !early?.apiKey &&
+        !process.env.OPENCODE_ZEN_API_KEY &&
+        !process.env.OPENCODE_API_KEY &&
+        !process.env.ZEN_API_KEY)
+    ) {
+      return await runOpencodeStep({
         config, state, neuronCfg: early, neuronId, userId, callRunId, abortSignal, emitUsage,
       });
     }

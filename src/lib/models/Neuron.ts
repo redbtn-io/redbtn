@@ -60,6 +60,7 @@ const neuronSchema = new mongoose.Schema<NeuronDocument>({
     type: Boolean,
     default: false,
   },
+  isPublic: { type: Boolean, default: false, index: true },
   parentNeuronId: {
     type: String,
     default: null,
@@ -79,8 +80,19 @@ const neuronSchema = new mongoose.Schema<NeuronDocument>({
     required: true,
     // Keep in sync with `NeuronProvider` in lib/types/neuron.ts. `create_neuron`
     // saves through this schema, so a provider missing here is rejected at
-    // validation time no matter what the TypeScript union says.
-    enum: ['ollama', 'openai', 'anthropic', 'google', 'custom', 'claude-code', 'agy-cli'],
+    enum: [
+      'ollama',
+      'openai',
+      'anthropic',
+      'google',
+      'custom',
+      'claude-code',
+      'agy-cli',
+      'copilot-sdk',
+      'opencode',
+      'opencode-zen',
+      'zen',
+    ],
   },
   endpoint: {
     type: String,

@@ -26,10 +26,22 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn } from 'child_process';
+import { EventEmitter } from 'events';
 import * as net from 'net';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+
+const bridgeNetMock = vi.hoisted(() => ({
+  createServer: vi.fn(),
+  realCreateServer: undefined as ((...args: any[]) => unknown) | undefined,
+}));
+vi.mock('net', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('net')>();
+  bridgeNetMock.realCreateServer = actual.createServer as (...args: any[]) => unknown;
+  bridgeNetMock.createServer.mockImplementation(actual.createServer);
+  return { ...actual, createServer: bridgeNetMock.createServer };
+});
 
 import {
   startRunToolBridge,
@@ -60,7 +72,6 @@ import {
   type RunBridgeToolRef,
 } from '../../src/lib/mcp/run-bridge';
 import { getNativeRegistry } from '../../src/lib/tools/native-registry';
-import { DATA_TOOL_RULES, getDataToolRule } from '../../src/lib/permissions/tool-map';
 import { runControlRegistry } from '../../src/lib/run/RunControlRegistry';
 import { __setRedisForTest } from '../../src/lib/permissions/exec-guard';
 import type { CapabilityProfile } from '../../src/lib/permissions/types';
@@ -500,8 +511,8 @@ describe('tools/list — allowlist intersection', () => {
     // native tools allowlisted by node are served (no wholesale bans)
     expect(names).toContain('create_neuron');
     expect(names).toContain('desktop_exec');
-    // not a native tool
-    expect(names).not.toContain('server.remoteThing');
+    // MCP tool declared by node is served
+    expect(names).toContain('server.remoteThing');
     // declared but not registered
     expect(names).not.toContain('not_a_registered_tool');
     expect(b.toolNames.sort()).toEqual(names);
@@ -530,6 +541,88 @@ describe('tools/list — allowlist intersection', () => {
     };
     const table = buildBridgeToolTable([graphTool]);
     expect(table.map((t) => t.name)).toEqual(['bdo_recon']);
+  });
+
+  it('serves MCP-sourced tools declared by the node', () => {
+    const mcpTool: RunBridgeToolRef = {
+      name: 'redboard__cards_list',
+      description: 'List cards on board',
+      inputSchema: { type: 'object', properties: { boardId: { type: 'string' } } },
+      source: 'mcp',
+    };
+    const table = buildBridgeToolTable([mcpTool]);
+    expect(table.map((t) => t.name)).toEqual(['redboard__cards_list']);
+    expect(table[0].description).toBe('List cards on board');
+  });
+
+  it('dispatches tools/call to MCP tool via invoke and wraps result in CallToolResult', async () => {
+    let invokedArgs: any;
+    const mcpTool: RunBridgeToolRef = {
+      name: 'redboard__card_create',
+      description: 'Create a card',
+      inputSchema: { type: 'object', properties: { title: { type: 'string' } } },
+      source: 'mcp',
+      invoke: async (args) => {
+        invokedArgs = args;
+        return { id: 'card-123', title: args.title };
+      },
+    };
+    const { bridge: b, published } = await start({ resolvedTools: [mcpTool] });
+    const c = await client(b);
+    const res = await c.send('tools/call', { name: 'redboard__card_create', arguments: { title: 'Test Card' } });
+    expect(res.result.isError).toBeUndefined();
+    expect(invokedArgs.title).toBe('Test Card');
+    expect(invokedArgs.environmentId).toBe(ENV_ID);
+    expect(res.result.content[0].text).toBe(JSON.stringify({ id: 'card-123', title: 'Test Card' }));
+    expect(published.starts[0].name).toBe('redboard__card_create');
+    expect(published.completes[0].result).toEqual({ id: 'card-123', title: 'Test Card' });
+  });
+
+  it('dispatches tools/call for MCP tool to mcpClient.callTool when invoke is not provided', async () => {
+    let calledTool: string | undefined;
+    let calledArgs: any;
+    const fakeMcpClient = {
+      callTool: async (toolName: string, args: any) => {
+        calledTool = toolName;
+        calledArgs = args;
+        return { content: [{ type: 'text', text: `Called ${toolName}` }] };
+      },
+    };
+    const mcpTool: RunBridgeToolRef = {
+      name: 'redboard__card_get',
+      description: 'Get a card',
+      inputSchema: { type: 'object', properties: { cardId: { type: 'string' } } },
+      source: 'mcp',
+    };
+    const { bridge: b } = await start({
+      resolvedTools: [mcpTool],
+      state: { runId: RUN_ID, mcpClient: fakeMcpClient, data: {} },
+    });
+    const c = await client(b);
+    const res = await c.send('tools/call', { name: 'redboard__card_get', arguments: { cardId: 'c1' } });
+    expect(res.result.isError).toBeUndefined();
+    expect(calledTool).toBe('card_get');
+    expect(calledArgs.cardId).toBe('c1');
+    expect(calledArgs.environmentId).toBe(ENV_ID);
+    expect(res.result.content[0].text).toBe('Called card_get');
+  });
+
+  it('handles MCP tool errors cleanly and returns CallToolResult with isError: true', async () => {
+    const mcpTool: RunBridgeToolRef = {
+      name: 'redboard__failing_tool',
+      description: 'Fail',
+      inputSchema: { type: 'object', properties: {} },
+      source: 'mcp',
+      invoke: async () => {
+        throw new Error('MCP backend connection failed');
+      },
+    };
+    const { bridge: b, published } = await start({ resolvedTools: [mcpTool] });
+    const c = await client(b);
+    const res = await c.send('tools/call', { name: 'redboard__failing_tool', arguments: {} });
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toContain('Error: MCP backend connection failed');
+    expect(published.errors[0].error).toBe('MCP backend connection failed');
   });
 });
 
@@ -902,6 +995,230 @@ describe('nonce gate', () => {
 // =============================================================================
 
 describe('lifecycle', () => {
+  it('retries shutdown when late listening beats the pending not-running close callback', async () => {
+    const controller = new AbortController();
+    const stepDir = path.join(tmpDir, 'pending-listen', 'step');
+    let listening = false;
+    let firstCloseCallback: ((error?: Error) => void) | undefined;
+    let secondCloseCallback: ((error?: Error) => void) | undefined;
+    const fake = new EventEmitter() as EventEmitter & {
+      maxConnections: number;
+      listening: boolean;
+      listen: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    Object.defineProperty(fake, 'listening', { get: () => listening });
+    fake.maxConnections = 0;
+    fake.listen = vi.fn(() => fake); // deliberately never emits 'listening'
+    fake.close = vi.fn((callback?: (error?: Error) => void) => {
+      if (!listening) {
+        firstCloseCallback = callback;
+        return fake;
+      }
+      listening = false;
+      secondCloseCallback = callback;
+      return fake;
+    });
+    bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+    const startPromise = startRunToolBridge({
+      runId: RUN_ID,
+      state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+      publisher: null,
+      resolvedTools: [],
+      environmentId: ENV_ID,
+      workingDir: WORKING_DIR,
+      abortSignal: controller.signal,
+      neuronStepId: 'bridge-startup-abort',
+      dir: stepDir,
+    });
+
+    try {
+      await vi.waitFor(() => expect(fake.listen).toHaveBeenCalledOnce());
+      expect(fs.existsSync(stepDir)).toBe(true);
+      controller.abort();
+      await vi.waitFor(() => expect(firstCloseCallback).toBeDefined());
+
+      // The listen event wins the race, but the first close callback has not
+      // yet reported ERR_SERVER_NOT_RUNNING. The shutdown promise must remain
+      // pending, then initiate and await a second close for the live server.
+      listening = true;
+      fake.emit('listening');
+      firstCloseCallback!(Object.assign(new Error('server is not running'), { code: 'ERR_SERVER_NOT_RUNNING' }));
+      await vi.waitFor(() => expect(fake.close).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(secondCloseCallback).toBeDefined());
+      expect(fs.existsSync(stepDir)).toBe(true);
+      let startupSettled = false;
+      void startPromise.finally(() => { startupSettled = true; }).catch(() => undefined);
+      await Promise.resolve();
+      expect(startupSettled).toBe(false);
+
+      secondCloseCallback!();
+      await expect(startPromise).rejects.toMatchObject({ name: 'AbortError' });
+      expect(fs.existsSync(stepDir)).toBe(false);
+    } finally {
+      firstCloseCallback?.(Object.assign(new Error('server is not running'), { code: 'ERR_SERVER_NOT_RUNNING' }));
+      secondCloseCallback?.();
+      await startPromise.catch(() => undefined);
+      bridgeNetMock.createServer.mockReset();
+      bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+    }
+  });
+
+  it('waits for the server.close callback after listening becomes false before removing bridge files', async () => {
+    const stepDir = path.join(tmpDir, 'delayed-close', 'step');
+    let listening = false;
+    let finishServerClose: (() => void) | undefined;
+    const fake = new EventEmitter() as EventEmitter & {
+      maxConnections: number;
+      listening: boolean;
+      listen: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    Object.defineProperty(fake, 'listening', { get: () => listening });
+    fake.maxConnections = 0;
+    fake.listen = vi.fn((socketPath: string) => {
+      fs.writeFileSync(socketPath, '');
+      listening = true;
+      fake.emit('listening');
+      return fake;
+    });
+    fake.close = vi.fn((callback?: () => void) => {
+      listening = false; // Node clears this before all handles have drained.
+      if (callback) finishServerClose = callback;
+      return fake;
+    });
+    bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+
+    let bridgeClose: Promise<void> | undefined;
+    try {
+      const started = await startRunToolBridge({
+        runId: RUN_ID,
+        state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+        publisher: null,
+        resolvedTools: [],
+        environmentId: ENV_ID,
+        workingDir: WORKING_DIR,
+        abortSignal: null,
+        neuronStepId: 'bridge-delayed-close',
+        dir: stepDir,
+      });
+      let cleanupResolved = false;
+      bridgeClose = started.close().then(() => { cleanupResolved = true; });
+
+      await Promise.resolve();
+      expect(fake.listening).toBe(false);
+      expect(fake.close).toHaveBeenCalledOnce();
+      expect(finishServerClose).toBeDefined();
+      expect(cleanupResolved).toBe(false);
+      expect(fs.existsSync(stepDir)).toBe(true);
+
+      finishServerClose!();
+      await bridgeClose;
+      expect(cleanupResolved).toBe(true);
+      expect(fs.existsSync(stepDir)).toBe(false);
+    } finally {
+      finishServerClose?.();
+      await bridgeClose?.catch(() => undefined);
+      bridgeNetMock.createServer.mockReset();
+      bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+    }
+  });
+
+  it('cleans up a failed listen when close reports that no server was listening', async () => {
+    const stepDir = path.join(tmpDir, 'listen-failure', 'step');
+    const listenError = new Error('fixture listen failure');
+    const fake = new EventEmitter() as EventEmitter & {
+      maxConnections: number;
+      listening: boolean;
+      listen: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    };
+    Object.defineProperty(fake, 'listening', { value: false });
+    fake.maxConnections = 0;
+    fake.listen = vi.fn(() => {
+      queueMicrotask(() => fake.emit('error', listenError));
+      return fake;
+    });
+    fake.close = vi.fn();
+    bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+
+    try {
+      await expect(startRunToolBridge({
+        runId: RUN_ID,
+        state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+        publisher: null,
+        resolvedTools: [],
+        environmentId: ENV_ID,
+        workingDir: WORKING_DIR,
+        abortSignal: null,
+        neuronStepId: 'bridge-listen-failure',
+        dir: stepDir,
+      })).rejects.toThrow('fixture listen failure');
+      // No close callback is needed after listen failed without creating a
+      // listening server; the failure path must still complete cleanup.
+      expect(fake.close).not.toHaveBeenCalled();
+      expect(fs.existsSync(stepDir)).toBe(false);
+    } finally {
+      bridgeNetMock.createServer.mockReset();
+      bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+    }
+  });
+
+  it.each(['callback-error', 'sync-throw'] as const)(
+    'keeps bridge files registered when server.close has an unconfirmed %s',
+    async (failureMode) => {
+      const stepDir = path.join(tmpDir, `close-unconfirmed-${failureMode}`, 'step');
+      let listening = false;
+      const fake = new EventEmitter() as EventEmitter & {
+        maxConnections: number;
+        listening: boolean;
+        listen: ReturnType<typeof vi.fn>;
+        close: ReturnType<typeof vi.fn>;
+      };
+      Object.defineProperty(fake, 'listening', { get: () => listening });
+      fake.maxConnections = 0;
+      fake.listen = vi.fn((socketPath: string) => {
+        fs.writeFileSync(socketPath, '');
+        listening = true;
+        fake.emit('listening');
+        return fake;
+      });
+      fake.close = vi.fn((callback?: (error?: Error) => void) => {
+        if (failureMode === 'sync-throw') throw new Error('fixture close throw');
+        listening = false;
+        queueMicrotask(() => callback?.(new Error('fixture close callback error')));
+        return fake;
+      });
+      bridgeNetMock.createServer.mockReturnValue(fake as unknown as net.Server);
+
+      try {
+        const started = await startRunToolBridge({
+          runId: RUN_ID,
+          state: { runId: RUN_ID, userId: 'u-test', data: { environmentId: ENV_ID } },
+          publisher: null,
+          resolvedTools: [],
+          environmentId: ENV_ID,
+          workingDir: WORKING_DIR,
+          abortSignal: null,
+          neuronStepId: `bridge-unconfirmed-${failureMode}`,
+          dir: stepDir,
+        });
+        await expect(started.close()).rejects.toMatchObject({ code: 'run_bridge_shutdown_unconfirmed' });
+        expect(fs.existsSync(stepDir)).toBe(true);
+        expect(fs.existsSync(started.socketPath)).toBe(true);
+
+        // The process-exit reaper remains registered and can perform its
+        // synchronous cleanup when the owning worker is fail-stopped.
+        cleanupOrphanedBridges();
+        expect(fs.existsSync(stepDir)).toBe(false);
+      } finally {
+        cleanupOrphanedBridges();
+        bridgeNetMock.createServer.mockReset();
+        bridgeNetMock.createServer.mockImplementation(bridgeNetMock.realCreateServer!);
+      }
+    },
+  );
+
   it('revokes when the run aborts', async () => {
     const controller = new AbortController();
     const { bridge: b } = await start({ abortSignal: controller.signal });
@@ -914,11 +1231,11 @@ describe('lifecycle', () => {
     expect(b.revokedReason).toMatch(/aborted/);
   });
 
-  it('starts already-revoked when handed an aborted signal', async () => {
+  it('refuses startup and cleans up when handed an already-aborted signal', async () => {
     const controller = new AbortController();
     controller.abort();
-    const { bridge: b } = await start({ abortSignal: controller.signal });
-    expect(b.revoked).toBe(true);
+    await expect(start({ abortSignal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fs.existsSync(path.join(tmpDir, 'step'))).toBe(false);
   });
 
   it('kills the child, revokes and closes on run cancellation', async () => {

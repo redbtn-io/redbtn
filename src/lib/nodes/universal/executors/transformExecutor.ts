@@ -39,6 +39,40 @@ export async function executeTransform(config: TransformStepConfig, state: any):
     console.log('[TransformExecutor] InputField:', config.inputField);
     console.log('[TransformExecutor] OutputField:', config.outputField);
     try {
+        // Atomic global counter. `increment` / `decrement` whose input AND
+        // output are the same `globalState.<namespace>.<key>` used to be a
+        // read (through the client's 5s cache) + a whole-value write: parallel
+        // branches or concurrent runs bumping one counter lost updates. Route
+        // it to the webapp's single-update atomic increment instead, keeping
+        // the step's historical semantics (missing or non-number value counts
+        // from 0; `value` resolving to 0/NaN means 1). Falls through to the
+        // legacy path only when the webapp predates the atomic endpoint.
+        const atomicCounter = sameGlobalStateKey(config.inputField, config.outputField);
+        if (atomicCounter && (config.operation === 'increment' || config.operation === 'decrement')) {
+            const amount = resolveStepAmount(config, state);
+            const delta = config.operation === 'increment' ? amount : -amount;
+            const client = getGlobalStateClient({
+                userId: state.data?.userId || state.userId,
+                workflowId: state.data?.graphId || state.graphId,
+            });
+            const res = await client.increment(atomicCounter.namespace, atomicCounter.key, delta, {
+                initial: 0,
+                onNonNumber: 'reset',
+                ttlSeconds: config.ttlSeconds,
+                description: config.description,
+            });
+            if (res.supported) {
+                if (!res.ok) {
+                    console.warn(`[TransformExecutor] Atomic ${config.operation} of ${atomicCounter.namespace}.${atomicCounter.key} failed: ${res.error}`);
+                }
+                return {
+                    _globalStateSet: res.ok,
+                    _globalStateKey: `${atomicCounter.namespace}.${atomicCounter.key}`,
+                };
+            }
+            console.warn('[TransformExecutor] Webapp has no atomic state endpoint — falling back to read-modify-write increment');
+        }
+
         // build-messages doesn't require inputField
         let inputData: any = undefined;
         if (config.inputField) {
@@ -773,6 +807,31 @@ async function executeGetGlobalOperation(config: TransformStepConfig, state: any
 }
 
 /**
+ * Amount for increment / decrement: `config.value` resolved against state,
+ * defaulting to 1 (and, historically, 0 / NaN also mean 1).
+ */
+function resolveStepAmount(config: TransformStepConfig, state: any): number {
+    if (config.value === undefined) return 1;
+    const resolved = resolveValue(config.value, state);
+    return Number(resolved) || 1;
+}
+
+/**
+ * When `inputField` and `outputField` both address the SAME whole global-state
+ * key (`globalState.<namespace>.<key>`, exactly three segments), return it.
+ * That is the read-modify-write shape an atomic server-side op can replace.
+ */
+export function sameGlobalStateKey(
+    inputField: string | undefined,
+    outputField: string | undefined,
+): { namespace: string; key: string } | null {
+    if (!inputField || !outputField || inputField !== outputField) return null;
+    const parts = inputField.split('.');
+    if (parts.length !== 3 || parts[0] !== 'globalState' || !parts[1] || !parts[2]) return null;
+    return { namespace: parts[1], key: parts[2] };
+}
+
+/**
  * Increment operation: Add to a number value
  *
  * Example:
@@ -787,11 +846,7 @@ async function executeGetGlobalOperation(config: TransformStepConfig, state: any
  */
 function executeIncrementOperation(config: TransformStepConfig, inputData: any, state: any): number {
     // Get the amount to increment by (default 1)
-    let incrementBy = 1;
-    if (config.value !== undefined) {
-        const resolved = resolveValue(config.value, state);
-        incrementBy = Number(resolved) || 1;
-    }
+    const incrementBy = resolveStepAmount(config, state);
     // Get current value (default 0)
     const currentValue = typeof inputData === 'number' ? inputData : 0;
     if (DEBUG)
@@ -814,11 +869,7 @@ function executeIncrementOperation(config: TransformStepConfig, inputData: any, 
  */
 function executeDecrementOperation(config: TransformStepConfig, inputData: any, state: any): number {
     // Get the amount to decrement by (default 1)
-    let decrementBy = 1;
-    if (config.value !== undefined) {
-        const resolved = resolveValue(config.value, state);
-        decrementBy = Number(resolved) || 1;
-    }
+    const decrementBy = resolveStepAmount(config, state);
     // Get current value (default 0)
     const currentValue = typeof inputData === 'number' ? inputData : 0;
     if (DEBUG)

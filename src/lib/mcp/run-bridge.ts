@@ -110,6 +110,7 @@ import { getDataToolRule } from '../permissions/tool-map';
 import { runControlRegistry } from '../run/RunControlRegistry';
 import { callerIsTrusted } from '../tools/native/_outbound-url';
 import type { ToolInvocationContext } from '../tools/tool-resolver';
+import { getMcpClient } from '../run/contextLookup';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -180,6 +181,17 @@ export const MAX_CONNECTIONS = 4;
 
 /** How long a peer may hold a socket without a valid auth frame. */
 export const AUTH_DEADLINE_MS = 5_000;
+
+/** Close failed without proving that the run-bridge server is no longer live. */
+export class RunBridgeShutdownUnconfirmedError extends Error {
+  readonly code = 'run_bridge_shutdown_unconfirmed';
+
+  constructor(runId: string, cause?: unknown) {
+    super(`run-bridge shutdown could not be confirmed for run ${runId}`);
+    this.name = 'RunBridgeShutdownUnconfirmedError';
+    if (cause !== undefined) Object.defineProperty(this, 'cause', { value: cause, configurable: true });
+  }
+}
 
 /** Bytes an UNAUTHENTICATED peer may buffer. The real auth frame is ~90. */
 export const MAX_PREAUTH_BYTES = 4 * 1024;
@@ -567,8 +579,7 @@ export function isForbiddenForBridge(name: string): boolean {
 
 /**
  * Build the served tool table: what the node declared, intersected with the
- * native registry, minus everything forbidden. MCP- and graph-sourced tools are
- * not bridged: their own transports have their own trust stories.
+ * native registry or provided as graph- or MCP-sourced tools, minus anything forbidden.
  */
 export function buildBridgeToolTable(resolvedTools: RunBridgeToolRef[]): Tool[] {
   const registry = getNativeRegistry();
@@ -580,7 +591,7 @@ export function buildBridgeToolTable(resolvedTools: RunBridgeToolRef[]): Tool[] 
     const name = tool?.name;
     if (typeof name !== 'string' || !name) continue;
     if (seen.has(name)) continue;
-    if (tool.source === 'graph') {
+    if (tool.source === 'graph' || tool.source === 'mcp') {
       seen.add(name);
       out.push({
         name,
@@ -927,13 +938,103 @@ export async function startRunToolBridge(
   let revoked = false;
   let revokedReason: string | null = null;
   let closed = false;
+  let serverClosePromise: Promise<void> | null = null;
+  let resolveServerClose: (() => void) | null = null;
+  let rejectServerClose: ((error: Error) => void) | null = null;
+  let serverShutdownRequested = false;
+  let serverShutdownComplete = false;
+  let serverShutdownFailed = false;
+  let serverCloseAttemptPending = false;
+  let listenAttemptPending = false;
   let unregisterCancel: () => void = () => {};
   let abortHandler: (() => void) | null = null;
+  let abortStartupWait: (() => void) | null = null;
 
   const server = net.createServer();
   // Node destroys anything past this before `connection` even fires, so the
   // ceiling holds whether or not the handler below ever runs.
   server.maxConnections = MAX_CONNECTIONS;
+
+  function finishServerShutdown(): void {
+    if (serverShutdownComplete || serverShutdownFailed) return;
+    serverShutdownComplete = true;
+    const resolve = resolveServerClose;
+    resolveServerClose = null;
+    rejectServerClose = null;
+    resolve?.();
+  }
+
+  function failServerShutdown(cause: unknown): void {
+    if (serverShutdownComplete || serverShutdownFailed) return;
+    serverShutdownFailed = true;
+    const reject = rejectServerClose;
+    resolveServerClose = null;
+    rejectServerClose = null;
+    reject?.(new RunBridgeShutdownUnconfirmedError(runId, cause));
+  }
+
+  function attemptServerClose(): void {
+    if (!serverShutdownRequested || serverShutdownComplete || serverShutdownFailed || serverCloseAttemptPending) return;
+    // A listen() call can still complete after an abort. Keep the shared
+    // shutdown promise pending until that attempt emits `listening` or `error`.
+    if (!server.listening && !listenAttemptPending) {
+      finishServerShutdown();
+      return;
+    }
+
+    serverCloseAttemptPending = true;
+    const onCloseComplete = (error?: Error): void => {
+      serverCloseAttemptPending = false;
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ERR_SERVER_NOT_RUNNING') {
+        // The server may have started between close() being issued and this
+        // callback. Re-check its live state and close again before resolving.
+        if (server.listening) attemptServerClose();
+        else if (!listenAttemptPending) finishServerShutdown();
+        return;
+      }
+      if (error) {
+        failServerShutdown(error);
+        return;
+      }
+      if (server.listening) attemptServerClose();
+      else if (!listenAttemptPending) finishServerShutdown();
+    };
+
+    try {
+      // Do not infer completion from `server.listening`: Node clears it as soon
+      // as close starts, before the callback confirms socket/handle drainage.
+      server.close(onCloseComplete);
+    } catch (error) {
+      serverCloseAttemptPending = false;
+      if ((error as NodeJS.ErrnoException)?.code !== 'ERR_SERVER_NOT_RUNNING') {
+        console.warn(`[RunBridge] server close initiation failed for run ${runId}:`, error);
+        failServerShutdown(error);
+        return;
+      }
+      if (server.listening) attemptServerClose();
+      else if (!listenAttemptPending) finishServerShutdown();
+    }
+  }
+
+  function initiateServerClose(): Promise<void> {
+    if (serverClosePromise) return serverClosePromise;
+    serverShutdownRequested = true;
+    serverClosePromise = new Promise<void>((resolve, reject) => {
+      resolveServerClose = resolve;
+      rejectServerClose = reject;
+    });
+    // revoke() initiates shutdown without awaiting. Keep a rejection handler on
+    // the shared promise; close() still observes and propagates the rejection.
+    void serverClosePromise.catch(() => undefined);
+    attemptServerClose();
+    return serverClosePromise;
+  }
+
+  function settleListenAttempt(): void {
+    if (!listenAttemptPending) return;
+    listenAttemptPending = false;
+    if (serverShutdownRequested) attemptServerClose();
+  }
 
   function revoke(reason: string): void {
     if (revoked) return;
@@ -948,11 +1049,7 @@ export async function startRunToolBridge(
       }
     }
     sockets.clear();
-    try {
-      server.close();
-    } catch {
-      /* ignore */
-    }
+    void initiateServerClose();
   }
 
   function fatal(err: Error): void {
@@ -978,8 +1075,10 @@ export async function startRunToolBridge(
         }
         abortHandler = null;
       }
-      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+    // Do not remove the socket/directory or unregister exit cleanup unless the
+    // server-close callback positively acknowledged shutdown.
+    await initiateServerClose();
     try {
       fs.unlinkSync(socketPath);
     } catch {
@@ -992,8 +1091,7 @@ export async function startRunToolBridge(
         console.warn(`[RunBridge] failed to remove step dir ${stepDir}:`, err);
       }
     }
-    // Whatever `removeDir` said, this bridge no longer needs the exit sweep:
-    // either the directory is gone, or the caller asked to keep it.
+    // Shutdown is confirmed, so the exit sweep no longer needs this bridge.
     ACTIVE_BRIDGE_PATHS.delete(socketPath);
   }
 
@@ -1199,10 +1297,12 @@ export async function startRunToolBridge(
     const toolId = generateBridgeToolId(name, ++seq);
 
     const graphTool = resolvedTools?.find((t) => t.name === name && t.source === 'graph');
-    const toolType = graphTool ? 'graph' : 'native';
+    const mcpTool = resolvedTools?.find((t) => t.name === name && t.source === 'mcp');
+    const customTool = graphTool || mcpTool;
+    const toolType = graphTool ? 'graph' : mcpTool ? 'mcp' : 'native';
 
     try {
-      if (publisher) {
+      if (publisher && typeof publisher.toolStart === 'function') {
         await publishBounded(
           'toolStart',
           publisher.toolStart(toolId, name, toolType, {
@@ -1218,14 +1318,31 @@ export async function startRunToolBridge(
       }
 
       let result: unknown;
-      if (graphTool && typeof graphTool.invoke === 'function') {
-        result = await graphTool.invoke(args, {
+      if (customTool && typeof customTool.invoke === 'function') {
+        result = await customTool.invoke(args, {
           state: state as AnyObject,
           credentials: (credentials ?? null) as any,
           runId,
           toolId,
           abortSignal: abortSignal ?? null,
         });
+      } else if (mcpTool) {
+        const mcpClient = getMcpClient(state);
+        if (!mcpClient) {
+          throw new Error(`MCP client not available in run context for tool '${name}'`);
+        }
+        const dotIdx = name.indexOf('__');
+        const toolName = dotIdx >= 0 ? name.slice(dotIdx + 2) : name;
+        result = await mcpClient.callTool(
+          toolName,
+          args,
+          {
+            conversationId: (state as any).options?.conversationId
+              ?? (state as any).data?.options?.conversationId,
+            credentials,
+          },
+          abortSignal ?? undefined,
+        );
       } else {
         // `untrustedCaller` is the property `lib/tools/caller-trust`,
         // `_outbound-url` and every URL-taking tool read. It is now a declared
@@ -1254,7 +1371,7 @@ export async function startRunToolBridge(
         result = await getNativeRegistry().callTool(name, args, context);
       }
 
-      if (publisher) {
+      if (publisher && typeof publisher.toolComplete === 'function') {
         await publishBounded(
           'toolComplete',
           publisher.toolComplete(
@@ -1272,7 +1389,7 @@ export async function startRunToolBridge(
           ),
         );
       }
-      if (graphTool) {
+      if (customTool) {
         if (result && Array.isArray((result as any).content)) {
           return result as CallToolResult;
         }
@@ -1289,10 +1406,16 @@ export async function startRunToolBridge(
       return result as CallToolResult;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (publisher) {
+      if (publisher && typeof publisher.toolError === 'function') {
         await publishBounded(
           'toolError',
-          publisher.toolError(toolId, message, { triggeredBy: 'neuron', neuronStepId }),
+          publisher.toolError(toolId, message, {
+            triggeredBy: 'neuron',
+            neuronStepId,
+            neuronStep: neuronStepId,
+            bridge: true,
+            source: toolType,
+          }),
         );
       }
       return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
@@ -1579,23 +1702,14 @@ export async function startRunToolBridge(
   });
 
   server.on('error', (err) => {
+    settleListenAttempt();
     console.warn(`[RunBridge] server error for run ${runId}:`, err);
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(socketPath, () => {
-      server.removeListener('error', reject);
-      resolve();
-    });
-  });
-  fs.chmodSync(socketPath, 0o600);
-  // From here on the socket and the step directory exist on disk. `close()`
-  // removes both; this covers the paths where `close()` never runs.
+  // Register cleanup and cancellation BEFORE listen. `net.Server.listen()` may
+  // remain pending; rejecting the caller's race alone is not sufficient because
+  // a late listening event could otherwise leave the Unix socket behind.
   registerForExitCleanup(socketPath, stepDir);
-
-  // Cancellation: one registration does all three jobs — kill the CLI child
-  // (the executor's callback), revoke the session, close the server.
   unregisterCancel = runControlRegistry.registerOnCancel(runId, () => {
     try {
       onCancel?.();
@@ -1603,48 +1717,130 @@ export async function startRunToolBridge(
       console.warn('[RunBridge] onCancel hook threw:', err);
     }
     revoke('run cancelled');
+    abortStartupWait?.();
+    void close({ removeDir: true }).catch((err) => {
+      console.warn('[RunBridge] cleanup after run cancellation failed:', err);
+    });
   });
-
+  const startupAbort = (): Error => {
+    const error = new Error('Run aborted while starting the tool bridge');
+    error.name = 'AbortError';
+    return error;
+  };
+  const abortStartup = () => {
+    if (revoked) return;
+    revoke('run aborted');
+    void close({ removeDir: true }).catch((err) => {
+      console.warn('[RunBridge] cleanup after startup abort failed:', err);
+    });
+  };
   if (abortSignal) {
-    if (abortSignal.aborted) {
-      revoke('run aborted');
-    } else {
-      abortHandler = () => revoke('run aborted');
-      abortSignal.addEventListener('abort', abortHandler, { once: true });
-    }
+    abortHandler = abortStartup;
+    if (abortSignal.aborted) abortStartup();
+    else abortSignal.addEventListener('abort', abortHandler, { once: true });
   }
+  try {
+    if (revoked) throw startupAbort();
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const onStartupError = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        server.removeListener('listening', onListening);
+        if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+        abortStartupWait = null;
+        void close({ removeDir: true }).catch(() => undefined);
+        reject(error);
+      };
+      const onListening = () => {
+        settleListenAttempt();
+        if (settled) {
+          // Abort may win while listen is pending. Close a late-bound server and
+          // repeat filesystem cleanup in case the first pass preceded creation.
+          void close({ removeDir: true }).catch((err) => {
+            console.warn('[RunBridge] late-listen cleanup failed:', err);
+          });
+          return;
+        }
+        settled = true;
+        if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+        abortStartupWait = null;
+        server.removeListener('error', onStartupError);
+        resolve();
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+        abortStartupWait = null;
+        server.removeListener('error', onStartupError);
+        // Keep onListening installed so a listen callback that arrives after
+        // this rejection still closes the server and removes its socket.
+        abortStartup();
+        reject(startupAbort());
+      };
+      abortStartupWait = onAbort;
+      server.once('error', onStartupError);
+      server.once('listening', onListening);
+      if (abortSignal?.aborted || revoked) {
+        onAbort();
+        return;
+      }
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+      listenAttemptPending = true;
+      try {
+        server.listen(socketPath);
+      } catch (error) {
+        settleListenAttempt();
+        reject(error);
+      }
+    });
+  } catch (error) {
+    await close({ removeDir: true });
+    throw error;
+  }
+  if (revoked || abortSignal?.aborted) {
+    await close({ removeDir: true });
+    throw startupAbort();
+  }
+  try {
+    fs.chmodSync(socketPath, 0o600);
 
-  const shimPath = resolveShimPath();
-  const mcpConfig = {
-    mcpServers: {
-      [BRIDGE_SERVER_NAME]: {
-        type: 'stdio',
-        command: process.execPath,
-        args: [shimPath],
-        env: {
-          REDBTN_BRIDGE_SOCK: socketPath,
-          REDBTN_BRIDGE_NONCE: nonce,
+    const shimPath = resolveShimPath();
+    const mcpConfig = {
+      mcpServers: {
+        [BRIDGE_SERVER_NAME]: {
+          type: 'stdio',
+          command: process.execPath,
+          args: [shimPath],
+          env: {
+            REDBTN_BRIDGE_SOCK: socketPath,
+            REDBTN_BRIDGE_NONCE: nonce,
+          },
         },
       },
-    },
-  };
+    };
 
-  return {
-    socketPath,
-    nonce,
-    shimPath,
-    mcpConfig,
-    toolNames: tools.map((t) => t.name),
-    tools,
-    stats,
-    get revoked() {
-      return revoked;
-    },
-    get revokedReason() {
-      return revokedReason;
-    },
-    maxCalls,
-    revoke,
-    close,
-  };
+    return {
+      socketPath,
+      nonce,
+      shimPath,
+      mcpConfig,
+      toolNames: tools.map((t) => t.name),
+      tools,
+      stats,
+      get revoked() {
+        return revoked;
+      },
+      get revokedReason() {
+        return revokedReason;
+      },
+      maxCalls,
+      revoke,
+      close,
+    };
+  } catch (error) {
+    await close({ removeDir: true });
+    throw error;
+  }
 }

@@ -48,6 +48,8 @@ const AUTH_SCHEME_RE = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
 const JWT_RE = /\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
 const URL_CREDENTIAL_RE = /([a-z][a-z0-9+.-]{0,31}:\/\/[^\s:/@]{1,256}:)[^\s@/]{1,256}@/gi;
 const RPAT_RE = /\brpat_[A-Za-z0-9_-]+/g;
+/** Workspace registration token, `rreg_<payload>.<signature>` (workspaces/workspace-token.ts). */
+const RREG_RE = /\brreg_[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?/g;
 const SK_RE = /\bsk-[A-Za-z0-9_-]+/g;
 const GHP_RE = /\bghp_[A-Za-z0-9]+/g;
 /** GitHub App installation / OAuth / refresh tokens and fine-grained PATs. */
@@ -67,6 +69,7 @@ function redactString(value: string): string {
     .replace(AUTH_SCHEME_RE, `$1 ${REDACTED}`)
     .replace(JWT_RE, REDACTED)
     .replace(RPAT_RE, REDACTED)
+    .replace(RREG_RE, REDACTED)
     .replace(SK_RE, REDACTED)
     .replace(GHP_RE, REDACTED)
     .replace(GH_TOKEN_RE, REDACTED)
