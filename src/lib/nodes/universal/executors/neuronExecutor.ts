@@ -36,6 +36,7 @@ import { runClaudeCodeStep } from './claudeCodeExecutor';
 import { runAgyCliStep } from './agyCliExecutor';
 import { runCopilotSdkStep } from './copilotSdkExecutor';
 import { runOpencodeStep } from './opencodeExecutor';
+import { missingSecretMessage, looksLikeProviderAuthError } from '../../../neurons/missing-secret';
 import {
   classifyFallbackTrigger,
   resolveFallbackNeuronId,
@@ -519,6 +520,24 @@ export async function executeNeuron(config: NeuronStepConfig, state: any): Promi
  * its own raw source, so an unresolved `{{...}}` is treated as absent: using it
  * as an id would just guarantee a registry miss.
  */
+/**
+ * The missing-secret explanation for a failed neuron step, or null. Only does
+ * a (cached) neuron-config lookup when the error already looks like a provider
+ * auth rejection, and never throws: a failed lookup keeps the original error.
+ */
+async function explainMissingSecret(error: unknown, config: NeuronStepConfig, state: any): Promise<string | null> {
+  try {
+    if (!looksLikeProviderAuthError(error)) return null;
+    const neuronId = resolveEffectiveNeuronId(config, state);
+    const userId = state?.userId || state?.data?.userId;
+    if (!neuronId) return null;
+    const cfg = await getNeuronRegistry(state).getConfig(neuronId, userId);
+    return missingSecretMessage(error, cfg, userId);
+  } catch {
+    return null;
+  }
+}
+
 function resolveEffectiveNeuronId(config: NeuronStepConfig, state: any): string | undefined {
   const resolved = resolveConfigValue(config.neuronId, state);
   const usable =
@@ -1645,8 +1664,12 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       throw error;
     }
 
+    // A provider auth rejection from a neuron whose vault secret did not
+    // resolve gets the real cause (which secret, which account) instead of the
+    // provider's bare "401 Missing Authentication header". See missing-secret.ts.
+    const secretHint = await explainMissingSecret(error, config, state);
     const wrapped = new Error(
-      `Neuron step failed: ${error instanceof Error ? error.message : String(error)}`
+      `Neuron step failed: ${secretHint ?? (error instanceof Error ? error.message : String(error))}`
     );
     // Keep the original reachable. The message alone is lossy: a
     // `ClaudeCodeError`'s `code`, a provider SDK's `status`, and a socket
