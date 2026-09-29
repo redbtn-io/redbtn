@@ -47,30 +47,31 @@ jobs:
           node-version: '24'
           cache: 'npm'
 
-      # REDBTN_NPM_TOKEN is a base64 user:pass string, so it must be written as
-      # `_auth` (-> `Authorization: Basic`). Writing it as `_authToken` makes npm
-      # send `Authorization: Bearer`, which Verdaccio rejects with 401. This block
-      # is a copy of the one in release.yml, which has always used `_auth` and has
-      # always worked. CI only appeared to work because actions/setup-node restored
-      # an npm cache that already held every @redbtn tarball, so npm never had to
-      # talk to the registry; the first genuinely new @redbtn dependency (redsecrets
-      # 0.2.1, this PR) forced a cold fetch and exposed the broken auth.
+      # Long-lived BASIC auth (username + base64 `_password`), the same pattern as
+      # webapp beta-ci.yml. REDBTN_NPM_PASSWORD holds the unencoded password, so it
+      # is base64-encoded here. The old REDBTN_NPM_TOKEN (`_auth`) held the retired
+      # redrun-build credential, which the registry now rejects with 401. CI only
+      # appeared to work while actions/setup-node restored an npm cache that already
+      # held every @redbtn tarball. `npm whoami` is NOT a validity check (Verdaccio
+      # answers 200 for any credential), so the step fetches a scoped packument.
       - name: Authenticate to @redbtn registry
         env:
-          REDBTN_NPM_TOKEN: ${{ secrets.REDBTN_NPM_TOKEN }}
+          REDBTN_NPM_USER: ${{ secrets.REDBTN_NPM_USER }}
+          REDBTN_NPM_PASSWORD: ${{ secrets.REDBTN_NPM_PASSWORD }}
           NPM_REGISTRY: https://registry.redbtn.io
         run: |
           set -eu
-          test -n "$REDBTN_NPM_TOKEN" || { echo 'REDBTN_NPM_TOKEN is not configured' >&2; exit 1; }
+          { test -n "${REDBTN_NPM_USER:-}" && test -n "${REDBTN_NPM_PASSWORD:-}"; } || { echo 'REDBTN_NPM_USER / REDBTN_NPM_PASSWORD are not configured' >&2; exit 1; }
           npmrc="$RUNNER_TEMP/redbtn-npmrc"
           umask 077
           {
             printf '@redbtn:registry=%s\n' "$NPM_REGISTRY"
-            printf '//registry.redbtn.io/:_auth=%s\n' "$REDBTN_NPM_TOKEN"
+            printf '//registry.redbtn.io/:username=%s\n' "$REDBTN_NPM_USER"
+            printf '//registry.redbtn.io/:_password=%s\n' "$(printf '%s' "$REDBTN_NPM_PASSWORD" | base64 -w0)"
             printf 'always-auth=true\n'
           } > "$npmrc"
           echo "NPM_CONFIG_USERCONFIG=$npmrc" >> "$GITHUB_ENV"
-          NPM_CONFIG_USERCONFIG="$npmrc" npm whoami --registry "$NPM_REGISTRY"
+          NPM_CONFIG_USERCONFIG="$npmrc" npm view @redbtn/redbtn name --registry "$NPM_REGISTRY" >/dev/null
 
       - name: Install dependencies
         run: npm ci
