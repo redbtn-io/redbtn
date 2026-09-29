@@ -37,19 +37,21 @@ jobs:
 
       - name: Authenticate to Verdaccio
         env:
-          REDBTN_NPM_TOKEN: ${{ secrets.REDBTN_NPM_TOKEN }}
+          REDBTN_NPM_USER: ${{ secrets.REDBTN_NPM_USER }}
+          REDBTN_NPM_PASSWORD: ${{ secrets.REDBTN_NPM_PASSWORD }}
         run: |
           set -eu
-          test -n "$REDBTN_NPM_TOKEN" || { echo 'REDBTN_NPM_TOKEN is not configured' >&2; exit 1; }
+          { test -n "${REDBTN_NPM_USER:-}" && test -n "${REDBTN_NPM_PASSWORD:-}"; } || { echo 'REDBTN_NPM_USER / REDBTN_NPM_PASSWORD are not configured' >&2; exit 1; }
           npmrc="$RUNNER_TEMP/redbtn-npmrc"
           umask 077
           {
             printf '@redbtn:registry=%s\n' "$NPM_REGISTRY"
-            printf '//registry.redbtn.io/:_auth=%s\n' "$REDBTN_NPM_TOKEN"
+            printf '//registry.redbtn.io/:username=%s\n' "$REDBTN_NPM_USER"
+            printf '//registry.redbtn.io/:_password=%s\n' "$(printf '%s' "$REDBTN_NPM_PASSWORD" | base64 -w0)"
             printf 'always-auth=true\n'
           } > "$npmrc"
           echo "NPM_CONFIG_USERCONFIG=$npmrc" >> "$GITHUB_ENV"
-          NPM_CONFIG_USERCONFIG="$npmrc" npm whoami --registry "$NPM_REGISTRY"
+          NPM_CONFIG_USERCONFIG="$npmrc" npm view @redbtn/redbtn name --registry "$NPM_REGISTRY" >/dev/null
 
       - name: Install dependencies
         run: npm ci
