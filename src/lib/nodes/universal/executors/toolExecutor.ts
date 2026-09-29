@@ -6,7 +6,7 @@
  */
 
 import { renderParameters, renderTemplate } from '../templateRenderer';
-import { executeWithErrorHandling } from './errorHandler';
+import { executeWithErrorHandlingDetailed, recordStepError, clearStepError } from './errorHandler';
 import { getParserRegistry } from './parserRegistry';
 import { ParserExecutor } from './parserExecutor';
 import { getToolResultErrorMessage } from './toolResultError';
@@ -131,14 +131,26 @@ export async function executeTool(config: ToolStepConfig, state: any): Promise<P
     const normalizedConfig = normalizeToolStepConfig(config);
     // If error handling configured (new way), use it
     if (normalizedConfig.errorHandling) {
-        return executeWithErrorHandling(
+        const { value, recovered } = await executeWithErrorHandlingDetailed(
             () => executeToolInternal(normalizedConfig, state),
             normalizedConfig.errorHandling,
             { type: 'tool', field: normalizedConfig.outputField }
         );
+        if (recovered) {
+            // `value` is the fallbackValue, merged into the step's update exactly
+            // as before; the error record travels beside it.
+            return recordStepError(
+                state,
+                normalizedConfig.outputField,
+                recovered,
+                { stepType: 'tool', toolName: normalizedConfig.toolName },
+                value,
+            );
+        }
+        return clearStepError(state, normalizedConfig.outputField, value);
     }
     // Otherwise use legacy retry logic (backward compatibility)
-    return executeToolInternal(normalizedConfig, state);
+    return clearStepError(state, normalizedConfig.outputField, await executeToolInternal(normalizedConfig, state));
 }
 
 /**

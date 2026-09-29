@@ -14,7 +14,7 @@
 
 import type { NeuronStepConfig } from '../types';
 import { renderTemplate, getNestedProperty } from '../templateRenderer';
-import { executeWithErrorHandling } from './errorHandler';
+import { executeWithErrorHandlingDetailed, recordStepError, clearStepError } from './errorHandler';
 import { AudioStreamPipeline } from '../../../tts/audio-stream';
 import { ParserExecutor, type ParserToolExecutor } from './parserExecutor';
 import { getParserRegistry } from './parserRegistry';
@@ -456,7 +456,7 @@ function setWorkspaceWorkingDir(state: any, defaultCwd = '/workspace'): void {
 export async function executeNeuron(config: NeuronStepConfig, state: any): Promise<Partial<any>> {
   // If error handling configured, wrap execution
   if (config.errorHandling) {
-    const result = await executeWithErrorHandling(
+    const { value: result, recovered } = await executeWithErrorHandlingDetailed(
       // The fallback neuron sits INSIDE the error-handling wrapper on purpose:
       // `retry` / `onError` / `fallbackValue` must only see a failure once the
       // primary AND its fallback have both failed. See neuronFallback.ts.
@@ -471,9 +471,10 @@ export async function executeNeuron(config: NeuronStepConfig, state: any): Promi
     // If fallback was used, the result will be the raw fallback value (e.g., a string)
     // We need to wrap it in the expected format: { [outputField]: value }
     // Check if result is already in the correct format (has outputField as a key)
+    let partial: Partial<any>;
     if (result && typeof result === 'object' && config.outputField in result) {
       // Already in correct format (normal execution succeeded)
-      return result;
+      partial = result;
     } else if (result !== undefined) {
       // Fallback was used - wrap the raw value in the expected format
       const resultStr = typeof result === 'string' ? result : String(result);
@@ -482,16 +483,29 @@ export async function executeNeuron(config: NeuronStepConfig, state: any): Promi
         fallbackType: typeof result,
         fallbackPreview: resultStr.substring(0, 50)
       });
-      return {
+      partial = {
         [config.outputField]: result
       };
+    } else {
+      partial = result;
     }
 
-    return result;
+    if (recovered) {
+      // The step carries on with its fallbackValue (or nothing, for 'skip').
+      // Keep the error where later steps can read it instead of only in the log.
+      let neuronId: string | null = null;
+      try {
+        neuronId = resolveEffectiveNeuronId(config, state) ?? null;
+      } catch {
+        /* the record is still worth writing without it */
+      }
+      return recordStepError(state, config.outputField, recovered, { stepType: 'neuron', neuronId }, partial);
+    }
+    return clearStepError(state, config.outputField, partial);
   }
 
   // Otherwise execute directly
-  return executeNeuronWithFallback(config, state);
+  return clearStepError(state, config.outputField, await executeNeuronWithFallback(config, state));
 }
 
 /**
