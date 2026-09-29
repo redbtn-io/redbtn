@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import {
   resolveOpencodeModel,
@@ -6,6 +7,23 @@ import {
   runOpencodeStep,
 } from '../../src/lib/nodes/universal/executors/opencodeExecutor';
 import { OPENCODE_FALLBACK_CODES } from '../../src/lib/nodes/universal/executors/neuronFallback';
+
+// resolveOpencodeBinary() falls back to the bare name 'opencode' when no
+// install is found, so its return value alone cannot tell whether the CLI
+// exists. The tests below that spawn it make a live model call; run them only
+// where the binary is actually on disk or on PATH (CI runners have none, and
+// a missing binary surfaces as an uncaught `spawn opencode ENOENT`).
+function opencodeInstalled(): boolean {
+  const bin = resolveOpencodeBinary();
+  if (bin !== 'opencode') return true;
+  try {
+    execFileSync('sh', ['-c', 'command -v opencode'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+const liveIt = it.skipIf(!opencodeInstalled());
 
 describe('opencodeExecutor', () => {
   it('resolves model names with opencode/ prefix if absent', () => {
@@ -35,7 +53,7 @@ describe('opencodeExecutor', () => {
     expect(err.name).toBe('OpencodeCliError');
   });
 
-  it('executes a step with mock or live opencode if binary is present', async () => {
+  liveIt('executes a step with mock or live opencode if binary is present', async () => {
     // If opencode binary is installed, verify runOpencodeStep executes
     const bin = resolveOpencodeBinary();
     if (bin && bin.includes('opencode')) {
@@ -67,7 +85,7 @@ describe('opencodeExecutor', () => {
     }
   });
 
-  it('dispatches through executeNeuron when provider is opencode', async () => {
+  liveIt('dispatches through executeNeuron when provider is opencode', async () => {
     const { executeNeuron } = await import('../../src/lib/nodes/universal/executors/neuronExecutor');
     const neuronRegistry = {
       getConfig: async (id: string) => ({
@@ -113,7 +131,7 @@ describe('opencodeExecutor', () => {
     expect(resolveOpencodeModel('opencode/muse-spark-1.3')).toBe('opencode/muse-spark-1.3-contributor-free');
   });
 
-  it('dispatches keyless opencode-zen neuron through runOpencodeStep', async () => {
+  liveIt('dispatches keyless opencode-zen neuron through runOpencodeStep', async () => {
     const { executeNeuron } = await import('../../src/lib/nodes/universal/executors/neuronExecutor');
     const neuronRegistry = {
       getConfig: async (id: string) => ({
