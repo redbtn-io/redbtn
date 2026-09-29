@@ -13,7 +13,7 @@ import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { MemoryManager } from "./lib/memory/memory";
 import { createGeminiModel, createOpenAIModel } from "./lib/models";
 import * as background from "./functions/background";
-import { McpRegistry } from "./lib/mcp/registry";
+import { McpRegistry, type McpToolScope } from "./lib/mcp/registry";
 import { GraphRegistry } from "./lib/graphs/GraphRegistry";
 import { NeuronRegistry } from "./lib/neurons/NeuronRegistry";
 import { createLogger } from "./lib/utils/logger";
@@ -62,6 +62,7 @@ export {
   Tool,
   CallToolResult,
   ServerRegistration,
+  McpToolScope,
 } from "./lib/mcp";
 
 // Export registries
@@ -642,13 +643,17 @@ export class Red {
    * @param toolName The name of the tool to call
    * @param args The arguments to pass to the tool
    * @param context Optional logging context (conversationId, generationId, messageId)
+   * @param signal Optional AbortSignal for mid-step interrupt
+   * @param scope Account the call is made for (the graph owner). Account-owned
+   *   MCP connections are only reachable when it matches.
    * @returns The tool execution result
    */
   public async callMcpTool(
     toolName: string,
     args: Record<string, unknown>,
     context?: { conversationId?: string; generationId?: string; messageId?: string; credentials?: any },
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    scope?: McpToolScope
   ): Promise<any> {
     // Tool start/complete/error events flow through RunPublisher.toolStart/toolComplete/toolError
     // which already persist to redlogs. No additional logging needed here.
@@ -659,7 +664,7 @@ export class Red {
       generationId: context?.generationId,
       messageId: context?.messageId,
       credentials: context?.credentials,
-    }, signal);
+    }, signal, scope);
   }
 
   /**

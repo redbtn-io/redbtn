@@ -12,6 +12,23 @@ export interface ServerRegistration {
   tools: Tool[];
   capabilities: Record<string, unknown> | { tools?: { listChanged?: boolean } };
   url: string;
+  /**
+   * Account that owns this server. When set, the server's tools are only
+   * resolvable by runs whose graph belongs to this account (see
+   * {@link McpToolScope}). Unset = legacy global registration, visible to every
+   * run on the worker.
+   */
+  ownerUserId?: string;
+}
+
+/**
+ * Which account is asking for a tool. Runs pass the owner of the graph being
+ * executed, so a user-owned MCP connection is only reachable from graphs on
+ * that account.
+ */
+export interface McpToolScope {
+  /** Owner of the graph being executed. */
+  userId?: string;
 }
 
 export interface ServerConfig {
@@ -19,6 +36,11 @@ export interface ServerConfig {
   url: string;  // e.g., 'http://localhost:3001/mcp'
   /** Optional HTTP headers forwarded on every request to this server (e.g. Authorization). */
   headers?: Record<string, string>;
+  /**
+   * Restrict this server to one account's runs. Omit for a global
+   * registration (the pre-existing behaviour).
+   */
+  ownerUserId?: string;
 }
 
 /**
@@ -67,7 +89,8 @@ export class McpRegistry {
         version: initResult.serverInfo.version,
         tools: toolsList.tools,
         capabilities: initResult.capabilities,
-        url
+        url,
+        ...(config.ownerUserId ? { ownerUserId: String(config.ownerUserId) } : {}),
       };
 
       this.clients.set(name, client);
@@ -145,6 +168,7 @@ export class McpRegistry {
       tools,
       capabilities: { tools: { listChanged: false } },
       url,
+      ...(config.ownerUserId ? { ownerUserId: String(config.ownerUserId) } : {}),
     };
 
     this.clients.set(name, client);
@@ -194,25 +218,42 @@ export class McpRegistry {
   }
 
   /**
-   * Find tool by name across all servers
+   * Whether a registration is visible to the given scope. Global (unowned)
+   * servers are visible to everyone; owned servers only to runs of their
+   * owner's graphs. An owned server is never visible to an unscoped lookup.
    */
-  findTool(toolName: string): { server: string; tool: Tool } | undefined {
-    for (const [serverName, registration] of this.servers.entries()) {
-      const tool = registration.tools.find(t => t.name === toolName);
-      if (tool) {
-        return { server: serverName, tool };
-      }
-    }
-    return undefined;
+  private isVisible(registration: ServerRegistration, scope?: McpToolScope): boolean {
+    if (!registration.ownerUserId) return true;
+    return !!scope?.userId && String(scope.userId) === registration.ownerUserId;
   }
 
   /**
-   * Get all tools from all servers
+   * Find tool by name across all servers visible to `scope`.
+   *
+   * The caller's own (account-owned) servers win over global ones when both
+   * expose the same tool name, so an account can shadow a global tool.
    */
-  getAllTools(): Array<{ server: string; tool: Tool }> {
+  findTool(toolName: string, scope?: McpToolScope): { server: string; tool: Tool } | undefined {
+    let globalMatch: { server: string; tool: Tool } | undefined;
+    for (const [serverName, registration] of this.servers.entries()) {
+      if (!this.isVisible(registration, scope)) continue;
+      const tool = registration.tools.find(t => t.name === toolName);
+      if (!tool) continue;
+      if (registration.ownerUserId) return { server: serverName, tool };
+      globalMatch ??= { server: serverName, tool };
+    }
+    return globalMatch;
+  }
+
+  /**
+   * Get all tools from all servers visible to `scope` (every server when
+   * `scope` is omitted — this is the admin/diagnostic view).
+   */
+  getAllTools(scope?: McpToolScope): Array<{ server: string; tool: Tool }> {
     const allTools: Array<{ server: string; tool: Tool }> = [];
 
     for (const [serverName, registration] of this.servers.entries()) {
+      if (scope && !this.isVisible(registration, scope)) continue;
       for (const tool of registration.tools) {
         allTools.push({ server: serverName, tool });
       }
@@ -227,6 +268,8 @@ export class McpRegistry {
    * @param signal Optional AbortSignal — passed through to the underlying
    *   client.callTool so mid-step interrupt cancels the in-flight HTTP/SSE
    *   request immediately. Required for the run-level abort path.
+   * @param scope Account asking for the tool (the graph owner). Account-owned
+   *   servers are only reachable when it matches; global servers always are.
    */
   async callTool(
     toolName: string,
@@ -243,9 +286,10 @@ export class McpRegistry {
         accountInfo?: { email?: string; name?: string; externalId?: string };
       };
     },
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    scope?: McpToolScope
   ): Promise<any> {
-    const found = this.findTool(toolName);
+    const found = this.findTool(toolName, scope);
 
     if (!found) {
       throw new Error(`Tool not found: ${toolName}`);
