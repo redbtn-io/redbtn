@@ -37,13 +37,18 @@ export interface ErrorHandlingConfig {
      * - 'throw': Throw error and stop execution (default)
      * - 'fallback': Use fallbackValue and continue
      * - 'skip': Skip this step and continue (outputField will be undefined)
+     * - 'continue': Carry on with the next step; outputField holds an error
+     *   marker `{ _stepError: true, error, code, stepType, attempts, at, ... }`
+     *   (a plain-object fallbackValue's keys are kept under it; a primitive,
+     *   null or array fallbackValue is written as-is). Neuron, tool and
+     *   connection steps.
      *
-     * On neuron and tool steps, 'fallback' and 'skip' also record the error at
+     * On neuron and tool steps, 'fallback', 'skip' and 'continue' also record the error at
      * `state.data._stepErrors[<outputField>]` (see `StepErrorRecord` in
      * executors/errorHandler.ts). A later successful neuron or tool step that
      * writes the same outputField clears it.
      */
-    onError?: 'throw' | 'fallback' | 'skip';
+    onError?: 'throw' | 'fallback' | 'skip' | 'continue';
 }
 
 /**
@@ -639,7 +644,7 @@ export interface GraphStepConfig {
         retry?: number;
         retryDelay?: number;
         fallbackValue?: any;
-        onError?: 'throw' | 'fallback' | 'skip';
+        onError?: 'throw' | 'fallback' | 'skip' | 'continue';
     };
 }
 

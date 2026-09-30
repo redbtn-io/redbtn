@@ -6,7 +6,7 @@
  */
 
 import { renderParameters, renderTemplate } from '../templateRenderer';
-import { executeWithErrorHandlingDetailed, recordStepError, clearStepError } from './errorHandler';
+import { executeWithErrorHandlingDetailed, recordStepError, clearStepError, buildContinueValue } from './errorHandler';
 import { getParserRegistry } from './parserRegistry';
 import { ParserExecutor } from './parserExecutor';
 import { getToolResultErrorMessage } from './toolResultError';
@@ -137,15 +137,20 @@ export async function executeTool(config: ToolStepConfig, state: any): Promise<P
             { type: 'tool', field: normalizedConfig.outputField }
         );
         if (recovered) {
-            // `value` is the fallbackValue, merged into the step's update exactly
-            // as before; the error record travels beside it.
-            return recordStepError(
-                state,
-                normalizedConfig.outputField,
-                recovered,
-                { stepType: 'tool', toolName: normalizedConfig.toolName },
-                value,
-            );
+            const subject = { stepType: 'tool' as const, toolName: normalizedConfig.toolName };
+            // 'continue': the outputField holds an error marker and the node
+            // carries on. 'fallback'/'skip': `value` is the fallbackValue (or
+            // undefined), merged into the step's update exactly as before.
+            const partial = recovered.strategy === 'continue'
+                ? {
+                    [normalizedConfig.outputField]: buildContinueValue(
+                        recovered,
+                        subject,
+                        normalizedConfig.errorHandling.fallbackValue,
+                    ),
+                }
+                : value;
+            return recordStepError(state, normalizedConfig.outputField, recovered, subject, partial);
         }
         return clearStepError(state, normalizedConfig.outputField, value);
     }

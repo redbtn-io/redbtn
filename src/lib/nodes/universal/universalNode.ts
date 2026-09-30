@@ -717,7 +717,7 @@ export function validateUniversalNodeConfig(nodeConfig: NodeConfig): void {
         // errorHandling.onError — an unrecognized value silently degrades to
         // 'throw' at runtime (errorHandler's switch default), making any
         // configured fallbackValue dead config. Reject it at validation time.
-        const validOnError = ['throw', 'fallback', 'skip'];
+        const validOnError = ['throw', 'fallback', 'skip', 'continue'];
         for (const eh of [(step as any).errorHandling, config?.errorHandling]) {
             if (eh?.onError !== undefined && !validOnError.includes(eh.onError)) {
                 throw new Error(
