@@ -57,6 +57,12 @@ import {
   redactToken,
   redactArgvForLog,
   bridgeGrant,
+  schemaDirGrant,
+  agyGrants,
+  agyTextDelta,
+  decodeKeychainAgyToken,
+  readHostAgyToken,
+  isAgyHostLoginSentinel,
   agyStateDir,
   maxConcurrent,
   AgyCliError,
@@ -578,27 +584,33 @@ describe('buildAgyHome', () => {
     expect(fs.existsSync(path.join(home, '.gemini/antigravity-cli/mcp_config.json'))).toBe(false);
   });
 
-  it('grants exactly the bridge, and denies nothing explicitly', () => {
+  it('grants exactly the bridge and its schema directory, and denies nothing explicitly', () => {
     // The allow list is the whole policy. `deny` stays EMPTY on purpose: the
     // CLI's headless auto-deny ends a blocked turn in ~3 s, whereas an explicit
     // deny is reported to the model as a refusal it retries against — one
     // measured run burned 165 673 input tokens doing exactly that.
     const home = build();
     const cfg = JSON.parse(fs.readFileSync(path.join(home, AGY_HOME_PATHS.config), 'utf8'));
+    const realHome = fs.realpathSync(home);
     expect(cfg.userSettings.globalPermissionGrants).toEqual({
-      allow: ['mcp(redbtn/*)'],
+      allow: ['mcp(redbtn/*)', `read_file(${realHome}/.gemini/antigravity-cli/mcp/redbtn)`],
       deny: [],
       ask: [],
     });
     expect(bridgeGrant()).toBe('mcp(redbtn/*)');
+    expect(agyGrants(home)).toEqual(cfg.userSettings.globalPermissionGrants.allow);
   });
 
-  it('never grants a command, a file write or a file read', () => {
+  it('never grants a command, a file write, a URL, or a read outside the schema dir', () => {
     const home = build();
     const raw = fs.readFileSync(path.join(home, AGY_HOME_PATHS.config), 'utf8');
-    for (const action of ['command(', 'write_file(', 'read_file(', 'read_url(', 'unsandboxed(']) {
+    for (const action of ['command(', 'write_file(', 'read_url(', 'unsandboxed(']) {
       expect(raw).not.toContain(action);
     }
+    const reads = raw.match(/read_file\([^)]*\)/g) ?? [];
+    expect(reads).toEqual([schemaDirGrant(home)]);
+    expect(schemaDirGrant(home)).toMatch(/\/\.gemini\/antigravity-cli\/mcp\/redbtn\)$/);
+    expect(schemaDirGrant(home)).not.toMatch(/read_file\(\/?\)|\*/);
   });
 
   it('names the subscription auth type in settings.json', () => {
@@ -1005,11 +1017,12 @@ describe('runAgyCliStep', () => {
     // The credential reaches the child as a FILE inside its private HOME, and
     // the only permission grant it finds there is the bridge.
     expect(seen.homeToken).toBe(TOKEN);
-    expect(JSON.parse(seen.grants).userSettings.globalPermissionGrants).toEqual({
-      allow: ['mcp(redbtn/*)'],
-      deny: [],
-      ask: [],
-    });
+    const granted = JSON.parse(seen.grants).userSettings.globalPermissionGrants;
+    expect(granted.deny).toEqual([]);
+    expect(granted.ask).toEqual([]);
+    expect(granted.allow).toHaveLength(2);
+    expect(granted.allow[0]).toBe('mcp(redbtn/*)');
+    expect(granted.allow[1]).toMatch(/^read_file\(.*\/home\/\.gemini\/antigravity-cli\/mcp\/redbtn\)$/);
   });
 
   it('bridges MCP tools to agy-cli child process via run-bridge', async () => {
@@ -1362,5 +1375,168 @@ socket.on('data', (chunk) => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+// =============================================================================
+// 10. Host login (the local-hub `keychain` sentinel) and live text streaming
+// =============================================================================
+
+describe('host login', () => {
+  const JSON_TOKEN = JSON.stringify({ token: { access_token: 'ya29.HOST' }, auth_method: 'oauth', id_token: 'x' });
+
+  it('recognises the sentinels, case-insensitively, and nothing else', () => {
+    for (const v of ['keychain', 'KEYCHAIN', ' host ', 'local']) expect(isAgyHostLoginSentinel(v)).toBe(true);
+    for (const v of ['', 'ya29.real-token', 'keychains', undefined, 42]) expect(isAgyHostLoginSentinel(v)).toBe(false);
+  });
+
+  it('decodes the macOS go-keyring item into the token-file JSON', () => {
+    const item = `go-keyring-base64:${Buffer.from(JSON_TOKEN).toString('base64')}\n`;
+    expect(decodeKeychainAgyToken(item)).toBe(JSON_TOKEN);
+    // Anything else passes through (the Linux file is already the JSON).
+    expect(decodeKeychainAgyToken(` ${JSON_TOKEN} `)).toBe(JSON_TOKEN);
+  });
+
+  it('reads the keychain on darwin and the token file elsewhere', () => {
+    const item = `go-keyring-base64:${Buffer.from(JSON_TOKEN).toString('base64')}`;
+    expect(readHostAgyToken({ platform: 'darwin', readKeychain: () => item, hostHome: tmpRoot })).toBe(JSON_TOKEN);
+
+    const hostHome = path.join(tmpRoot, 'hosthome');
+    fs.mkdirSync(path.join(hostHome, '.gemini/antigravity-cli'), { recursive: true });
+    fs.writeFileSync(path.join(hostHome, '.gemini/antigravity-cli/antigravity-oauth-token'), `${JSON_TOKEN}\n`);
+    expect(readHostAgyToken({ platform: 'linux', hostHome })).toBe(JSON_TOKEN);
+    // A failed keychain read falls back to the file.
+    expect(
+      readHostAgyToken({ platform: 'darwin', readKeychain: () => { throw new Error('no item'); }, hostHome }),
+    ).toBe(JSON_TOKEN);
+    expect(readHostAgyToken({ platform: 'linux', hostHome: path.join(tmpRoot, 'nobody') })).toBe('');
+  });
+
+  it('runs a turn on the host login: the token reaches only the private HOME, nothing is cached', async () => {
+    const hostHome = path.join(tmpRoot, 'hosthome2');
+    fs.mkdirSync(path.join(hostHome, '.gemini/antigravity-cli'), { recursive: true });
+    fs.writeFileSync(path.join(hostHome, '.gemini/antigravity-cli/antigravity-oauth-token'), JSON_TOKEN);
+    const dump = path.join(tmpRoot, 'host-dump.json');
+    process.env.AGY_CLI_BIN = writeFakeAgy(`${dumpLine(dump)} out(${JSON.stringify(SUCCESS_ENVELOPE)});`);
+    const savedHostHome = process.env.AGY_HOST_HOME;
+    const savedPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    process.env.AGY_HOST_HOME = hostHome;
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    try {
+      const runId = `run_${Math.random().toString(36).slice(2, 8)}`;
+      const result = await runAgyCliStep({
+        config: stepConfig(),
+        state: baseState(runId, makePublisher()),
+        neuronCfg: { ...NEURON_CFG, apiKey: 'keychain' },
+        neuronId: 'agy-flash-3-8',
+        userId: 'user_test',
+        callRunId: runId,
+        abortSignal: undefined,
+        emitUsage: () => {},
+      });
+      expect(result['data.out']).toBe('ok-e1\n');
+    } finally {
+      if (savedPlatform) Object.defineProperty(process, 'platform', savedPlatform);
+      if (savedHostHome === undefined) delete process.env.AGY_HOST_HOME;
+      else process.env.AGY_HOST_HOME = savedHostHome;
+    }
+    const seen = JSON.parse(fs.readFileSync(dump, 'utf8'));
+    expect(seen.homeToken).toBe(JSON_TOKEN);
+    expect(JSON.stringify(seen.env)).not.toContain('ya29.HOST');
+    // No cache: the host login is the only source of truth.
+    expect(fs.existsSync(path.join(process.env.AGY_STATE_DIR as string, 'antigravity-oauth-token'))).toBe(false);
+  });
+
+  it('fails with agy_no_token, naming the fix, when the host has no login', async () => {
+    const savedHostHome = process.env.AGY_HOST_HOME;
+    const savedPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    process.env.AGY_HOST_HOME = path.join(tmpRoot, 'empty-home');
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    try {
+      const runId = `run_${Math.random().toString(36).slice(2, 8)}`;
+      await expect(
+        runAgyCliStep({
+          config: stepConfig(),
+          state: baseState(runId, makePublisher()),
+          neuronCfg: { ...NEURON_CFG, apiKey: 'keychain' },
+          neuronId: 'agy-flash-3-8',
+          userId: 'user_test',
+          callRunId: runId,
+          abortSignal: undefined,
+          emitUsage: () => {},
+        }),
+      ).rejects.toMatchObject({ code: 'agy_no_token', message: expect.stringContaining('Run `agy` once') });
+    } finally {
+      if (savedPlatform) Object.defineProperty(process, 'platform', savedPlatform);
+      if (savedHostHome === undefined) delete process.env.AGY_HOST_HOME;
+      else process.env.AGY_HOST_HOME = savedHostHome;
+    }
+  });
+});
+
+describe('live text streaming', () => {
+  it('agyTextDelta takes agent_response deltas only', () => {
+    const line = (o: unknown) => JSON.stringify(o);
+    expect(agyTextDelta(line({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: 'Hi' } }))).toBe('Hi');
+    expect(agyTextDelta(line({ event: 'step_update', step_update: { step_type: 'tool', text_delta: 'x' } }))).toBe('');
+    expect(agyTextDelta(line({ event: 'result', result: { response: 'x', text_delta: 'x' } }))).toBe('');
+    expect(agyTextDelta('not json text_delta')).toBe('');
+  });
+
+  it('publishes each delta in order when the node streams, and leaves the answer alone when they agree', async () => {
+    const response = 'I will call now.\nIt is 2031.\n';
+    const deltas = ['I will ', 'call now.', '\n', 'It is ', '2031.', '\n'];
+    process.env.AGY_CLI_BIN = writeFakeAgy(
+      `whenPrompt(() => {\n` +
+        `  emit({event: "init", init: {model: "gemini-3.8-flash"}});\n` +
+        deltas
+          .map((d, i) => `  emit({event: "step_update", step_update: {step_index: ${i < 3 ? 1 : 3}, state: "ACTIVE", step_type: "agent_response", text_delta: ${JSON.stringify(d)}}});\n`)
+          .join('') +
+        `  emit({event: "step_update", step_update: {step_index: 2, state: "DONE", step_type: "tool", tool_name: "call_mcp_tool", text_delta: "NOT-ANSWER"}});\n` +
+        `  emit({event: "result", result: ${JSON.stringify({ ...SUCCESS_ENVELOPE, response })}});\n` +
+        `});`,
+    );
+    const chunks: string[] = [];
+    const replaced: string[] = [];
+    const publisher = {
+      ...makePublisher(),
+      chunk: async (t: string) => { await new Promise((r) => setTimeout(r, 5)); chunks.push(t); },
+      replaceOutputContent: async (t: string) => { replaced.push(t); },
+    };
+    const runId = `run_${Math.random().toString(36).slice(2, 8)}`;
+    const result = await runAgyCliStep({
+      config: stepConfig({ stream: true }),
+      state: baseState(runId, publisher as Any),
+      neuronCfg: NEURON_CFG,
+      neuronId: 'agy-flash-3-8',
+      userId: 'user_test',
+      callRunId: runId,
+      abortSignal: undefined,
+      emitUsage: () => {},
+    });
+    expect(chunks).toEqual(deltas);
+    expect(chunks.join('')).toBe(response);
+    expect(result['data.out']).toBe(response);
+    expect(replaced).toEqual([]);
+  });
+
+  it('does not publish when the node did not ask to stream', async () => {
+    process.env.AGY_CLI_BIN = writeFakeAgy(
+      `whenPrompt(() => { emit({event: "step_update", step_update: {step_type: "agent_response", text_delta: "ok-e1\\n"}}); emit({event: "result", result: ${JSON.stringify(SUCCESS_ENVELOPE)}}); });`,
+    );
+    const chunks: string[] = [];
+    const publisher = { ...makePublisher(), chunk: async (t: string) => { chunks.push(t); } };
+    const runId = `run_${Math.random().toString(36).slice(2, 8)}`;
+    await runAgyCliStep({
+      config: stepConfig(),
+      state: baseState(runId, publisher as Any),
+      neuronCfg: NEURON_CFG,
+      neuronId: 'agy-flash-3-8',
+      userId: 'user_test',
+      callRunId: runId,
+      abortSignal: undefined,
+      emitUsage: () => {},
+    });
+    expect(chunks).toEqual([]);
   });
 });

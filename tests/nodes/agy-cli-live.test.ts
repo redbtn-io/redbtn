@@ -59,6 +59,7 @@ import {
   buildAgyChildEnv,
   buildAgyStdinMessage,
   parseAgyEnvelope,
+  readHostAgyToken,
 } from '../../src/lib/nodes/universal/executors/agyCliExecutor';
 import { runDirRoot } from '../../src/lib/nodes/universal/executors/claudeCodeExecutor';
 import { getNativeRegistry } from '../../src/lib/tools/native-registry';
@@ -86,7 +87,15 @@ function readIfPresent(file: string): string | null {
   }
 }
 
-const TOKEN = readIfPresent(TOKEN_FILE);
+/**
+ * `AGY_LIVE_HOST_LOGIN=1` runs the suite on THIS machine's own agy login (the
+ * local-hub `keychain` sentinel: macOS keychain or ~/.gemini token file)
+ * instead of a token file, which also exercises the host-login path end to end:
+ *   AGY_CLI_LIVE=1 AGY_LIVE_HOST_LOGIN=1 AGY_CLI_BIN=$(command -v agy) \
+ *     npx vitest run tests/nodes/agy-cli-live.test.ts
+ */
+const HOST_LOGIN = process.env.AGY_LIVE_HOST_LOGIN === '1';
+const TOKEN = HOST_LOGIN ? 'keychain' : readIfPresent(TOKEN_FILE);
 const INSTALLATION_ID = readIfPresent(INSTALLATION_ID_FILE) ?? undefined;
 
 /** Is the real CLI executable here? A token without a binary is still a skip. */
@@ -95,7 +104,7 @@ function cliVersion(): string | null {
     const listed = execFileSync(BIN, ['models'], {
       encoding: 'utf8',
       timeout: 60_000,
-      env: { ...process.env, HOME: path.join(DEFAULT_HOME, 'home') },
+      env: HOST_LOGIN ? process.env : { ...process.env, HOME: path.join(DEFAULT_HOME, 'home') },
     });
     return listed.includes('gemini') ? 'ok' : null;
   } catch {
@@ -390,7 +399,8 @@ describe.skipIf(!LIVE)('agy-cli executor, live against the real CLI', () => {
 
       buildAgyHome({
         home,
-        token: TOKEN as string,
+        // A home built by hand needs the real credential, not the sentinel.
+        token: (HOST_LOGIN ? readHostAgyToken() : TOKEN) as string,
         installationId: INSTALLATION_ID?.trim(),
         // A bridge-shaped MCP config that points at nothing: the tool surface
         // is irrelevant here, the grant is what is under test.

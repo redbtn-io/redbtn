@@ -206,6 +206,8 @@ export type { SynthesizeOptions, AudioStreamPipelineOptions, TranscribeOptions, 
 // Export conversation streaming
 export { ConversationPublisher, createConversationPublisher, ConversationKeys } from './lib/conversation';
 export type { ConversationEvent, ConversationAttachmentEvent } from './lib/conversation';
+export { resolveResponseKind, storedMessageKind, errorTurnNote, RESPONSE_KIND_FIELD } from './lib/conversation/response-kind';
+export type { ResponseKind } from './lib/conversation/response-kind';
 
 // Export stream session pub/sub
 export {

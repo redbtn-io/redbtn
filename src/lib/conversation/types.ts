@@ -156,6 +156,12 @@ export interface ConversationRunCompleteEvent {
   runId: string;
   messageId: string;
   finalContent?: string;
+  /**
+   * Present when the final content is not a model answer: 'fallback' (an
+   * errorHandling fallbackValue) or 'error' (a graph-declared error reply).
+   * Persisted as `messages[].metadata.kind`; context loaders omit such turns.
+   */
+  responseKind?: 'error' | 'fallback';
   timestamp: number;
 }
 

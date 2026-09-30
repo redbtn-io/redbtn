@@ -138,10 +138,11 @@
  * @module lib/nodes/universal/executors/agyCliExecutor
  */
 
-import { spawn, type ChildProcessByStdio } from 'child_process';
+import { spawn, execFileSync, type ChildProcessByStdio } from 'child_process';
 import type { Readable, Writable } from 'stream';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import * as crypto from 'crypto';
 
 import type { NeuronStepConfig } from '../types';
@@ -302,6 +303,69 @@ export function bridgeGrant(): string {
 }
 
 /**
+ * The second grant: READ access to the directory where the CLI itself writes
+ * the bridge's tool schemas.
+ *
+ * VERIFIED against agy 1.2.12 (2026-09-29): MCP tools are progressively
+ * disclosed. Before its first `call_mcp_tool` the model `view_file`s
+ * `$HOME/.gemini/antigravity-cli/mcp/<server>/<tool>.json`, a schema file the
+ * CLI generated. With only `mcp(redbtn/*)` granted that read is auto-denied and
+ * the turn ENDS with `denied_actions: [read_file]` and an empty response, so
+ * every tool-using step failed with `agy_tool_denied`. Granting read on exactly
+ * that directory (and nothing else) restores the tool loop; a read anywhere
+ * else is still denied (VERIFIED: `/etc/hosts` refused in the same turn).
+ *
+ * The path must be the REAL path: the CLI checks the resolved path
+ * (`/tmp` → `/private/tmp` on macOS) against the grant.
+ */
+export function schemaDirGrant(home: string): string {
+  let real = home;
+  try {
+    real = fs.realpathSync(home);
+  } catch {
+    /* not created yet; the caller creates HOME first */
+  }
+  return `read_file(${path.join(real, '.gemini/antigravity-cli/mcp', BRIDGE_SERVER_NAME)})`;
+}
+
+/**
+ * The step directory, by its REAL path. The child's `HOME` is derived from it,
+ * so every path the CLI shows the model is already resolved and matches the
+ * schema-dir grant (VERIFIED: with `HOME=/tmp/...` on macOS the model asked for
+ * `/tmp/.../now.json`, which the CLI checks as `/private/tmp/...` against a
+ * grant it then does not match).
+ */
+function realDir(dir: string): string {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return dir;
+  }
+}
+
+/**
+ * The bridge's MCP `instructions`, which agy 1.2.x writes to
+ * `mcp/<server>/instructions.md`. VERIFIED: the model reads that file before
+ * its first call whether or not it exists; when it does not, the model goes
+ * looking (`ls` of the directory, a read elsewhere), the policy denies it and
+ * the turn ends empty. Serving the file removes the reason to look.
+ */
+export function agyBridgeInstructions(toolNames: string[]): string {
+  const names = toolNames.slice(0, 60).join(', ');
+  return (
+    `The ${BRIDGE_SERVER_NAME} server exposes this run's tools${names ? `: ${names}` : ''}. ` +
+    `Each tool's input schema is ${'`'}<tool>.json${'`'} in this directory. Call a tool with ` +
+    `call_mcp_tool (ServerName "${BRIDGE_SERVER_NAME}", ToolName, Arguments). Do not list ` +
+    `directories, run commands or read any other file: everything else is denied.`
+  );
+}
+
+/** Every grant the child gets: the bridge, and the bridge's schema directory. */
+export function agyGrants(home: string): string[] {
+  return [bridgeGrant(), schemaDirGrant(home)];
+}
+
+/**
  * Per-worker directory holding the refreshable OAuth token.
  *
  * Read at call time, not at import time, so a test can point it elsewhere
@@ -309,6 +373,75 @@ export function bridgeGrant(): string {
  */
 export function agyStateDir(): string {
   return process.env.AGY_STATE_DIR || '/var/lib/redbtn/agy';
+}
+
+/**
+ * Secret values that mean "use this machine's own `agy` login" instead of a
+ * token stored in the vault. The local-hub convention (same sentinel the hub's
+ * claude-code shim understands): the account's `AGY_OAUTH_TOKEN` secret is the
+ * literal string `keychain`, so no credential is ever copied into the DB.
+ */
+export const AGY_HOST_LOGIN_SENTINELS: ReadonlySet<string> = new Set(['keychain', 'host', 'local']);
+
+export function isAgyHostLoginSentinel(value: unknown): boolean {
+  return typeof value === 'string' && AGY_HOST_LOGIN_SENTINELS.has(value.trim().toLowerCase());
+}
+
+/**
+ * Decode what the macOS keychain holds for agy into the token FILE format.
+ *
+ * VERIFIED against agy 1.2.12 on macOS: the login lives in the keychain
+ * (service `gemini`, account `antigravity`) as `go-keyring-base64:<base64>`,
+ * and the base64 decodes to the JSON document (`token`, `auth_method`,
+ * `id_token`) that the Linux build keeps in
+ * `~/.gemini/antigravity-cli/antigravity-oauth-token`. A private-HOME child on
+ * macOS cannot reach the keychain (its search list is under `$HOME`), but it
+ * accepts that JSON as the token file; the raw `go-keyring-base64:` string is
+ * rejected. So the executor decodes.
+ */
+export function decodeKeychainAgyToken(raw: string): string {
+  const trimmed = (raw || '').trim();
+  const prefix = 'go-keyring-base64:';
+  if (trimmed.startsWith(prefix)) {
+    return Buffer.from(trimmed.slice(prefix.length), 'base64').toString('utf8').trim();
+  }
+  return trimmed;
+}
+
+/**
+ * Read THIS machine's current agy login, read-only, at spawn time.
+ *
+ * macOS: `security find-generic-password -s gemini -a antigravity -w`.
+ * Elsewhere: the token file under the worker user's real HOME
+ * (`AGY_HOST_HOME` overrides). Returns '' when there is no login.
+ */
+export function readHostAgyToken(opts: {
+  platform?: NodeJS.Platform;
+  readKeychain?: () => string;
+  hostHome?: string;
+} = {}): string {
+  const platform = opts.platform ?? process.platform;
+  if (platform === 'darwin') {
+    try {
+      const raw = opts.readKeychain
+        ? opts.readKeychain()
+        : execFileSync('security', ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w'], {
+            encoding: 'utf8',
+            timeout: 10_000,
+            stdio: ['ignore', 'pipe', 'ignore'],
+          });
+      const decoded = decodeKeychainAgyToken(raw);
+      if (decoded) return decoded;
+    } catch {
+      /* fall through to the file */
+    }
+  }
+  const hostHome = opts.hostHome ?? (process.env.AGY_HOST_HOME || os.homedir());
+  try {
+    return fs.readFileSync(path.join(hostHome, '.gemini/antigravity-cli/antigravity-oauth-token'), 'utf8').trim();
+  } catch {
+    return '';
+  }
 }
 
 /** Mount point every workspace container uses; the worker cwd mirrors it. */
@@ -484,6 +617,12 @@ function installExitHooks(): void {
 
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.on(signal, () => {
+      // A host that owns shutdown (redworker's SIGTERM drain) registered its own
+      // listener: let it drain in-flight runs. Killing the CLI children here and
+      // removing every listener (as this hook used to) SIGTERMed live runs
+      // (exit 143) and deleted the host's drain handler on every worker deploy.
+      // The `exit` hook still SIGKILLs any survivor once the host exits.
+      if (process.listenerCount(signal) > 1) return;
       killAllLiveChildren('SIGTERM');
       process.removeAllListeners(signal);
       process.kill(process.pid, signal);
@@ -695,7 +834,8 @@ export function buildAgyHome(params: {
   grants?: string[];
 }): void {
   const { home, token, installationId, mcpConfig } = params;
-  const grants = params.grants ?? [bridgeGrant()];
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  const grants = params.grants ?? agyGrants(home);
 
   for (const rel of ['.gemini', '.gemini/antigravity-cli', '.gemini/config', '.config', '.cache']) {
     fs.mkdirSync(path.join(home, rel), { recursive: true, mode: 0o700 });
@@ -1050,6 +1190,46 @@ function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
+/**
+ * The text a `stream-json` line adds to the answer, or '' if none.
+ *
+ * Only `agent_response` steps count: tool steps carry `tool_info`, never
+ * answer text, and the user-input step echoes nothing.
+ */
+export function agyTextDelta(line: string): string {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('{') || !trimmed.includes('text_delta')) return '';
+  try {
+    const parsed = JSON.parse(trimmed);
+    const step = parsed?.event === 'step_update' ? parsed.step_update : null;
+    if (!step || step.step_type !== 'agent_response') return '';
+    return typeof step.text_delta === 'string' ? step.text_delta : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * `tool(target)` for a tool step the permission policy refused, or ''.
+ * The target is the path / command / URL the step named, truncated.
+ */
+export function agyDeniedStep(line: string): string {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('{') || !trimmed.includes('"ERROR"')) return '';
+  try {
+    const step = JSON.parse(trimmed)?.step_update;
+    if (!step || step.step_type !== 'tool' || step.state !== 'ERROR') return '';
+    const info = step.tool_info ?? {};
+    const message = String(info?.error?.message ?? '');
+    if (!/permission/i.test(message)) return '';
+    const params = info.parameters ?? {};
+    const target = params.AbsolutePath ?? params.CommandLine ?? params.Url ?? params.DirectoryPath ?? '';
+    return `${String(step.tool_name ?? info.name ?? 'tool').slice(0, 40)}(${String(target).slice(0, 160)})`;
+  } catch {
+    return '';
+  }
+}
+
 /** Remove the OAuth token from text bound for a log, an error or the archive. */
 export function redactToken(text: string, token: string): string {
   if (!text || !token || token.length < 8) return text;
@@ -1160,10 +1340,21 @@ export async function runAgyCliStep(
   // `AGY_OAUTH_TOKEN` is the worker-level fallback, so a fleet can be brought
   // up before any neuron document names a secret. Never from `appConfig.env`
   // in cleartext when a secret reference is available.
-  const secretToken =
+  const configuredToken =
     (typeof neuronCfg?.apiKey === 'string' && neuronCfg.apiKey) ||
     process.env.AGY_OAUTH_TOKEN ||
     '';
+  // The host-login sentinel: this machine's own agy login, read now, used for
+  // this run only, never cached and never written anywhere but the private HOME.
+  const hostLogin = isAgyHostLoginSentinel(configuredToken);
+  const secretToken = hostLogin ? readHostAgyToken() : configuredToken;
+  if (hostLogin && !secretToken) {
+    throw new AgyCliError(
+      'agy_no_token',
+      `Neuron '${neuronId}' uses the host-login sentinel ('${configuredToken}') but this machine ` +
+        `has no Antigravity login. Run \`agy\` once and sign in, then retry.`,
+    );
+  }
   if (!secretToken) {
     throw new AgyCliError(
       'agy_no_token',
@@ -1192,7 +1383,7 @@ export async function runAgyCliStep(
   );
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.chmodSync(dir, 0o700);
-  const home = path.join(dir, 'home');
+  const home = path.join(realDir(dir), 'home');
 
   const cwd = ensureCwd(mount.tree, dir);
 
@@ -1349,6 +1540,7 @@ export async function runAgyCliStep(
           ? config.maxToolIterations
           : undefined,
       onCancel: () => requestKill('run cancelled'),
+      instructions: agyBridgeInstructions(servable.map((t) => t.name)),
     });
 
     // ── the private HOME ───────────────────────────────────────────────────
@@ -1358,9 +1550,11 @@ export async function runAgyCliStep(
     const stateDir = agyStateDir();
     let startingToken = secretToken;
     try {
-      startingToken = await withStateLock(ensureStateDir(stateDir), () =>
-        readCachedToken(stateDir, secretToken),
-      );
+      if (!hostLogin) {
+        startingToken = await withStateLock(ensureStateDir(stateDir), () =>
+          readCachedToken(stateDir, secretToken),
+        );
+      }
     } catch (err) {
       console.warn(
         `[AgyCli] could not read the cached token (${(err as Error)?.message}); using the secret`,
@@ -1371,6 +1565,7 @@ export async function runAgyCliStep(
       token: startingToken,
       installationId,
       mcpConfig: bridge.mcpConfig,
+      grants: agyGrants(home),
     });
 
     // ── prompts ────────────────────────────────────────────────────────────
@@ -1378,7 +1573,11 @@ export async function runAgyCliStep(
     // prompt is delimited INSIDE the single argv prompt. The delimiters are the
     // same ones the claude-code executor uses for its oversized-prompt path, so
     // a graph moved between the two providers sees the same text.
-    const preamble = BRIDGE_PREAMBLE.replace('%TREE%', mount.tree);
+    const preambleTree =
+      typeof state?.data?.workingDir === 'string' && state.data.workingDir.trim()
+        ? state.data.workingDir
+        : mount.tree;
+    const preamble = BRIDGE_PREAMBLE.replace('%TREE%', preambleTree);
     const systemPrompt = buildSystemPrompt(config, state, preamble);
     const userPrompt = buildUserPrompt(config, state);
     const prompt = `=== SYSTEM INSTRUCTIONS ===\n${systemPrompt}\n=== END SYSTEM INSTRUCTIONS ===\n\n${userPrompt}`;
@@ -1507,6 +1706,34 @@ export async function runAgyCliStep(
     }
 
     // ── stdout / stderr ────────────────────────────────────────────────────
+    // Live streaming: every `agent_response` step carries its text as
+    // `text_delta`s, and the result's `response` is exactly their
+    // concatenation (VERIFIED, agy 1.2.12), so the deltas are published as
+    // they arrive when the node asked for streaming. One serial publish chain
+    // keeps them in order (see the claude-code executor's ORDERING note).
+    const streamToUser = (config as AnyObject).stream === true && typeof publisher?.chunk === 'function';
+    let publishChain: Promise<void> = Promise.resolve();
+    let published = '';
+    let lineRemainder = '';
+    // What each refused tool step reached for (tool + target), so a denial is
+    // diagnosable from the error rather than just "ViewFile".
+    const deniedSteps: string[] = [];
+    const onStdoutLine = (line: string): void => {
+      const denied = agyDeniedStep(line);
+      if (denied && deniedSteps.length < 10) deniedSteps.push(denied);
+      if (!streamToUser) return;
+      const delta = agyTextDelta(line);
+      if (!delta) return;
+      published += delta;
+      publishChain = publishChain.then(async () => {
+        try {
+          await publisher!.chunk(delta);
+        } catch (err) {
+          console.warn('[AgyCli] chunk publish failed:', err);
+        }
+      });
+    };
+
     let stdout = '';
     let stdoutOverflowed = false;
     child.stdout.setEncoding('utf8');
@@ -1516,6 +1743,9 @@ export async function runAgyCliStep(
         return;
       }
       stdout += chunk;
+      const lines = (lineRemainder + chunk).split('\n');
+      lineRemainder = lines.pop() ?? '';
+      for (const line of lines) onStdoutLine(line);
     });
 
     let stderrTail = '';
@@ -1549,11 +1779,17 @@ export async function runAgyCliStep(
       },
     );
 
+    if (lineRemainder) onStdoutLine(lineRemainder);
+    await publishChain;
+
     // ── the refreshed token, back to the cache ─────────────────────────────
     // Done before any throw below, because a run that FAILED may still have
     // refreshed the credential on its way in, and throwing that away would make
     // the next run fail the same way.
-    await persistRefreshedToken(home, stateDir, secretToken, startingToken);
+    // Host-login mode keeps no cache: the host's own login is re-read every run
+    // and is the only source of truth, so a refresh inside the private HOME is
+    // simply discarded with it.
+    if (!hostLogin) await persistRefreshedToken(home, stateDir, secretToken, startingToken);
 
     // ── outcome ────────────────────────────────────────────────────────────
     const envelope = parseAgyEnvelope(stdout);
@@ -1674,11 +1910,16 @@ export async function runAgyCliStep(
         .map((d) => d?.display_name || d?.action || 'unknown')
         .slice(0, 8)
         .join(', ');
+      if (deniedSteps.length > 0) {
+        console.error(`[AgyCli][security] step ${stepId} denied tool steps:`, deniedSteps);
+      }
       throw new AgyCliError(
         'agy_tool_denied',
+        (deniedSteps.length > 0 ? `[${deniedSteps.slice(0, 3).join('; ')}] ` : '') +
         `agy-cli step '${stepId}' produced no output: the CLI reached for ${denials.length} ` +
           `action(s) the permission policy denies (${names}) and the turn ended. Only ` +
-          `${bridgeGrant()} is granted; every built-in tool is denied by design.`,
+          `${bridgeGrant()} (and reading its tool schemas) is granted; every built-in tool is ` +
+          `denied by design.`,
       );
     }
 
@@ -1705,6 +1946,17 @@ export async function runAgyCliStep(
               `(${err instanceof Error ? err.message : String(err)}): ${finalText.slice(0, 200)}`,
           );
         }
+      }
+    }
+
+    // The stream is what the user saw; `response` is the answer. They agree
+    // for a well-formed turn. If not, REPLACE the run's final content rather
+    // than splicing a second writer onto the stream.
+    if (streamToUser && published && typeof output === 'string' && !published.trimEnd().endsWith(output.trimEnd())) {
+      try {
+        await publisher?.replaceOutputContent?.(output);
+      } catch (err) {
+        console.warn('[AgyCli] final content replacement failed:', err);
       }
     }
 

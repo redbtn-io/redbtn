@@ -20,6 +20,7 @@
 import Redis from 'ioredis';
 import { countTokens, freeTiktoken } from '../utils/tokenizer';
 import { StoredToolExecution } from './database';
+import { storedMessageKind, type ResponseKind } from '../conversation/response-kind';
 
 export interface ConversationMessage {
   id?: string; // Optional message ID (e.g., msg_1234567890_abc123def)
@@ -36,6 +37,13 @@ export interface ConversationMessage {
   timestamp: number;
   thinking?: string; // Optional thinking/reasoning text
   toolExecutions?: StoredToolExecution[]; // Tool executions for this message
+  /**
+   * Set on an assistant turn that is not a model answer: a fallback value or
+   * a graph-declared / run error (persisted as `metadata.kind`). Context
+   * loaders leave these out of prompt history by default so models do not
+   * learn to repeat error text. See `../conversation/response-kind.ts`.
+   */
+  kind?: ResponseKind;
 }
 
 export interface ConversationMetadata {
@@ -139,8 +147,14 @@ export class MemoryManager {
    * Get conversation context: returns messages that fit within token limit.
    * Use getContextSummary() separately to retrieve summary for merging with system prompts.
    */
-  async getContextForConversation(conversationId: string): Promise<ConversationMessage[]> {
-    const messages = await this.getMessages(conversationId);
+  async getContextForConversation(
+    conversationId: string,
+    options: { includeErrorTurns?: boolean } = {},
+  ): Promise<ConversationMessage[]> {
+    const all = await this.getMessages(conversationId);
+    // Error / fallback turns are left out BEFORE budgeting so they neither
+    // reach the model nor spend its token budget.
+    const messages = options.includeErrorTurns ? all : all.filter((m) => !m.kind);
     
     // Calculate tokens and return messages that fit within limit
     let totalTokens = 0;
@@ -318,6 +332,7 @@ export class MemoryManager {
         timestamp: m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp) || Date.now(),
         thinking: typeof m.thinking === 'string' ? m.thinking : undefined,
         toolExecutions: Array.isArray(m.toolExecutions) ? m.toolExecutions : [],
+        ...(storedMessageKind(m) ? { kind: storedMessageKind(m) } : {}),
       }));
 
       // Refresh the Redis cache opportunistically so subsequent
@@ -372,6 +387,7 @@ export class MemoryManager {
       timestamp: m.timestamp instanceof Date ? m.timestamp.getTime() : Number(m.timestamp) || Date.now(),
       thinking: typeof m.thinking === 'string' ? m.thinking : undefined,
       toolExecutions: Array.isArray(m.toolExecutions) ? m.toolExecutions : [],
+      ...(storedMessageKind(m) ? { kind: storedMessageKind(m) } : {}),
     }));
   }
 
