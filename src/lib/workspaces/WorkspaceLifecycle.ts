@@ -85,9 +85,21 @@ function connectionFromEnv(): { host: string; port: number; password?: string; u
   }
 }
 
+/**
+ * Workspace lifecycle jobs are consumed by the redRun workers, which are
+ * shared by every redbtn release channel and listen on BullMQ's default
+ * `bull` prefix. This deliberately does NOT follow BULLMQ_PREFIX /
+ * REDBTN_CHANNEL (a beta webapp with BULLMQ_PREFIX=beta used to enqueue to
+ * `beta:workspace-lifecycle`, which nothing consumes). Override only if redRun
+ * itself moves: REDRUN_BULLMQ_PREFIX.
+ */
+export function redrunBullmqPrefix(): string {
+  return (process.env.REDRUN_BULLMQ_PREFIX ?? '').trim() || 'bull';
+}
+
 const queues = new Map<string, any>();
 function getQueue(name: string): any {
-  const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
+  const prefix = redrunBullmqPrefix();
   const key = `${prefix}:${name}`;
   if (!queues.has(key)) {
     queues.set(key, new BullQueue(name, { connection: connectionFromEnv(), prefix }));
@@ -169,7 +181,7 @@ export const bullLifecycleQueue: LifecycleQueue = {
   },
 
   async listNodeQueues() {
-    const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
+    const prefix = redrunBullmqPrefix();
     const pattern = `${prefix}:${WORKSPACE_QUEUE}--*:meta`;
     const found = new Set<string>();
     try {

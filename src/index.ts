@@ -5,6 +5,7 @@
 
 // Load environment variables from .env early for library modules
 import 'dotenv/config';
+import { channelKey } from './lib/channel';
 
 import { ChatOllama } from "@langchain/ollama";
 import { ChatOpenAI } from "@langchain/openai";
@@ -254,6 +255,15 @@ export {
   EnvironmentSecretMissingError,
   EnvironmentSharedSecretMissingError,
 } from './lib/environments';
+
+// Release-channel Redis namespacing (REDBTN_CHANNEL; prod = unprefixed keys)
+export {
+  channelKey,
+  redbtnChannel,
+  isDefaultRedbtnChannel,
+  bullmqPrefix,
+  DEFAULT_REDBTN_CHANNEL,
+} from './lib/channel';
 export type {
   // Manager / session config
   EnvironmentManagerOptions,
@@ -399,7 +409,7 @@ export class Red {
     this.redlog = RedLog.create({
       redisUrl: config.redisUrl,
       mongoUri: config.databaseUrl,
-      prefix: 'redlog',
+      prefix: channelKey('redlog'),
       namespace: 'run',
       console: false,
     });

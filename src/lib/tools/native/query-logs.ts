@@ -42,6 +42,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { channelKey } from '../../channel';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -78,7 +79,7 @@ function getLogReader(): unknown {
   _reader = new LogReader({
     redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
     mongoUri: process.env.MONGODB_URI || 'mongodb://localhost:27017/redbtn',
-    prefix: 'redlog',
+    prefix: channelKey('redlog'),
     console: false,
   });
 

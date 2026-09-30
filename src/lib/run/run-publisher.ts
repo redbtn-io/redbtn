@@ -64,6 +64,7 @@ import { assertChatComponentSpec } from '../chat-components/spec-schema';
 import { heartbeatAutomationSlot, releaseAutomationSlot } from './automation-concurrency';
 import { redactSensitive } from '../utils/redact-sensitive';
 import { clampForLog } from '../utils/clamp-for-log';
+import { bullmqPrefix } from '../channel';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -1625,7 +1626,7 @@ export class RunPublisher {
         timestamp: Date.now(),
       };
       // Use module-level singleton Queue to avoid per-event connection churn (C-1).
-      const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
+      const prefix = bullmqPrefix();
       const queue = getArchiveQueue('run-archive', this.redis, prefix);
       await queue.add('archive', jobData, {
         // BullMQ does not allow colons in jobIds — use underscore separator
