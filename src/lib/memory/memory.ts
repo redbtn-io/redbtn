@@ -149,12 +149,20 @@ export class MemoryManager {
    */
   async getContextForConversation(
     conversationId: string,
-    options: { includeErrorTurns?: boolean } = {},
+    options: { includeErrorTurns?: boolean; includeEmptyAssistant?: boolean } = {},
   ): Promise<ConversationMessage[]> {
     const all = await this.getMessages(conversationId);
     // Error / fallback turns are left out BEFORE budgeting so they neither
-    // reach the model nor spend its token budget.
-    const messages = options.includeErrorTurns ? all : all.filter((m) => !m.kind);
+    // reach the model nor spend its token budget. So are assistant messages
+    // with no text: turn-by-turn segmentation persists a tool-only segment
+    // (content "", toolExecutions set) before the reply's content segment,
+    // and an empty assistant turn in model input is noise at best (some
+    // providers reject it) and doubles every reply's assistant turn.
+    const messages = all.filter(
+      (m) =>
+        (options.includeErrorTurns || !m.kind) &&
+        (options.includeEmptyAssistant || !isEmptyAssistantMessage(m)),
+    );
     
     // Calculate tokens and return messages that fit within limit
     let totalTokens = 0;
@@ -736,4 +744,22 @@ ${contentToSummarize}`;
     freeTiktoken();
     await this.redis.quit();
   }
+}
+
+/**
+ * An assistant message with no text to show a model: a tool-only segment of a
+ * turn-by-turn reply, or an empty placeholder. Context loaders skip these.
+ */
+export function isEmptyAssistantMessage(m: { role?: string; content?: unknown }): boolean {
+  if (m?.role !== 'assistant') return false;
+  const c = m.content;
+  if (typeof c === 'string') return c.trim().length === 0;
+  if (Array.isArray(c)) {
+    return !c.some((part: any) =>
+      typeof part === 'string'
+        ? part.trim().length > 0
+        : part && (part.type !== 'text' || (typeof part.text === 'string' && part.text.trim().length > 0)),
+    );
+  }
+  return c == null;
 }
