@@ -13,6 +13,7 @@
  * @module functions/run
  */
 import type { Red } from '../index';
+import { createRunMcpClient, resolveRunMcpScope } from '../lib/mcp/run-scope';
 import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys, RunConfig, type SecretsIdentity } from '../lib/run';
 import { runControlRegistry, type CancelResult } from '../lib/run/RunControlRegistry';
 import { getOrCreateMeteringClient } from '../lib/run/meteringClient';
@@ -519,6 +520,8 @@ function startRunProgressWatchdog(args: {
   abortController: AbortController;
   idleTimeoutMs: number;
   intervalMs?: number;
+  /** Called right before the watchdog aborts the run for its own terminal error. */
+  onTerminal?: () => void;
 }): { promise: Promise<never>; stop: () => void } {
   const intervalMs = args.intervalMs ?? getRunProgressWatchdogIntervalMs(args.idleTimeoutMs);
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -542,12 +545,16 @@ function startRunProgressWatchdog(args: {
     const check = async () => {
       if (stopped) return;
       const lastProgressAt = await getLastProgressAt(args.publisher);
+      // stop() may have been called while the state read was in flight
+      // (run settled / interrupted) — don't abort a run we no longer own.
+      if (stopped) return;
       const lastProgressMs = lastProgressAt ? Date.parse(lastProgressAt) : NaN;
       const stale =
         !Number.isFinite(lastProgressMs)
         || Date.now() - lastProgressMs >= args.idleTimeoutMs;
       if (stale) {
         const error = new RunProgressWatchdogError(args.runId, lastProgressAt, args.idleTimeoutMs);
+        args.onTerminal?.();
         abortRunForTerminalError(args.runId, args.abortController, error.message);
         stop();
         reject(error);
@@ -566,6 +573,8 @@ function startRunConfigTimeout(args: {
   runId: string;
   abortController: AbortController;
   configTimeoutMs: number;
+  /** Called right before the timeout aborts the run for its own terminal error. */
+  onTerminal?: () => void;
 }): { promise: Promise<never>; stop: () => void } {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
@@ -582,6 +591,7 @@ function startRunConfigTimeout(args: {
     timer = setTimeout(() => {
       if (stopped) return;
       const error = new RunConfigTimeoutError(args.runId, args.configTimeoutMs);
+      args.onTerminal?.();
       abortRunForTerminalError(args.runId, args.abortController, error.message);
       stop();
       reject(error);
@@ -592,13 +602,134 @@ function startRunConfigTimeout(args: {
   return { promise, stop };
 }
 
+/**
+ * Normalise an AbortSignal reason into the interrupter's reason string.
+ * The registry aborts with `{ reason }`; other callers may abort with a bare
+ * string. Mirrors the extraction executeStreaming does between events.
+ */
+function extractAbortReason(reasonRaw: unknown): string | undefined {
+  if (typeof reasonRaw === 'string') return reasonRaw;
+  if (reasonRaw && typeof (reasonRaw as { reason?: unknown }).reason === 'string') {
+    return (reasonRaw as { reason: string }).reason;
+  }
+  return undefined;
+}
+
+/**
+ * Race the run's AbortSignal. Rejects with RunInterruptedError as soon as the
+ * signal fires (or immediately if it already has), unless `isSuppressed()`
+ * says the abort was self-inflicted by the watchdog's own timeout paths — in
+ * that case the watchdog's own error wins the race and this never settles.
+ *
+ * `stop()` detaches the listener so a settled run leaks nothing.
+ */
+function startRunAbortWatch(args: {
+  signal: AbortSignal;
+  isSuppressed?: () => boolean;
+}): { promise: Promise<never>; stop: () => void } {
+  let onAbort: (() => void) | null = null;
+  let stopped = false;
+
+  const stop = () => {
+    stopped = true;
+    if (onAbort) {
+      args.signal.removeEventListener('abort', onAbort);
+      onAbort = null;
+    }
+  };
+
+  const promise = new Promise<never>((_resolve, reject) => {
+    const fire = () => {
+      if (stopped || args.isSuppressed?.()) {
+        stop();
+        return;
+      }
+      stop();
+      reject(new RunInterruptedError(extractAbortReason(args.signal.reason)));
+    };
+    if (args.signal.aborted) {
+      fire();
+      return;
+    }
+    onAbort = fire;
+    args.signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+  return { promise, stop };
+}
+
+const SETTLED_RUN_STATUSES: ReadonlySet<string> = new Set(['completed', 'error', 'interrupted']);
+
+/**
+ * True once this process has already published a terminal verdict for the
+ * run. `RunPublisher.complete/fail/interrupt` flip `state.status`
+ * synchronously before their first await, so checking the cached state is a
+ * race-free first-writer-wins guard between the watchdog's early settle and a
+ * graph step that ignored the abort and finishes (or throws) later.
+ */
+function isRunSettled(publisher: RunPublisher): boolean {
+  const status = publisher.getCachedState?.()?.status;
+  return typeof status === 'string' && SETTLED_RUN_STATUSES.has(status);
+}
+
+/**
+ * Settle an interrupted run from the watchdog when the graph step in flight
+ * ignores the abort. Publishes the same terminal `run_interrupted` verdict
+ * and returns the same `interrupted` RunResult shape that executeStreaming /
+ * executeNonStreaming produce for a cooperative interrupt.
+ */
+async function interruptRunFromWatchdog(
+  publisher: RunPublisher,
+  error: RunInterruptedError,
+): Promise<RunResult> {
+  const reason = error.reason;
+  if (!isRunSettled(publisher)) {
+    try {
+      await publisher.interrupt(reason);
+    } catch (publishErr) {
+      console.error('[run:watchdog] publisher.interrupt() failed:', publishErr);
+    }
+  }
+  const state = await publisher.getState();
+  const cached = publisher.getCachedState?.();
+  return {
+    runId: publisher.id,
+    graphId: state?.graphId || '',
+    graphName: state?.graphName || '',
+    status: 'interrupted',
+    content: cached?.output?.content || '',
+    thinking: cached?.output?.thinking || '',
+    data: {},
+    interruptedReason: reason,
+    metadata: {
+      startedAt: state?.startedAt || Date.now(),
+      completedAt: Date.now(),
+      duration: state?.startedAt ? Date.now() - state.startedAt : 0,
+      nodesExecuted: state?.graph.nodesExecuted || 0,
+      executionPath: state?.graph.executionPath || [],
+    },
+    graphTrace: {
+      executionPath: state?.graph.executionPath || [],
+      nodeProgress: Object.fromEntries(
+        Object.entries(state?.graph.nodeProgress || {}).map(([nodeId, progress]: [string, any]) => [
+          nodeId,
+          { status: progress.status, nodeName: progress.nodeName, nodeType: progress.nodeType, startedAt: progress.startedAt, completedAt: progress.completedAt, error: progress.error },
+        ])
+      ),
+      startTime: state?.startedAt,
+      endTime: Date.now(),
+    },
+    tools: state?.tools || [],
+  };
+}
+
 async function failRunFromWatchdog(
   publisher: RunPublisher,
   error: RunProgressWatchdogError | RunConfigTimeoutError,
 ): Promise<RunResult> {
   const stack = error.stack;
   try {
-    await publisher.fail(error.message, stack);
+    if (!isRunSettled(publisher)) await publisher.fail(error.message, stack);
   } catch (publishErr) {
     console.error('[run:watchdog] publisher.fail() failed:', publishErr);
     try {
@@ -653,22 +784,40 @@ async function executeWithRunProgressWatchdog(
   },
 ): Promise<RunResult> {
   console.log(`[run] ${args.runId} effective configTimeoutMs: ${args.configTimeoutMs}, idleTimeoutMs: ${args.idleTimeoutMs}`);
-  const progressWatchdog = startRunProgressWatchdog(args);
+  // The watchdog's own timeout paths abort the run controller before
+  // rejecting with their terminal error. Flag that so the abort watch below
+  // doesn't mistake a self-inflicted abort for an external interrupt.
+  let terminalAbortInFlight = false;
+  const onTerminal = () => { terminalAbortInFlight = true; };
+  const progressWatchdog = startRunProgressWatchdog({ ...args, onTerminal });
   // Wall-clock timeout is always enforced (capped at platform ceiling).
   // Default 12h for unset, 24h ceiling for explicit 0. There is never a truly unbounded run.
-  const configTimeout = args.configTimeoutMs > 0 ? startRunConfigTimeout(args) : null;
+  const configTimeout = args.configTimeoutMs > 0 ? startRunConfigTimeout({ ...args, onTerminal }) : null;
+  // Race the run's AbortSignal too. A graph step that ignores the abort would
+  // otherwise keep the run (and its lock renewal) alive until it finished on
+  // its own; this settles the run as `interrupted` promptly so the caller's
+  // cleanup (lock release, registry unregister) runs through the normal path.
+  const abortWatch = startRunAbortWatch({
+    signal: args.abortController.signal,
+    isSuppressed: () => terminalAbortInFlight,
+  });
   try {
-    const racers: Promise<RunResult>[] = [operation(), progressWatchdog.promise];
+    const racers: Promise<RunResult>[] = [operation(), progressWatchdog.promise, abortWatch.promise];
     if (configTimeout) racers.push(configTimeout.promise);
     return await Promise.race(racers);
   } catch (err) {
     if (err instanceof RunProgressWatchdogError || err instanceof RunConfigTimeoutError) {
       return failRunFromWatchdog(args.publisher, err);
     }
+    if (err instanceof RunInterruptedError) {
+      console.warn(`[run] ${args.runId} interrupted while a step was still executing — settling without waiting for it`);
+      return interruptRunFromWatchdog(args.publisher, err);
+    }
     throw err;
   } finally {
     progressWatchdog.stop();
     configTimeout?.stop();
+    abortWatch.stop();
   }
 }
 
@@ -932,7 +1081,7 @@ async function executeNonStreaming(
     // event's `output` carries every state-root field (not just the
     // content/thinking/data quadrant). Canonical aliases are still layered
     // on top by RunPublisher for backwards compatibility.
-    await publisher.complete(
+    if (!isRunSettled(publisher)) await publisher.complete(
       { content: cleanedContent, thinking, data: result.data || {} },
       result as Record<string, unknown>,
     );
@@ -979,7 +1128,7 @@ async function executeNonStreaming(
     if (isRunInterruptedError(error)) {
       const reason = (error as RunInterruptedError).reason;
       try {
-        await publisher.interrupt(reason);
+        if (!isRunSettled(publisher)) await publisher.interrupt(reason);
       } catch (publishErr) {
         console.error('[run:executeNonStreaming] publisher.interrupt() failed:', publishErr);
       }
@@ -1015,7 +1164,7 @@ async function executeNonStreaming(
       };
     }
     try {
-      await publisher.fail(errorMessage, errorStack);
+      if (!isRunSettled(publisher)) await publisher.fail(errorMessage, errorStack);
     } catch (publishErr) {
       // If even publisher.fail() fails (e.g., Redis disconnected mid-run),
       // fall back to the raw helper so subscribers still see a terminal
@@ -1215,7 +1364,7 @@ async function executeStreaming(
     // event's `output` carries every state-root field — not just the legacy
     // content/thinking/data quadrant. Falls back to just the convenience
     // fields when on_chain_end never fired (defensive).
-    await publisher.complete(
+    if (!isRunSettled(publisher)) await publisher.complete(
       { content: finalContent, thinking: finalThinking, data: finalData },
       graphFinalState ?? undefined,
     );
@@ -1261,7 +1410,7 @@ async function executeStreaming(
     if (isRunInterruptedError(error)) {
       const reason = (error as RunInterruptedError).reason;
       try {
-        await publisher.interrupt(reason);
+        if (!isRunSettled(publisher)) await publisher.interrupt(reason);
       } catch (publishErr) {
         console.error('[run:executeStreaming] publisher.interrupt() failed:', publishErr);
       }
@@ -1297,7 +1446,7 @@ async function executeStreaming(
       };
     }
     try {
-      await publisher.fail(errorMessage, errorStack);
+      if (!isRunSettled(publisher)) await publisher.fail(errorMessage, errorStack);
     } catch (publishErr) {
       // If publisher.fail() itself fails (Redis hiccup mid-run), fall back
       // to the raw helper so subscribers still see a terminal event.
@@ -1493,6 +1642,8 @@ async function subscribeForInterrupt(
 export const __test__ = {
   subscribeForInterrupt,
   buildInitialState,
+  executeWithRunProgressWatchdog,
+  startRunAbortWatch,
 };
 
 // =============================================================================
@@ -1707,15 +1858,13 @@ export async function run(
       refreshConnection: options.connectionFetcher.refreshConnection,
     });
   }
-  const runCtxMcpClient = {
-    callTool: (toolName: string, args: unknown, meta?: unknown, signal?: AbortSignal) =>
-      red.callMcpTool(
-        toolName,
-        args as Record<string, unknown>,
-        meta as Record<string, unknown>,
-        signal,
-      ),
-  };
+  // MCP connections are scoped to the account the run EXECUTES AS (see
+  // lib/mcp/run-scope) — never another account's, and there are no global
+  // user connections.
+  const runCtxMcpClient = createRunMcpClient(
+    (toolName, args, meta, signal, scope) => red.callMcpTool(toolName, args, meta, signal, scope),
+    resolveRunMcpScope(options),
+  );
   // Data-permissions: resolve the agent's capability profile from the graph
   // config (if any). `null` when the graph declares no profile → the run is
   // UNPROFILED and the native-tool gate is a no-op (backward compatible). When
@@ -1796,6 +1945,10 @@ export async function run(
   }
 
   const cleanup = async () => {
+    // Stop renewing the lock first: nothing below may be allowed to keep an
+    // abandoned run's lock alive. release() below still deletes it only if
+    // we hold the token.
+    try { lock.stopRenewal(); } catch { /* ignore */ }
     if (interruptSub) {
       try { await interruptSub.quit(); } catch { /* ignore */ }
     }

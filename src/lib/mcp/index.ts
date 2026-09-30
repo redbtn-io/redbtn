@@ -19,3 +19,4 @@ export * from './registry';
 // were dropped.
 // event-publisher (McpEventPublisher / tool:event:* Redis key) removed in v0.0.51-alpha.
 // McpEventPublisher was never instantiated; RunPublisher handles all tool events now.
+export * from './run-scope';
