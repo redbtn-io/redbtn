@@ -19,7 +19,7 @@ export interface RecoveredStepFailure {
     error: Error;
     /** How many times the operation ran: the initial attempt plus retries. */
     attempts: number;
-    strategy: 'fallback' | 'skip';
+    strategy: 'fallback' | 'skip' | 'continue';
 }
 
 /**
@@ -105,17 +105,21 @@ export async function executeWithErrorHandlingDetailed<T>(
             if (DEBUG)
                 console.log(`[ErrorHandler] Skipping ${stepInfo?.type || 'step'}`);
             return { value: undefined as unknown as T, recovered: { error: finalError, attempts: attempt, strategy: 'skip' } };
+        case 'continue':
+            // The executor turns this into an error marker at the step's
+            // outputField (see `buildContinueValue`); `value` is unused.
+            return { value: undefined as unknown as T, recovered: { error: finalError, attempts: attempt, strategy: 'continue' } };
         case 'throw':
         default:
             if (onError !== 'throw') {
-                // An unrecognized onError (e.g. 'continue') silently degrades to
+                // An unrecognized onError (e.g. a typo) silently degrades to
                 // 'throw', turning any configured fallbackValue into dead config
                 // — exactly how the Become cli-analyst swallowed its ssh_shell
                 // failures. Config validation rejects new offenders; this warn
                 // surfaces existing bad documents.
                 console.warn(
                     `[ErrorHandler] Invalid onError value "${String(onError)}" — ` +
-                    `valid: throw | fallback | skip. Treating as 'throw'.`
+                    `valid: throw | fallback | skip | continue. Treating as 'throw'.`
                 );
             }
             console.error(`[ErrorHandler] Throwing error: ${lastError?.message}`);
@@ -321,4 +325,68 @@ export function clearStepError(state: any, outputField: string, partial: any): a
     const merged = { ...existing, [outputField]: undefined };
     state.data._stepErrors = merged;
     return { ...partial, 'data._stepErrors': merged };
+}
+
+// =============================================================================
+// onError: 'continue' — the error marker written to the step's outputField
+// =============================================================================
+
+/**
+ * What a step with `errorHandling.onError: 'continue'` writes to its
+ * `outputField` when every attempt failed. The node (and the run) then carries
+ * on with its remaining steps, as 'fallback' / 'skip' do.
+ *
+ * `_stepError: true` is the flag readers test; `error` is the redacted message.
+ * When the step's `fallbackValue` is a plain object its keys are kept UNDER the
+ * marker's, so an authored `{ success: false, sent: false }` shape still reads
+ * the same, with `error` replaced by the real message.
+ */
+export interface StepContinueMarker {
+    _stepError: true;
+    error: string;
+    code: string | null;
+    stepType: 'neuron' | 'tool' | 'connection';
+    neuronId?: string | null;
+    toolName?: string;
+    attempts: number;
+    at: string;
+    [key: string]: unknown;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+}
+
+/**
+ * The value a 'continue' step leaves at its outputField.
+ *
+ * - `fallbackValue` unset or a plain object: the error marker (object keys
+ *   merged underneath; the configured object is never mutated).
+ * - `fallbackValue` a primitive, `null` or an array: that value, unchanged. The
+ *   step's readers were written for that type (`''` fed into a template, `null`
+ *   tested for truthiness), where an object would render as `[object Object]`.
+ *   The error is still recorded at `data._stepErrors[outputField]`.
+ */
+export function buildContinueValue(
+    failure: RecoveredStepFailure,
+    subject: StepErrorSubject | { stepType: 'connection' },
+    fallbackValue: unknown,
+    now: Date = new Date(),
+): unknown {
+    const hasFallback = fallbackValue !== undefined;
+    if (hasFallback && !isPlainRecord(fallbackValue)) return fallbackValue;
+    const marker: StepContinueMarker = {
+        ...(hasFallback ? (fallbackValue as Record<string, unknown>) : {}),
+        _stepError: true,
+        error: stepErrorMessage(failure.error),
+        code: classifyStepErrorCode(failure.error),
+        stepType: subject.stepType,
+        attempts: failure.attempts,
+        at: now.toISOString(),
+    };
+    if (subject.stepType === 'neuron') marker.neuronId = subject.neuronId;
+    if (subject.stepType === 'tool') marker.toolName = subject.toolName;
+    return marker;
 }

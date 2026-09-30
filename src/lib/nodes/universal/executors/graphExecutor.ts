@@ -60,7 +60,7 @@ export interface GraphStepConfig {
         retry?: number;
         retryDelay?: number;
         fallbackValue?: any;
-        onError?: 'throw' | 'fallback' | 'skip';
+        onError?: 'throw' | 'fallback' | 'skip' | 'continue';
     };
 }
 

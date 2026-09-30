@@ -14,7 +14,7 @@
 
 import type { NeuronStepConfig } from '../types';
 import { renderTemplate, getNestedProperty } from '../templateRenderer';
-import { executeWithErrorHandlingDetailed, recordStepError, clearStepError } from './errorHandler';
+import { executeWithErrorHandlingDetailed, recordStepError, clearStepError, buildContinueValue } from './errorHandler';
 import { AudioStreamPipeline } from '../../../tts/audio-stream';
 import { ParserExecutor, type ParserToolExecutor } from './parserExecutor';
 import { getParserRegistry } from './parserRegistry';
@@ -499,6 +499,16 @@ export async function executeNeuron(config: NeuronStepConfig, state: any): Promi
         neuronId = resolveEffectiveNeuronId(config, state) ?? null;
       } catch {
         /* the record is still worth writing without it */
+      }
+      if (recovered.strategy === 'continue') {
+        // The outputField holds an error marker and the node carries on.
+        partial = {
+          [config.outputField]: buildContinueValue(
+            recovered,
+            { stepType: 'neuron', neuronId },
+            config.errorHandling.fallbackValue,
+          ),
+        };
       }
       return recordStepError(state, config.outputField, recovered, { stepType: 'neuron', neuronId }, partial);
     }
