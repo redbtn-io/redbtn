@@ -597,6 +597,85 @@ function renderObjectTemplates(obj: any, state: any): any {
 }
 
 /**
+ * Unwrap a tool-result message envelope into its message array.
+ *
+ * `get_context_history(format:'llm')` (and other native tools that follow the
+ * MCP convention of returning a JSON text payload) produce
+ * `{ messages: [...], metadata: {...} }`, which the tool executor JSON-parses
+ * into state. Graphs that point a concat at the tool's `outputField` (the
+ * system `context` node does exactly this) previously saw a non-array and,
+ * with `fallbackToConcat`, silently dropped the whole history. A real array is
+ * never touched; only a plain (non-array) object whose `messages` field is an
+ * array is unwrapped.
+ */
+export function unwrapMessageEnvelope(value: any): { value: any; unwrapped: boolean } {
+    if (
+        value !== null &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        Array.isArray((value as any).messages)
+    ) {
+        return { value: (value as any).messages, unwrapped: true };
+    }
+    return { value, unwrapped: false };
+}
+
+function isChatMessage(m: any): boolean {
+    return m !== null && typeof m === 'object' && typeof m.role === 'string' && 'content' in m;
+}
+
+/**
+ * Two chat messages are "the same turn" when they carry the same id, or the
+ * same role and content. get_context_history prefixes a multi-party user turn
+ * as `${name}: ${content}` (and sets `name`), so that prefixed form also
+ * matches the raw content the run input carries.
+ */
+function sameChatMessage(a: any, b: any): boolean {
+    if (!isChatMessage(a) || !isChatMessage(b)) return false;
+    if (a.id !== undefined && b.id !== undefined) return a.id === b.id;
+    if (a.role !== b.role) return false;
+    if (typeof a.content !== 'string' || typeof b.content !== 'string') {
+        return JSON.stringify(a.content) === JSON.stringify(b.content);
+    }
+    const ac = a.content.trim();
+    const bc = b.content.trim();
+    if (ac === bc) return true;
+    if (typeof a.name === 'string' && a.name && ac === `${a.name}: ${bc}`) return true;
+    if (typeof b.name === 'string' && b.name && bc === `${b.name}: ${ac}`) return true;
+    return false;
+}
+
+/**
+ * Join two message arrays, dropping the overlap where the tail of `first`
+ * repeats the head of `second`.
+ *
+ * Why: the conversation dispatch path (web chat, terminal/CLI sessions)
+ * persists the triggering user message BEFORE the run starts, so the history
+ * get_context_history loads already ends with the current turn, while
+ * `data.messages` (seeded from `input.message`) starts with it. A plain concat
+ * would hand the model the current message twice. Only a contiguous boundary
+ * overlap is removed, so an earlier turn that happens to repeat text is never
+ * touched, and a history that does NOT yet contain the current turn
+ * (voice/stream subgraph calls) is joined unchanged.
+ */
+export function concatMessagesDeduped(first: any[], second: any[]): any[] {
+    const max = Math.min(first.length, second.length);
+    for (let k = max; k > 0; k--) {
+        let match = true;
+        for (let i = 0; i < k; i++) {
+            if (!sameChatMessage(first[first.length - k + i], second[i])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return [...first.slice(0, first.length - k), ...second];
+        }
+    }
+    return [...first, ...second];
+}
+
+/**
  * Concat operation: Concatenate two arrays
  *
  * Example:
@@ -605,12 +684,18 @@ function renderObjectTemplates(obj: any, state: any): any {
  * state.otherArrayField: ["c", "d"]
  * result: ["a", "b", "c", "d"]
  *
+ * Either side may also be a tool-result envelope `{ messages: [...] }`
+ * (get_context_history llm format); it is unwrapped to its array. When an
+ * envelope was unwrapped, or `dedupeMessages: true` is set on the step, the
+ * join drops a duplicated boundary turn (see concatMessagesDeduped). Two real
+ * arrays without `dedupeMessages` concatenate exactly as before.
+ *
  * @param config - Transform step configuration
- * @param inputData - First array
+ * @param rawInputData - First array (or {messages} envelope)
  * @param state - Current graph state (to lookup second array)
  * @returns Concatenated array
  */
-function executeConcatOperation(config: TransformStepConfig, inputData: any, state: any): any[] {
+function executeConcatOperation(config: TransformStepConfig, rawInputData: any, state: any): any[] {
     // fallbackToConcat: if either array is missing, use the one that exists (or empty array if both missing)
     const fallbackToConcat = (config as any).fallbackToConcat;
     const fallbackToInput = (config as any).fallbackToInput;
@@ -620,17 +705,29 @@ function executeConcatOperation(config: TransformStepConfig, inputData: any, sta
         throw new Error('Concat operation requires value or concatWith (second array field name)');
     }
     // Get second array from state (handles nested paths)
-    let secondArray = getNestedProperty(state, secondArrayField);
+    let rawSecond = getNestedProperty(state, secondArrayField);
     // Fallback: try data. prefix if not found (migration support)
-    if (secondArray === undefined && !secondArrayField.startsWith('data.') && !secondArrayField.startsWith('state.')) {
+    if (rawSecond === undefined && !secondArrayField.startsWith('data.') && !secondArrayField.startsWith('state.')) {
         const dataPath = `data.${secondArrayField}`;
         const dataValue = getNestedProperty(state, dataPath);
-        if (Array.isArray(dataValue)) {
+        if (Array.isArray(dataValue) || unwrapMessageEnvelope(dataValue).unwrapped) {
             if (DEBUG)
                 console.log(`[ConcatOperation] Using data. prefix for '${secondArrayField}'`);
-            secondArray = dataValue;
+            rawSecond = dataValue;
         }
     }
+    const firstUnwrap = unwrapMessageEnvelope(rawInputData);
+    const secondUnwrap = unwrapMessageEnvelope(rawSecond);
+    const inputData = firstUnwrap.value;
+    const secondArray = secondUnwrap.value;
+    const dedupe = firstUnwrap.unwrapped || secondUnwrap.unwrapped || (config as any).dedupeMessages === true;
+    if (firstUnwrap.unwrapped || secondUnwrap.unwrapped) {
+        console.log('[ConcatOperation] Unwrapped {messages} envelope:', {
+            input: firstUnwrap.unwrapped,
+            concatWith: secondUnwrap.unwrapped,
+        });
+    }
+    const join = (a: any[], b: any[]): any[] => (dedupe ? concatMessagesDeduped(a, b) : [...a, ...b]);
     const inputIsArray = Array.isArray(inputData);
     const secondIsArray = Array.isArray(secondArray);
     if (DEBUG)
@@ -642,12 +739,17 @@ function executeConcatOperation(config: TransformStepConfig, inputData: any, sta
     if (fallbackToConcat) {
         let result: any[];
         if (inputIsArray && secondIsArray) {
-            result = [...inputData, ...secondArray];
+            result = join(inputData, secondArray);
         } else if (inputIsArray) {
             // Only input exists, use it
             result = [...inputData];
         } else if (secondIsArray) {
             // Only second array exists, use it
+            if (inputData !== undefined && inputData !== null) {
+                // A present-but-unusable input (e.g. a tool error string) is
+                // dropped. Say so, so a lost history is never silent again.
+                console.warn(`[ConcatOperation] Input ${config.inputField} is not an array (${typeof inputData}); using only ${secondArrayField}`);
+            }
             result = [...secondArray];
         } else {
             // Neither exists, return empty array
@@ -677,7 +779,7 @@ function executeConcatOperation(config: TransformStepConfig, inputData: any, sta
     if (DEBUG) {
         console.log('[ConcatOperation] Concatenating:', inputData.length, '+', secondArray.length);
     }
-    return [...inputData, ...secondArray];
+    return join(inputData, secondArray);
 }
 
 /**
