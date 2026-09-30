@@ -12,6 +12,7 @@
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 import { MemoryManager } from '../../memory/memory';
 import { resolveCallerUserId, checkConversationAccess } from './_conversation-access';
+import { errorTurnNote } from '../../conversation/response-kind';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -24,7 +25,19 @@ interface GetContextArgs {
   includeSummary?: boolean;
   summaryType?: 'trailing' | 'executive' | 'both';
   format?: 'raw' | 'formatted' | 'llm';
+  /**
+   * What to do with assistant turns stored with `metadata.kind` 'error' /
+   * 'fallback' (fallback values, graph-declared error replies, failed runs):
+   *   - 'omit' (default): leave them out, so the model never sees (and never
+   *     learns to repeat) error text;
+   *   - 'note': replace each with a short bracketed note, no verbatim text;
+   *   - 'include': keep them verbatim (debugging / transcripts).
+   */
+  errorTurns?: 'omit' | 'note' | 'include';
+  /** Shorthand for `errorTurns: 'include'`. */
+  includeErrorTurns?: boolean;
 }
+
 
 let _memoryManager: MemoryManager | null = null;
 
@@ -80,6 +93,19 @@ const getContext: NativeToolDefinition = {
         description: 'Output format: raw (objects), formatted (text), llm (ready for model)',
         default: 'llm',
       },
+      errorTurns: {
+        type: 'string',
+        enum: ['omit', 'note', 'include'],
+        description:
+          'Assistant turns that were error or fallback messages rather than answers: omit them (default), ' +
+          'replace each with a short note, or include them verbatim',
+        default: 'omit',
+      },
+      includeErrorTurns: {
+        type: 'boolean',
+        description: 'Shorthand for errorTurns: "include"',
+        default: false,
+      },
     },
     required: ['conversationId'],
   },
@@ -94,6 +120,12 @@ const getContext: NativeToolDefinition = {
       includeSystemPrompt = false,
       systemPromptText,
     } = args;
+    const errorTurns: 'omit' | 'note' | 'include' =
+      args.includeErrorTurns === true || String(args.includeErrorTurns) === 'true'
+        ? 'include'
+        : args.errorTurns === 'note' || args.errorTurns === 'include'
+          ? args.errorTurns
+          : 'omit';
 
     const publisher = context?.publisher || null;
     const nodeId = context?.nodeId || 'get_context';
@@ -144,7 +176,12 @@ const getContext: NativeToolDefinition = {
       }
 
       // Fetch recent messages within token limit
-      const recentMessages = await mm.getContextForConversation(conversationId);
+      const loaded = await mm.getContextForConversation(conversationId, {
+        includeErrorTurns: errorTurns !== 'omit',
+      });
+      const recentMessages = errorTurns === 'note'
+        ? loaded.map((m) => (m.kind ? { ...m, content: errorTurnNote(m.kind), thinking: undefined, toolExecutions: [] } : m))
+        : loaded;
 
       // Who is in this conversation? Human turns carry a userId and agent
       // turns `agent:<id>`; without resolving those to names every format
