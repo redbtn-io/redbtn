@@ -7,6 +7,8 @@
  * @module lib/run/types
  */
 
+import { channelKey } from '../channel';
+
 /**
  * Status of a run execution
  *
@@ -693,7 +695,7 @@ export const RunKeys = {
    * standalone (non-cluster) engine Redis the tag is inert but harmless.
    */
   automationConcurrencyTotal: (automationId: string) =>
-    `automation:concurrency:{${automationId}}:total`,
+    channelKey(`automation:concurrency:{${automationId}}:total`),
   /**
    * Automation concurrency — PER-TRIGGER scope:
    * `automation:concurrency:{automationId}:trigger:{triggerId}`.
@@ -703,7 +705,7 @@ export const RunKeys = {
    * with the total key (see above) so both can be updated in one atomic script.
    */
   automationConcurrencyTrigger: (automationId: string, triggerId: string) =>
-    `automation:concurrency:{${automationId}}:trigger:${triggerId}`,
+    channelKey(`automation:concurrency:{${automationId}}:trigger:${triggerId}`),
 } as const;
 
 // =============================================================================

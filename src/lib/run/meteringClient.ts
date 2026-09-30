@@ -17,6 +17,8 @@
  * Metering is strictly optional: any failure here is swallowed and disables
  * metering for the process — it must never affect a run.
  */
+import { channelKey } from '../channel';
+
 let _meteringClient: any = null;
 let _meteringInitTried = false;
 
@@ -34,8 +36,9 @@ export function getOrCreateMeteringClient(redis: any): any {
       NeuronMeteringClient,
       ToolMeteringClient,
       ResourceMeteringClient,
+      USAGE_EVENTS_STREAM = 'usage:events',
     } = require('@redbtn/redtoken');
-    const publisher = new UsageEventPublisher(redis);
+    const publisher = new UsageEventPublisher(redis, { streamKey: channelKey(USAGE_EVENTS_STREAM) });
     publisher.on?.('error', (err: unknown) => console.warn('[metering] publish error (non-fatal):', err));
     // A bundle of per-surface clients sharing one publisher. Executors reach the
     // surface they emit for: neuron (LLM), tool (native/MCP incl. scrape/search/
