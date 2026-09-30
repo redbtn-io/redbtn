@@ -503,7 +503,15 @@ export async function requestDesktopRaw(args: RequestDesktopRawArgs): Promise<An
           }
           return;
         }
-        finish({ ...parsed, ok: parsed.ok === true });
+        if (args.kind === 'exec' && parsed.kind === 'ack') {
+          return;
+        }
+        const isCancelled =
+          parsed.error?.code === 'command_cancelled' ||
+          parsed.error?.message === 'Command killed by interrupt' ||
+          parsed.result?.exitCode === 130;
+        const ok = !isCancelled && parsed.ok === true;
+        finish({ ...parsed, ok });
       });
 
       const channels = args.onChunk ? [replyChannel, streamChannel] : [replyChannel];
@@ -513,6 +521,12 @@ export async function requestDesktopRaw(args: RequestDesktopRawArgs): Promise<An
           if (args.abortSignal) {
             if (args.abortSignal.aborted) {
               void pub.publish(cmdChannel, JSON.stringify({ kind: 'exec_cancel', id }));
+              finish({
+                ok: false,
+                error: { code: 'command_cancelled', message: 'Command killed by interrupt' },
+                result: { exitCode: 130, failed: true },
+              });
+              return;
             } else {
               abortListener = () => {
                 if (pub) {

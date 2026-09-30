@@ -59,6 +59,7 @@ import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '.
 import { environmentManager } from '../../environments/EnvironmentManager';
 import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
 import { resolveRunUserIdOrEmpty } from './_run-identity';
+import { runControlRegistry } from '../../run/RunControlRegistry';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -251,13 +252,30 @@ const runCommandTool: NativeToolDefinition = {
     }
 
     // ── Execute ───────────────────────────────────────────────────────────
+    const localAbortController = new AbortController();
+    let removeAbortListener: (() => void) | null = null;
+    if (context?.abortSignal) {
+      if (context.abortSignal.aborted) {
+        localAbortController.abort(context.abortSignal.reason);
+      } else {
+        const onAbort = () => localAbortController.abort(context.abortSignal?.reason);
+        context.abortSignal.addEventListener('abort', onAbort, { once: true });
+        removeAbortListener = () => context.abortSignal?.removeEventListener('abort', onAbort);
+      }
+    }
+    const unregisterCancel = runId
+      ? runControlRegistry.registerOnCancel(runId, () => {
+          localAbortController.abort('run cancelled');
+        })
+      : () => {};
+
     try {
       let streamedBytes = 0;
       const result = await session.exec(command, {
         cwd: workingDir,
         env: envVars,
         timeout: timeout > 0 ? timeout : undefined,
-        abortSignal: context?.abortSignal || undefined,
+        abortSignal: localAbortController.signal,
         onChunk: (chunk) => {
           streamedBytes += chunk.chunk.length;
           if (context?.onChunk) {
@@ -320,28 +338,37 @@ const runCommandTool: NativeToolDefinition = {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       const duration = Date.now() - startTime;
-      const isAbort = msg.includes('abort') || msg.includes('cancel');
+      const isAbort =
+        msg.includes('abort') ||
+        msg.includes('cancel') ||
+        (err as any)?.code === 'command_cancelled' ||
+        localAbortController.signal.aborted;
       // A session that carries its own code (DesktopAgentError: ENV_OFFLINE,
       // capability_disabled, payload_too_large) has already named the failure
       // more precisely than EXEC_FAILED can. Pass it through so the agent can
       // act on it — an offline push connector is blocked, not retryable.
       const sessionCode = (err as { code?: unknown })?.code;
-      const code = typeof sessionCode === 'string' && sessionCode
-        ? sessionCode
-        : isAbort ? 'ABORTED' : 'EXEC_FAILED';
+      const code = isAbort
+        ? 'KILLED_BY_INTERRUPT'
+        : (typeof sessionCode === 'string' && sessionCode ? sessionCode : 'EXEC_FAILED');
+      const errorMessage = isAbort ? 'Command killed by interrupt' : msg;
       console.error(`[run_command] env=${environmentId} exec failed after ${duration}ms (${code}): ${msg}`);
       return {
         content: [{
           type: 'text',
           text: JSON.stringify({
             success: false,
-            error: msg,
+            exitCode: isAbort ? 130 : 1,
+            error: errorMessage,
             code,
             durationMs: duration,
           }),
         }],
         isError: true,
       };
+    } finally {
+      removeAbortListener?.();
+      unregisterCancel();
     }
   },
 };

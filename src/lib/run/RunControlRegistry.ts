@@ -191,6 +191,13 @@ export interface RunControlContext {
    * round-trip or a state-mutating step.
    */
   capabilityProfile?: any;
+  /**
+   * Set when a graceful stop (steering) is requested. Step executors and
+   * universalNode check this between steps and halt at the next safe boundary,
+   * without killing in-flight tools.
+   */
+  gracefulStopRequested?: boolean;
+  gracefulStopReason?: string;
 }
 
 /**
@@ -205,6 +212,7 @@ export interface CancelAck {
   currentStep?: { type: string; index: number };
   neuronCallsCancelled: number;
   reason?: string;
+  mode?: 'abort' | 'steer' | 'graceful';
 }
 
 export interface CancelNoAck {
@@ -488,7 +496,42 @@ export class RunControlRegistry {
       currentStep: ctx.currentStep,
       neuronCallsCancelled: cancelled,
       reason,
+      mode: 'abort',
     };
+  }
+
+  /**
+   * Request a graceful stop after the current step finishes (or immediately
+   * if streaming text).
+   *
+   * Unlike cancel(), this does NOT fire tool-level onCancel callbacks,
+   * so in-flight commands/tools run to completion. It DOES abort in-flight
+   * neuron streaming text calls so the current turn's output stops immediately.
+   * UniversalNode and the graph runner check isGracefulStopRequested() between
+   * steps and throw RunInterruptedError at the next safe boundary.
+   */
+  requestGracefulStop(runId: string, reason = 'steered'): boolean {
+    const ctx = this.contexts.get(runId);
+    if (!ctx) return false;
+    ctx.gracefulStopRequested = true;
+    ctx.gracefulStopReason = reason;
+
+    for (const call of ctx.neuronCalls) {
+      try {
+        call.cancel({ reason });
+      } catch (err) {
+        console.warn(`[RunControlRegistry] NeuronCall.cancel threw during graceful stop for run ${runId}:`, err);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Check whether a graceful stop has been requested for a run.
+   */
+  isGracefulStopRequested(runId: string | undefined): boolean {
+    if (!runId) return false;
+    return !!this.contexts.get(runId)?.gracefulStopRequested;
   }
 
   /**
