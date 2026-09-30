@@ -1228,6 +1228,16 @@ async function executeStreaming(
   let thinkingBuffer = '';
   let inThinkingTag = false;
   let pendingBuffer = '';
+  // True once the respond node streamed ANY token. Tokens sit in
+  // `pendingBuffer` until more than 8 chars have arrived (so a `<think>` /
+  // `</think>` tag is never split), which means a reply of <= 8 chars is still
+  // entirely in the buffer at on_chain_end: `fullContent` is empty there. The
+  // "graph produced a response nobody streamed" fallback below used
+  // `!fullContent` as its "nothing was streamed" test, emitted the response,
+  // and then the drain after the loop emitted the buffered copy too: every
+  // short streamed reply was published twice ("44174417", "lock oklock ok")
+  // and persisted that way.
+  let respondStreamed = false;
   let graphOutputData: Record<string, unknown> | null = null;
   // Full final graph state (state-root object, not just .data). Captured at
   // LangGraph on_chain_end so we can pass it to publisher.complete() and thus
@@ -1277,6 +1287,7 @@ async function executeStreaming(
       const isRespondNode = runName === 'respond' || runName === 'responder';
       if (event.event === 'on_llm_stream' && event.data?.chunk?.content && isRespondNode) {
         const content = event.data.chunk.content;
+        respondStreamed = true;
         pendingBuffer += content;
         while (pendingBuffer.length > 8) {
           if (!inThinkingTag && pendingBuffer.startsWith('<think>')) {
@@ -1325,7 +1336,14 @@ async function executeStreaming(
 
         // Also check if content was already streamed by the tool parser (via runPublisher.chunk)
         const alreadyStreamed = publisher.getCachedState()?.output?.content;
-        if (responseContent && typeof responseContent === 'string' && !fullContent && !alreadyStreamed) {
+        if (
+          responseContent &&
+          typeof responseContent === 'string' &&
+          !respondStreamed &&
+          !fullContent &&
+          !pendingBuffer &&
+          !alreadyStreamed
+        ) {
           const { thinking, cleanedContent } = extractThinkingFromContent(responseContent);
           if (thinking) {
             thinkingBuffer = thinking;
@@ -1640,6 +1658,7 @@ async function subscribeForInterrupt(
 }
 
 export const __test__ = {
+  executeStreaming,
   subscribeForInterrupt,
   buildInitialState,
   executeWithRunProgressWatchdog,
