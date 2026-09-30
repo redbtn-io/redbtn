@@ -81,6 +81,9 @@ export interface NeuronStepConfig {
      *     error_result. NOT `agy_auth_required` — that one means a human has to
      *     redo a Google login, and hiding it behind a fallback would keep the
      *     graphs green while the subscription stopped being used at all.
+     *   - `opencode`: spawn_failed, rate_limited, queue_timeout, timeout,
+     *     failed, error_result. NOT auth_failed / no_host_login /
+     *     free_tier_refused / tool_denied (config or security defects).
      *   - API providers: 429, 5xx, network errors, timeouts.
      *   - NEVER: run interrupt/abort, provider 4xx, bad schemas, content
      *     refusals, or either CLI provider's config/security codes.

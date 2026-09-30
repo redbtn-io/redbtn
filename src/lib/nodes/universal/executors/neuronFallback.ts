@@ -149,10 +149,19 @@ export const COPILOT_SDK_FALLBACK_CODES: ReadonlySet<string> = new Set([
   'copilot_sdk_timeout',
 ]);
 
-/** Operational OpenCode CLI failures that can be survived by another neuron. */
+/**
+ * Operational OpenCode CLI failures that can be survived by another neuron.
+ *
+ * Deliberately ABSENT: `opencode_auth_failed` and `opencode_no_host_login`
+ * (a missing/rejected key is a neuron defect a fallback would hide),
+ * `opencode_free_tier_refused` (the tool policy tripped Zen's gate — a config
+ * defect), `opencode_tool_denied` (a tripped security guard), and the
+ * prompt/structured-output/model config defects.
+ */
 export const OPENCODE_FALLBACK_CODES: ReadonlySet<string> = new Set([
   'opencode_spawn_failed',
   'opencode_rate_limited',
+  'opencode_queue_timeout',
   'opencode_timeout',
   'opencode_failed',
   'opencode_error_result',
