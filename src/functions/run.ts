@@ -13,6 +13,7 @@
  * @module functions/run
  */
 import type { Red } from '../index';
+import { createRunMcpClient, resolveRunMcpScope } from '../lib/mcp/run-scope';
 import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys, RunConfig, type SecretsIdentity } from '../lib/run';
 import { runControlRegistry, type CancelResult } from '../lib/run/RunControlRegistry';
 import { getOrCreateMeteringClient } from '../lib/run/meteringClient';
@@ -1857,15 +1858,13 @@ export async function run(
       refreshConnection: options.connectionFetcher.refreshConnection,
     });
   }
-  const runCtxMcpClient = {
-    callTool: (toolName: string, args: unknown, meta?: unknown, signal?: AbortSignal) =>
-      red.callMcpTool(
-        toolName,
-        args as Record<string, unknown>,
-        meta as Record<string, unknown>,
-        signal,
-      ),
-  };
+  // MCP connections are scoped to the account the run EXECUTES AS (see
+  // lib/mcp/run-scope) — never another account's, and there are no global
+  // user connections.
+  const runCtxMcpClient = createRunMcpClient(
+    (toolName, args, meta, signal, scope) => red.callMcpTool(toolName, args, meta, signal, scope),
+    resolveRunMcpScope(options),
+  );
   // Data-permissions: resolve the agent's capability profile from the graph
   // config (if any). `null` when the graph declares no profile → the run is
   // UNPROFILED and the native-tool gate is a no-op (backward compatible). When
