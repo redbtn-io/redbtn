@@ -103,4 +103,27 @@ describe('get_context_history error turns', () => {
     expect(props.errorTurns.default).toBe('omit');
     expect(props.includeErrorTurns.type).toBe('boolean');
   });
+
+  it('renders interrupted turn as a clearly-labelled compact note regardless of errorTurns', async () => {
+    mm.getContextForConversation.mockResolvedValueOnce([
+      { id: 'm1', role: 'user', content: 'run sleep', timestamp: 1 },
+      {
+        id: 'm2',
+        role: 'assistant',
+        content: 'partial text',
+        timestamp: 2,
+        kind: 'interrupted',
+        toolExecutions: [
+          { tool: 'run_command', result: { success: false, exitCode: 130, error: 'Command killed by interrupt' } },
+        ],
+      },
+      { id: 'm3', role: 'user', content: 'continue please', timestamp: 3 },
+    ]);
+    const msgs = await llmMessages({ errorTurns: 'omit' });
+    expect(msgs).toHaveLength(3);
+    expect(msgs[1].role).toBe('assistant');
+    expect(msgs[1].content).toContain('[Note: This turn was interrupted by the user while executing.');
+    expect(msgs[1].content).toContain('Completed tool calls: run_command -> {"success":false,"exitCode":130,"error":"Command killed by interrupt"}.');
+    expect(msgs[1].content).toContain('Partial output before interrupt: "partial text".');
+  });
 });

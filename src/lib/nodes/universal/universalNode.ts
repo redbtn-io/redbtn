@@ -80,6 +80,11 @@ function getRunSignal(state: any): AbortSignal | undefined {
  * why this is critical (state-stashed signals don't survive checkpoints).
  */
 export function checkAbort(state: any): void {
+    const runId = state?.runId || state?.data?.runId;
+    if (runId && runControlRegistry.isGracefulStopRequested(runId)) {
+        const reason = runControlRegistry.get(runId)?.gracefulStopReason || 'steered';
+        throw new RunInterruptedError(reason);
+    }
     const signal = getRunSignal(state);
     if (signal?.aborted) {
         const reason = signal.reason as { reason?: string } | string | undefined;
@@ -100,7 +105,6 @@ export function checkAbort(state: any): void {
     // to maxIterations. Consult the cancelled-run tombstone so it still aborts.
     // This only fires for runs that were explicitly cancelled/interrupted —
     // healthy long-running loops keep their live context and are unaffected.
-    const runId = state?.runId || state?.data?.runId;
     if (runId && runControlRegistry.wasCancelled(runId)) {
         throw new RunInterruptedError('cancelled');
     }

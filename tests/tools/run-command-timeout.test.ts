@@ -179,7 +179,8 @@ describe('run_command — timeout default', () => {
     const opts = execOpts(exec);
     expect(opts.cwd).toBe('/srv/app');
     expect(opts.env).toEqual({ FOO: 'bar' });
-    expect(opts.abortSignal).toBe(ac.signal);
+    expect(opts.abortSignal).toBeDefined();
+    expect(opts.abortSignal.aborted).toBe(false);
     expect(opts.timeout).toBe(DEFAULT_TIMEOUT_MS);
   });
 

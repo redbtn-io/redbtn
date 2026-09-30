@@ -23,7 +23,7 @@
  *      that field succeeds, so a recovered response is not marked.
  */
 
-export type ResponseKind = 'error' | 'fallback';
+export type ResponseKind = 'error' | 'fallback' | 'interrupted';
 
 /** State field a graph step sets to mark its response (`data.responseKind`). */
 export const RESPONSE_KIND_FIELD = 'responseKind';
@@ -32,7 +32,7 @@ export const RESPONSE_KIND_FIELD = 'responseKind';
 const RESPONSE_FIELDS = ['data.response', 'response'] as const;
 
 export function isResponseKind(value: unknown): value is ResponseKind {
-  return value === 'error' || value === 'fallback';
+  return value === 'error' || value === 'fallback' || value === 'interrupted';
 }
 
 /** The kind of a run's final response, from its final `state.data`. */
@@ -68,7 +68,56 @@ export function storedMessageKind(message: unknown): ResponseKind | undefined {
  * Deliberately carries none of the original text.
  */
 export function errorTurnNote(kind: ResponseKind): string {
-  return kind === 'fallback'
-    ? '[An earlier reply here was an automatic fallback message, not an answer; it is omitted.]'
-    : '[An earlier turn here failed before a real answer; its error message is omitted.]';
+  if (kind === 'fallback') {
+    return '[An earlier reply here was an automatic fallback message, not an answer; it is omitted.]';
+  }
+  if (kind === 'interrupted') {
+    return '[This turn was interrupted by the user while executing.]';
+  }
+  return '[An earlier turn here failed before a real answer; its error message is omitted.]';
 }
+
+/**
+ * Format a compact, clearly-labelled note for an interrupted turn
+ * in the model's context showing what tools finished and any partial output.
+ */
+export function formatInterruptedTurnNote(message: {
+  content?: unknown;
+  toolExecutions?: Array<{
+    tool?: string;
+    name?: string;
+    parameters?: unknown;
+    result?: unknown;
+    status?: string;
+  }>;
+  metadata?: Record<string, unknown>;
+}): string {
+  const parts: string[] = ['[Note: This turn was interrupted by the user while executing.'];
+
+  if (Array.isArray(message.toolExecutions) && message.toolExecutions.length > 0) {
+    const toolSummaries = message.toolExecutions.map((t) => {
+      const name = t.tool || t.name || 'tool';
+      let resStr = '';
+      if (t.result !== undefined && t.result !== null) {
+        let raw = typeof t.result === 'string' ? t.result : JSON.stringify(t.result);
+        if (raw.length > 120) {
+          raw = raw.slice(0, 117) + '...';
+        }
+        resStr = ` -> ${raw}`;
+      }
+      return `${name}${resStr}`;
+    }).join('; ');
+    parts.push(`Completed tool calls: ${toolSummaries}.`);
+  }
+
+  const rawContent = typeof message.content === 'string' ? message.content : '';
+  const partial = rawContent.trim();
+  if (partial) {
+    const snippet = partial.length > 300 ? partial.slice(0, 297) + '...' : partial;
+    parts.push(`Partial output before interrupt: "${snippet}".`);
+  }
+
+  parts.push(']');
+  return parts.join(' ');
+}
+

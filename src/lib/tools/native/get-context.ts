@@ -12,7 +12,7 @@
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 import { MemoryManager } from '../../memory/memory';
 import { resolveCallerUserId, checkConversationAccess } from './_conversation-access';
-import { errorTurnNote } from '../../conversation/response-kind';
+import { errorTurnNote, formatInterruptedTurnNote } from '../../conversation/response-kind';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -179,9 +179,24 @@ const getContext: NativeToolDefinition = {
       const loaded = await mm.getContextForConversation(conversationId, {
         includeErrorTurns: errorTurns !== 'omit',
       });
-      const recentMessages = errorTurns === 'note'
-        ? loaded.map((m) => (m.kind ? { ...m, content: errorTurnNote(m.kind), thinking: undefined, toolExecutions: [] } : m))
-        : loaded;
+      const recentMessages = loaded.map((m) => {
+        if (m.kind === 'interrupted') {
+          return {
+            ...m,
+            content: formatInterruptedTurnNote(m),
+            thinking: undefined,
+          };
+        }
+        if (errorTurns === 'note' && m.kind) {
+          return {
+            ...m,
+            content: errorTurnNote(m.kind),
+            thinking: undefined,
+            toolExecutions: [],
+          };
+        }
+        return m;
+      });
 
       // Who is in this conversation? Human turns carry a userId and agent
       // turns `agent:<id>`; without resolving those to names every format
