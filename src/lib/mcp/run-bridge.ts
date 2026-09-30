@@ -457,6 +457,13 @@ export interface StartRunToolBridgeOptions {
   onCancel?: () => void;
   /** Auth deadline per connection (ms). Defaults to `AUTH_DEADLINE_MS`. */
   authDeadlineMs?: number;
+  /**
+   * Optional MCP `instructions` returned from `initialize`. Omitted when unset,
+   * so existing callers see an unchanged handshake. The agy CLI writes it to
+   * `mcp/<server>/instructions.md` and its model reads that file before the
+   * first call; without it the model goes looking and trips the deny policy.
+   */
+  instructions?: string;
 }
 
 export interface RunBridgeStats {
@@ -886,7 +893,10 @@ export async function startRunToolBridge(
     onFatal,
     onCancel,
     authDeadlineMs = AUTH_DEADLINE_MS,
+    instructions,
   } = options;
+  const serverInstructions =
+    typeof instructions === 'string' && instructions.trim() ? instructions.slice(0, 4096) : '';
 
   const tools = buildBridgeToolTable(resolvedTools ?? []);
   const toolsByName = new Map<string, Tool>(tools.map((t) => [t.name, t]));
@@ -1467,6 +1477,7 @@ export async function startRunToolBridge(
           protocolVersion: echoable ? requested : DEFAULT_PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: BRIDGE_SERVER_NAME, version: '1.0.0' },
+          ...(serverInstructions ? { instructions: serverInstructions } : {}),
         });
         return;
       }
