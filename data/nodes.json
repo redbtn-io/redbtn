@@ -465,7 +465,7 @@
       {
         "type": "conditional",
         "config": {
-          "condition": "\"{{state.data.contextMessages.length}}\" > \"0\"",
+          "condition": "\"{{state.data.contextMessages.messages.length}}\" > \"0\"",
           "setField": "contextLoaded",
           "trueValue": true,
           "falseValue": false

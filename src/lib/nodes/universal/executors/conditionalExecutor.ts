@@ -240,9 +240,24 @@ function evaluateCondition(conditionStr: string): boolean {
     const match = trimmed.match(comparisonRegex);
     if (match) {
         const [, left, operator, right] = match;
+        // Quotes are stripped before the numeric parse so a quoted template
+        // such as `"{{state.items.length}}" > "0"` compares as numbers
+        // ("12" > "0"), not as raw strings. Unquoted operands parse exactly as
+        // before.
+        const leftStr = stripQuotes(left.trim());
+        const rightStr = stripQuotes(right.trim());
+        const isRelational = operator === '>' || operator === '>=' || operator === '<' || operator === '<=';
+        // A relational comparison against a missing value is false. A missing
+        // value is what a template renders to when its path does not exist:
+        // "undefined"/"null"/"", or the unresolved `{{...}}` placeholder the
+        // renderer leaves behind. Before this, `"undefined" > "0"` fell
+        // through to the existence check below and was always true.
+        if (isRelational && (isMissingOperand(leftStr) || isMissingOperand(rightStr))) {
+            return false;
+        }
         // Try numeric comparison
-        const leftNum = parseFloat(left.trim());
-        const rightNum = parseFloat(right.trim());
+        const leftNum = toNumber(left.trim(), leftStr);
+        const rightNum = toNumber(right.trim(), rightStr);
         if (!isNaN(leftNum) && !isNaN(rightNum)) {
             switch (operator) {
                 case '>': return leftNum > rightNum;
@@ -253,18 +268,44 @@ function evaluateCondition(conditionStr: string): boolean {
                 case '!=': return leftNum !== rightNum;
             }
         }
-        // String comparison - strip quotes from both sides
-        const leftStr = stripQuotes(left.trim());
-        const rightStr = stripQuotes(right.trim());
+        // String comparison (quotes already stripped from both sides)
         switch (operator) {
             case '==':
             case '===': return leftStr === rightStr;
             case '!=':
             case '!==': return leftStr !== rightStr;
+            // Non-numeric relational: plain string ordering. Previously this
+            // fell through to the existence check and was always true.
+            case '>': return leftStr > rightStr;
+            case '>=': return leftStr >= rightStr;
+            case '<': return leftStr < rightStr;
+            case '<=': return leftStr <= rightStr;
         }
     }
     // Existence check: non-empty string is truthy
     return trimmed.length > 0 && trimmed !== '0' && trimmed !== 'null' && trimmed !== 'undefined';
+}
+
+/**
+ * Numeric value of a comparison operand, or NaN.
+ *
+ * An unquoted operand keeps the historical `parseFloat` behaviour. A quoted
+ * operand must be entirely numeric, so quoted strings such as versions
+ * ("2.0.1" vs "2.0.5") keep comparing as strings instead of as `2`.
+ */
+function toNumber(raw: string, stripped: string): number {
+    if (raw !== stripped) {
+        return /^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(stripped.trim()) ? Number(stripped) : NaN;
+    }
+    return parseFloat(stripped);
+}
+
+/**
+ * True when a (quote-stripped) comparison operand is what a template renders
+ * to for a path that does not exist.
+ */
+function isMissingOperand(str: string): boolean {
+    return str === '' || str === 'undefined' || str === 'null' || /^\{\{[\s\S]*\}\}$/.test(str);
 }
 
 /**
