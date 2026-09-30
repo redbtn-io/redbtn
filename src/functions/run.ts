@@ -15,7 +15,7 @@
 import type { Red } from '../index';
 import { createRunMcpClient, resolveRunMcpScope } from '../lib/mcp/run-scope';
 import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys, RunConfig, type SecretsIdentity } from '../lib/run';
-import { runControlRegistry, type CancelResult } from '../lib/run/RunControlRegistry';
+import { runControlRegistry, type CancelResult, type CancelAck } from '../lib/run/RunControlRegistry';
 import { getOrCreateMeteringClient } from '../lib/run/meteringClient';
 import { resolveCapabilityProfile } from '../lib/permissions/resolve';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
@@ -1272,8 +1272,11 @@ async function executeStreaming(
       const ctrlSignal = runCtrlForStream?.controller?.signal;
       const legacySignal = initialState._abortController?.signal;
       const aborted = ctrlSignal?.aborted || legacySignal?.aborted;
-      if (aborted) {
-        const reasonRaw = ctrlSignal?.aborted ? ctrlSignal.reason : legacySignal?.reason;
+      const graceful = runControlRegistry.isGracefulStopRequested(runId);
+      if (aborted || graceful) {
+        const reasonRaw = ctrlSignal?.aborted
+          ? ctrlSignal.reason
+          : (graceful ? runControlRegistry.get(runId)?.gracefulStopReason : legacySignal?.reason);
         const reason = reasonRaw as { reason?: string } | string | undefined;
         const reasonStr =
           typeof reason === 'string'
@@ -1564,29 +1567,46 @@ async function subscribeForInterrupt(
   }
   sub.on('message', async (_chan: string, raw: string) => {
     let reason: string | undefined;
+    let mode: string | undefined;
     try {
       const parsed = raw ? JSON.parse(raw) : {};
       if (typeof parsed?.reason === 'string') reason = parsed.reason;
+      if (typeof parsed?.mode === 'string') mode = parsed.mode;
     } catch {
       // Malformed JSON — still cancel, just without a reason.
     }
-    console.log(`[run] Interrupt received for ${runId}${reason ? ` (reason: ${reason})` : ''}`);
+    const isSteer = mode === 'steer' || mode === 'graceful';
+    console.log(`[run] Interrupt received for ${runId}${reason ? ` (reason: ${reason})` : ''}${isSteer ? ` (mode: ${mode})` : ''}`);
 
-    // 1. Drive the registry — this aborts the run-level controller AND
-    //    walks every in-flight NeuronCall set up by the neuron registry,
-    //    cancelling them directly (cooperative + force-close fallback).
+    // 1. Drive the registry — either request a graceful stop (steering: stop after
+    //    current step finishes, leave running tools alone) or full cancel (abort now,
+    //    kill remote process groups, abort controller immediately).
     let cancelResult: CancelResult;
     try {
-      cancelResult = runControlRegistry.cancel(runId, reason);
+      if (isSteer) {
+        const stopped = runControlRegistry.requestGracefulStop(runId, reason);
+        cancelResult = {
+          ack: stopped,
+          runId,
+          workerId: WORKER_ID,
+          reason,
+          mode: 'steer',
+          neuronCallsCancelled: 0,
+        } as CancelAck;
+      } else {
+        cancelResult = runControlRegistry.cancel(runId, reason);
+      }
     } catch (err) {
       console.warn(`[run] runControlRegistry.cancel(${runId}) threw:`, err);
       cancelResult = { ack: false, runId, reason };
     }
 
     // 2. Also abort the local controller for any legacy callers that
-    //    might still read `state._abortController` (defensive).
-    try { controller.abort({ reason } as any); } catch {
-      try { controller.abort(); } catch { /* ignore */ }
+    //    might still read `state._abortController` (defensive, abort-only).
+    if (!isSteer) {
+      try { controller.abort({ reason } as any); } catch {
+        try { controller.abort(); } catch { /* ignore */ }
+      }
     }
 
     // 3. Publish ACK so the webapp interrupt endpoint's handshake can

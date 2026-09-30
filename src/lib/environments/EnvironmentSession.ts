@@ -632,6 +632,11 @@ export class EnvironmentSession extends EventEmitter implements IEnvironmentSess
         });
       };
 
+      // External abort signal checked before spawning
+      if (opts.abortSignal?.aborted) {
+        return settle(new Error('exec aborted'), null);
+      }
+
       // The exec callback signature: (err, stream)
       this.client!.exec(fullCommand, (err, channelStream) => {
         if (err) {

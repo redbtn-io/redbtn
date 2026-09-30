@@ -364,6 +364,50 @@ export class ConversationPublisher {
   }
 
   /**
+   * Signal a run has been interrupted in this conversation.
+   *
+   * Persists completed tool history AND any partial content streamed so far,
+   * marked with `metadata.kind = 'interrupted'`.
+   */
+  async publishRunInterrupted(
+    runId: string,
+    messageId: string,
+    reason: string,
+    tools?: unknown[],
+    agentId?: string,
+    content?: string,
+  ): Promise<void> {
+    await this.publish({
+      type: 'run_interrupted',
+      runId,
+      messageId,
+      reason,
+      ...(agentId ? { agentId } : {}),
+      timestamp: Date.now(),
+    });
+
+    if (messageId) {
+      try {
+        await this.persistMessage({
+          messageId,
+          role: 'assistant',
+          content: content || '',
+          metadata: {
+            runId,
+            runInterruptedReason: reason,
+            ...(agentId ? { agentId } : {}),
+            kind: 'interrupted',
+          },
+          toolExecutions: Array.isArray(tools) && tools.length > 0 ? tools : undefined,
+          agentId,
+        });
+      } catch (err) {
+        console.error('[ConversationPublisher] Interrupted persistMessage failed:', err);
+      }
+    }
+  }
+
+  /**
    * Publish an attachment event to the conversation stream.
    * Called by RunPublisher when a file is produced or received during a run.
    * The chat UI uses this to render inline previews without polling.
@@ -769,6 +813,32 @@ export class ConversationPublisher {
           );
         } catch (err) {
           console.error('[ConversationPublisher] agentId $set failed:', err);
+        }
+      }
+
+      // content backfill: when params.content is non-empty, ensure it lands
+      // on the message even if the $push above was a duplicate no-op (e.g.
+      // archiver wrote an empty placeholder earlier).
+      if (params.content) {
+        try {
+          await db.collection('user_conversations').updateOne(
+            { ...filter, 'messages.id': params.messageId },
+            { $set: { 'messages.$.content': params.content } },
+          );
+        } catch (err) {
+          console.error('[ConversationPublisher] content $set failed:', err);
+        }
+      }
+
+      // runInterruptedReason backfill: in-place $set so interrupt metadata lands.
+      if (params.metadata?.runInterruptedReason) {
+        try {
+          await db.collection('user_conversations').updateOne(
+            { ...filter, 'messages.id': params.messageId },
+            { $set: { 'messages.$.metadata.runInterruptedReason': params.metadata.runInterruptedReason } },
+          );
+        } catch (err) {
+          console.error('[ConversationPublisher] runInterruptedReason $set failed:', err);
         }
       }
 

@@ -160,8 +160,8 @@ export class MemoryManager {
     // providers reject it) and doubles every reply's assistant turn.
     const messages = all.filter(
       (m) =>
-        (options.includeErrorTurns || !m.kind) &&
-        (options.includeEmptyAssistant || !isEmptyAssistantMessage(m)),
+        (options.includeErrorTurns || !m.kind || m.kind === 'interrupted') &&
+        (options.includeEmptyAssistant || !isEmptyAssistantMessage(m) || m.kind === 'interrupted'),
     );
     
     // Calculate tokens and return messages that fit within limit

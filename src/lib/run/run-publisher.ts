@@ -841,15 +841,16 @@ export class RunPublisher {
     // interrupt indicator and stop showing the spinner.
     if (this.convPublisher && this.convMessageId) {
       try {
-        // Pass tools so the assistant message gets the tool history that
-        // ran before the interrupt. Same backstop semantics as complete().
-        await this.convPublisher.publishRunError(
+        // Pass tools and partial content so the assistant message gets the
+        // history that ran before the interrupt, marked {kind: 'interrupted'}.
+        await this.convPublisher.publishRunInterrupted(
           this.runId,
           this.convMessageId,
           reason ? `Run interrupted: ${reason}` : 'Run interrupted',
           this.state!.tools,
           // Thread agentId so interrupted-run messages are also attributed.
           this.agentId,
+          this.state!.output?.content || '',
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_interrupted failed:", err);
@@ -1876,21 +1877,23 @@ export async function publishRunError(
  * external automation hook). Returns the number of subscribers that received
  * the message — `0` means nobody is listening (run already done, or never
  * reached the subscription stage).
- *
  * @param redis - Redis client
  * @param runId - Run to interrupt
  * @param reason - Optional free-form reason (forwarded as `payload.reason`)
+ * @param mode - Optional mode: 'abort' (default, kills running tools) or 'steer'/'graceful' (stops after current step)
  * @returns Number of subscribers that received the interrupt
  */
 export async function publishRunInterrupt(
   redis: Redis,
   runId: string,
   reason?: string,
+  mode?: 'abort' | 'steer' | 'graceful',
 ): Promise<number> {
   const payload = JSON.stringify({
     type: 'interrupt',
     runId,
     reason,
+    mode: mode ?? 'abort',
     timestamp: Date.now(),
   });
   try {

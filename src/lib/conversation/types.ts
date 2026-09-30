@@ -161,7 +161,7 @@ export interface ConversationRunCompleteEvent {
    * errorHandling fallbackValue) or 'error' (a graph-declared error reply).
    * Persisted as `messages[].metadata.kind`; context loaders omit such turns.
    */
-  responseKind?: 'error' | 'fallback';
+  responseKind?: 'error' | 'fallback' | 'interrupted';
   timestamp: number;
 }
 
@@ -170,6 +170,15 @@ export interface ConversationRunErrorEvent {
   runId: string;
   messageId: string;
   error: string;
+  timestamp: number;
+}
+
+export interface ConversationRunInterruptedEvent {
+  type: 'run_interrupted';
+  runId: string;
+  messageId: string;
+  reason?: string;
+  agentId?: string;
   timestamp: number;
 }
 
@@ -284,6 +293,7 @@ export type ConversationEvent =
   | ConversationToolEvent
   | ConversationRunCompleteEvent
   | ConversationRunErrorEvent
+  | ConversationRunInterruptedEvent
   | ConversationAttachmentEvent
   | ConversationComponentEvent
   | ConversationAudioChunkEvent

@@ -31,6 +31,7 @@ import {
   resolveResponseKind,
   storedMessageKind,
   errorTurnNote,
+  formatInterruptedTurnNote,
 } from '../../src/lib/conversation/response-kind';
 import { ConversationPublisher } from '../../src/lib/conversation/conversation-publisher';
 import { MemoryManager } from '../../src/lib/memory/memory';
@@ -127,16 +128,33 @@ describe('ConversationPublisher persists the kind', () => {
     expect(event && 'responseKind' in event).toBe(false);
   });
 
-  it('a failed run is marked error; an interrupted one is not', async () => {
+  it('a failed run is marked error; an interrupted run via publishRunInterrupted is marked interrupted', async () => {
     await publisher().publishRunError('run-3', 'msg-3', 'boom', [], undefined, true);
     const failed = updates().find((u) => u.$push);
     expect(failed!.$push.messages.metadata).toMatchObject({ runError: 'boom', kind: 'error' });
 
     mongo.updateOne.mockClear();
-    await publisher().publishRunError('run-4', 'msg-4', 'Run interrupted', [], 'agent-1');
+    await publisher().publishRunInterrupted('run-4', 'msg-4', 'User cancelled', [{ tool: 'run_command', result: { exitCode: 130 } }], 'agent-1', 'partial answer');
     const interrupted = updates().find((u) => u.$push);
-    expect(interrupted!.$push.messages.metadata.kind).toBeUndefined();
-    expect(updates().some((u) => u.$set && 'messages.$.metadata.kind' in u.$set)).toBe(false);
+    expect(interrupted!.$push.messages.metadata.kind).toBe('interrupted');
+    expect(interrupted!.$push.messages.content).toBe('partial answer');
+    expect(updates().some((u) => u.$set?.['messages.$.metadata.kind'] === 'interrupted')).toBe(true);
+    expect(updates().some((u) => u.$set?.['messages.$.content'] === 'partial answer')).toBe(true);
+  });
+});
+
+describe('formatInterruptedTurnNote', () => {
+  it('formats compact note with completed tools and partial output', () => {
+    const note = formatInterruptedTurnNote({
+      content: 'Let me inspect the files...',
+      toolExecutions: [
+        { tool: 'run_command', result: { success: false, exitCode: 130, error: 'Command killed by interrupt' } },
+      ],
+    });
+    expect(note).toContain('[Note: This turn was interrupted by the user while executing.');
+    expect(note).toContain('Completed tool calls: run_command -> {"success":false,"exitCode":130,"error":"Command killed by interrupt"}.');
+    expect(note).toContain('Partial output before interrupt: "Let me inspect the files...".');
+    expect(note.endsWith(']')).toBe(true);
   });
 });
 
@@ -187,5 +205,16 @@ describe('MemoryManager keeps error turns out of context', () => {
   it('includeErrorTurns opts back in', async () => {
     const msgs = await manager().getContextForConversation('conv-kind-1', { includeErrorTurns: true });
     expect(msgs).toHaveLength(6);
+  });
+
+  it('getContextForConversation preserves interrupted turns by default even if empty', async () => {
+    const withInterrupted = [
+      ...stored,
+      { id: 'm7', role: 'user', content: 'steer me', timestamp: 7 },
+      { id: 'm8', role: 'assistant', content: '', metadata: { kind: 'interrupted' }, timestamp: 8 },
+    ];
+    mongo.findOne.mockResolvedValueOnce({ messages: withInterrupted });
+    const msgs = await manager().getContextForConversation('conv-kind-1');
+    expect(msgs.map((m) => m.id)).toEqual(['m1', 'm3', 'm5', 'm6', 'm7', 'm8']);
   });
 });
