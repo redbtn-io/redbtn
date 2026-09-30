@@ -17,6 +17,7 @@
  *   archived.
  */
 
+import { storedMessageKind, type ResponseKind } from './response-kind';
 import type Redis from 'ioredis';
 import { ConversationKeys, ConversationConfig, type ConversationEvent } from './types';
 import { bullmqPrefix } from '../channel';
@@ -267,6 +268,8 @@ export class ConversationPublisher {
     tools?: unknown[],
     graphRun?: unknown,
     agentId?: string,
+    /** Set when the final content is not a model answer (see response-kind.ts). */
+    responseKind?: ResponseKind,
   ): Promise<void> {
     await this.publish({
       type: 'run_complete',
@@ -275,6 +278,7 @@ export class ConversationPublisher {
       finalContent,
       ...(graphRun ? { graphRun } : {}),
       ...(agentId ? { agentId } : {}),
+      ...(responseKind ? { responseKind } : {}),
       timestamp: Date.now(),
     });
     // Persist whenever we have a messageId — runs can complete with empty
@@ -289,7 +293,7 @@ export class ConversationPublisher {
           messageId,
           role: 'assistant',
           content: finalContent || '',
-          metadata: { runId, ...(agentId ? { agentId } : {}) },
+          metadata: { runId, ...(agentId ? { agentId } : {}), ...(responseKind ? { kind: responseKind } : {}) },
           toolExecutions: Array.isArray(tools) ? tools : undefined,
           graphRun,
           agentId,
@@ -317,6 +321,12 @@ export class ConversationPublisher {
     error: string,
     tools?: unknown[],
     agentId?: string,
+    /**
+     * Mark the persisted assistant turn `metadata.kind: 'error'` so context
+     * loaders keep it out of prompt history. True for a failed run; an
+     * interrupted run keeps whatever partial answer it streamed unmarked.
+     */
+    markAsError = false,
   ): Promise<void> {
     await this.publish({
       type: 'run_error',
@@ -337,13 +347,13 @@ export class ConversationPublisher {
     // beats a silently missing one — the runError metadata tells the UI what
     // happened. Dedup ($ne on messages.id) prevents duplicates if the
     // archiver wrote the row first.
-    if (messageId && (Array.isArray(tools) && tools.length > 0 || agentId)) {
+    if (messageId && (Array.isArray(tools) && tools.length > 0 || agentId || markAsError)) {
       try {
         await this.persistMessage({
           messageId,
           role: 'assistant',
           content: '',
-          metadata: { runId, runError: error, ...(agentId ? { agentId } : {}) },
+          metadata: { runId, runError: error, ...(agentId ? { agentId } : {}), ...(markAsError ? { kind: 'error' } : {}) },
           toolExecutions: Array.isArray(tools) && tools.length > 0 ? tools : undefined,
           agentId,
         });
@@ -759,6 +769,21 @@ export class ConversationPublisher {
           );
         } catch (err) {
           console.error('[ConversationPublisher] agentId $set failed:', err);
+        }
+      }
+
+      // kind backfill: in-place $set so an error/fallback turn is marked
+      // whether the $push above created the row or the archiver wrote it
+      // first. Only written when present, so a normal turn never gains one.
+      const kind = storedMessageKind({ metadata: params.metadata });
+      if (kind) {
+        try {
+          await db.collection('user_conversations').updateOne(
+            { ...filter, 'messages.id': params.messageId },
+            { $set: { 'messages.$.metadata.kind': kind } },
+          );
+        } catch (err) {
+          console.error('[ConversationPublisher] kind $set failed:', err);
         }
       }
 

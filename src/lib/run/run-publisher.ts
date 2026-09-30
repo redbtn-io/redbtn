@@ -19,6 +19,7 @@
  *
  * @module lib/run/run-publisher
  */
+import { resolveResponseKind } from '../conversation/response-kind';
 import type { Redis } from 'ioredis';
 import {
   readSharedState,
@@ -621,6 +622,9 @@ export class RunPublisher {
           // Thread agentId through so it lands on metadata.agentId of the
           // persisted message. Absent for single-agent / non-attributed runs.
           this.agentId,
+          // Fallback / graph-declared error replies are marked so context
+          // loaders keep them out of prompt history (see response-kind.ts).
+          resolveResponseKind(output?.data ?? (finalState as { data?: unknown } | undefined)?.data),
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_complete failed:", err);
@@ -752,6 +756,8 @@ export class RunPublisher {
           this.state!.tools,
           // Thread agentId so failed-run messages are also attributed.
           this.agentId,
+          // A failed run's turn is marked kind 'error' (kept out of history).
+          true,
         );
       } catch (err) {
         console.warn("[RunPublisher] Conv forward run_error failed:", err);
