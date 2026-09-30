@@ -23,6 +23,7 @@ import { runControlRegistry } from '../../run/RunControlRegistry';
 import { getRunPublisher, getMeteringClient } from '../../run/contextLookup';
 import { stripWorkspaceBinding } from '../../workspaces/workspace-binding';
 import type { NodeConfig } from './types';
+import { PARALLEL_BRANCH_FAILURE_KEY } from '../../run/run-shared-state';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -478,6 +479,11 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
                 await eventPublisher.nodeError(graphNodeId, errorMessage);
             }
 
+            // Inside a `parallel:` block, tell sibling branches this one died, so a
+            // polling sibling (waiting on a flag this node would have written) stops
+            // instead of holding the join open forever. See loopExecutor.
+            await markParallelBranchFailure(state, graphNodeId, errorMessage);
+
             // Safe stringify for step config (avoid circular references)
             try {
                 console.error(`[UniversalNode] Step config:`, JSON.stringify(step.config, null, 2));
@@ -793,5 +799,25 @@ export function validateUniversalNodeConfig(nodeConfig: NodeConfig): void {
                 }
                 break;
         }
+    }
+}
+
+
+/**
+ * Leave the run-shared failure marker for sibling branches of a `parallel:`
+ * block. No-op outside parallel blocks or without a run publisher; never throws.
+ */
+export async function markParallelBranchFailure(state: any, graphNodeId: string, errorMessage: string): Promise<void> {
+    if (!state?._parallelContext) return;
+    const publisher = getRunPublisher(state) as any;
+    if (!publisher || typeof publisher.setSharedField !== 'function') return;
+    try {
+        await publisher.setSharedField(PARALLEL_BRANCH_FAILURE_KEY, {
+            node: graphNodeId,
+            error: String(errorMessage).slice(0, 500),
+            at: Date.now(),
+        });
+    } catch (err) {
+        console.warn('[UniversalNode] Failed to record parallel branch failure:', err);
     }
 }

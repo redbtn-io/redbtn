@@ -144,3 +144,11 @@ function parseValue(raw: string): unknown {
     return raw;
   }
 }
+
+/**
+ * Run-shared key a node inside a `parallel:` block writes when it FAILS, so a
+ * polling sibling (a loop waiting on a flag the failed node would have set)
+ * can stop instead of spinning until the run is cancelled. Value:
+ * `{ node: <graphNodeId>, error: <message>, at: <epoch ms> }`.
+ */
+export const PARALLEL_BRANCH_FAILURE_KEY = '_parallelBranchFailure';
