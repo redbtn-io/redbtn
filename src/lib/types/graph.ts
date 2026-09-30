@@ -231,7 +231,24 @@ export interface GraphConfig {
     name?: string;
     description?: string;
     capabilities: Array<{
-      resource: 'state' | 'knowledge' | 'exec' | 'computer' | 'environment';
+      // Must list EVERY CapabilityResource. It stopped at 'environment' when
+      // #425 gated conversation/graph/run/web/task/..., so no type-checked
+      // profile could grant conversation:read and profiles silently lacked it.
+      resource:
+        | 'state'
+        | 'knowledge'
+        | 'exec'
+        | 'computer'
+        | 'environment'
+        | 'graph'
+        | 'tool'
+        | 'automation'
+        | 'run'
+        | 'conversation'
+        | 'stream'
+        | 'communication'
+        | 'web'
+        | 'task';
       actions: Array<'read' | 'write' | 'create' | 'delete' | 'execute' | 'control'>;
       selector: string;
     }>;

@@ -47,6 +47,10 @@ export const RED_CODER_CAPABILITY_PROFILE: GraphCapabilityProfile & {
     { resource: 'exec', actions: ['execute'], selector: '*' },
     { resource: 'state', actions: ['read'], selector: '*' },
     { resource: 'knowledge', actions: ['read'], selector: '*' },
+    // The coder-context-builder subgraph (coder-ctx-chat) loads the chat
+    // history with get_context_history, which is gated as conversation:read.
+    // Without this grant every Red Coder run dies at its first context step.
+    { resource: 'conversation', actions: ['read'], selector: '*' },
     // Scoped write grants (calibrated to bare-prefix glob matching coder, coder/*, coder-*, etc.)
     // to support future out-of-band memory persistence without selector traps:
     { resource: 'state', actions: ['write', 'create'], selector: 'coder*' },

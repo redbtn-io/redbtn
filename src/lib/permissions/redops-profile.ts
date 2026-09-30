@@ -34,13 +34,23 @@
  */
 
 import type { GraphConfig } from '../types/graph';
-import type { Capability } from './types';
+import type { Capability, CapabilityResource } from './types';
 
 /** The capability-profile shape as a graph config declares it. */
 export type GraphCapabilityProfile = NonNullable<GraphConfig['capabilities']>;
 
 /** One grant inside a graph-declared capability profile. */
 export type GraphCapabilityEntry = GraphCapabilityProfile['capabilities'][number];
+
+/**
+ * Exhaustiveness guard: every gated `CapabilityResource` must be expressible in
+ * a graph-declared profile. When #425 gated conversation/graph/run/... the
+ * graph-side union was not widened, so no type-checked profile could grant
+ * `conversation:read` — and graphs with a `context` node broke under any
+ * profile. The build now fails if the two unions drift again.
+ */
+type _GraphAdmitsEveryResource = [CapabilityResource] extends [GraphCapabilityEntry['resource']] ? true : never;
+export const GRAPH_ADMITS_EVERY_CAPABILITY_RESOURCE: _GraphAdmitsEveryResource = true;
 
 /**
  * The three graphs that dispatch the Red Ops fleet. All three are PUBLISHED and
