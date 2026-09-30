@@ -6,7 +6,7 @@
  */
 import type { ConnectionStepConfig } from '../types';
 import { renderTemplate } from '../templateRenderer';
-import { executeWithErrorHandling } from './errorHandler';
+import { executeWithErrorHandlingDetailed, buildContinueValue } from './errorHandler';
 import { getConnectionManager } from '../../../run/contextLookup';
 
 // Debug logging
@@ -18,7 +18,7 @@ const DEBUG = false;
 export async function executeConnection(config: ConnectionStepConfig, state: any): Promise<Partial<any>> {
     // If error handling configured, use it
     if (config.errorHandling) {
-        return executeWithErrorHandling(
+        const { value, recovered } = await executeWithErrorHandlingDetailed(
             () => executeConnectionInternal(config, state),
             config.errorHandling,
             {
@@ -26,6 +26,17 @@ export async function executeConnection(config: ConnectionStepConfig, state: any
                 field: config.outputField,
             }
         );
+        if (recovered?.strategy === 'continue' && config.outputField) {
+            // The outputField holds an error marker and the node carries on.
+            return {
+                [config.outputField]: buildContinueValue(
+                    recovered,
+                    { stepType: 'connection' },
+                    config.errorHandling.fallbackValue,
+                ),
+            };
+        }
+        return value;
     }
     return executeConnectionInternal(config, state);
 }
