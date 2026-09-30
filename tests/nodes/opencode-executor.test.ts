@@ -611,9 +611,14 @@ describe('runOpencodeStep', () => {
     }
   });
 
-  it('reports opencode_spawn_failed when the binary is not there', async () => {
-    process.env.OPENCODE_CLI_BIN = path.join(tmpRoot, 'no-such-opencode');
-    process.env.OPENCODE_BIN_PATH = path.join(tmpRoot, 'no-such-opencode');
+  it('reports opencode_spawn_failed when the binary cannot be spawned', async () => {
+    // An existing but non-executable file: resolveOpencodeBinary() takes it (so a
+    // real opencode installed on the CI host at /usr/local/bin etc. is never
+    // picked up), and spawn() fails with EACCES.
+    const unrunnable = path.join(tmpRoot, 'unrunnable-opencode');
+    fs.writeFileSync(unrunnable, 'not a program\n', { mode: 0o644 });
+    process.env.OPENCODE_CLI_BIN = unrunnable;
+    process.env.OPENCODE_BIN_PATH = unrunnable;
     // resolveOpencodeBinary skips missing paths, so point PATH lookups nowhere.
     const savedPath = process.env.PATH;
     process.env.PATH = tmpRoot;
