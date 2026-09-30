@@ -116,10 +116,18 @@ export function buildDenialReason(
     .map((c) => c.selector)
     .filter((s) => s && s !== 'none');
 
+  // When the profile has NO grant at all for this resource+action, say exactly
+  // which grant to add. The common cause is a profile written before the
+  // resource became gated (conversation/graph/run/web/task/... were mapped in
+  // engine 0.0.250): every graph with a `context` node calls
+  // get_context_history, so a profile without conversation:read kills the run
+  // at its first step with no obvious remedy for the operator.
   const scope =
     allowedSelectors.length > 0
       ? `Allowed ${resource} ${action} selectors: ${allowedSelectors.join(', ')}.`
-      : `This agent has no ${resource} ${action} grants.`;
+      : `This agent has no ${resource} ${action} grants. To allow it, add ` +
+        `{"resource":"${resource}","actions":["${action}"],"selector":"*"} ` +
+        `(or a narrower selector) to the graph's capabilities profile.`;
 
   return (
     `Permission denied: agent profile '${profile.name}' does not allow ` +
