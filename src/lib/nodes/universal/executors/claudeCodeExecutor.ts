@@ -360,6 +360,10 @@ function killAllLiveChildren(signal: NodeJS.Signals = 'SIGTERM'): void {
  * handlers re-raise so normal shutdown is not swallowed — installing a
  * listener for SIGTERM/SIGINT otherwise silently disables the default
  * terminate behaviour, which would hang the worker on deploy.
+ *
+ * When the host has its own SIGTERM listener (redworker drains in-flight runs
+ * on deploy), the signal hook stands aside entirely and the `exit` hook is the
+ * only cleanup: survivors are SIGKILLed after the host's drain, not before it.
  */
 function installExitHooks(): void {
   if (exitHooksInstalled) return;
@@ -369,6 +373,12 @@ function installExitHooks(): void {
 
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.on(signal, () => {
+      // A host that owns shutdown (redworker's SIGTERM drain) registered its own
+      // listener: let it drain in-flight runs. Killing the CLI children here and
+      // removing every listener (as this hook used to) SIGTERMed live runs
+      // (exit 143) and deleted the host's drain handler on every worker deploy.
+      // The `exit` hook still SIGKILLs any survivor once the host exits.
+      if (process.listenerCount(signal) > 1) return;
       killAllLiveChildren('SIGTERM');
       // Restore the default and re-raise, so this hook observes the shutdown
       // without becoming the thing that decides it.

@@ -617,6 +617,12 @@ function installExitHooks(): void {
 
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.on(signal, () => {
+      // A host that owns shutdown (redworker's SIGTERM drain) registered its own
+      // listener: let it drain in-flight runs. Killing the CLI children here and
+      // removing every listener (as this hook used to) SIGTERMed live runs
+      // (exit 143) and deleted the host's drain handler on every worker deploy.
+      // The `exit` hook still SIGKILLs any survivor once the host exits.
+      if (process.listenerCount(signal) > 1) return;
       killAllLiveChildren('SIGTERM');
       process.removeAllListeners(signal);
       process.kill(process.pid, signal);
