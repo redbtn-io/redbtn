@@ -13,6 +13,7 @@ import type { LoopStepConfig } from '../types';
 import { executeStep } from '../stepExecutor';
 import { checkAbort } from '../universalNode';
 import { getRunPublisher } from '../../../run/contextLookup';
+import { PARALLEL_BRANCH_FAILURE_KEY } from '../../../run/run-shared-state';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -98,6 +99,20 @@ function resolveConfigValue(value: any, state: any): any {
  * @param state - Current state (includes data from previous steps)
  * @returns Partial state update with loop results
  */
+/**
+ * The run-shared marker a failing node in a `parallel:` block leaves for its
+ * siblings (see `markParallelBranchFailure` in universalNode). Returns it when
+ * it names a DIFFERENT graph node than the one this loop runs in.
+ */
+export function siblingBranchFailure(state: any): { node: string; error: string } | null {
+    const marker = state?.shared?.[PARALLEL_BRANCH_FAILURE_KEY];
+    if (!marker || typeof marker !== 'object') return null;
+    const node = typeof marker.node === 'string' ? marker.node : '';
+    const own = state?.nodeConfig?.graphNodeId;
+    if (!node || (own && node === own)) return null;
+    return { node, error: typeof marker.error === 'string' ? marker.error : 'failed' };
+}
+
 export async function executeLoop(
   config: LoopStepConfig,
   state: any,
@@ -124,6 +139,7 @@ export async function executeLoop(
     // Track iteration count (1-indexed for user-friendly exit conditions)
     let iteration = 0;
     let exitConditionMet = false;
+    let exitedOnSiblingFailure = false;
     // Clone current state to avoid mutating during loop
     const loopState: Record<string, any> = { ...state };
     // Resolve the RunPublisher via the run-control registry. As of the
@@ -168,6 +184,26 @@ export async function executeLoop(
                 }
             } catch (err) {
                 console.warn('[LoopExecutor] Failed to overlay auto-state:', err);
+            }
+        }
+
+        // A polling loop in a `parallel:` block (the thinking-indicator) exits
+        // when a sibling branch has FAILED. The sibling routes the run to
+        // error_handler, but LangGraph only reaches the join once every branch
+        // returns, and the producer that would have written the poller's exit
+        // flag (e.g. `shared.thinking = false`) died before it could. Without
+        // this, the poller spun until the run was cancelled by hand
+        // (gemini-assistant on beta, 2026-09-30: 54 iterations of typing).
+        if (loopState._parallelContext) {
+            const failed = siblingBranchFailure(loopState);
+            if (failed) {
+                console.warn(
+                    `[LoopExecutor] Sibling branch "${failed.node}" failed — stopping this polling loop ` +
+                    `after ${iteration - 1} iteration(s): ${failed.error}`,
+                );
+                iteration--;
+                exitedOnSiblingFailure = true;
+                break;
             }
         }
 
@@ -235,7 +271,7 @@ export async function executeLoop(
         }
     }
     // Handle max iterations reached
-    if (iteration === maxIterations && !exitConditionMet) {
+    if (iteration === maxIterations && !exitConditionMet && !exitedOnSiblingFailure) {
         console.warn(`[LoopExecutor] Max iterations (${maxIterations}) reached without meeting exit condition`);
         if (onMaxIterations === 'throw') {
             throw new Error(`Loop exceeded max iterations (${maxIterations}) without meeting exit condition: ${exitCondition}`);
@@ -252,7 +288,8 @@ export async function executeLoop(
         'userId', 'accountTier', 'options', 'query', 'data']; // IMPORTANT: Don't return 'data' directly - it overwrites parent state!
     const result: Record<string, any> = {
         loopIterations: iteration,
-        loopExitConditionMet: exitConditionMet
+        loopExitConditionMet: exitConditionMet,
+        ...(exitedOnSiblingFailure ? { loopExitedOnSiblingFailure: true } : {}),
     };
     // Copy only data fields (not infrastructure) from loop state
     // IMPORTANT: Only include fields with defined values to avoid overwriting graph state with undefined
