@@ -23,6 +23,7 @@ import {
   type StreamEvent,
   type StreamEventType,
 } from './types';
+import { bullmqPrefix } from '../channel';
 
 // ---------------------------------------------------------------------------
 // Module-level singleton BullMQ Queue instances
@@ -417,7 +418,7 @@ export class StreamEventPublisher {
         event: archiveEvent,
         timestamp: Date.now(),
       };
-      const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
+      const prefix = bullmqPrefix();
       const queue = getArchiveQueue('stream-archive', this.redis, prefix);
       await queue.add('archive', jobData, {
         jobId: `${this.sessionId}_${seq}`,

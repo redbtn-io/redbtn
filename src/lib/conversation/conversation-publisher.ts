@@ -19,6 +19,7 @@
 
 import type Redis from 'ioredis';
 import { ConversationKeys, ConversationConfig, type ConversationEvent } from './types';
+import { bullmqPrefix } from '../channel';
 
 // ---------------------------------------------------------------------------
 // Module-level singleton BullMQ Queue instances (C-1 fix)
@@ -608,7 +609,7 @@ export class ConversationPublisher {
         timestamp: Date.now(),
       };
       // Use module-level singleton Queue to avoid per-event connection churn (C-1).
-      const prefix = process.env.BULLMQ_PREFIX ?? 'bull';
+      const prefix = bullmqPrefix();
       const queue = getArchiveQueue('conversation-archive', this.redis, prefix);
       await queue.add('archive', jobData, {
         // BullMQ keeps completed jobs for a while. The sequence key can expire

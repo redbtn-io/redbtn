@@ -88,13 +88,14 @@ import type {
 } from '../native-registry';
 import { environmentManager } from '../../environments/EnvironmentManager';
 import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvironment';
+import { channelKey } from '../../channel';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
 /** Per-environment Redis hash key holding `jobId → JSON metadata`. */
 export function jobsHashKey(environmentId: string): string {
-  return `env:${environmentId}:jobs`;
+  return channelKey(`env:${environmentId}:jobs`);
 }
 
 /** TTL on the per-environment jobs hash. After 24h with no activity it expires. */
