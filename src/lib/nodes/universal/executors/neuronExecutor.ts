@@ -1885,6 +1885,18 @@ function emitNeuronUsage(params: {
             cacheUsage.cacheReadInputTokens,
         );
       }
+
+      const pub = getRunPublisher(params.state);
+      if (pub && typeof pub.recordUsage === 'function' && recorded?.sample) {
+        pub.recordUsage({
+          model: modelStr || params.neuronId,
+          inputTokens: recorded.sample.inputTokens,
+          outputTokens: recorded.sample.outputTokens,
+          totalTokens: recorded.sample.totalTokens,
+          cacheCreationInputTokens: cacheUsage?.cacheCreationInputTokens,
+          cacheReadInputTokens: cacheUsage?.cacheReadInputTokens,
+        });
+      }
     } catch (e) {
       console.warn('[metering] neuron emit failed (non-fatal):', e instanceof Error ? e.message : e);
     }

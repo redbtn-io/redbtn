@@ -432,6 +432,7 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
 
             if (eventPublisher) {
                 const stepName = (step as any).name || step.type;
+                const nodePub = getRunPublisher(currentState);
                 await eventPublisher.nodeProgress(graphNodeId, stepName, {
                     index: i,
                     total: steps.length,
@@ -439,6 +440,7 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
                         stepType: step.type,
                         phase: 'complete',
                         updatedFields,
+                        ...(nodePub?.state?.usage ? { usage: nodePub.state.usage } : {}),
                     },
                 });
             }

@@ -132,6 +132,18 @@ export interface TokenMetadata {
 }
 
 /**
+ * Structured token and provider usage for a run.
+ */
+export interface RunUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  model?: string;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}
+
+/**
  * Complete run state stored in Redis
  *
  * Key pattern: `run:{runId}`
@@ -159,6 +171,7 @@ export interface RunState {
   graph: GraphTrace;
   tools: ToolExecution[];
   metadata?: TokenMetadata;
+  usage?: RunUsage;
 }
 
 /**
@@ -180,6 +193,7 @@ export interface RunStartEvent extends BaseEvent {
 export interface RunCompleteEvent extends BaseEvent {
   type: 'run_complete';
   metadata?: TokenMetadata;
+  usage?: RunUsage;
   /**
    * Process-style exit code for the run. Terminal bindings (the CLI / webapp
    * console) map this directly to a shell exit status:
