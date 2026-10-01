@@ -56,6 +56,36 @@ const GHP_RE = /\bghp_[A-Za-z0-9]+/g;
 const GH_TOKEN_RE = /\b(?:ghs|gho|ghu|ghr)_[A-Za-z0-9]+/g;
 const GITHUB_PAT_RE = /\bgithub_pat_[A-Za-z0-9_]+/g;
 const AKIA_RE = /\bAKIA[0-9A-Z]{12,}/g;
+/** redauth refresh token (`rfsh_…`, the CLI's long-lived cloud login). */
+const RFSH_RE = /\brfsh_[A-Za-z0-9_-]+/g;
+/**
+ * `key: value` / `key=value` / `"key": "value"` inside free text (command
+ * stdout, a cat'ed JSON or .env file). The structured walk only sees object
+ * keys, so a credential file printed by `run_command` reached the model with
+ * any value no token pattern recognised (2026-10-01: a `rfsh_` refresh token
+ * from ~/.config/redbtn/credentials.d). Bounded key/value lengths keep it linear.
+ */
+const KEY_VALUE_RE = /(["']?)([A-Za-z][A-Za-z0-9_.-]{0,63})\1(\s{0,4}[:=]\s{0,4})(["']?)([^\s"',;}\]]{1,4096})\4/g;
+
+/**
+ * Only values shaped like a credential: long enough, carrying a digit, and not
+ * a plain number. References (`process.env.TOKEN`, `config.apiKey`) and type
+ * annotations carry no digit, so they pass through. Source code the agent greps (`token: string`) stays readable.
+ */
+function looksLikeSecretValue(val: string): boolean {
+  if (val.length < 12) return false;
+  if (!/\d/.test(val)) return false;
+  if (/^-?\d+(?:\.\d+)?$/.test(val)) return false;
+  return true;
+}
+
+function redactKeyValues(text: string): string {
+  return text.replace(KEY_VALUE_RE, (match, q1, key, sep, q2, val) => {
+    if (!sensitiveKey(key)) return match;
+    if (val === REDACTED || !looksLikeSecretValue(val)) return match;
+    return `${q1}${key}${q1}${sep}${q2}${REDACTED}${q2}`;
+  });
+}
 
 function redactString(value: string): string {
   let out = value;
@@ -65,6 +95,7 @@ function redactString(value: string): string {
     out = out.replace(PRIVATE_KEY_RE, REDACTED).replace(PRIVATE_KEY_HEADER_RE, REDACTED);
   }
   if (out.includes('://')) out = out.replace(URL_CREDENTIAL_RE, `$1${REDACTED}@`);
+  if (out.includes(':') || out.includes('=')) out = redactKeyValues(out);
   return out
     .replace(AUTH_SCHEME_RE, `$1 ${REDACTED}`)
     .replace(JWT_RE, REDACTED)
@@ -74,7 +105,8 @@ function redactString(value: string): string {
     .replace(GHP_RE, REDACTED)
     .replace(GH_TOKEN_RE, REDACTED)
     .replace(GITHUB_PAT_RE, REDACTED)
-    .replace(AKIA_RE, REDACTED);
+    .replace(AKIA_RE, REDACTED)
+    .replace(RFSH_RE, REDACTED);
 }
 
 /** Return a JSON-compatible, non-mutating copy with credential values masked. */
