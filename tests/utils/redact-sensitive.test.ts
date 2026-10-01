@@ -124,3 +124,34 @@ describe('redactSensitive — extended credential patterns', () => {
     expect(nonSensitive).toBe('my-regular-mode');
   });
 });
+
+describe('redactSensitive — credentials inside free text', () => {
+  const rfsh = 'rfsh_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0u1V2w';
+
+  it('masks a redauth refresh token anywhere in text', () => {
+    const out = redactSensitive({ stdout: `token was ${rfsh} ok` });
+    expect(out.stdout).not.toContain('rfsh_a1B2');
+    expect(out.stdout).toContain(REDACTED);
+  });
+
+  it('masks a credential file printed by run_command (2026-10-01)', () => {
+    const file = JSON.stringify({ access_token: '[REDACTED]', refresh_token: 'opaque9f8e7d6c5b4a3f2e1d0c', expires_at: 1790827109785, scope: 'profile email' });
+    const out = redactSensitive({ stdout: `===CRED===\n${file}\n` });
+    expect(out.stdout).not.toContain('opaque9f8e7d6c5b4a3f2e1d0c');
+    expect(out.stdout).toContain('"refresh_token":"[REDACTED]"');
+    expect(out.stdout).toContain('"expires_at":1790827109785');
+    expect(out.stdout).toContain('"scope":"profile email"');
+  });
+
+  it('masks .env style secrets', () => {
+    const out = redactSensitive({ stdout: 'DISCORD_BOT_TOKEN=MTE4ODk1NjQ3Mj.abc123XYZ\nPORT=3000\nCLIENT_SECRET: 9f8e7d6c5b4a3f2e1d0c' });
+    expect(out.stdout).not.toContain('MTE4ODk1NjQ3Mj');
+    expect(out.stdout).not.toContain('9f8e7d6c5b4a3f2e1d0c');
+    expect(out.stdout).toContain('PORT=3000');
+  });
+
+  it('leaves source code and counts readable', () => {
+    const code = 'interface A { token: string; apiKey: config.apiKey; refreshToken: process.env.REFRESH_TOKEN }\n"tokens": 1200, "totalTokens": 48213';
+    expect(redactSensitive({ stdout: code }).stdout).toBe(code);
+  });
+});
