@@ -50,6 +50,7 @@ import {
   type RunEvent,
   type RunOutput,
   type TokenMetadata,
+  type RunUsage,
   type ToolExecution,
   type SubgraphTag,
   type AttachmentKind,
@@ -688,9 +689,43 @@ export class RunPublisher {
         : undefined);
     const exitCode = typeof rawExit === 'number' && Number.isFinite(rawExit) ? rawExit : 0;
 
+    // If usage was not recorded incrementally, attempt extraction from final state (e.g. data._cli or metadata.tokens)
+    if (!this.state!.usage) {
+      const cli = (safeFinalState as Record<string, any>)?.data?._cli;
+      if (cli && typeof cli === 'object') {
+        let inT = 0, outT = 0, totT = 0, m: string | undefined;
+        for (const step of Object.values(cli)) {
+          const s = step as any;
+          if (s?.usage) {
+            inT += s.usage.prompt_tokens ?? s.usage.input_tokens ?? 0;
+            outT += s.usage.completion_tokens ?? s.usage.output_tokens ?? 0;
+            totT += s.usage.total_tokens ?? (inT + outT);
+          }
+          if (s?.model) m = s.model;
+        }
+        if (totT > 0 || inT > 0 || outT > 0) {
+          this.recordUsage({ inputTokens: inT, outputTokens: outT, totalTokens: totT, model: m });
+          await this.saveState();
+        }
+      } else if (Array.isArray((safeFinalState as Record<string, any>)?.metadata?.tokens)) {
+        let inT = 0, outT = 0, totT = 0, m: string | undefined;
+        for (const sample of (safeFinalState as Record<string, any>).metadata.tokens) {
+          inT += sample.inputTokens ?? 0;
+          outT += sample.outputTokens ?? 0;
+          totT += sample.totalTokens ?? (inT + outT);
+          if (sample.model) m = sample.model;
+        }
+        if (totT > 0 || inT > 0 || outT > 0) {
+          this.recordUsage({ inputTokens: inT, outputTokens: outT, totalTokens: totT, model: m });
+          await this.saveState();
+        }
+      }
+    }
+
     await this.publish({
       type: 'run_complete',
       metadata: this.state!.metadata,
+      usage: this.state!.usage,
       output: eventOutput,
       exitCode,
       timestamp: Date.now(),
@@ -703,7 +738,7 @@ export class RunPublisher {
       metadata: {
         duration,
         nodesExecuted: this.state!.graph.nodesExecuted,
-        tokenUsage: this.state!.metadata?.tokens?.total,
+        tokenUsage: this.state!.usage?.totalTokens ?? this.state!.metadata?.tokens?.total,
       },
     });
   }
@@ -1475,6 +1510,38 @@ export class RunPublisher {
     this.ensureInitialized();
     this.state!.metadata = { ...this.state!.metadata, ...metadata };
     await this.saveState();
+  }
+
+  recordUsage(sample: RunUsage): void {
+    if (!this.state) return;
+    if (!this.state.usage) {
+      this.state.usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    }
+    const inp = sample.inputTokens ?? 0;
+    const out = sample.outputTokens ?? 0;
+    const tot = sample.totalTokens ?? (inp + out);
+    this.state.usage.inputTokens = (this.state.usage.inputTokens ?? 0) + inp;
+    this.state.usage.outputTokens = (this.state.usage.outputTokens ?? 0) + out;
+    this.state.usage.totalTokens = (this.state.usage.totalTokens ?? 0) + tot;
+    if (sample.model) {
+      this.state.usage.model = sample.model;
+    }
+    if (sample.cacheReadInputTokens) {
+      this.state.usage.cacheReadInputTokens =
+        (this.state.usage.cacheReadInputTokens ?? 0) + sample.cacheReadInputTokens;
+    }
+    if (sample.cacheCreationInputTokens) {
+      this.state.usage.cacheCreationInputTokens =
+        (this.state.usage.cacheCreationInputTokens ?? 0) + sample.cacheCreationInputTokens;
+    }
+    this.state.metadata = {
+      model: sample.model ?? this.state.metadata?.model,
+      tokens: {
+        input: this.state.usage.inputTokens,
+        output: this.state.usage.outputTokens,
+        total: this.state.usage.totalTokens,
+      },
+    };
   }
 
   // ===========================================================================

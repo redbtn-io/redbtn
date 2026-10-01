@@ -20,6 +20,7 @@ export {
   type ToolStatus,
   type ProgressStep,
   type TokenMetadata,
+  type RunUsage,
   type RunEvent,
   type RunEventType,
   type RunStartEvent,
