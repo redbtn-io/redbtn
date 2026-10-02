@@ -50,6 +50,9 @@ import {
   shouldCacheHistoryPrefix,
   historyCacheInvokeOptions,
   extractCacheUsage,
+  supportsPromptCacheKey,
+  derivePromptCacheKey,
+  promptCacheKeyInvokeOptions,
 } from '../../../neurons/prompt-cache';
 import { WorkspaceRepository } from '../../../workspaces/WorkspaceRepository';
 import { acquireWorkspace, WorkspaceSession } from '../../../workspaces/WorkspaceLifecycle';
@@ -849,8 +852,22 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // streaming path re-runs `normalizeMessages()`, which flattens a marked
     // system block array back to a plain string.
     const promptCache = supportsPromptCache(early?.provider, early?.model);
-    /** Marked copy of `msgs` + the call options that carry the history breakpoint. */
+    // ── OpenAI-compatible cache affinity ────────────────────────────────────
+    // Implicit caching only hits when the next turn reaches the replica that
+    // served the last one; `prompt_cache_key` is what routes it there (see
+    // prompt-cache.ts for the measurements). Keyed on the conversation opening,
+    // so every turn of one conversation carries the same key.
+    const promptCacheKeyScope = supportsPromptCacheKey(early?.provider, early?.endpoint)
+      ? neuronId
+      : undefined;
+    /** Marked copy of `msgs` + the call options that carry the history breakpoint / cache key. */
     const withPromptCache = (msgs: any[]): { messages: any[]; invokeOptions?: Record<string, unknown> } => {
+      if (promptCacheKeyScope) {
+        return {
+          messages: msgs,
+          invokeOptions: promptCacheKeyInvokeOptions(derivePromptCacheKey(promptCacheKeyScope, msgs)),
+        };
+      }
       if (!promptCache) return { messages: msgs };
       return {
         messages: applySystemCacheControl(msgs),
@@ -1003,6 +1020,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
             resolvedTools: resolved,
             hostedSpecs,
             promptCache,
+            promptCacheKeyScope,
             neuronId,
             userId,
             callRunId,
@@ -1806,6 +1824,13 @@ export interface NativeToolUseLoopArgs {
    * doesn't re-look it up per iteration.
    */
   promptCache?: boolean;
+  /**
+   * Set when the neuron's endpoint honours `prompt_cache_key` (OpenAI /
+   * OpenRouter). The loop derives ONE key from the opening messages and sends
+   * it on every iteration, so each turn reaches the replica holding the cache
+   * of the previous one. Undefined disables it.
+   */
+  promptCacheKeyScope?: string;
   neuronId: string;
   userId: string;
   callRunId: string | undefined;
@@ -2005,7 +2030,16 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
   }
 
   // Working message list — grows as the loop appends assistant + tool messages.
+  // APPEND-ONLY: every request must be a byte-for-byte prefix extension of the
+  // previous one, or the provider's prompt cache misses. Never insert, rewrite
+  // or trim earlier entries here.
   const messages: any[] = [...baseMessages];
+
+  // One affinity key for the whole loop — derived from the opening, which the
+  // loop never changes.
+  const cacheKeyOptions = args.promptCacheKeyScope
+    ? promptCacheKeyInvokeOptions(derivePromptCacheKey(args.promptCacheKeyScope, baseMessages))
+    : undefined;
 
   let lastToolResult: unknown = undefined;
   let lastToolName: string | undefined;
@@ -2037,12 +2071,15 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
               : undefined,
           }
         : { messages, invokeOptions: undefined };
+      const turnInvokeOptions = cacheKeyOptions || cachedTurn.invokeOptions
+        ? { ...cachedTurn.invokeOptions, ...cacheKeyOptions }
+        : undefined;
       response = await neuronRegistry.callNeuron(neuronId, userId, cachedTurn.messages, {
         signal: abortSignal,
         runId: callRunId,
         stream: false,
         modelOverride: boundModel,
-        invokeOptions: cachedTurn.invokeOptions,
+        invokeOptions: turnInvokeOptions,
       });
     } catch (invokeErr: any) {
       throw new Error(
@@ -2058,6 +2095,20 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
       providerResponse: response,
       stepIdOverride: `${neuronStepId}:tool${iteration}`,
     });
+
+    // Per-turn cache visibility in the worker log: a growing transcript should
+    // read almost all of its input from cache from the second turn on. A row of
+    // zeroes here means the prefix or the affinity key broke.
+    {
+      const inputTokens = response?.usage_metadata?.input_tokens;
+      if (typeof inputTokens === 'number' && inputTokens > 0) {
+        const cacheRead = extractCacheUsage(response)?.cacheReadInputTokens ?? 0;
+        console.log(
+          `[NeuronExecutor] tool-loop turn ${iteration + 1}: input=${inputTokens} cacheRead=${cacheRead} ` +
+            `(${Math.round((cacheRead / inputTokens) * 100)}%)`,
+        );
+      }
+    }
 
     const toolCalls: any[] = Array.isArray(response?.tool_calls) ? response.tool_calls : [];
     const responseContent: string = typeof response?.content === 'string'
