@@ -110,11 +110,31 @@ function redactString(value: string): string {
 }
 
 /** Return a JSON-compatible, non-mutating copy with credential values masked. */
+/**
+ * Token COUNTS are not secrets. Usage blocks (`inputTokens`, `outputTokens`,
+ * `cacheReadInputTokens`, `metadata.tokens: { input, output, total }`) all end
+ * in "tokens", so the suffix rule above masked every one of them in persisted
+ * run events — which is why a run's cache-hit share could not be read back.
+ * Only a NUMBER under a plural `…tokens` key, or a `tokens` object made purely
+ * of numbers, is let through; a string (a real credential) under any of these
+ * keys is still redacted, and the singular `token` key is never exempt.
+ */
+function isTokenCount(key: string, value: unknown): boolean {
+  const norm = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!norm.endsWith('tokens')) return false;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (norm === 'tokens' && value && typeof value === 'object' && !Array.isArray(value)) {
+    const entries = Object.values(value as Record<string, unknown>);
+    return entries.length > 0 && entries.every((v) => typeof v === 'number' && Number.isFinite(v));
+  }
+  return false;
+}
+
 export function redactSensitive<T>(value: T, rootKey = ''): T {
   const seen = new WeakSet<object>();
 
   const visit = (input: unknown, key = ''): unknown => {
-    if (key && sensitiveKey(key)) return REDACTED;
+    if (key && sensitiveKey(key) && !isTokenCount(key, input)) return REDACTED;
     if (typeof input === 'string') return redactString(input);
     if (input === null || typeof input !== 'object') return input;
     if (input instanceof Date) return input;

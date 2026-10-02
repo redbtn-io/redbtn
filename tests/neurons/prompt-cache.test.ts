@@ -275,3 +275,50 @@ describe('rendered system prompt is byte-stable across renders', () => {
     expect(nextDay).not.toBe(early);
   });
 });
+
+describe('prompt_cache_key helpers', () => {
+  it('gates on provider and endpoint', async () => {
+    const { supportsPromptCacheKey } = await import('../../src/lib/neurons/prompt-cache');
+    expect(supportsPromptCacheKey('openai')).toBe(true);
+    expect(supportsPromptCacheKey('openai', 'https://openrouter.ai/api/v1')).toBe(true);
+    expect(supportsPromptCacheKey('custom', 'https://openrouter.ai/api/v1')).toBe(true);
+    expect(supportsPromptCacheKey('opencode-zen', 'https://eu.openrouter.ai/api/v1')).toBe(true);
+    expect(supportsPromptCacheKey('custom', 'https://openrouter.ai.evil.com/v1')).toBe(false);
+    expect(supportsPromptCacheKey('custom', 'http://localhost:8000/v1')).toBe(false);
+    expect(supportsPromptCacheKey('custom')).toBe(false);
+    expect(supportsPromptCacheKey('anthropic', 'https://openrouter.ai/api/v1')).toBe(false);
+    expect(supportsPromptCacheKey('google')).toBe(false);
+    expect(supportsPromptCacheKey('ollama')).toBe(false);
+  });
+
+  it('derives one key per conversation opening, stable as the transcript grows', async () => {
+    const { derivePromptCacheKey } = await import('../../src/lib/neurons/prompt-cache');
+    const opening = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'card A' },
+    ];
+    const k = derivePromptCacheKey('muse', opening);
+    expect(k).toMatch(/^rb-[0-9a-f]{32}$/);
+    const grown = [
+      ...opening,
+      { role: 'assistant', content: '', tool_calls: [] },
+      { role: 'tool', content: 'result', tool_call_id: 'c1' },
+      { role: 'user', content: 'more' },
+    ];
+    expect(derivePromptCacheKey('muse', grown)).toBe(k);
+    // Different conversation, different neuron -> different key.
+    expect(derivePromptCacheKey('muse', [opening[0], { role: 'user', content: 'card B' }])).not.toBe(k);
+    expect(derivePromptCacheKey('other', opening)).not.toBe(k);
+    // Block-array content keys the same as its string form.
+    expect(
+      derivePromptCacheKey('muse', [{ role: 'system', content: [{ type: 'text', text: 'sys' }] }, opening[1]]),
+    ).toBe(k);
+    expect(derivePromptCacheKey('muse', [])).toBeUndefined();
+  });
+
+  it('wraps the key as a ChatOpenAI call option', async () => {
+    const { promptCacheKeyInvokeOptions } = await import('../../src/lib/neurons/prompt-cache');
+    expect(promptCacheKeyInvokeOptions('rb-x')).toEqual({ promptCacheKey: 'rb-x' });
+    expect(promptCacheKeyInvokeOptions(undefined)).toBeUndefined();
+  });
+});
