@@ -155,3 +155,27 @@ describe('redactSensitive — credentials inside free text', () => {
     expect(redactSensitive({ stdout: code }).stdout).toBe(code);
   });
 });
+
+describe('redactSensitive — token counts are not secrets', () => {
+  it('keeps numeric usage counters readable', () => {
+    const usage = {
+      inputTokens: 6296424,
+      outputTokens: 78489,
+      totalTokens: 6374913,
+      cacheReadInputTokens: 5900000,
+      model: 'meta/muse-spark-1.3-contributor',
+    };
+    expect(redactSensitive({ usage })).toEqual({ usage });
+    const metadata = { tokens: { input: 10, output: 2, total: 12 } };
+    expect(redactSensitive({ metadata })).toEqual({ metadata });
+  });
+
+  it('still redacts strings under the same keys, and the singular token key', () => {
+    expect(redactSensitive({ accessTokens: 'abc', tokens: 'xyz', token: 1234 })).toEqual({
+      accessTokens: '[REDACTED]',
+      tokens: '[REDACTED]',
+      token: '[REDACTED]',
+    });
+    expect(redactSensitive({ tokens: { input: 1, refresh: 'rfsh_abc' } }).tokens).toBe('[REDACTED]');
+  });
+});

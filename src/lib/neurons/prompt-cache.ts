@@ -38,10 +38,14 @@
  *
  * # Support
  *
- * Anthropic only. OpenAI and Gemini cache repeated prefixes implicitly with no
- * markers to set — `extractCacheUsage()` still reports their cached-token
- * counters so the same accounting works for all three.
+ * Breakpoints are Anthropic only. OpenAI-compatible endpoints cache repeated
+ * prefixes implicitly but need a `prompt_cache_key` so the turns of one
+ * conversation land on the replica that holds the cache (see the bottom of this
+ * file). Gemini caches implicitly. `extractCacheUsage()` reports every
+ * provider's cached-token counters so the same accounting works for all.
  */
+
+import { createHash } from 'node:crypto';
 
 /** The only cache type Anthropic exposes today (5-minute TTL). */
 export const EPHEMERAL_CACHE_CONTROL = { type: 'ephemeral' as const };
@@ -254,4 +258,115 @@ export function extractCacheUsage(response: unknown): CacheUsage | null {
   }
 
   return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cache affinity for OpenAI-compatible endpoints (`prompt_cache_key`)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// OpenAI-style "implicit" caching has no markers, but it is still per machine:
+// the provider keeps the KV cache of a prompt on the replica that served it,
+// and a later request only reads it if it lands on that same replica.
+// `prompt_cache_key` is the routing hint that makes that happen — requests that
+// share a key are sent to the same backend.
+//
+// Without it the hit rate collapses on any provider that load-balances across
+// many replicas. Measured 2026-10-02 against `meta/muse-spark-1.3-contributor`
+// on OpenRouter (single provider "Meta"), six identical ~6.9k-token requests:
+//
+//   no key                    113, 113, 113, 113, 113, 113  cached tokens
+//   user / session_id only    mostly 113, one partial hit
+//   prompt_cache_key          3825, 6769, 6769, 6769, 6769, 6769
+//
+// (113 is a tool-preamble the provider caches globally.) The engine's native
+// tool loop re-sends a strictly growing, append-only transcript, so every turn
+// is a perfect prefix of the next one; all it was missing was the key. On
+// OpenRouter the same field doubles as the provider sticky-routing key when no
+// `session_id` is sent, so this one field covers both layers.
+
+/**
+ * Should this neuron's calls carry a `prompt_cache_key`?
+ *
+ * `openai` neurons talk to api.openai.com or an OpenAI-compatible gateway
+ * (OpenRouter is the one in use); both honour the field. Other providers that
+ * reuse `ChatOpenAI` (`custom`, the zen family) point at arbitrary servers that
+ * may reject an unknown body field, so they only get it when the endpoint is
+ * OpenRouter itself. Anthropic/Google/Ollama never do — they have their own
+ * mechanisms (or none).
+ */
+export function supportsPromptCacheKey(provider?: string, endpoint?: string): boolean {
+  if (provider === 'openai') return true;
+  if (provider === 'custom' || provider === 'opencode-zen' || provider === 'zen') {
+    return isOpenRouterEndpoint(endpoint);
+  }
+  return false;
+}
+
+function isOpenRouterEndpoint(endpoint?: string): boolean {
+  if (typeof endpoint !== 'string' || endpoint.length === 0) return false;
+  try {
+    const host = new URL(endpoint).hostname.toLowerCase();
+    return host === 'openrouter.ai' || host.endsWith('.openrouter.ai');
+  } catch {
+    return false;
+  }
+}
+
+function messageRole(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.role === 'string') return m.role;
+  if (typeof m._getType === 'function') {
+    const t = m._getType();
+    return t === 'human' ? 'user' : t === 'ai' ? 'assistant' : t;
+  }
+  return undefined;
+}
+
+function contentText(m: any): string {
+  const c = m?.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) {
+    return c
+      .map((part: any) => (typeof part === 'string' ? part : typeof part?.text === 'string' ? part.text : ''))
+      .join('');
+  }
+  return '';
+}
+
+/**
+ * Derive the `prompt_cache_key` for a conversation.
+ *
+ * The key must be identical on every turn of one conversation and different
+ * between unrelated conversations (one key for everything would pin all traffic
+ * to one replica and overflow it). Hashing the OPENING of the conversation —
+ * the first system message and the first non-system message, plus the neuron —
+ * gives exactly that without any plumbing: the tool loop and multi-turn chat
+ * only ever append, so the opening never changes, and two runs that open with
+ * the same text (a retry of the same card) share the key and the cache. This is
+ * also how OpenRouter identifies a conversation for sticky routing.
+ *
+ * Returns undefined when there is nothing to key on. Pure.
+ */
+export function derivePromptCacheKey(scope: string, messages: unknown[]): string | undefined {
+  if (!Array.isArray(messages) || messages.length === 0) return undefined;
+  const firstSystem = messages.find((m) => {
+    const r = messageRole(m);
+    return r === 'system' || r === 'developer';
+  });
+  const firstOther = messages.find((m) => {
+    const r = messageRole(m);
+    return r !== undefined && r !== 'system' && r !== 'developer';
+  });
+  const opening = `${contentText(firstSystem)}\u0000${contentText(firstOther)}`;
+  if (opening === '\u0000') return undefined;
+  const digest = createHash('sha256').update(`${scope}\u0000${opening}`).digest('hex').slice(0, 32);
+  return `rb-${digest}`;
+}
+
+/**
+ * Call options carrying the affinity key. `@langchain/openai` reads
+ * `promptCacheKey` off the call options and sends it as `prompt_cache_key`.
+ */
+export function promptCacheKeyInvokeOptions(key: string | undefined): Record<string, unknown> | undefined {
+  return key ? { promptCacheKey: key } : undefined;
 }

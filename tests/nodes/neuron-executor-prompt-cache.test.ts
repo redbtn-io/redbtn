@@ -241,3 +241,31 @@ describe('neuronExecutor — cache usage accounting', () => {
     expect(h.samples[0].uncachedInputTokens).toBeUndefined();
   });
 });
+
+describe('neuronExecutor — prompt_cache_key for OpenAI-compatible endpoints', () => {
+  it('sends a promptCacheKey call option for openai and OpenRouter-backed neurons only', async () => {
+    const cases: Array<[Any, boolean]> = [
+      [{ provider: 'openai', model: 'meta/muse-spark-1.3-contributor', endpoint: 'https://openrouter.ai/api/v1' }, true],
+      [{ provider: 'openai', model: 'gpt-5' }, true],
+      [{ provider: 'custom', model: 'x', endpoint: 'https://openrouter.ai/api/v1' }, true],
+      [{ provider: 'custom', model: 'x', endpoint: 'http://vllm.internal:8000/v1' }, false],
+      [{ provider: 'google', model: 'gemini-2.5-flash' }, false],
+      [{ provider: 'anthropic', model: 'claude-opus-5' }, false],
+      [{ provider: 'ollama', model: 'llama3.1:70b' }, false],
+    ];
+    for (const [cfg, expected] of cases) {
+      const h = makeHarness(cfg);
+      await executeNeuron(baseConfig as Any, h.state);
+      const key = h.calls[0].options.invokeOptions?.promptCacheKey;
+      if (expected) expect(key, `${cfg.provider} ${cfg.endpoint ?? ''}`).toMatch(/^rb-[0-9a-f]{32}$/);
+      else expect(key, `${cfg.provider} ${cfg.endpoint ?? ''}`).toBeUndefined();
+    }
+  });
+
+  it('keeps the system prompt a plain string for openai (no Anthropic markers)', async () => {
+    const h = makeHarness({ provider: 'openai', model: 'gpt-5' });
+    await executeNeuron(baseConfig as Any, h.state);
+    expect(h.calls[0].messages[0].content).toBe('You are Red, a careful assistant.');
+    expect(h.calls[0].options.invokeOptions?.cache_control).toBeUndefined();
+  });
+});
