@@ -139,6 +139,17 @@ export {
 } from './RunControlRegistry';
 
 export {
+  awaitWithCancelGrace,
+  killProcessGroupWithEscalation,
+  signalProcessGroup,
+  ToolInterruptedError,
+  isToolInterruptedError,
+  TOOL_CANCEL_GRACE_MS_DEFAULT,
+  TOOL_SIGKILL_GRACE_MS_DEFAULT,
+  TOOL_INTERRUPTED_CODE,
+} from './tool-cancel';
+
+export {
   readRunProgress,
   isRunProgressStale,
   touchRunProgress,
