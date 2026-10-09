@@ -108,6 +108,7 @@ import type { NativeToolContext } from '../tools/native-registry';
 import { coerceArgsToSchema } from '../tools/coerce-args';
 import { getDataToolRule } from '../permissions/tool-map';
 import { runControlRegistry } from '../run/RunControlRegistry';
+import { awaitWithCancelGrace } from '../run/tool-cancel';
 import { callerIsTrusted } from '../tools/native/_outbound-url';
 import type { ToolInvocationContext } from '../tools/tool-resolver';
 import { getMcpClient } from '../run/contextLookup';
@@ -1328,14 +1329,26 @@ export async function startRunToolBridge(
       }
 
       let result: unknown;
+      // Bounded post-abort grace (steer/interrupt): each branch is handed the
+      // run's abortSignal and owns its own completion; if it settles inside
+      // the grace its output is kept (clean handoff to the steered prompt),
+      // and if it hangs past the grace this throws ToolInterruptedError so
+      // the run finalizes and frees the run lock. The tool's own onCancel
+      // hooks own the actual kill — this bound only stops the wait. This is
+      // NOT a total-runtime timeout: healthy (un-aborted) calls await as long
+      // as they need.
       if (customTool && typeof customTool.invoke === 'function') {
-        result = await customTool.invoke(args, {
-          state: state as AnyObject,
-          credentials: (credentials ?? null) as any,
-          runId,
-          toolId,
-          abortSignal: abortSignal ?? null,
-        });
+        result = await awaitWithCancelGrace(
+          customTool.invoke(args, {
+            state: state as AnyObject,
+            credentials: (credentials ?? null) as any,
+            runId,
+            toolId,
+            abortSignal: abortSignal ?? null,
+          }),
+          abortSignal ?? undefined,
+          { toolName: name },
+        );
       } else if (mcpTool) {
         const mcpClient = getMcpClient(state);
         if (!mcpClient) {
@@ -1343,15 +1356,19 @@ export async function startRunToolBridge(
         }
         const dotIdx = name.indexOf('__');
         const toolName = dotIdx >= 0 ? name.slice(dotIdx + 2) : name;
-        result = await mcpClient.callTool(
-          toolName,
-          args,
-          {
-            conversationId: (state as any).options?.conversationId
-              ?? (state as any).data?.options?.conversationId,
-            credentials,
-          },
+        result = await awaitWithCancelGrace(
+          mcpClient.callTool(
+            toolName,
+            args,
+            {
+              conversationId: (state as any).options?.conversationId
+                ?? (state as any).data?.options?.conversationId,
+              credentials,
+            },
+            abortSignal ?? undefined,
+          ),
           abortSignal ?? undefined,
+          { toolName: name },
         );
       } else {
         // `untrustedCaller` is the property `lib/tools/caller-trust`,
@@ -1373,12 +1390,19 @@ export async function startRunToolBridge(
         // Belt: read the flag back through the predicate the tools use.
         assertUntrustedContext(context);
 
-        // Deliberately NOT wrapped in a timeout. A tool owns its own deadline
-        // (`run_command` reads `RUN_COMMAND_DEFAULT_TIMEOUT_MS` for itself since
-        // PR #379), it is handed the run's `abortSignal`, and a hung tool costs one of
-        // `MAX_INFLIGHT_CALLS` slots rather than the session. A blanket deadline
-        // here would kill legitimate long work with no way for a node to opt out.
-        result = await getNativeRegistry().callTool(name, args, context);
+        // Deliberately NOT wrapped in a total-runtime timeout. A tool owns its
+        // own deadline (`run_command` reads `RUN_COMMAND_DEFAULT_TIMEOUT_MS`
+        // for itself since PR #379), it is handed the run's `abortSignal`, and
+        // a hung tool costs one of `MAX_INFLIGHT_CALLS` slots rather than the
+        // session. A blanket deadline here would kill legitimate long work
+        // with no way for a node to opt out. The await below adds ONLY a
+        // bounded post-ABORT grace (see above): un-aborted calls still run as
+        // long as they need.
+        result = await awaitWithCancelGrace(
+          getNativeRegistry().callTool(name, args, context),
+          abortSignal ?? undefined,
+          { toolName: name },
+        );
       }
 
       if (publisher && typeof publisher.toolComplete === 'function') {

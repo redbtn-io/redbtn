@@ -11,6 +11,7 @@ import { getParserRegistry } from './parserRegistry';
 import { ParserExecutor } from './parserExecutor';
 import { getToolResultErrorMessage } from './toolResultError';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
+import { awaitWithCancelGrace } from '../../../run/tool-cancel';
 import { getRunPublisher, getMcpClient, getConnectionManager, getGraphRegistry, getMeteringClient } from '../../../run/contextLookup';
 import { ToolHangError, withToolIdleWatchdog, type ToolIdleWatchdogHandle } from '../../../tools/tool-idle-watchdog';
 import { getNativeRegistry } from '../../../tools/native-registry';
@@ -639,12 +640,25 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                         }
                         await new Promise(resolve => setTimeout(resolve, attempt * 1000));
                     }
-                    const nativeResult = await callNativeToolWithIdleWatchdog(
-                        nativeRegistry,
-                        config.toolName,
-                        renderedParams,
-                        nativeContext,
-                        resolveNativeToolIdleTimeoutMs(config),
+                    // Bounded post-abort grace (steer/interrupt): the run's abort
+                    // is already forwarded to the tool via nativeContext. If
+                    // the tool settles inside the grace its output is kept
+                    // (clean handoff); if it hangs, this throws
+                    // ToolInterruptedError so the run finalizes and frees the
+                    // run lock instead of wedging behind a dead tool. The
+                    // tool's own onCancel hooks (registered via
+                    // runControlRegistry) fire before the abort and own the
+                    // actual kill — this bound only stops the wait.
+                    const nativeResult = await awaitWithCancelGrace(
+                        callNativeToolWithIdleWatchdog(
+                            nativeRegistry,
+                            config.toolName,
+                            renderedParams,
+                            nativeContext,
+                            resolveNativeToolIdleTimeoutMs(config),
+                        ),
+                        getRunSignal(state),
+                        { toolName: config.toolName },
                     );
                     const nativeError = getToolResultErrorMessage(nativeResult, config.toolName, 'Native');
                     if (nativeError) {
@@ -752,15 +766,22 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                 // are stripped between nodes — see RunControlRegistry.ts).
                 if (DEBUG)
                     console.log(`[ToolExecutor] Calling mcpClient.callTool: ${config.toolName}`);
-                const result = await callMcpToolWithIdleWatchdog(
-                    mcpClient,
-                    config.toolName,
-                    renderedParams,
-                    meta,
+                // Same bounded post-abort grace as the native path above:
+                // settle in time ⇒ result kept; hang ⇒ ToolInterruptedError
+                // so the run finalizes and the steered turn can take the lock.
+                const result = await awaitWithCancelGrace(
+                    callMcpToolWithIdleWatchdog(
+                        mcpClient,
+                        config.toolName,
+                        renderedParams,
+                        meta,
+                        getRunSignal(state),
+                        runPublisher || null,
+                        toolId,
+                        resolveMcpToolIdleTimeoutMs(config),
+                    ),
                     getRunSignal(state),
-                    runPublisher || null,
-                    toolId,
-                    resolveMcpToolIdleTimeoutMs(config),
+                    { toolName: config.toolName },
                 );
                 const mcpError = getToolResultErrorMessage(result, config.toolName, 'MCP');
                 if (mcpError) {

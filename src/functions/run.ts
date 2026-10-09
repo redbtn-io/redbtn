@@ -188,6 +188,14 @@ export interface RunOptions {
    * just replayed once at startup.
    */
   resumeFromRunId?: string;
+  /**
+   * Opt-in bounded wait (ms) for a busy conversation run lock.
+   * Used by the steer-dispatch handoff path, which may arrive while the
+   * previous run's lock release is still propagating (interrupt ACK → run
+   * finalize → release). Default 0 = fail fast with `lock-busy`. Callers
+   * must bound this inside the steer time budget — never set globally.
+   */
+  lockWaitMs?: number;
 }
 
 export interface RunResult {
@@ -1753,7 +1761,9 @@ export async function run(
   const runLock = new RunLock(redis);
   let lock;
   try {
-    lock = await runLock.acquire(lockKey, { agentId });
+    // lockWaitMs is opt-in (steer-dispatch handoff only) — default fail-fast.
+    const lockWaitMs = Math.max(0, (options as RunOptions).lockWaitMs ?? 0);
+    lock = await runLock.acquire(lockKey, { agentId, ...(lockWaitMs > 0 ? { waitMs: lockWaitMs } : {}) });
   } catch (err) {
     await publishFallbackError(err, 'lock-acquire');
     throw err;
