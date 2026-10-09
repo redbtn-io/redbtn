@@ -35,6 +35,7 @@
  */
 
 import type { CapabilityAction, CapabilityResource } from './types';
+import { isUsableConversationId } from '../conversation/conversation-id';
 
 /** One or more addresses extracted from a tool call (some tools fan out). */
 export interface ExtractedAddress {
@@ -155,7 +156,10 @@ function recentRunsAddress(args: Record<string, unknown>): ExtractedAddress {
 
 function conversationId(args: Record<string, unknown>): ExtractedAddress {
   const id = str(args.conversationId);
-  if (!id) return { addresses: [], unscoped: true };
+  // Unusable ids (undefined / "undefined" / unrendered templates) address
+  // nothing — treat them as unscoped rather than scoping a grant to a
+  // `conversations:undefined` shaped address.
+  if (!id || !isUsableConversationId(id)) return { addresses: [], unscoped: true };
   return { addresses: [id] };
 }
 

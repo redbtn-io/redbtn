@@ -12,6 +12,7 @@
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 import { MemoryManager } from '../../memory/memory';
 import { resolveCallerUserId, checkConversationAccess } from './_conversation-access';
+import { isUsableConversationId } from '../../conversation/conversation-id';
 import { errorTurnNote, formatInterruptedTurnNote } from '../../conversation/response-kind';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -130,6 +131,76 @@ const getContext: NativeToolDefinition = {
     const publisher = context?.publisher || null;
     const nodeId = context?.nodeId || 'get_context';
     const startTime = Date.now();
+
+    // ── No-conversation fast path ─────────────────────────────────────
+    // Automation/cron runs have no conversation: the system `context` node
+    // renders `{{state.data.options.conversationId}}` to JS `undefined`.
+    // Return a SUCCESSFUL empty context (not an error) so the node
+    // continues normally, and never let the id reach a Redis key or a
+    // Mongo filter. This MUST come before the access check: there is no
+    // document to check access against, and refusing here would break
+    // every conversation-less run.
+    if (!isUsableConversationId(conversationId)) {
+      console.log(
+        `[get_context] No usable conversationId (${String(conversationId)}) — returning empty context`
+      );
+      if (format === 'raw') {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  conversationId: null,
+                  trailingSummary: null,
+                  executiveSummary: null,
+                  messages: [],
+                  totalTokens: 0,
+                  noConversation: true,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+      if (format === 'formatted') {
+        return {
+          content: [
+            {
+              type: 'text',
+              text:
+                '# Conversation Context: (none — run has no conversation)\n\n' +
+                '## Recent Messages (0 messages, ~0 tokens)\n\n' +
+                '(no conversation — automation/cron run)\n',
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                messages: [],
+                metadata: {
+                  conversationId: null,
+                  messageCount: 0,
+                  totalTokens: 0,
+                  hasTrailingSummary: false,
+                  hasExecutiveSummary: false,
+                  noConversation: true,
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
 
     console.log(`[get_context] Building context for ${conversationId}, format=${format}`);
 

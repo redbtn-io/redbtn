@@ -8,6 +8,7 @@
  */
 
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
+import { isUsableConversationId } from '../../conversation/conversation-id';
 
 const definition: NativeToolDefinition = {
   description: 'Push a message to a conversation. Appears instantly in the chat UI and is saved to the database. Can target any conversation by ID.',
@@ -49,9 +50,9 @@ const definition: NativeToolDefinition = {
       || (context.state?.options?.conversationId as string | undefined)
       || (context.state?.conversationId as string | undefined);
 
-    if (!conversationId) {
+    if (!isUsableConversationId(conversationId)) {
       return {
-        content: [{ type: 'text', text: JSON.stringify({ error: 'No conversationId available. Pass it explicitly or run within a conversation context.' }) }],
+        content: [{ type: 'text', text: JSON.stringify({ error: 'No usable conversationId available. Pass it explicitly or run within a conversation context.' }) }],
         isError: true,
       };
     }

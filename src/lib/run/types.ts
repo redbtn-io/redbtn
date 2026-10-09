@@ -8,6 +8,10 @@
  */
 
 import { channelKey } from '../channel';
+import {
+  InvalidConversationIdError,
+  isUsableConversationId,
+} from '../conversation/conversation-id';
 
 /**
  * Status of a run execution
@@ -611,14 +615,28 @@ export const RunKeys = {
    * Execution lock: `run:lock:{conversationId}` or `run:lock:{conversationId}:{agentId}`
    * Prevents multiple runs of the SAME agent in the same conversation.
    * Different agents can run concurrently in the same conversation (group chat).
+   *
+   * Throws on unusable ids — a `run:lock:undefined` key would serialize
+   * unrelated conversation-less runs onto one lock. Callers for automation
+   * runs must pass an explicit run-scoped key instead.
    */
-  lock: (conversationId: string, agentId?: string) => agentId
-    ? `run:lock:${conversationId}:${agentId}`
-    : `run:lock:${conversationId}`,
+  lock: (conversationId: string, agentId?: string) => {
+    if (!isUsableConversationId(conversationId)) {
+      throw new InvalidConversationIdError(conversationId, 'RunKeys.lock');
+    }
+    return agentId
+      ? `run:lock:${conversationId}:${agentId}`
+      : `run:lock:${conversationId}`;
+  },
   /** Active runs for user: `run:user:{userId}` */
   userRuns: (userId: string) => `run:user:${userId}`,
   /** Active run for conversation: `run:conversation:{conversationId}` */
-  conversationRun: (conversationId: string) => `run:conversation:${conversationId}`,
+  conversationRun: (conversationId: string) => {
+    if (!isUsableConversationId(conversationId)) {
+      throw new InvalidConversationIdError(conversationId, 'RunKeys.conversationRun');
+    }
+    return `run:conversation:${conversationId}`;
+  },
   /**
    * Requeue-on-boot recovery record: `run:recovery:{runId}`.
    *

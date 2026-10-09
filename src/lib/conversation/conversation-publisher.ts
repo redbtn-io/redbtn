@@ -20,6 +20,7 @@
 import { storedMessageKind, type ResponseKind } from './response-kind';
 import type Redis from 'ioredis';
 import { ConversationKeys, ConversationConfig, type ConversationEvent } from './types';
+import { assertUsableConversationId } from './conversation-id';
 import { bullmqPrefix } from '../channel';
 
 // ---------------------------------------------------------------------------
@@ -94,6 +95,7 @@ export class ConversationPublisher {
   private readonly ttl: number;
 
   constructor(options: ConversationPublisherOptions) {
+    assertUsableConversationId(options?.conversationId, 'ConversationPublisher');
     this.redis = options.redis;
     this.conversationId = options.conversationId;
     this.userId = options.userId;

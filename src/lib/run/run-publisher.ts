@@ -62,6 +62,7 @@ import {
 } from './types';
 import type { RedLog } from '@redbtn/redlog';
 import { ConversationPublisher, createConversationPublisher } from '../conversation';
+import { isUsableConversationId } from '../conversation/conversation-id';
 import { assertChatComponentSpec } from '../chat-components/spec-schema';
 import { heartbeatAutomationSlot, releaseAutomationSlot } from './automation-concurrency';
 import { redactSensitive } from '../utils/redact-sensitive';
@@ -450,7 +451,7 @@ export class RunPublisher {
       conversationId,
     });
     await this.saveState();
-    if (conversationId) {
+    if (isUsableConversationId(conversationId)) {
       await this.redis.set(RunKeys.conversationRun(conversationId), this.runId, 'EX', this.stateTtl);
       // Create ConversationPublisher for forwarding events to the chat UI
       try {
@@ -2121,6 +2122,9 @@ function summarizeToolResult(result: unknown): { meta: Record<string, unknown>; 
 }
 
 export async function getActiveRunForConversation(redis: Redis, conversationId: string): Promise<string | null> {
+  // Never resolve a pointer for an unusable id — `run:conversation:undefined`
+  // would serialize unrelated conversation-less runs onto one key.
+  if (!isUsableConversationId(conversationId)) return null;
   const runId = await redis.get(RunKeys.conversationRun(conversationId));
   if (!runId) return null;
   const stateJson = await redis.get(RunKeys.state(runId));
