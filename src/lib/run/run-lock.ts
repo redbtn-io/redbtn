@@ -13,6 +13,7 @@
  */
 import type { Redis } from 'ioredis';
 import { RunKeys, RunConfig } from './types';
+import { assertUsableConversationId } from '../conversation/conversation-id';
 
 /**
  * Lock acquisition result
@@ -81,6 +82,7 @@ export class RunLock {
   constructor(private readonly redis: Redis) {}
 
   async acquire(conversationId: string, options?: AcquireLockOptions & { agentId?: string }): Promise<RunLockHandle | null> {
+    assertUsableConversationId(conversationId, 'RunLock.acquire');
     const agentId = options?.agentId;
     const key = RunKeys.lock(conversationId, agentId);
     const token = generateToken();
@@ -127,12 +129,14 @@ export class RunLock {
   }
 
   async release(conversationId: string, token: string, agentId?: string): Promise<boolean> {
+    assertUsableConversationId(conversationId, 'RunLock.release');
     const key = RunKeys.lock(conversationId, agentId);
     const result = await this.redis.eval(RELEASE_LOCK_SCRIPT, 1, key, token);
     return result === 1;
   }
 
   async renew(conversationId: string, token: string, ttlSeconds?: number, agentId?: string): Promise<boolean> {
+    assertUsableConversationId(conversationId, 'RunLock.renew');
     const key = RunKeys.lock(conversationId, agentId);
     const ttl = ttlSeconds ?? RunConfig.LOCK_TTL_SECONDS;
     const result = await this.redis.eval(RENEW_LOCK_SCRIPT, 1, key, token, ttl.toString());
@@ -140,12 +144,14 @@ export class RunLock {
   }
 
   async isLocked(conversationId: string, agentId?: string): Promise<boolean> {
+    assertUsableConversationId(conversationId, 'RunLock.isLocked');
     const key = RunKeys.lock(conversationId, agentId);
     const value = await this.redis.get(key);
     return value !== null;
   }
 
   async getLockInfo(conversationId: string, agentId?: string): Promise<{ token: string; ttl: number } | null> {
+    assertUsableConversationId(conversationId, 'RunLock.getLockInfo');
     const key = RunKeys.lock(conversationId, agentId);
     const [token, ttl] = await Promise.all([this.redis.get(key), this.redis.ttl(key)]);
     if (!token || ttl < 0) return null;
@@ -153,6 +159,7 @@ export class RunLock {
   }
 
   async forceRelease(conversationId: string, agentId?: string): Promise<boolean> {
+    assertUsableConversationId(conversationId, 'RunLock.forceRelease');
     const key = RunKeys.lock(conversationId, agentId);
     const result = await this.redis.del(key);
     return result === 1;

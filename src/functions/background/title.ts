@@ -6,6 +6,7 @@ import type { Red } from '../../index';
 import type { ChatOllama } from '@langchain/ollama';
 import { extractThinking } from '../../lib/utils/thinking';
 import { invokeWithRetry } from '../../lib/utils/retry';
+import { isUsableConversationId } from '../../lib/conversation/conversation-id';
 
 /**
  * Update the conversation title on the canonical user_conversations doc.
@@ -13,6 +14,9 @@ import { invokeWithRetry } from '../../lib/utils/retry';
  * `conversationId` field (quietly no-ops if neither matches).
  */
 async function persistTitle(conversationId: string, title: string): Promise<void> {
+  // Never build a `{ conversationId: undefined }` filter (serialises to
+  // null and matches any doc lacking the field) or touch bad Redis keys.
+  if (!isUsableConversationId(conversationId)) return;
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mongoose = require('mongoose');
@@ -43,6 +47,7 @@ export async function generateTitleInBackground(
   red: Red,
   chatModel: ChatOllama
 ): Promise<void> {
+  if (!isUsableConversationId(conversationId)) return;
   try {
     // Only generate title after 2nd or 6th message
     if (messageCount !== 2 && messageCount !== 6) {
@@ -125,6 +130,7 @@ export async function setConversationTitle(
   title: string,
   red: Red
 ): Promise<void> {
+  if (!isUsableConversationId(conversationId)) return;
   const metaKey = `conversation:${conversationId}:metadata`;
   await red.memory['redis'].hset(metaKey, {
     'title': title,
@@ -144,6 +150,7 @@ export async function getConversationTitle(
   conversationId: string,
   red: Red
 ): Promise<string | null> {
+  if (!isUsableConversationId(conversationId)) return null;
   const metadataResult = await red.callMcpTool('get_conversation_metadata', {
     conversationId
   }, { conversationId });

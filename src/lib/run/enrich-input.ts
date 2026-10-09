@@ -26,6 +26,7 @@
 
 import type { TriggeredRun, EnrichedInput, EnrichmentResult, Trigger } from './trigger-types';
 import type { RawAutomationConcurrency } from './automation-concurrency';
+import { isUsableConversationId } from '../conversation/conversation-id';
 
 // =============================================================================
 // Types for lazy-loaded DB dependencies
@@ -250,6 +251,14 @@ async function loadConversationEnrichment(
   const graphInputs: Record<string, unknown> = {};
   const schemaDefaults: Record<string, unknown> = {};
   const configOverrides: Record<string, unknown> = {};
+
+  // Conversation-less automation runs have no document to load. The
+  // ObjectId check below already skips non-ObjectId ids, but fail fast on
+  // unusable ids (undefined / "undefined" / unrendered templates) so the
+  // id can never reach a query.
+  if (!isUsableConversationId(conversationId)) {
+    return { graphInputs, schemaDefaults, configOverrides };
+  }
 
   try {
     const mongoose = (await import('mongoose')).default;

@@ -15,6 +15,7 @@
  */
 
 import type { NativeToolContext, NativeMcpResult } from '../native-registry';
+import { isUsableConversationId } from '../../conversation/conversation-id';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -88,7 +89,7 @@ export function resolveScopeNamespace(
     (state.conversationId as string | undefined) ||
     (state.data?.conversationId as string | undefined) ||
     (state.options?.conversationId as string | undefined);
-  if (!conversationId || typeof conversationId !== 'string' || !conversationId.trim()) {
+  if (!isUsableConversationId(conversationId)) {
     return {
       ok: false,
       error:

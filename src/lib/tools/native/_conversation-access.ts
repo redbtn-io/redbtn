@@ -18,6 +18,10 @@
 import mongoose from 'mongoose';
 import type { NativeToolContext } from '../native-registry';
 import { isSystemResource } from '../../system-resource';
+import {
+  InvalidConversationIdError,
+  isUsableConversationId,
+} from '../../conversation/conversation-id';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -52,8 +56,15 @@ export function resolveCallerUserId(context: NativeToolContext): string | null {
 /**
  * Build a MongoDB filter to match the conversation document in
  * `user_conversations`. Mirrors MemoryManager.buildConversationFilter.
+ *
+ * Throws {@link InvalidConversationIdError} on unusable ids: a
+ * `{ conversationId: undefined }` filter is serialised by the driver as
+ * `null` and matches ANY doc lacking that field, so we never query.
  */
 function buildConversationFilter(conversationId: string): AnyObject {
+  if (!isUsableConversationId(conversationId)) {
+    throw new InvalidConversationIdError(conversationId, 'buildConversationFilter');
+  }
   const { ObjectId } = mongoose.Types;
   return ObjectId.isValid(conversationId)
     ? { _id: new ObjectId(conversationId) }
@@ -99,6 +110,17 @@ export async function checkConversationAccess(
   opts: { allowRoles?: ConversationRole[] } = {},
 ): Promise<ConversationAccessResult> {
   const allowRoles = opts.allowRoles ?? ['owner', 'member', 'viewer'];
+
+  // Refuse before touching Mongo: an unusable id must never become a query
+  // filter (see buildConversationFilter). Automation/cron runs without a
+  // conversation land here via get_context_history and store_message.
+  if (!isUsableConversationId(conversationId)) {
+    return {
+      ok: false,
+      role: null,
+      error: `Invalid conversationId: ${String(conversationId)}`,
+    };
+  }
 
   const db = mongoose.connection.db;
   if (!db) {

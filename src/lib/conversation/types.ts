@@ -6,11 +6,26 @@
  * the push_message tool, or external triggers.
  */
 
+import {
+  InvalidConversationIdError,
+  isUsableConversationId,
+} from './conversation-id';
+
 export const ConversationKeys = {
   /** Pub/sub channel for real-time events */
-  stream: (conversationId: string) => `conversation:stream:${conversationId}`,
+  stream: (conversationId: string) => {
+    if (!isUsableConversationId(conversationId)) {
+      throw new InvalidConversationIdError(conversationId, 'ConversationKeys.stream');
+    }
+    return `conversation:stream:${conversationId}`;
+  },
   /** Event list for replay on reconnection (short TTL) */
-  events: (conversationId: string) => `conversation:events:${conversationId}`,
+  events: (conversationId: string) => {
+    if (!isUsableConversationId(conversationId)) {
+      throw new InvalidConversationIdError(conversationId, 'ConversationKeys.events');
+    }
+    return `conversation:events:${conversationId}`;
+  },
 } as const;
 
 export const ConversationConfig = {
