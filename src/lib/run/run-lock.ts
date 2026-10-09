@@ -30,6 +30,15 @@ export interface AcquireLockOptions {
   ttlSeconds?: number;
   autoRenew?: boolean;
   renewalIntervalMs?: number;
+  /**
+   * Opt-in bounded wait for a busy lock (steer-dispatch handoff only).
+   * Default 0 = fail fast (today's behaviour). When > 0, `acquire()` retries
+   * until the lock frees or the budget expires, then returns null as before.
+   * Never use globally — it turns every genuine collision into a hang.
+   */
+  waitMs?: number;
+  /** Interval between busy-lock retries. Default 150ms. */
+  retryIntervalMs?: number;
 }
 
 /**
@@ -64,6 +73,10 @@ function generateToken(): string {
   return `${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class RunLock {
   constructor(private readonly redis: Redis) {}
 
@@ -72,9 +85,20 @@ export class RunLock {
     const key = RunKeys.lock(conversationId, agentId);
     const token = generateToken();
     const ttl = options?.ttlSeconds ?? RunConfig.LOCK_TTL_SECONDS;
+    const waitMs = Math.max(0, options?.waitMs ?? 0);
+    const retryIntervalMs = Math.max(25, options?.retryIntervalMs ?? 150);
 
-    const result = await this.redis.set(key, token, 'EX', ttl, 'NX');
-    if (result !== 'OK') return null;
+    // Opt-in bounded wait: the steer-dispatch path may arrive while the
+    // previous run's lock release is still propagating (interrupt ACK →
+    // run finalize → release). Retry inside the budget instead of failing
+    // on millisecond 0; default stays fail-fast.
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      const result = await this.redis.set(key, token, 'EX', ttl, 'NX');
+      if (result === 'OK') break;
+      if (Date.now() >= deadline) return null;
+      await sleep(Math.min(retryIntervalMs, Math.max(25, deadline - Date.now())));
+    }
 
     let renewalTimer: ReturnType<typeof setInterval> | null = null;
     const stopRenewal = () => {
