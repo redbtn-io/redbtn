@@ -23,6 +23,7 @@ import type {
   NativeToolContext,
   NativeMcpResult,
 } from '../native-registry';
+import { isUsableConversationId } from '../../conversation/conversation-id';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -81,13 +82,13 @@ const deleteConversationTool: NativeToolDefinition = {
     // Default to archive=true if not explicitly false (covers undefined / true / non-boolean).
     const archive = args.archive !== false;
 
-    if (!conversationId) {
+    if (!isUsableConversationId(conversationId)) {
       return {
         content: [
           {
             type: 'text',
             text: JSON.stringify({
-              error: 'conversationId is required and must be a non-empty string',
+              error: 'conversationId is required and must be a usable id (not empty, "undefined", or an unrendered template)',
               code: 'VALIDATION',
             }),
           },

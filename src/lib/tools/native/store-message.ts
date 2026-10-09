@@ -11,6 +11,7 @@
 import type { NativeToolDefinition, NativeMcpResult, NativeToolContext } from '../native-registry';
 import { MemoryManager, ConversationMessage } from '../../memory/memory';
 import { resolveCallerUserId, checkConversationAccess } from './_conversation-access';
+import { isUsableConversationId } from '../../conversation/conversation-id';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -91,6 +92,24 @@ const storeMessage: NativeToolDefinition = {
       `[store_message] conversationId:${conversationId}, role:${role}, ` +
       `messageId:${messageId || '(auto)'}, content length:${content?.length}`
     );
+
+    // Refuse before the access check or any storage touch: an unusable id
+    // must never reach buildConversationFilter or a Redis key.
+    if (!isUsableConversationId(conversationId)) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: `Invalid conversationId: ${String(conversationId)}`,
+              code: 'VALIDATION',
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
 
     // ── Access check ──────────────────────────────────────────────────
     // This tool writes directly to MemoryManager/user_conversations,

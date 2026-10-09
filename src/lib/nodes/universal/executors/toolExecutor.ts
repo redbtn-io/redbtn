@@ -16,6 +16,7 @@ import { getRunPublisher, getMcpClient, getConnectionManager, getGraphRegistry, 
 import { ToolHangError, withToolIdleWatchdog, type ToolIdleWatchdogHandle } from '../../../tools/tool-idle-watchdog';
 import { getNativeRegistry } from '../../../tools/native-registry';
 import { resolveToolStepTrust } from '../../../tools/caller-trust';
+import { isUsableConversationId } from '../../../conversation/conversation-id';
 import type { ToolStepConfig } from '../types';
 
 function getNativeRegistryLazy(): any {
@@ -250,7 +251,7 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
             const targetConvId = streamTarget === true
                 ? (state.data?.conversationId || state.conversationId || state.options?.conversationId)
                 : String(streamTarget);
-            if (targetConvId) {
+            if (isUsableConversationId(targetConvId)) {
                 const { createConversationPublisher } = require('../../../conversation/index.js');
                 convPublisher = createConversationPublisher({
                     redis: streamRedis,

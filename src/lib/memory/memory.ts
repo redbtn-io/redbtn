@@ -21,6 +21,11 @@ import Redis from 'ioredis';
 import { countTokens, freeTiktoken } from '../utils/tokenizer';
 import { StoredToolExecution } from './database';
 import { storedMessageKind, type ResponseKind } from '../conversation/response-kind';
+import {
+  assertUsableConversationId,
+  isUsableConversationId,
+  InvalidConversationIdError,
+} from '../conversation/conversation-id';
 
 export interface ConversationMessage {
   id?: string; // Optional message ID (e.g., msg_1234567890_abc123def)
@@ -77,6 +82,11 @@ export class MemoryManager {
    * that's intentional, we fail quietly for legacy string ids).
    */
   private buildConversationFilter(conversationId: string): Record<string, unknown> {
+    // Refuse before querying: `{ conversationId: undefined }` serialises to
+    // null and matches any doc lacking the field (2026-10-09 incident).
+    if (!isUsableConversationId(conversationId)) {
+      throw new InvalidConversationIdError(conversationId, 'MemoryManager.buildConversationFilter');
+    }
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mongoose = require('mongoose');
     const { ObjectId } = mongoose.Types;
@@ -151,6 +161,7 @@ export class MemoryManager {
     conversationId: string,
     options: { includeErrorTurns?: boolean; includeEmptyAssistant?: boolean } = {},
   ): Promise<ConversationMessage[]> {
+    assertUsableConversationId(conversationId, 'MemoryManager.getContextForConversation');
     const all = await this.getMessages(conversationId);
     // Error / fallback turns are left out BEFORE budgeting so they neither
     // reach the model nor spend its token budget. So are assistant messages
@@ -189,6 +200,7 @@ export class MemoryManager {
    * This returns the TRAILING summary (old trimmed messages).
    */
   async getContextSummary(conversationId: string): Promise<string | null> {
+    assertUsableConversationId(conversationId, 'MemoryManager.getContextSummary');
     return await this.getTrailingSummary(conversationId);
   }
 
@@ -197,6 +209,7 @@ export class MemoryManager {
    * Stores in both MongoDB (persistence) and Redis (hot cache of last 100 messages)
    */
   async addMessage(conversationId: string, message: ConversationMessage): Promise<void> {
+    assertUsableConversationId(conversationId, 'MemoryManager.addMessage');
     const key = `conversations:${conversationId}:messages`;
     const idIndexKey = `${key}:ids`;
 
@@ -313,6 +326,7 @@ export class MemoryManager {
    * (e.g. a freshly created conv).
    */
   async getMessages(conversationId: string): Promise<ConversationMessage[]> {
+    assertUsableConversationId(conversationId, 'MemoryManager.getMessages');
     const key = `conversations:${conversationId}:messages`;
 
     try {
@@ -382,6 +396,7 @@ export class MemoryManager {
    * `user_conversations` document.
    */
   async getAllMessagesFromDB(conversationId: string): Promise<ConversationMessage[]> {
+    assertUsableConversationId(conversationId, 'MemoryManager.getAllMessagesFromDB');
     const db = this.getMongoDb();
     if (!db) return [];
     const filter = this.buildConversationFilter(conversationId);
@@ -403,6 +418,7 @@ export class MemoryManager {
    * Get trailing summary (old trimmed messages)
    */
   async getTrailingSummary(conversationId: string): Promise<string | null> {
+    assertUsableConversationId(conversationId, 'MemoryManager.getTrailingSummary');
     const key = `conversations:${conversationId}:summary:trailing`;
     return await this.redis.get(key);
   }
@@ -411,6 +427,7 @@ export class MemoryManager {
    * Store trailing summary (old trimmed messages)
    */
   async setTrailingSummary(conversationId: string, summary: string): Promise<void> {
+    assertUsableConversationId(conversationId, 'MemoryManager.setTrailingSummary');
     const summaryKey = `conversations:${conversationId}:summary:trailing`;
     const metaKey = `conversations:${conversationId}:metadata`;
     
@@ -424,6 +441,7 @@ export class MemoryManager {
    * Get executive summary (full conversation overview)
    */
   async getExecutiveSummary(conversationId: string): Promise<string | null> {
+    assertUsableConversationId(conversationId, 'MemoryManager.getExecutiveSummary');
     const key = `conversations:${conversationId}:summary:executive`;
     return await this.redis.get(key);
   }
@@ -432,6 +450,7 @@ export class MemoryManager {
    * Store executive summary (full conversation overview)
    */
   async setExecutiveSummary(conversationId: string, summary: string): Promise<void> {
+    assertUsableConversationId(conversationId, 'MemoryManager.setExecutiveSummary');
     const summaryKey = `conversations:${conversationId}:summary:executive`;
     await this.redis.set(summaryKey, summary);
     console.log(`[Memory] Updated executive summary for ${conversationId}`);
@@ -441,6 +460,7 @@ export class MemoryManager {
    * Get conversation metadata
    */
   async getMetadata(conversationId: string): Promise<ConversationMetadata | null> {
+    assertUsableConversationId(conversationId, 'MemoryManager.getMetadata');
     const key = `conversations:${conversationId}:metadata`;
     const data = await this.redis.hgetall(key);
     
@@ -466,6 +486,7 @@ export class MemoryManager {
    *   `user_conversations` document. No separate conversations collection.
    */
   private async updateMetadata(conversationId: string): Promise<void> {
+    assertUsableConversationId(conversationId, 'MemoryManager.updateMetadata');
     const key = `conversations:${conversationId}:metadata`;
     const messageCount = await this.redis.llen(`conversations:${conversationId}:messages`);
 
@@ -504,6 +525,7 @@ export class MemoryManager {
    * Returns true when total tokens exceed MAX_CONTEXT_TOKENS + SUMMARY_CUSHION_TOKENS.
    */
   async needsSummarization(conversationId: string): Promise<boolean> {
+    assertUsableConversationId(conversationId, 'MemoryManager.needsSummarization');
     const messages = await this.getMessages(conversationId);
     const totalTokens = await this.countMessagesTokens(messages);
     
@@ -516,6 +538,7 @@ export class MemoryManager {
    * This includes any existing summary in the summarization.
    */
   async trimAndSummarize(conversationId: string): Promise<void> {
+    assertUsableConversationId(conversationId, 'MemoryManager.trimAndSummarize');
     const messages = await this.getMessages(conversationId);
     const existingSummary = await this.getTrailingSummary(conversationId);
     
@@ -592,6 +615,7 @@ export class MemoryManager {
    * Get content that needs to be summarized (after trimAndSummarize was called)
    */
   async getContentToSummarize(conversationId: string): Promise<string | null> {
+    assertUsableConversationId(conversationId, 'MemoryManager.getContentToSummarize');
     const metaKey = `conversations:${conversationId}:metadata`;
     return await this.redis.hget(metaKey, 'contentToSummarize');
   }
@@ -600,6 +624,7 @@ export class MemoryManager {
    * Check if trailing summary generation is pending
    */
   async needsSummaryGeneration(conversationId: string): Promise<boolean> {
+    assertUsableConversationId(conversationId, 'MemoryManager.needsSummaryGeneration');
     const metaKey = `conversations:${conversationId}:metadata`;
     const value = await this.redis.hget(metaKey, 'needsTrailingSummaryGeneration');
     return value === 'true';
@@ -615,6 +640,7 @@ export class MemoryManager {
     conversationId: string,
     llmInvoker: (prompt: string) => Promise<string>
   ): Promise<boolean> {
+    assertUsableConversationId(conversationId, 'MemoryManager.summarizeIfNeeded');
     try {
       const needsSummary = await this.needsSummarization(conversationId);
       
@@ -670,6 +696,7 @@ export class MemoryManager {
     conversationId: string,
     llmInvoker: (prompt: string) => Promise<string>
   ): Promise<void> {
+    assertUsableConversationId(conversationId, 'MemoryManager.generateExecutiveSummary');
     try {
       const messages = await this.getMessages(conversationId);
       
@@ -714,6 +741,7 @@ ${contentToSummarize}`;
    * Get current token count for a conversation (useful for monitoring)
    */
   async getTokenCount(conversationId: string): Promise<number> {
+    assertUsableConversationId(conversationId, 'MemoryManager.getTokenCount');
     const messages = await this.getMessages(conversationId);
     return await this.countMessagesTokens(messages);
   }
@@ -722,6 +750,7 @@ ${contentToSummarize}`;
    * Get token count for messages that would be returned by getContextForConversation
    */
   async getContextTokenCount(conversationId: string): Promise<number> {
+    assertUsableConversationId(conversationId, 'MemoryManager.getContextTokenCount');
     const contextMessages = await this.getContextForConversation(conversationId);
     return await this.countMessagesTokens(contextMessages);
   }
@@ -730,6 +759,7 @@ ${contentToSummarize}`;
    * Delete a conversation (for cleanup/testing)
    */
   async deleteConversation(conversationId: string): Promise<void> {
+    assertUsableConversationId(conversationId, 'MemoryManager.deleteConversation');
     await this.redis.del(`conversations:${conversationId}:messages`);
     await this.redis.del(`conversations:${conversationId}:messages:ids`);
     await this.redis.del(`conversations:${conversationId}:summary:trailing`);
