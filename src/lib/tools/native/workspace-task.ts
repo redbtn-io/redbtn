@@ -11,10 +11,13 @@
  * Capabilities (permissions/workspace-grants.ts):
  *   - gated `workspace:execute` on the workspace (DATA_TOOL_RULES), plus
  *     `workspace:write` when `ship: true` (checked here, against the parent's
- *     effective profile);
+ *     effective profile) — and, when `base` is not the workspace's own base
+ *     branch, `workspace:write` on `<o>/<r>@<base>` (decideShipBase);
  *   - the child runs under an ENGINE-DERIVED profile, never broader than the
  *     parent: `workspace:execute@<id>` (+ `workspace:write@<id>` only when
- *     shipping), no `workspace:control`, no state / knowledge / exec grants —
+ *     shipping, + `workspace:write@<o>/<r>@<base>` only when shipping into a
+ *     non-default base the parent may target), no `workspace:control`, no
+ *     state / knowledge / exec grants —
  *     its commands run on the checkout through the derived
  *     `exec:execute@<checkout env>` its own producer adds. The override is a
  *     `run()` option that only in-process engine callers can set.
@@ -29,7 +32,9 @@ import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '.
 import { WorkspaceRepository } from '../../workspaces/WorkspaceRepository';
 import { toolOk, toolError, resolveWorkspaceDb, resolveRunUserId, BRANCH_RE } from './workspace-common';
 import { getCapabilityProfile, getGraphRegistry, getNeuronRegistry, getMemory, getMcpClient } from '../../run/contextLookup';
-import { decideWorkspace, workspaceAliases } from '../../permissions/workspace-grants';
+import { decideWorkspace, decideShipBase, workspaceAliases } from '../../permissions/workspace-grants';
+import { persistDenial } from '../../permissions/persist-denial';
+import { CapabilityDeniedError } from '../../permissions/types';
 import { WORKSPACE_TASK_GRAPH_ID, WORKSPACE_TASK_DEFAULT_NEURON, deriveWorkspaceTaskProfile } from '../../workspaces/workspace-task-contract';
 import { MODEL_DRIVEN_STATE_KEY, isModelDrivenState } from '../caller-trust';
 
@@ -118,9 +123,28 @@ const tool: NativeToolDefinition = {
       return toolError('workspace_task needs a capability profile granting workspace:execute on the workspace', 'FORBIDDEN');
     }
     const aliases = workspaceAliases({ workspaceId, repo: ws.config?.gitRepoUrl, branch: ws.config?.gitBranch });
+    const configuredBase: string = (typeof ws.config?.gitBranch === 'string' && ws.config.gitBranch.trim()) || 'main';
+    const requestedBase = base || configuredBase;
     if (ship) {
       const decision = decideWorkspace(profile, 'write', aliases);
       if (!decision.allowed) return toolError(decision.reason ?? 'workspace:write is required for ship:true', 'FORBIDDEN');
+      // A PR into any branch other than the workspace's base needs a write
+      // grant naming that base (`<o>/<r>@<base>`), not just the workspace.
+      const baseDecision = decideShipBase(profile, { repo: ws.config?.gitRepoUrl, configuredBase }, requestedBase);
+      if (!baseDecision.allowed) {
+        persistDenial(
+          context,
+          'workspace_task',
+          new CapabilityDeniedError({
+            resource: 'workspace',
+            action: 'write',
+            address: baseDecision.address ?? requestedBase,
+            profileName: profile.name ?? 'unnamed-profile',
+            message: baseDecision.reason ?? 'Permission denied.',
+          }),
+        );
+        return toolError(baseDecision.reason ?? `opening a pull request into '${requestedBase}' is not allowed`, 'FORBIDDEN');
+      }
     }
 
     const parentDepth = Number(state?.data?.input?._invokeGraphDepth ?? state?._invokeGraphDepth ?? 0) || 0;
@@ -145,7 +169,7 @@ const tool: NativeToolDefinition = {
       workspaceId,
       brief,
       ship,
-      base: base || ws.config?.gitBranch || 'main',
+      base: requestedBase,
       neuronId,
       checkoutKey,
       repo: ws.config?.gitRepoUrl,
@@ -170,7 +194,11 @@ const tool: NativeToolDefinition = {
         runId: childRunId,
         stream: false,
         source: { application: 'workspace_task' },
-        capabilityProfileOverride: deriveWorkspaceTaskProfile(workspaceId, ship),
+        capabilityProfileOverride: deriveWorkspaceTaskProfile(
+          workspaceId,
+          ship,
+          ship && requestedBase !== configuredBase ? { repo: ws.config?.gitRepoUrl, base: requestedBase } : null,
+        ),
       });
       Promise.resolve(submitted).then(
         (result: any) => {
