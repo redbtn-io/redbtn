@@ -241,6 +241,7 @@ export interface GraphConfig {
         | 'computer'
         | 'environment'
         | 'graph'
+        | 'node'
         | 'tool'
         | 'automation'
         | 'run'

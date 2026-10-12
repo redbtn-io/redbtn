@@ -176,6 +176,7 @@ export function normalizeProfile(raw: unknown): CapabilityProfile | null {
     'computer',
     'environment',
     'graph',
+    'node',
     'tool',
     'automation',
     'run',
