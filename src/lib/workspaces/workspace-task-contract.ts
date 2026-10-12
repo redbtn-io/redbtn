@@ -5,6 +5,7 @@
  * drops named exports in the compiled CommonJS build.
  */
 import type { CapabilityProfile } from '../permissions/types';
+import { repoBaseAliases } from '../permissions/workspace-grants';
 
 type AnyObject = Record<string, any>;
 
@@ -19,19 +20,29 @@ export const WORKSPACE_TASK_DEFAULT_NEURON = 'sonnet-5';
  * was checked against, never broader. `read` lets the worker look at its own
  * workspace; `execute` lets its producer check the workspace out (which
  * derives exec on that checkout's environment only); `write` (ship only) lets
- * it push its branch and open a PR. No `control` (merge), no state, knowledge
- * or exec grants of its own.
+ * it push its branch and open a PR into the workspace's base branch. When the
+ * parent was allowed to ship into ANOTHER base (it holds write on
+ * `<o>/<r>@<base>`, see decideShipBase), `shipBase` adds exactly that grant —
+ * and no other branch. No `control` (merge), no state, knowledge or exec
+ * grants of its own.
  */
-export function deriveWorkspaceTaskProfile(workspaceId: string, ship: boolean): CapabilityProfile {
+export function deriveWorkspaceTaskProfile(
+  workspaceId: string,
+  ship: boolean,
+  shipBase?: { repo: unknown; base: string } | null,
+): CapabilityProfile {
+  const capabilities: CapabilityProfile['capabilities'] = [
+    { resource: 'workspace', actions: ship ? ['read', 'execute', 'write'] : ['read', 'execute'], selector: workspaceId },
+  ];
+  const baseSelector = ship && shipBase ? repoBaseAliases(shipBase.repo, shipBase.base)[1] : undefined;
+  if (baseSelector) capabilities.push({ resource: 'workspace', actions: ['write'], selector: baseSelector });
   return {
     name: `workspace-task:${workspaceId}`,
     description:
       'Derived by workspace_task: this worker may check out and work in exactly one workspace' +
-      (ship ? ', and push its branch / open a pull request from it' : '') +
+      (ship ? `, and push its branch / open a pull request into ${baseSelector ? `'${shipBase!.base}'` : 'its base branch'}` : '') +
       '. No merge, no state or knowledge access, no exec outside its own checkout.',
-    capabilities: [
-      { resource: 'workspace', actions: ship ? ['read', 'execute', 'write'] : ['read', 'execute'], selector: workspaceId },
-    ],
+    capabilities,
   };
 }
 

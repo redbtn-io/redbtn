@@ -1,4 +1,4 @@
-# Workspace capabilities (engine 0.0.296-alpha)
+# Workspace capabilities (engine 0.0.296-alpha; PR-base rule 0.0.297-alpha)
 
 Managed agent workspaces (`ws_…`, one GitHub repository at one base branch, e.g.
 `ws_0DA2G6LbYX3t` = `github.com/XiroEx/become@beta`) are a capability resource of their
@@ -20,7 +20,7 @@ grant every one you need:
 |---|---|
 | `read` | `workspace_get`, `get_workspace_task` |
 | `execute` | `workspace_for_repo`, `workspace_task`, and **checking the workspace out** (the neuron-step producer, `state.data.workspaceId`) — which DERIVES exec on that checkout, §4 |
-| `write` | `workspace_ship` (push the checkout's branch, open a PR) |
+| `write` | `workspace_ship` (push the checkout's branch, open a PR into the workspace's base; another base needs `write` on `<o>/<r>@<thatBase>`, §3b) |
 | `control` | `workspace_merge` (merge a PR into its base branch) |
 
 ## 2. Selectors
@@ -54,6 +54,17 @@ Selector syntax is the usual one: exact, `p*` (prefix), `p/*` (prefix jail), `*`
 | `workspace_merge {prUrl}` | `github.com/<o>/<r>` + `<o>/<r>` of the PR; if THIS run shipped the PR, also `<o>/<r>@<PR base>`, and — only when the PR targets the workspace's own base — the workspace's identities. So `workspace:control@ws_x` merges what the run shipped into ws_x's base; any other PR needs a repo-level selector |
 | `get_workspace_task {runId}` | the task run's workspace |
 
+## 3b. Pull requests into another base branch (0.0.297)
+
+A write grant on the workspace (its ws_ id, or the bare repo) lets a run open pull
+requests into the workspace's own base branch (`config.gitBranch`, default `main`) only.
+A PR into ANY other branch, via `workspace_ship {base}` or `workspace_task {ship:true, base}`,
+also needs a write grant naming that base: `<o>/<r>@<base>` or `github.com/<o>/<r>@<base>`
+(or a wildcard / prefix selector covering it). Otherwise the call fails `FORBIDDEN` before
+anything is pushed or started, and the denial is audited. `workspace:write@*` and the
+legacy `exec:execute@*` are unchanged. A `workspace_task` child shipping into a non-default
+base gets exactly `workspace:write@<o>/<r>@<base>` added to its derived profile.
+
 ## 4. Derived grants
 
 When a run whose effective profile allows `workspace:execute` on a workspace checks it out
@@ -76,7 +87,8 @@ system graph `workspace-task` (`ops/workspace-task/`, seeded with `seed.mjs`) an
   (`connectionIdentityUserId` / `secretsIdentity`), so the workspace, its GitHub
   installation and the checkout are the caller's.
 - Profile: ENGINE-DERIVED, never broader than the parent —
-  `workspace:read+execute@<workspaceId>` (+ `write` when `ship`), constrained by the worker
+  `workspace:read+execute@<workspaceId>` (+ `write` when `ship`, + `write@<o>/<r>@<base>` when
+  shipping into a non-default base the parent may target, §3b), constrained by the worker
   graph's declared ceiling (`workspace:read/execute/write@*`). No `control`, no
   state/knowledge/exec grants; exec comes only from §4 on its own checkout. The override is
   a `run()` option only in-process engine code can set (`RunOptions.capabilityProfileOverride`).

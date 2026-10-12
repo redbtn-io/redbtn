@@ -23,7 +23,10 @@ import {
   BRANCH_RE,
 } from './workspace-common';
 
-import { recordShippedPullRequest, workspaceAliases, repoSlug } from '../../permissions/workspace-grants';
+import { recordShippedPullRequest, workspaceAliases, repoSlug, decideShipBase } from '../../permissions/workspace-grants';
+import { getCapabilityProfile } from '../../run/contextLookup';
+import { persistDenial } from '../../permissions/persist-denial';
+import { CapabilityDeniedError } from '../../permissions/types';
 
 type AnyObject = Record<string, any>;
 const PUSH_TIMEOUT_MS = 5 * 60 * 1000;
@@ -39,7 +42,7 @@ const tool: NativeToolDefinition = {
       branch: { type: 'string', description: 'Remote branch name to push HEAD to (e.g. red/fix-login-redirect)' },
       title: { type: 'string', description: 'Pull request title' },
       body: { type: 'string', description: 'Pull request description (markdown)' },
-      base: { type: 'string', description: 'Base branch (defaults to the workspace base branch)' },
+      base: { type: 'string', description: 'Base branch (defaults to the workspace base branch; another branch needs a write grant naming it)' },
       environmentId: { type: 'string', description: 'Pinned by the platform; do not set' },
     },
     required: ['branch', 'title'],
@@ -61,6 +64,34 @@ const tool: NativeToolDefinition = {
       if (!workspace) return toolError(`workspace ${ws.workspaceId} not found`, 'NOT_FOUND');
       const gitRepoUrl = workspace.config?.gitRepoUrl;
       if (!gitRepoUrl) return toolError('this workspace has no repository configured', 'NO_REPO');
+      // The PR's base. Into the workspace's own base branch, the dispatch
+      // gate's workspace:write on the workspace is enough; into any OTHER
+      // branch (e.g. `main` from a `beta` workspace) the profile must grant
+      // workspace:write on `<o>/<r>@<base>` itself (decideShipBase). Checked
+      // before anything is pushed.
+      const configuredBase: string = (typeof workspace.config?.gitBranch === 'string' && workspace.config.gitBranch.trim()) || 'main';
+      const base = (typeof args?.base === 'string' && args.base.trim()) || configuredBase;
+      if (base !== configuredBase) {
+        if (!BRANCH_RE.test(base)) return toolError('base is not a valid git branch name');
+        const profile = getCapabilityProfile(context?.state);
+        if (profile) {
+          const decision = decideShipBase(profile, { repo: gitRepoUrl, configuredBase }, base);
+          if (!decision.allowed) {
+            persistDenial(
+              context,
+              'workspace_ship',
+              new CapabilityDeniedError({
+                resource: 'workspace',
+                action: 'write',
+                address: decision.address ?? base,
+                profileName: profile.name ?? 'unnamed-profile',
+                message: decision.reason ?? 'Permission denied.',
+              }),
+            );
+            return toolError(decision.reason ?? `opening a pull request into '${base}' is not allowed`, 'FORBIDDEN');
+          }
+        }
+      }
       // The push needs a token for THIS owner's App installation. On a
       // delegated run the workspace was created under the CALLER
       // (`workspace_for_repo` → `resolveRunUserId`), so `workspace.userId` is
@@ -68,7 +99,6 @@ const tool: NativeToolDefinition = {
       // second identity decision to get wrong here.
       const { githubInstallationId, error } = await resolveJobInstallation(workspace.userId, gitRepoUrl);
       if (error) return error;
-      const base = (typeof args?.base === 'string' && args.base.trim()) || workspace.config?.gitBranch || 'main';
       const result = await resolveLifecycleQueue(context).runJob(
         workspaceNodeQueue(String(ws.nodeId)),
         'push',
@@ -111,7 +141,7 @@ const tool: NativeToolDefinition = {
           }),
           repo: repoSlug(gitRepoUrl),
           base,
-          workspaceBranch: workspace.config?.gitBranch ?? null,
+          workspaceBranch: configuredBase,
         });
       }
       return toolOk(result ?? { ok: false });

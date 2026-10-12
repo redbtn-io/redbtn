@@ -123,7 +123,7 @@ describe('workspace_task', () => {
     expect(input).toMatchObject({ workspaceId: 'ws_1', brief: 'Fix the login redirect', ship: false, base: 'beta', checkoutKey: b.checkoutKey, parentRunId: RUN });
   });
 
-  it('ship:true needs workspace:write — and then the child may ship (never control)', async () => {
+  it('ship:true needs workspace:write — and then the child may ship into the workspace base (never control)', async () => {
     runControlRegistry.register(RUN, 'w', { capabilityProfile: work });
     const denied = await workspaceTask.handler({ workspaceId: 'ws_1', brief: 'x', ship: true }, ctx());
     expect(denied.isError).toBe(true);
@@ -132,12 +132,54 @@ describe('workspace_task', () => {
 
     runControlRegistry.unregister(RUN);
     runControlRegistry.register(RUN, 'w', { capabilityProfile: ship });
-    const ok = await workspaceTask.handler({ workspaceId: 'ws_1', brief: 'x', ship: true, base: 'main' }, ctx());
+    const ok = await workspaceTask.handler({ workspaceId: 'ws_1', brief: 'x', ship: true }, ctx());
     expect(ok.isError).toBeFalsy();
     const prof = h.runCalls[0].options.capabilityProfileOverride as CapabilityProfile;
     expect(prof.capabilities).toEqual([{ resource: 'workspace', actions: ['read', 'execute', 'write'], selector: 'ws_1' }]);
     expect(JSON.stringify(prof.capabilities)).not.toMatch(/"control"|"state"|"knowledge"|"exec"/);
+    expect(h.runCalls[0].input.base).toBe('beta');
+  });
+
+  it('ship:true into ANOTHER base needs write on <o>/<r>@<base> — the ws_ id grant is not enough', async () => {
+    runControlRegistry.register(RUN, 'w', { capabilityProfile: ship });
+    const denied = await workspaceTask.handler({ workspaceId: 'ws_1', brief: 'x', ship: true, base: 'main' }, ctx());
+    expect(denied.isError).toBe(true);
+    expect(body(denied).code).toBe('FORBIDDEN');
+    expect(body(denied).error).toMatch(/workspace:write on 'acme\/app@main'/);
+    expect(h.runCalls).toHaveLength(0);
+    // naming the workspace base explicitly is fine
+    expect((await workspaceTask.handler({ workspaceId: 'ws_1', brief: 'x', ship: true, base: 'beta' }, ctx())).isError).toBeFalsy();
+    // ship:false never opens a PR, so its base is not gated
+    expect((await workspaceTask.handler({ workspaceId: 'ws_1', brief: 'x', base: 'main' }, ctx())).isError).toBeFalsy();
+    expect(h.runCalls).toHaveLength(2);
+
+    runControlRegistry.unregister(RUN);
+    const shipMain: CapabilityProfile = {
+      name: 'op',
+      capabilities: [...ship.capabilities, { resource: 'workspace', actions: ['write'], selector: 'github.com/Acme/app@main' }],
+    };
+    runControlRegistry.register(RUN, 'w', { capabilityProfile: shipMain });
+    h.runCalls = [];
+    const ok = await workspaceTask.handler({ workspaceId: 'ws_1', brief: 'x', ship: true, base: 'main' }, ctx());
+    expect(ok.isError).toBeFalsy();
+    // the child may open a PR into exactly that base, and no other
+    expect((h.runCalls[0].options.capabilityProfileOverride as CapabilityProfile).capabilities).toEqual([
+      { resource: 'workspace', actions: ['read', 'execute', 'write'], selector: 'ws_1' },
+      { resource: 'workspace', actions: ['write'], selector: 'acme/app@main' },
+    ]);
     expect(h.runCalls[0].input.base).toBe('main');
+  });
+
+  it('legacy exec:execute@* and workspace:write@* may ship into any base', async () => {
+    for (const prof of [
+      { name: 'legacy', capabilities: [{ resource: 'exec', actions: ['execute'], selector: '*' }] },
+      { name: 'wild', capabilities: [{ resource: 'workspace', actions: ['read', 'execute', 'write'], selector: '*' }] },
+    ] as CapabilityProfile[]) {
+      runControlRegistry.register(RUN, 'w', { capabilityProfile: prof });
+      const r = await workspaceTask.handler({ workspaceId: 'ws_1', brief: 'x', ship: true, base: 'main' }, ctx());
+      expect(r.isError, prof.name).toBeFalsy();
+      runControlRegistry.unregister(RUN);
+    }
   });
 
   it('keeps the parent run-as-caller delegation', async () => {
