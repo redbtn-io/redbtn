@@ -52,7 +52,7 @@ export type CapabilityResource =
   | 'state'
   | 'knowledge'
   | 'exec'         // run commands / file I/O via an env session (run_command, ssh_shell, read_file, ssh_copy, desktop_exec)
-  | 'workspace'    // managed agent workspaces (FAIL-CLOSED): workspace_for_repo (read), checkout + workspace_ship (execute), workspace_merge (write) — keyed by ws_ id / owner/repo[@branch]; see workspace-grants.ts
+  | 'workspace'    // managed agent workspaces (FAIL-CLOSED): workspace_get / get_workspace_task (read); workspace_for_repo / workspace_task / checkout (execute); workspace_ship (write); workspace_merge (control) — keyed by ws_ id / owner/repo[@branch]; see workspace-grants.ts
   | 'computer'     // screen/mouse/keyboard (desktop_* computer-use tools)
   | 'environment'  // reserved: managing env configs (not gated yet)
   | 'graph'        // graph tools: invoke_graph (execute); graph_patch / update_graph / publish_graph (write); delete_graph (delete) — keyed by graphId
