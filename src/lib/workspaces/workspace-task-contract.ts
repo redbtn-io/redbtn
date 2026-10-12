@@ -6,6 +6,7 @@
  */
 import type { CapabilityProfile } from '../permissions/types';
 import { repoBaseAliases } from '../permissions/workspace-grants';
+import { getRunPublisher } from '../run/contextLookup';
 
 type AnyObject = Record<string, any>;
 
@@ -47,11 +48,17 @@ export function deriveWorkspaceTaskProfile(
 }
 
 /**
- * A workspace_task run's Redis state, read through the parent run publisher's
- * client (the same connection the engine uses), or null.
+ * A workspace_task run's Redis state, read through the calling run's publisher
+ * (the same connection the engine uses), or null. A context without one (the
+ * neuron tool-use loop and the CLI run bridge pass `publisher: null`) falls
+ * back to the run's own publisher from the run-control registry.
  */
-export async function readWorkspaceTaskState(context: { publisher?: unknown } | undefined, runId: string): Promise<AnyObject | null> {
-  const redis = (context?.publisher as any)?.redis;
+export async function readWorkspaceTaskState(
+  context: { publisher?: unknown; state?: unknown } | undefined,
+  runId: string,
+): Promise<AnyObject | null> {
+  const publisher = (context?.publisher ?? getRunPublisher(context?.state)) as any;
+  const redis = publisher?.redis;
   if (!runId || !redis || typeof redis.get !== 'function') return null;
   try {
     const raw = await redis.get(`run:${runId}`);

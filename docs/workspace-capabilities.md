@@ -97,6 +97,11 @@ system graph `workspace-task` (`ops/workspace-task/`, seeded with `seed.mjs`) an
   branch-mode checkout keyed `task-…`.
 - **Not durable:** the child runs in-process (like `invoke_graph` wait:false). A worker
   redeploy kills it like any in-flight run and nothing requeues it.
+- **Callable from a model (0.0.298):** the neuron tool-use loop and the CLI run bridge
+  call native tools with `publisher: null`; `workspace_task`, `get_workspace_task` and
+  `invoke_graph` then use the RUN's own publisher (run-control registry) for the child
+  run's infrastructure. Before 0.0.298 they failed there with `UNAVAILABLE` /
+  `parent_state_incomplete` and only worked from graph tool steps.
 
 `get_workspace_task {runId}` → `queued | working | shipped | completed | failed |
 interrupted | unknown`, `prUrl`, `summary` (tail of the worker's report), timestamps.
