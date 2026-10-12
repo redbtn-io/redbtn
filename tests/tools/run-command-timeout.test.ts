@@ -178,7 +178,9 @@ describe('run_command — timeout default', () => {
     );
     const opts = execOpts(exec);
     expect(opts.cwd).toBe('/srv/app');
-    expect(opts.env).toEqual({ FOO: 'bar' });
+    // Tool-child isolation: the engine always injects REDBTN_NO_SESSION so a
+    // nested `redbtn` can never resolve the parent session pointer.
+    expect(opts.env).toEqual({ FOO: 'bar', REDBTN_NO_SESSION: '1' });
     expect(opts.abortSignal).toBeDefined();
     expect(opts.abortSignal.aborted).toBe(false);
     expect(opts.timeout).toBe(DEFAULT_TIMEOUT_MS);
