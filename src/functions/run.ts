@@ -16,6 +16,7 @@ import type { Red } from '../index';
 import { createRunMcpClient, resolveRunMcpScope } from '../lib/mcp/run-scope';
 import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunState, RunKeys, RunConfig, type SecretsIdentity } from '../lib/run';
 import { runControlRegistry, type CancelResult, type CancelAck } from '../lib/run/RunControlRegistry';
+import { TOOL_CANCEL_GRACE_MS_DEFAULT } from '../lib/run/tool-cancel';
 import { getOrCreateMeteringClient } from '../lib/run/meteringClient';
 import { resolveCapabilityProfile } from '../lib/permissions/resolve';
 import { normalizeProfile } from '../lib/permissions/enforce';
@@ -1613,6 +1614,32 @@ async function subscribeForInterrupt(
           mode: 'steer',
           neuronCallsCancelled: 0,
         } as CancelAck;
+        // A steered run's in-flight tool must not hold the session forever:
+        // graceful stop lets text stop immediately and short tools finish,
+        // but a long tool (e.g. `sleep 40` via the CLI connector) would
+        // otherwise serialize every later turn behind it (DesktopAgentSession
+        // op-chain) until it exits on its own. Escalate to a full cancel
+        // after the tool-cancel grace window so the tool's process group is
+        // killed (exec_cancel → connector SIGKILL) and the op chain frees.
+        // Skipped automatically when the run already settled (unregistered).
+        if (stopped) {
+          const graceMs = TOOL_CANCEL_GRACE_MS_DEFAULT;
+          const escalateReason = reason ? `${reason} (steer grace expired)` : 'steer grace expired';
+          const timer = setTimeout(() => {
+            try {
+              if (!runControlRegistry.isGracefulStopRequested(runId)) return;
+              console.log(`[run] Steer grace expired for ${runId} — escalating to cancel`);
+              runControlRegistry.cancel(runId, escalateReason);
+              try { controller.abort({ reason: escalateReason } as any); } catch {
+                try { controller.abort(); } catch { /* ignore */ }
+              }
+            } catch (err) {
+              console.warn(`[run] steer escalation cancel(${runId}) threw:`, err);
+            }
+          }, graceMs);
+          // Never hold the worker open for the escalation timer alone.
+          try { (timer as unknown as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
+        }
       } else {
         cancelResult = runControlRegistry.cancel(runId, reason);
       }

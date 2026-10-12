@@ -62,7 +62,7 @@ import type {
   NativeMcpResult,
 } from '../native-registry';
 import { isSystemResource } from '../../system-resource';
-import { getGraphRegistry, getNeuronRegistry, getMemory, getMcpClient } from '../../run/contextLookup';
+import { getGraphRegistry, getNeuronRegistry, getMemory, getMcpClient, getRunPublisher } from '../../run/contextLookup';
 import { MODEL_DRIVEN_STATE_KEY, isModelDrivenState } from '../caller-trust';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -225,10 +225,16 @@ const invokeGraphTool: NativeToolDefinition = {
     // is available to the access check below AND reused when building the
     // Red-shaped duck object in step 5 (avoids a use-before-declaration).
     const publisher = context?.publisher as AnyObject | null;
+    // The neuron tool-use loop and the CLI run bridge call native tools with
+    // `publisher: null` (on purpose: they own the tool events), so the child
+    // run's infrastructure and the trusted identity come from the RUN's own
+    // publisher (run-control registry) when the context carries none.
+    // Progress events below still go only to a publisher the caller handed in.
+    const runPublisher = (publisher ?? getRunPublisher(context?.state) ?? null) as AnyObject | null;
     // We intentionally use the run-level publisher identity (non-mutable across
     // graph state updates) and fall back to `state.options.userId` only as a
     // compatibility path for non-run callers.
-    const publisherUserId = publisher?.user;
+    const publisherUserId = runPublisher?.user;
     const callerUserId =
       (typeof publisherUserId === 'string' && publisherUserId.length > 0
         ? publisherUserId
@@ -331,8 +337,8 @@ const invokeGraphTool: NativeToolDefinition = {
     }
 
     // ── 5. Build a Red-shaped duck object from the parent's state ────────────
-    // `publisher` was resolved once in step 2 — reuse it here.
-    const redShape = buildRedShape(context?.state || {}, publisher);
+    // The run publisher was resolved once in step 2 — reuse it here.
+    const redShape = buildRedShape(context?.state || {}, runPublisher);
     if (!redShape) {
       return {
         content: [

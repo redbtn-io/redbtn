@@ -31,7 +31,7 @@
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { WorkspaceRepository } from '../../workspaces/WorkspaceRepository';
 import { toolOk, toolError, resolveWorkspaceDb, resolveRunUserId, BRANCH_RE } from './workspace-common';
-import { getCapabilityProfile, getGraphRegistry, getNeuronRegistry, getMemory, getMcpClient } from '../../run/contextLookup';
+import { getCapabilityProfile, getGraphRegistry, getNeuronRegistry, getMemory, getMcpClient, getRunPublisher } from '../../run/contextLookup';
 import { decideWorkspace, decideShipBase, workspaceAliases } from '../../permissions/workspace-grants';
 import { persistDenial } from '../../permissions/persist-denial';
 import { CapabilityDeniedError } from '../../permissions/types';
@@ -150,7 +150,11 @@ const tool: NativeToolDefinition = {
     const parentDepth = Number(state?.data?.input?._invokeGraphDepth ?? state?._invokeGraphDepth ?? 0) || 0;
     if (parentDepth + 1 > MAX_INVOKE_DEPTH) return toolError('recursion limit exceeded', 'RECURSION');
 
-    const publisher = context?.publisher as AnyObject | null;
+    // The neuron tool-use loop and the CLI run bridge call native tools with
+    // `publisher: null` (on purpose: they own the tool events). The child run
+    // still needs the RUN's infrastructure (Redis, redlog), so fall back to
+    // the run's own publisher from the run-control registry.
+    const publisher = (context?.publisher ?? getRunPublisher(state) ?? null) as AnyObject | null;
     const redShape = buildRedShape(state, publisher);
     if (!redShape) return toolError('cannot start a child run from this context (missing run infrastructure)', 'UNAVAILABLE');
 
