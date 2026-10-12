@@ -172,7 +172,10 @@ export class DesktopAgentSession extends EventEmitter implements IEnvironmentSes
         {
           command,
           ...(opts.cwd ? { cwd: opts.cwd } : {}),
-          ...(opts.env ? { env: opts.env } : {}),
+          // Isolate nested CLI invocations from the parent terminal session
+          // (REDBTN_NO_SESSION=1 → CLI runs sessionless, no phantom turns).
+          // The connector allowlists this non-secret flag through its scrub.
+          env: { ...(opts.env ?? {}), REDBTN_NO_SESSION: '1' },
           ...(commandTimeoutMs !== undefined ? { timeoutMs: commandTimeoutMs } : {}),
         },
         // Strictly longer than the command budget — see RELAY_GRACE_MS.
