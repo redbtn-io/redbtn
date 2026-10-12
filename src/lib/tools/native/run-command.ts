@@ -271,9 +271,14 @@ const runCommandTool: NativeToolDefinition = {
 
     try {
       let streamedBytes = 0;
+      // Isolate nested CLI invocations: a `redbtn` run inside this tool
+      // must not resolve the parent session pointer (phantom turns).
+      // The CLI honors REDBTN_NO_SESSION=1 (SessionManager.existing);
+      // the connector allowlists it through its env scrub.
+      const childEnv = { ...(envVars ?? {}), REDBTN_NO_SESSION: '1' };
       const result = await session.exec(command, {
         cwd: workingDir,
-        env: envVars,
+        env: childEnv,
         timeout: timeout > 0 ? timeout : undefined,
         abortSignal: localAbortController.signal,
         onChunk: (chunk) => {
