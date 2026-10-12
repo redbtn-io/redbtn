@@ -5,8 +5,9 @@
  * The container never holds a GitHub credential. This asks the node that
  * owns the working copy (its redrun worker) to push with the platform's
  * GitHub App token and open (or find) the PR. The bridge pins
- * `environmentId` to the run's workspace environment, so the capability jail
- * scopes this exactly like run_command.
+ * `environmentId` to the run's workspace environment; the capability gate
+ * (`workspace:write`, 0.0.296) addresses the call by the workspace whose
+ * checkout runs in that environment — see permissions/workspace-address.ts.
  */
 import type { NativeToolDefinition, NativeToolContext, NativeMcpResult } from '../native-registry';
 import { WorkspaceRepository } from '../../workspaces/WorkspaceRepository';
@@ -21,6 +22,8 @@ import {
   noteShippedPullRequest,
   BRANCH_RE,
 } from './workspace-common';
+
+import { recordShippedPullRequest, workspaceAliases, repoSlug } from '../../permissions/workspace-grants';
 
 type AnyObject = Record<string, any>;
 const PUSH_TIMEOUT_MS = 5 * 60 * 1000;
@@ -65,6 +68,7 @@ const tool: NativeToolDefinition = {
       // second identity decision to get wrong here.
       const { githubInstallationId, error } = await resolveJobInstallation(workspace.userId, gitRepoUrl);
       if (error) return error;
+      const base = (typeof args?.base === 'string' && args.base.trim()) || workspace.config?.gitBranch || 'main';
       const result = await resolveLifecycleQueue(context).runJob(
         workspaceNodeQueue(String(ws.nodeId)),
         'push',
@@ -77,7 +81,7 @@ const tool: NativeToolDefinition = {
           branch,
           title,
           body: typeof args?.body === 'string' ? args.body : '',
-          base: (typeof args?.base === 'string' && args.base.trim()) || workspace.config?.gitBranch || 'main',
+          base,
           gitRepoUrl,
           ownerUserId: workspace.userId,
           githubInstallationId,
@@ -92,6 +96,24 @@ const tool: NativeToolDefinition = {
       // detail page can say what this run shipped. Never fatal: the push
       // already happened, and a bookkeeping failure must not report it as one.
       await noteShippedPullRequest(context, ws, { prUrl: result?.prUrl });
+      // Remember the PR for the capability gate: a later workspace_merge of
+      // it in this run is also addressed by this workspace when the PR targets
+      // the workspace's base branch, so `workspace:control` on the workspace
+      // covers merging what the run itself shipped into its base. See
+      // permissions/workspace-address.ts.
+      if (result?.prUrl) {
+        recordShippedPullRequest(context?.runId || context?.state?.runId || context?.state?.data?.runId, result.prUrl, {
+          workspaceId: ws.workspaceId,
+          aliases: workspaceAliases({
+            workspaceId: ws.workspaceId,
+            repo: gitRepoUrl,
+            branch: workspace.config?.gitBranch,
+          }),
+          repo: repoSlug(gitRepoUrl),
+          base,
+          workspaceBranch: workspace.config?.gitBranch ?? null,
+        });
+      }
       return toolOk(result ?? { ok: false });
     } catch (err: unknown) {
       return toolError(`workspace_ship failed: ${err instanceof Error ? err.message : String(err)}`, 'FAILED');

@@ -78,6 +78,7 @@ import { loadAndResolveEnvironment } from '../../environments/loadAndResolveEnvi
 import { resolveRunUserId } from './_run-identity';
 import { requestDesktop, requestDesktopRaw, type ComputerAction, type ComputerResultMessage } from './desktop-request';
 import { RELAY_GRACE_MS } from '../../environments/DesktopAgentSession';
+import { getCapabilityProfile } from '../../run/contextLookup';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -514,31 +515,74 @@ async function resolveInstallId(context: NativeToolContext, environmentId?: stri
   }
 }
 
+/** Does `machine` name this environment exactly (environmentId, installId or name, case-insensitively)? */
+function machineNamesEnvironment(machine: string, env: AnyObject | null | undefined): boolean {
+  const m = machine.trim().toLowerCase();
+  if (!m || !env) return false;
+  return [env.environmentId, env.installId, env.name].some(
+    (v) => typeof v === 'string' && v.trim().toLowerCase() === m,
+  );
+}
+
 /**
- * Resolve target desktop installId from either environmentId OR machine name / prefix / installId.
+ * May a machine-only call use FUZZY lookup (installId prefix, name substring)?
+ * Only when no scoped grant governs it: an ungated tool, an unprofiled run, or
+ * a profile that grants the tool's resource on '*'. Otherwise the capability
+ * gate checked the literal `machine` string, and a fuzzy match could land on a
+ * different desktop than the one the grant names (2026-10-12 hardening).
  */
-async function resolveTargetInstallId(context: NativeToolContext, args: AnyObject): Promise<string | undefined> {
-  const target = args?.environmentId || args?.machine;
-  if (!target) {
+function fuzzyMachineLookupAllowed(context: NativeToolContext, resource?: 'computer' | 'exec'): boolean {
+  if (!resource) return true;
+  const profile = getCapabilityProfile(context?.state);
+  if (!profile) return true;
+  return (profile.capabilities ?? []).some(
+    (c: AnyObject) => c?.resource === resource && typeof c?.selector === 'string' && c.selector.trim() === '*',
+  );
+}
+
+/**
+ * Resolve the target desktop's installId from `environmentId` OR `machine`.
+ *
+ * The capability gate checks `environmentId || machine` (tool-map `envId`), so
+ * this resolves THAT address and nothing else:
+ *   - `environmentId` given: resolve it, never fall back to `machine` when it
+ *     fails, and refuse when `machine` names a different desktop.
+ *   - `machine` only: an exact environmentId / installId / name match; the
+ *     fuzzy prefix / substring search is kept only where no scoped grant
+ *     governs the call (see fuzzyMachineLookupAllowed).
+ */
+async function resolveTargetInstallId(
+  context: NativeToolContext,
+  args: AnyObject,
+  resource?: 'computer' | 'exec',
+): Promise<string | undefined> {
+  const envArg = typeof args?.environmentId === 'string' ? args.environmentId.trim() : '';
+  const machineArg = typeof args?.machine === 'string' ? args.machine.trim() : '';
+  if (!envArg && !machineArg) {
     throw new Error('environmentId is required to target a desktop instance.');
   }
   const userId = resolveUserId(context);
   if (!userId) return undefined;
 
-  // 1. If explicit environmentId was provided, resolve via loadAndResolveEnvironment
-  if (args.environmentId) {
+  // 1. Explicit environmentId: the checked address. Resolve it or fail.
+  if (envArg) {
+    let env: AnyObject;
     try {
-      const { env } = await loadAndResolveEnvironment(args.environmentId, userId);
-      return env.installId;
+      ({ env } = await loadAndResolveEnvironment(envArg, userId));
     } catch (err) {
-      if (!args.machine) {
-        throw new Error(`Failed to resolve environment ${args.environmentId}: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      throw new Error(`Failed to resolve environment ${envArg}: ${err instanceof Error ? err.message : String(err)}`);
     }
+    if (machineArg && !machineNamesEnvironment(machineArg, { ...env, environmentId: env?.environmentId ?? envArg })) {
+      throw new Error(
+        `environmentId "${envArg}" and machine "${machineArg}" name different desktops; pass only one of them.`,
+      );
+    }
+    return env.installId;
   }
 
-  // 2. If target is a machine name/prefix/installId:
-  const q = String(args.machine || args.environmentId).trim();
+  // 2. Machine only.
+  const q = machineArg;
+  const fuzzy = fuzzyMachineLookupAllowed(context, resource);
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(q)) {
     return q;
   }
@@ -548,15 +592,22 @@ async function resolveTargetInstallId(context: NativeToolContext, args: AnyObjec
     const conn = mongoose.connection;
     if (conn?.db) {
       const envCol = conn.db.collection('environments');
+      const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const docs = await envCol.find({
         userId,
         kind: 'desktop-agent',
-        $or: [
-          { environmentId: q },
-          { installId: q },
-          { installId: { $regex: `^${q}`, $options: 'i' } },
-          { name: { $regex: q, $options: 'i' } },
-        ],
+        $or: fuzzy
+          ? [
+              { environmentId: q },
+              { installId: q },
+              { installId: { $regex: `^${escaped}`, $options: 'i' } },
+              { name: { $regex: escaped, $options: 'i' } },
+            ]
+          : [
+              { environmentId: q },
+              { installId: q },
+              { name: { $regex: `^${escaped}$`, $options: 'i' } },
+            ],
       }).toArray();
 
       if (docs.length === 1 && docs[0].installId) {
@@ -566,9 +617,12 @@ async function resolveTargetInstallId(context: NativeToolContext, args: AnyObjec
         const matches = docs.map((d: any) => `${d.name || '(unnamed)'} [${d.installId?.slice(0, 8)}]`).join(', ');
         throw new Error(`"${q}" matches multiple desktop environments: ${matches}`);
       }
+      if (!fuzzy) {
+        throw new Error(`No desktop environment is named exactly "${q}" (pass its environmentId).`);
+      }
     }
   } catch (err: any) {
-    if (err.message && err.message.includes('matches multiple')) {
+    if (err?.message && (err.message.includes('matches multiple') || err.message.includes('named exactly'))) {
       throw err;
     }
   }
@@ -577,6 +631,7 @@ async function resolveTargetInstallId(context: NativeToolContext, args: AnyObjec
     const { env } = await loadAndResolveEnvironment(q, userId);
     return env.installId;
   } catch {
+    if (!fuzzy) throw new Error(`Failed to resolve desktop "${q}".`);
     return q;
   }
 }
@@ -608,7 +663,7 @@ async function runAction(
 
   let installId: string | undefined = undefined;
   try {
-    installId = await resolveTargetInstallId(context, args);
+    installId = await resolveTargetInstallId(context, args, 'computer');
     if (!installId) {
       return {
         kind: 'computer_result',
@@ -2200,7 +2255,7 @@ const desktopExecTool: NativeToolDefinition = {
 
     let installId: string | undefined = undefined;
     try {
-      installId = await resolveTargetInstallId(context, rawArgs);
+      installId = await resolveTargetInstallId(context, rawArgs, 'exec');
       if (!installId) {
         return textResult({
           ok: false,

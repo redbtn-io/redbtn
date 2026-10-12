@@ -238,6 +238,7 @@ export interface GraphConfig {
         | 'state'
         | 'knowledge'
         | 'exec'
+        | 'workspace'
         | 'computer'
         | 'environment'
         | 'graph'

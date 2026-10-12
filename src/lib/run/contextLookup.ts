@@ -17,6 +17,7 @@
  * (it's the same shape `_abortController` already uses via `getRunSignal`).
  */
 import { runControlRegistry } from './RunControlRegistry';
+import { withDerivedGrants, RUN_SCOPE } from '../permissions/workspace-grants';
 
 function resolveRunId(state: any): string | undefined {
   return state?.runId || state?.data?.runId;
@@ -95,12 +96,29 @@ export function getCapabilityProfile(state: any): any | undefined {
   // still surviving checkpoints (only the primitive scopeId flows through state)
   // and staying tamper-resistant (state carries the lookup KEY, never the
   // profile itself; an unknown/cleared scope falls back to the parent profile).
+  //
+  // Either way the profile comes back with the grants DERIVED for that scope
+  // during the run appended (permissions/workspace-grants.ts: a checkout of an
+  // allowed workspace adds exec:execute@<its environment>). An unprofiled run
+  // stays unprofiled.
+  const runId = resolveRunId(state);
   const scope = state?.data?._capabilityScope;
   if (typeof scope === 'string' && subgraphProfiles.has(scope)) {
-    return subgraphProfiles.get(scope);
+    return withDerivedGrants(subgraphProfiles.get(scope), runId, scope);
   }
-  const ctx = runControlRegistry.get(resolveRunId(state));
-  return ctx?.capabilityProfile ?? state?.capabilityProfile;
+  const ctx = runControlRegistry.get(runId);
+  return withDerivedGrants(ctx?.capabilityProfile ?? state?.capabilityProfile, runId, RUN_SCOPE);
+}
+
+/**
+ * The key of the profile scope `getCapabilityProfile(state)` resolves: the
+ * subgraph scopeId when a trusted subgraph's own profile is in force, else
+ * `'run'`. Derived grants are stored under it, so a grant earned inside a
+ * jailed subgraph never widens the parent run (and vice versa).
+ */
+export function getCapabilityScopeKey(state: any): string {
+  const scope = state?.data?._capabilityScope;
+  return typeof scope === 'string' && subgraphProfiles.has(scope) ? scope : RUN_SCOPE;
 }
 
 /**

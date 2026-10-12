@@ -1,0 +1,130 @@
+{
+  "graphId": "workspace-task",
+  "name": "Workspace Task Worker",
+  "description": "Platform worker started by the workspace_task tool: checks a managed workspace out on its own branch and runs a coding agent on one brief inside that checkout; pushes and opens a PR only when the task was started with ship:true. Runs under a profile derived from the caller's grants (never broader); the declared profile below is only the ceiling.",
+  "graphType": "workflow",
+  "tier": 4,
+  "isPublic": false,
+  "isSystem": true,
+  "tags": [
+    "platform",
+    "workspace"
+  ],
+  "capabilities": {
+    "name": "workspace-task-ceiling",
+    "description": "CEILING for workspace_task children. Each run gets an engine-derived profile (workspace:read/execute[/write]@<its workspace>), constrained by this one; exec on the checkout comes only from the derived checkout grant.",
+    "capabilities": [
+      {
+        "resource": "workspace",
+        "actions": [
+          "read",
+          "execute",
+          "write"
+        ],
+        "selector": "*"
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "id": "task",
+      "type": "universal",
+      "config": {
+        "name": "Workspace task",
+        "steps": [
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.workspaceId",
+              "value": "{{state.data.input.workspaceId}}"
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.checkoutKey",
+              "value": "{{state.data.input.checkoutKey}}"
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.workspaceMode",
+              "value": "branch"
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.wsTools",
+              "value": "{{(function(){var t=['run_command','read_file','edit_file','write_file','list_dir','glob','grep_files','ssh_run_async','ssh_tail','ssh_kill','ssh_jobs'];var i=(state.data&&state.data.input)||{};if(i.ship===true||i.ship==='true')t.push('workspace_ship');return t;})()}}"
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.shipRules",
+              "value": "{{(function(){var i=(state.data&&state.data.input)||{};var b=String(i.base||i.baseBranch||'main');if(i.ship===true||i.ship==='true')return '## Shipping\\n`workspace_ship({branch, title, body, base})` pushes your COMMITTED work (HEAD) to `branch` and opens the pull request into `'+b+'`; it returns `prUrl`. Use a branch named `task/<short-slug>`. Commit first. Call it once, when the work is done and verified; call it again only to fix a failure. You never merge.';return '## Shipping\\nThis task does not ship: commit your work in the checkout and report it. Do not try to push or open a pull request.';})()}}"
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.shipStep",
+              "value": "{{(function(){var i=(state.data&&state.data.input)||{};return (i.ship===true||i.ship==='true')?'6. Ship with workspace_ship. 7. Report.':'6. Report.';})()}}"
+            }
+          },
+          {
+            "type": "neuron",
+            "config": {
+              "neuronId": "{{state.data.input.neuronId || 'sonnet-5'}}",
+              "tools": [],
+              "toolsFrom": "data.wsTools",
+              "toolStrategy": "native",
+              "maxToolIterations": 250,
+              "temperature": 0.3,
+              "timeoutMs": 7200000,
+              "inactivityTimeout": 900000,
+              "stream": false,
+              "systemPrompt": "You are a coding agent working inside a managed workspace checkout.\n\n## Your environment\n- Repository: {{state.data.input.repo}} (base branch {{state.data.input.baseBranch}}), checked out at /workspace on your own branch. Explore it yourself; nothing about it is pre-loaded.\n- Everything you do happens inside this one container through the tools below. There is no other machine, and there is no GitHub credential inside the container: do not git fetch, pull or push.\n\n## Shell\n`run_command` \u2014 use this for ALL shell commands. Pass `command`, and optionally `cwd` (defaults to /workspace).\n\n## File tools\n`read_file` \u00b7 `edit_file` (surgical find-and-replace, preferred) \u00b7 `write_file` \u00b7 `list_dir` \u00b7 `glob` \u00b7 `grep_files`.\n\n## Long-running processes\n`ssh_run_async` (start a background job) \u00b7 `ssh_tail` (poll it every 5-10 s; never sleep for minutes) \u00b7 `ssh_kill` \u00b7 `ssh_jobs`.\n\n{{state.data.shipRules}}\n\n## Workflow\n1. Explore. 2. Plan. 3. Edit surgically. 4. Verify (typecheck / tests where they can run here). 5. Commit (git add, git commit). {{state.data.shipStep}}\n\nEnd with a short report: what you changed (files), what you verified, the PR URL if you opened one, and anything left undone. Never claim a check you did not run.",
+              "userPrompt": "{{state.data.input.brief}}",
+              "outputField": "data.response"
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.workspaceId",
+              "value": ""
+            }
+          },
+          {
+            "type": "transform",
+            "config": {
+              "operation": "set",
+              "outputField": "data.ws",
+              "value": ""
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "__start__",
+      "to": "task"
+    },
+    {
+      "from": "task",
+      "to": "__end__"
+    }
+  ]
+}
