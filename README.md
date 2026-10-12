@@ -275,6 +275,30 @@ roster chosen at RUN time:
 - `validateGraphConfig` rejects a non-string or non-path `toolsFrom`
   (`NEURON_BAD_TOOLS_FROM`); whether the path exists is only known at run time.
 
+### Capability grants for editing graphs, nodes and automations
+
+A graph may carry a capability profile (`capabilities: { name, capabilities:
+[{ resource, actions, selector }] }`); a profiled run may only use a gated tool
+when a grant covers it (unprofiled runs are unrestricted for these resources).
+Since 0.0.295-alpha the edit tools are gated, keyed by the id they change:
+
+| tool | grant needed | keyed by |
+|---|---|---|
+| `graph_patch`, `update_graph`, `publish_graph` | `graph:write` | `graphId` |
+| `delete_graph` | `graph:delete` | `graphId` |
+| `node_patch`, `update_node` | `node:write` | `nodeId` |
+| `delete_node` | `node:delete` | `nodeId` |
+| `update_automation`, `enable_automation`, `disable_automation` | `automation:write` | `automationId` |
+| `invoke_graph` / `trigger_automation` (unchanged) | `graph:execute` / `automation:execute` | `graphId` / `automationId` |
+
+`graph:read/write@<graphId>` is `{ "resource": "graph", "actions": ["read", "write"], "selector": "<graphId>" }`.
+Nodes have their own `node` resource because a node document can be shared by
+many graphs and the gate cannot look up an owner without I/O; nodes created by
+`publish_graph` are named `<graphId>-<nodeInstanceId>`, so
+`{ "resource": "node", "actions": ["write"], "selector": "<graphId>-*" }` covers
+exactly one graph's published nodes. Selectors: exact, `prefix*`, `prefix/*`,
+`*`. A call without the id is unscoped and needs a `*` grant.
+
 ### MCP Tools
 
 Tools are exposed via the [Model Context Protocol](https://modelcontextprotocol.io/). The engine resolves tools through three layers:

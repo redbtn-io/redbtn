@@ -130,6 +130,12 @@ function graphId(args: Record<string, unknown>): ExtractedAddress {
   return { addresses: [id] };
 }
 
+function nodeId(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.nodeId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
 function toolNameAddress(args: Record<string, unknown>): ExtractedAddress {
   const name = str(args.toolName);
   if (!name) return { addresses: [], unscoped: true };
@@ -348,12 +354,37 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
 
   // ── Graph tools ───────────────────────────────────────────────────────────
   invoke_graph: { resource: 'graph', action: 'execute', extract: graphId },
+  // Editing a graph is a WRITE on that graph, keyed by graphId — a profiled
+  // agent may only change the graphs its profile names (`graph:write@<graphId>`,
+  // or a prefix/wildcard). publish_graph changes what RUNS, so it is a write
+  // too. Before 0.0.295 these were unmapped and therefore ungated even under a
+  // profile: a jailed operator could rewrite any graph its user owns.
+  graph_patch: { resource: 'graph', action: 'write', extract: graphId },
+  update_graph: { resource: 'graph', action: 'write', extract: graphId },
+  publish_graph: { resource: 'graph', action: 'write', extract: graphId },
+  delete_graph: { resource: 'graph', action: 'delete', extract: graphId },
+
+  // ── Node tools (standalone node documents) ───────────────────────────────
+  // Keyed by nodeId under their own `node` resource rather than by "the owning
+  // graph": a node document is shared by every graph that references it (system
+  // nodes like `context` are in most graphs), and mapping nodeId -> graph would
+  // need a DB read inside this synchronous gate. Nodes promoted by publish are
+  // named `<graphId>-<nodeInstanceId>`, so `node:write@<graphId>-*` jails an
+  // agent to exactly the published nodes of one graph.
+  node_patch: { resource: 'node', action: 'write', extract: nodeId },
+  update_node: { resource: 'node', action: 'write', extract: nodeId },
+  delete_node: { resource: 'node', action: 'delete', extract: nodeId },
 
   // ── Meta tools ("tool tools") ─────────────────────────────────────────────
   invoke_tool: { resource: 'tool', action: 'execute', extract: toolNameAddress },
 
   // ── Automations ───────────────────────────────────────────────────────────
   trigger_automation: { resource: 'automation', action: 'execute', extract: automationId },
+  // Changing an automation (its graph, trigger, schedule, inputs) or switching
+  // it on/off is a WRITE on that automation, keyed by automationId.
+  update_automation: { resource: 'automation', action: 'write', extract: automationId },
+  enable_automation: { resource: 'automation', action: 'write', extract: automationId },
+  disable_automation: { resource: 'automation', action: 'write', extract: automationId },
 
   // ── Runs ──────────────────────────────────────────────────────────────────
   get_recent_runs: { resource: 'run', action: 'read', extract: recentRunsAddress },

@@ -51,9 +51,10 @@ export type CapabilityResource =
   | 'exec'         // run commands / file I/O via an env session (run_command, ssh_shell, read_file, ssh_copy, desktop_exec)
   | 'computer'     // screen/mouse/keyboard (desktop_* computer-use tools)
   | 'environment'  // reserved: managing env configs (not gated yet)
-  | 'graph'        // graph tools (invoke_graph)
+  | 'graph'        // graph tools: invoke_graph (execute); graph_patch / update_graph / publish_graph (write); delete_graph (delete) — keyed by graphId
+  | 'node'         // standalone node documents: node_patch / update_node (write); delete_node (delete) — keyed by nodeId
   | 'tool'         // tool-of-tools meta dispatch (invoke_tool)
-  | 'automation'   // automation tools (trigger_automation)
+  | 'automation'   // automation tools: trigger_automation (execute); update_automation / enable_automation / disable_automation (write) — keyed by automationId
   | 'run'          // run queries (get_recent_runs, get_run, get_run_logs)
   | 'conversation' // conversation queries (get_messages, get_context_history, get_conversation)
   | 'stream'       // stream session queries (list_stream_sessions, get_stream_session)
