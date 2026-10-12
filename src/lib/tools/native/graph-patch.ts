@@ -96,7 +96,11 @@ const graphPatchTool: NativeToolDefinition = {
     '/defaultInput, /provides, /parameters. Identity, ownership, and privilege fields (graphId, userId, ' +
     'isSystem, isImmutable) cannot be patched. The result must still pass validateGraphConfig — if a ' +
     'patch would leave the graph invalid (orphan edges, undefined node refs, etc.) the request is ' +
-    'rejected and the graph is NOT modified. Refuses to patch system or immutable graphs (fork first).',
+    'rejected and the graph is NOT modified. Refuses to patch system or immutable graphs (fork first). ' +
+    '/nodes and /edges ops apply to the RUNTIME config — the same nodes/edges get_graph returns, i.e. ' +
+    'what automation and chat runs execute (the published version of a published graph) — and take ' +
+    'effect on the next run. The response says what was written (`runtime`, `draft`) and carries a ' +
+    '`warning` when unpublished Studio edits exist that a later publish would put back.',
   server: 'graphs',
   inputSchema: {
     type: 'object',

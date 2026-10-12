@@ -410,6 +410,26 @@ export class RunPublisher {
     }
   }
 
+  /**
+   * Write one entry to this run's persistent log (redlog — what
+   * `GET /api/runs/:runId/logs` and the `get_run_logs` tool read back).
+   * For step-level notices worth keeping with the run that are not run
+   * events, e.g. a neuron step whose `toolsFrom` resolved to nothing.
+   * Never throws.
+   */
+  async log(
+    level: 'info' | 'warn' | 'error' | 'debug',
+    message: string,
+    metadata?: Record<string, unknown>,
+    category = 'step',
+  ): Promise<void> {
+    try {
+      await this.persistLog({ level, category, message, metadata });
+    } catch {
+      /* persistLog already swallows redlog failures; belt and braces */
+    }
+  }
+
   // ===========================================================================
   // Lifecycle Methods
   // ===========================================================================

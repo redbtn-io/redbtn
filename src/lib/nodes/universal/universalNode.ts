@@ -24,6 +24,7 @@ import { getRunPublisher, getMeteringClient } from '../../run/contextLookup';
 import { stripWorkspaceBinding } from '../../workspaces/workspace-binding';
 import type { NodeConfig } from './types';
 import { PARALLEL_BRANCH_FAILURE_KEY } from '../../run/run-shared-state';
+import { normaliseToolsFromPath } from './toolsFromPath';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -740,6 +741,13 @@ export function validateUniversalNodeConfig(nodeConfig: NodeConfig): void {
                 }
                 if (!config.outputField) {
                     throw new Error(`Step ${stepNumber} (neuron): missing required field "outputField"`);
+                }
+                {
+                    // Runtime tool list — see executors/toolsFrom.ts.
+                    const { error } = normaliseToolsFromPath(config.toolsFrom);
+                    if (error) {
+                        throw new Error(`Step ${stepNumber} (neuron): ${error}`);
+                    }
                 }
                 break;
 

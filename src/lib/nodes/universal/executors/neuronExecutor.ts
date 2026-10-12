@@ -36,6 +36,7 @@ import { runClaudeCodeStep } from './claudeCodeExecutor';
 import { runAgyCliStep } from './agyCliExecutor';
 import { runCopilotSdkStep } from './copilotSdkExecutor';
 import { runOpencodeStep } from './opencodeExecutor';
+import { resolveToolsFrom, summariseToolsFrom } from './toolsFrom';
 import { missingSecretMessage, looksLikeProviderAuthError } from '../../../neurons/missing-secret';
 import {
   classifyFallbackTrigger,
@@ -457,7 +458,13 @@ function setWorkspaceWorkingDir(state: any, defaultCwd = '/workspace'): void {
  * @param state - Current graph state
  * @returns Partial state with output field set to LLM response
  */
-export async function executeNeuron(config: NeuronStepConfig, state: any): Promise<Partial<any>> {
+export async function executeNeuron(rawConfig: NeuronStepConfig, state: any): Promise<Partial<any>> {
+  // `toolsFrom` is resolved ONCE, here, before anything else sees the step:
+  // every path below — the API tool loop, every CLI executor's run bridge,
+  // retries and the fallback neuron — reads `config.tools`, so they all get
+  // the same merged list from the same moment of run state.
+  const config = await applyToolsFrom(rawConfig, state);
+
   // If error handling configured, wrap execution
   if (config.errorHandling) {
     const { value: result, recovered } = await executeWithErrorHandlingDetailed(
@@ -520,6 +527,51 @@ export async function executeNeuron(config: NeuronStepConfig, state: any): Promi
 
   // Otherwise execute directly
   return clearStepError(state, config.outputField, await executeNeuronWithFallback(config, state));
+}
+
+/**
+ * Apply a step's `toolsFrom` (see toolsFrom.ts for the contract): return the
+ * config the step actually runs with — `tools` = literal tools, then the
+ * runtime refs read from run state, de-duplicated — and record what happened
+ * in the run log. Missing / non-array values and malformed entries are
+ * warnings, never errors.
+ *
+ * A step without `toolsFrom` is returned untouched. The returned config drops
+ * `toolsFrom`, so a retry or fallback re-entering with it never re-reads state.
+ */
+async function applyToolsFrom(config: NeuronStepConfig, state: any): Promise<NeuronStepConfig> {
+  if (config.toolsFrom === undefined || config.toolsFrom === null) return config;
+
+  const res = resolveToolsFrom(config, state);
+  const { toolsFrom, ...rest } = config;
+  const stepLabel = `Neuron step '${config.outputField}'`;
+  const meta = {
+    toolsFrom,
+    outputField: config.outputField,
+    added: res.added.length,
+    duplicates: res.duplicates,
+    total: res.tools.length,
+  };
+  const publisher = getRunPublisher(state);
+  const runLog = async (level: 'info' | 'warn', message: string): Promise<void> => {
+    try {
+      await publisher?.log?.(level, message, meta);
+    } catch {
+      /* the run log is best-effort; the step must not fail over it */
+    }
+  };
+
+  for (const warning of res.warnings) {
+    console.warn(`[NeuronExecutor] ${stepLabel}: ${warning}`);
+    await runLog('warn', `${stepLabel}: ${warning}`);
+  }
+  if (res.path) {
+    const summary = summariseToolsFrom(res);
+    console.log(`[NeuronExecutor] ${stepLabel}: ${summary}`);
+    await runLog('info', `${stepLabel}: ${summary}`);
+  }
+
+  return { ...rest, tools: res.tools };
 }
 
 /**
@@ -897,6 +949,9 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     //
     // Backward-compat: when `config.tools` is empty/missing, we fall through
     // to the existing plain-LLM / structuredOutput path unchanged.
+    //
+    // `config.tools` here already includes any runtime refs from `toolsFrom`
+    // (merged once in `executeNeuron`, see applyToolsFrom / toolsFrom.ts).
     // -------------------------------------------------------------------------
     const attachedTools = Array.isArray(config.tools) ? config.tools : [];
     if (attachedTools.length > 0) {
