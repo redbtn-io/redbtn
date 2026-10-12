@@ -1925,6 +1925,8 @@ export async function run(
   const runCtxMcpClient = createRunMcpClient(
     (toolName, args, meta, signal, scope) => red.callMcpTool(toolName, args, meta, signal, scope),
     resolveRunMcpScope(options),
+    // Same account scope as callTool: lets neurons see each tool's schema.
+    (toolName, scope) => red.mcpRegistry?.findTool?.(toolName, scope),
   );
   // Data-permissions: resolve the agent's capability profile from the graph
   // config (if any). `null` when the graph declares no profile → the run is

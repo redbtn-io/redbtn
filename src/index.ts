@@ -22,6 +22,12 @@ import { RedLog } from "@redbtn/redlog";
 import { OrphanReaper, type ReaperDb } from "./lib/run/orphan-reaper";
 import { runControlRegistry } from "./lib/run/RunControlRegistry";
 
+// MCP static rosters: workers pass cached tool definitions (name, description,
+// inputSchema) to `mcpRegistry.registerStaticServer`. Exported so a worker can
+// feature-detect an engine that keeps those schemas.
+export { normalizeStaticRoster } from "./lib/mcp/registry";
+export type { StaticToolSpec } from "./lib/mcp/registry";
+
 // Export database utilities for external use
 export {
   getDatabase,

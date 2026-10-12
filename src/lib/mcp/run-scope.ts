@@ -14,7 +14,7 @@
  *
  * @module lib/mcp/run-scope
  */
-import type { McpToolScope } from './registry';
+import type { FoundTool, McpToolScope } from './registry';
 
 export type CallMcpTool = (
   toolName: string,
@@ -23,6 +23,9 @@ export type CallMcpTool = (
   signal: AbortSignal | undefined,
   scope: McpToolScope,
 ) => Promise<unknown>;
+
+/** Look a tool up in the registry for one account scope (no network). */
+export type FindMcpTool = (toolName: string, scope: McpToolScope) => FoundTool | undefined;
 
 /**
  * Resolve the MCP scope for a run: the account it executes as. Mirrors
@@ -38,8 +41,16 @@ export function resolveRunMcpScope(options: {
   return who ? { userId: String(who) } : {};
 }
 
-/** Build the run-context `mcpClient`, bound to one account scope. */
-export function createRunMcpClient(callMcpTool: CallMcpTool, scope: McpToolScope) {
+/**
+ * Build the run-context `mcpClient`, bound to one account scope.
+ *
+ * `findMcpTool` backs `findTool`, which the neuron tool resolver uses to hand
+ * the model a tool's real description and input schema. Without it every MCP
+ * tool reaches the model as an empty object schema, and the model guesses
+ * argument names and types (`channel_id` for `channelId`, a 64-bit Discord id
+ * as a JSON number that gets rounded to a different id).
+ */
+export function createRunMcpClient(callMcpTool: CallMcpTool, scope: McpToolScope, findMcpTool?: FindMcpTool) {
   const frozen: McpToolScope = Object.freeze({ ...scope });
   return {
     scope: frozen,
@@ -51,5 +62,6 @@ export function createRunMcpClient(callMcpTool: CallMcpTool, scope: McpToolScope
         signal,
         frozen,
       ),
+    findTool: (toolName: string): FoundTool | undefined => (findMcpTool ? findMcpTool(toolName, frozen) : undefined),
   };
 }
