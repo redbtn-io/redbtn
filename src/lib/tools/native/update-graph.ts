@@ -52,7 +52,7 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
 
 const updateGraphTool: NativeToolDefinition = {
   description:
-    'Update an existing graph (PATCH). All fields in patch are optional. If the caller does not own the graph (or it is system/immutable), the webapp will auto-fork it and the response will include cloned: true and the new graphId — use that for subsequent edits.',
+    'Update an existing graph (PATCH). All fields in patch are optional. If the caller does not own the graph (or it is system/immutable), the webapp will auto-fork it and the response will include cloned: true and the new graphId — use that for subsequent edits. On a PUBLISHED graph, nodes/edges edits are saved to the draft and do not run until publish_graph (the response carries runtime.updated: false and a warning); use graph_patch to change the live config directly.',
   server: 'platform',
   inputSchema: {
     type: 'object',
@@ -157,6 +157,11 @@ const updateGraphTool: NativeToolDefinition = {
               updatedAt: data?.updatedAt ?? null,
               createdAt: data?.createdAt ?? null,
               name: data?.name ?? null,
+              // Whether the edit reached what RUNS. A published graph keeps
+              // running its published version; edits to its nodes/edges land
+              // in the draft until publish_graph. The hub says so here.
+              ...(data?.runtime && typeof data.runtime === 'object' ? { runtime: data.runtime } : {}),
+              ...(typeof data?.warning === 'string' ? { warning: data.warning } : {}),
             }),
           },
         ],

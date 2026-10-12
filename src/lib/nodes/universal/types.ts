@@ -252,6 +252,29 @@ export interface NeuronStepConfig {
      */
     tools?: ToolRef[];
     /**
+     * Runtime tool list: a dot path into run state (e.g. `"data.opTools"`;
+     * a leading `state.` is accepted and ignored) whose value is read when
+     * the step EXECUTES.
+     *
+     * When that value is an array of ToolRefs (exactly the shapes `tools`
+     * accepts: `'get_global_state'`, `'mcp:...'`, `'mcp:<server>.<tool>'`,
+     * `'graph:...'`, `'hosted:...'`, or `{ name, source }` objects) its
+     * entries are appended AFTER the literal `tools`, de-duplicated by ref
+     * identity (`toolRefKey`: `'now'`, `{ name: 'now' }` and
+     * `{ name: 'now', source: 'native' }` are one ref). Strings are taken
+     * literally — no template rendering.
+     *
+     * A missing value or a non-array is ignored with a warning in the run log
+     * (never an error); malformed entries inside the array are skipped the
+     * same way. The merged list goes through the same resolver, capability
+     * grants and (for CLI neurons: claude-code, agy-cli, copilot-sdk,
+     * opencode) the same per-run MCP bridge as literal `tools` — the bridge
+     * offers exactly the resolved merged list.
+     *
+     * An empty / whitespace-only string is treated as absent.
+     */
+    toolsFrom?: string;
+    /**
      * Tool-binding strategy. Defaults to `'auto'`.
      *
      * - `'auto'`             — consult the capability matrix to pick the best

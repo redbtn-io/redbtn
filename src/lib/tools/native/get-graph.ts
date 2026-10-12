@@ -13,6 +13,14 @@
  *
  * Use this to inspect a graph's input schema (`inputSchema`) before invoking
  * it via `invoke_graph`, or to introspect the node/edge structure.
+ *
+ * `nodes` / `edges` are the RUNTIME config — exactly what the engine executes
+ * for an automation or chat run (`GraphRegistry.getConfig`: the published
+ * version when the graph has one, otherwise the graph's live nodes/edges).
+ * Until 2026-10-12 the hub answered with the Studio DRAFT here, which on
+ * graphs edited through graph_patch was days stale (graph_patch writes the
+ * live config, never the draft). Unpublished Studio edits are now shown
+ * separately under `draft`, and only when they differ from what runs.
  */
 
 import type {
@@ -50,9 +58,50 @@ function buildHeaders(context: NativeToolContext): Record<string, string> {
   return headers;
 }
 
+/**
+ * Make the hub's graph payload unambiguous for an agent, and smaller.
+ *
+ * The hub (2026-10-12+) returns the RUNTIME config as `nodes`/`edges` plus a
+ * `runtime` block, a `draft` block (published graphs only — the Studio working
+ * copy, which always carries nodes for Studio's sake) and a `published` block
+ * that repeats the runtime nodes. For an agent:
+ *   - a draft with no unpublished changes is noise: keep its timestamps only;
+ *   - a draft WITH unpublished changes is kept whole and labelled as not live;
+ *   - the published block's nodes/edges duplicate `nodes`/`edges` when the
+ *     published version is what runs: keep its metadata only.
+ * An older hub (no `runtime` block) is passed through unchanged.
+ */
+export function shapeGraphForAgent(graph: AnyObject): AnyObject {
+  if (!graph || typeof graph !== 'object' || !graph.runtime || typeof graph.runtime !== 'object') {
+    return graph;
+  }
+  const out: AnyObject = { ...graph };
+  const draft = graph.draft;
+  if (draft && typeof draft === 'object') {
+    if (draft.hasUnpublishedChanges === true) {
+      out.draft = {
+        ...draft,
+        note: 'Unpublished Studio edits. NOT what runs; publish_graph makes them live (and replaces the published nodes/edges above).',
+      };
+    } else {
+      out.draft = {
+        savedAt: draft.savedAt ?? null,
+        hasUnpublishedChanges: false,
+        note: 'No unpublished edits: the draft matches the published version (nodes omitted).',
+      };
+    }
+  }
+  const published = graph.published;
+  if (published && typeof published === 'object' && graph.runtime.source === 'published') {
+    const { nodes: _nodes, edges: _edges, ...meta } = published;
+    out.published = { ...meta, note: 'nodes/edges are the top-level nodes/edges (this version is what runs).' };
+  }
+  return out;
+}
+
 const getGraphTool: NativeToolDefinition = {
   description:
-    'Fetch the full definition of a single graph (nodes, edges, layout, input schema, metadata). Use to inspect a graph\'s shape and required inputs before invoking it via invoke_graph.',
+    'Fetch the full definition of a single graph (nodes, edges, layout, input schema, metadata). Use to inspect a graph\'s shape and required inputs before invoking it via invoke_graph. nodes/edges are the RUNTIME config: exactly what automation and chat runs execute (the published version of a published graph). `runtime.source` says which; unpublished Studio edits, when any exist, appear separately under `draft` (hasUnpublishedChanges: true) and do NOT run until publish_graph.',
   server: 'graph',
   inputSchema: {
     type: 'object',
@@ -113,7 +162,7 @@ const getGraphTool: NativeToolDefinition = {
       const data = (await response.json()) as AnyObject;
       // Route returns { graph: {...} } — surface the inner object directly so
       // agents don't need to peel off the wrapper.
-      const graph = (data?.graph ?? data) as AnyObject;
+      const graph = shapeGraphForAgent((data?.graph ?? data) as AnyObject);
 
       return {
         content: [

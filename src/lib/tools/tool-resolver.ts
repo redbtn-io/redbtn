@@ -107,6 +107,40 @@ function normalise(ref: ToolRef): NormalisedToolRef {
   return { name: ref.name, descriptionOverride: ref.description, source: 'native' };
 }
 
+/** Sources a `{ name, source }` ToolRef may name explicitly. */
+const TOOL_REF_SOURCES: ReadonlySet<string> = new Set(['native', 'mcp', 'graph', 'hosted']);
+
+/**
+ * Whether `value` has a shape the resolver can accept as a ToolRef: a
+ * non-empty string, or an object with a non-empty string `name`, an optional
+ * string `description` and an optional `source` from the known set. Says
+ * nothing about whether the tool EXISTS — that stays the resolver's job.
+ */
+export function isToolRefShape(value: unknown): value is ToolRef {
+  if (typeof value === 'string') return value.length > 0;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const ref = value as { name?: unknown; source?: unknown; description?: unknown };
+  if (typeof ref.name !== 'string' || ref.name.length === 0) return false;
+  if (ref.source !== undefined && (typeof ref.source !== 'string' || !TOOL_REF_SOURCES.has(ref.source))) {
+    return false;
+  }
+  if (ref.description !== undefined && typeof ref.description !== 'string') return false;
+  return true;
+}
+
+/**
+ * Canonical identity of a ToolRef: `${source}:${name}` after the same
+ * normalisation the resolver applies, so two refs with the same key resolve
+ * to the same tool. Used to de-duplicate merged tool lists (`toolsFrom`):
+ * `'now'`, `{ name: 'now' }` and `{ name: 'now', source: 'native' }` all key
+ * `native:now`; `'mcp:a.b'` and `{ name: 'a.b', source: 'mcp' }` both key
+ * `mcp:a.b`. A description override does not change identity.
+ */
+export function toolRefKey(ref: ToolRef): string {
+  const norm = normalise(ref);
+  return `${norm.source}:${norm.name}`;
+}
+
 /**
  * Strip well-known wrapper objects to get a plain JSON schema.
  * Some native tools store zod-like or wrapped schemas — we only need the
