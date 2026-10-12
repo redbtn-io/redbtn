@@ -166,3 +166,81 @@ describe('get_graph — upstream error', () => {
     expect(JSON.parse(r.content[0].text).error).toMatch(/ETIMEDOUT/);
   });
 });
+
+describe('get_graph — runtime view vs draft (2026-10-12)', () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    process.env.WEBAPP_URL = 'http://test-webapp.example';
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  function serve(graph: Record<string, unknown>) {
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ graph }), { status: 200 }),
+    ) as unknown as typeof globalThis.fetch;
+  }
+
+  const runtimeNodes = [{ id: 'op', config: { nodeId: 'g-op' } }];
+  const runtimeEdges = [{ from: '__start__', to: 'op' }];
+
+  test('published graph without unpublished edits: draft and published collapse to metadata', async () => {
+    serve({
+      graphId: 'g',
+      nodes: runtimeNodes,
+      edges: runtimeEdges,
+      runtime: { source: 'published', version: 3, publishedAt: '2026-10-10T00:00:00Z', patchedAt: null },
+      draft: {
+        nodes: [{ id: 'op', config: { steps: [] } }],
+        edges: runtimeEdges,
+        savedAt: '2026-10-09T00:00:00Z',
+        hasUnpublishedChanges: false,
+      },
+      published: { nodes: runtimeNodes, edges: runtimeEdges, version: 3, publishedAt: '2026-10-10T00:00:00Z' },
+    });
+    const r = await getGraphTool.handler({ graphId: 'g' }, makeMockContext());
+    const { graph } = JSON.parse(r.content[0].text);
+    expect(graph.nodes).toEqual(runtimeNodes);
+    expect(graph.runtime.source).toBe('published');
+    expect(graph.draft.nodes).toBeUndefined();
+    expect(graph.draft.hasUnpublishedChanges).toBe(false);
+    expect(graph.published.nodes).toBeUndefined();
+    expect(graph.published.version).toBe(3);
+  });
+
+  test('unpublished Studio edits are kept whole and labelled as not running', async () => {
+    const draftNodes = [{ id: 'op', config: { steps: [{ type: 'neuron' }] } }];
+    serve({
+      graphId: 'g',
+      nodes: runtimeNodes,
+      edges: runtimeEdges,
+      runtime: { source: 'published', version: 3, publishedAt: '2026-10-10T00:00:00Z', patchedAt: null },
+      draft: { nodes: draftNodes, edges: runtimeEdges, savedAt: '2026-10-11T00:00:00Z', hasUnpublishedChanges: true },
+      published: { nodes: runtimeNodes, edges: runtimeEdges, version: 3 },
+    });
+    const { graph } = JSON.parse((await getGraphTool.handler({ graphId: 'g' }, makeMockContext())).content[0].text);
+    expect(graph.nodes).toEqual(runtimeNodes);
+    expect(graph.draft.nodes).toEqual(draftNodes);
+    expect(graph.draft.note).toMatch(/NOT what runs/);
+  });
+
+  test('unpublished graph: runtime is the graph itself, no draft', async () => {
+    serve({ graphId: 'g', nodes: runtimeNodes, edges: runtimeEdges, runtime: { source: 'graph', version: null }, draft: null, published: null });
+    const { graph } = JSON.parse((await getGraphTool.handler({ graphId: 'g' }, makeMockContext())).content[0].text);
+    expect(graph.nodes).toEqual(runtimeNodes);
+    expect(graph.draft).toBeNull();
+    expect(graph.published).toBeNull();
+  });
+
+  test('an older hub without a runtime block is passed through unchanged', async () => {
+    const legacy = { graphId: 'g', nodes: runtimeNodes, edges: runtimeEdges, draft: { nodes: [], savedAt: 'x' }, published: null };
+    serve(legacy);
+    const { graph } = JSON.parse((await getGraphTool.handler({ graphId: 'g' }, makeMockContext())).content[0].text);
+    expect(graph).toEqual(legacy);
+  });
+});

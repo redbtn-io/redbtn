@@ -22,6 +22,7 @@
  */
 import { END } from '@langchain/langgraph';
 import type { GraphConfig, GraphEdgeConfig, GraphNodeConfig } from '../types/graph';
+import { normaliseToolsFromPath } from '../nodes/universal/toolsFromPath';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -597,6 +598,22 @@ export async function validateGraphConfig(
             stepIndex,
             message: `Node '${node.id}' step[${stepIndex}] (neuron) is missing required 'outputField'`,
           });
+        }
+        // `toolsFrom` — runtime tool list (executors/toolsFrom.ts). The
+        // executor ignores an unusable value with a run-log warning; at
+        // authoring time it is an error, so a typo cannot quietly run the
+        // step with fewer tools than intended. Whether the path EXISTS can
+        // only be known at run time.
+        if (stepConfig.toolsFrom !== undefined && stepConfig.toolsFrom !== null) {
+          const { error } = normaliseToolsFromPath(stepConfig.toolsFrom);
+          if (error) {
+            err({
+              code: 'NEURON_BAD_TOOLS_FROM',
+              nodeId: node.id,
+              stepIndex,
+              message: `Node '${node.id}' step[${stepIndex}] (neuron) ${error}`,
+            });
+          }
         }
       }
 

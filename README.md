@@ -248,6 +248,33 @@ metered neuron when a subscription runtime cannot run. See `neuronFallback.ts`:
 { neuronId: 'agy-flash-3-8', fallbackNeuronId: 'sonnet-5' }
 ```
 
+### Neuron step tools: `tools` and `toolsFrom`
+
+A `neuron` step offers the model the tools in its literal `tools` array
+(`'get_global_state'`, `'mcp:<server>.<tool>'`, `'graph:<graphId>'`,
+`'hosted:web_search'`, or `{ name, source }` objects). `toolsFrom` adds a
+roster chosen at RUN time:
+
+```json
+{ "type": "transform", "config": { "operation": "set", "outputField": "data.opTools", "value": ["now", "mcp:redboard.redboard_card_run"] } },
+{ "type": "neuron", "config": { "neuronId": "sonnet-5", "tools": ["get_global_state"], "toolsFrom": "data.opTools",
+  "userPrompt": "...", "outputField": "data.response" } }
+```
+
+- `toolsFrom` is a dot path into run state (`"data.opTools"`; a leading
+  `state.` is accepted). The array found there is appended AFTER the literal
+  `tools`, de-duplicated by ref identity (`'now'`, `{ "name": "now" }` and
+  `{ "name": "now", "source": "native" }` are one ref).
+- Missing or non-array values are ignored with a warning in the run log
+  (`get_run_logs`), never an error; malformed entries are skipped the same way.
+  Strings are taken literally (no template rendering).
+- It works for API neurons and for CLI neurons (`claude-code`, `agy-cli`,
+  `copilot-sdk`, `opencode`): the per-run MCP bridge offers exactly the merged,
+  resolved list. Capability enforcement is unchanged: runtime refs go through
+  the same resolver and grants as literal ones.
+- `validateGraphConfig` rejects a non-string or non-path `toolsFrom`
+  (`NEURON_BAD_TOOLS_FROM`); whether the path exists is only known at run time.
+
 ### MCP Tools
 
 Tools are exposed via the [Model Context Protocol](https://modelcontextprotocol.io/). The engine resolves tools through three layers:
