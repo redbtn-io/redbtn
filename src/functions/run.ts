@@ -18,6 +18,9 @@ import { RunPublisher, RunLock, createRunPublisher, publishRunError, type RunSta
 import { runControlRegistry, type CancelResult, type CancelAck } from '../lib/run/RunControlRegistry';
 import { getOrCreateMeteringClient } from '../lib/run/meteringClient';
 import { resolveCapabilityProfile } from '../lib/permissions/resolve';
+import { normalizeProfile } from '../lib/permissions/enforce';
+import { constrainProfile } from '../lib/permissions/constrain';
+import type { CapabilityProfile } from '../lib/permissions/types';
 import { ConnectionManager, type UserConnection, type ConnectionProvider } from '../lib/connections';
 import { createMongoCheckpointer } from '../lib/graphs/MongoCheckpointer';
 import { resolveRecursionLimit, isGraphRecursionError, formatRecursionLimitError } from '../lib/graphs/recursionLimit';
@@ -196,6 +199,15 @@ export interface RunOptions {
    * must bound this inside the steer time budget — never set globally.
    */
   lockWaitMs?: number;
+  /**
+   * ENGINE-INTERNAL. A capability profile to enforce on this run instead of
+   * the one its graph declares; the graph's own profile (when it declares one)
+   * stays the CEILING — a grant the declared profile does not cover is
+   * dropped. Set only by in-process engine callers that derived it from a
+   * parent run's grants (`workspace_task`); the worker never maps it from job
+   * data and no API accepts it, so no external trigger can set it.
+   */
+  capabilityProfileOverride?: CapabilityProfile;
 }
 
 export interface RunResult {
@@ -1920,7 +1932,10 @@ export async function run(
   // present, the native-tool dispatch chokepoint enforces it fail-closed. We
   // resolve here (not in the tool layer) so the profile is fixed at run start
   // and can't be swapped mid-run by a state-mutating step.
-  const capabilityProfile = resolveCapabilityProfile(compiledGraph?.config);
+  const declaredProfile = resolveCapabilityProfile(compiledGraph?.config);
+  const capabilityProfile = options.capabilityProfileOverride
+    ? constrainProfile(normalizeProfile(options.capabilityProfileOverride) ?? { name: 'override', capabilities: [] }, declaredProfile)
+    : declaredProfile;
   const runCtx = runControlRegistry.register(runId, WORKER_ID, {
     runPublisher: publisher,
     neuronRegistry: red.neuronRegistry,

@@ -36,11 +36,19 @@
 
 import type { CapabilityAction, CapabilityResource } from './types';
 import { isUsableConversationId } from '../conversation/conversation-id';
+import { repoSlug, repoSlugFromPullRequestUrl, workspaceAliases } from './workspace-grants';
 
 /** One or more addresses extracted from a tool call (some tools fan out). */
 export interface ExtractedAddress {
   /** Addresses to check. ALL must pass for the call to be allowed. */
   addresses: string[];
+  /**
+   * Several identities of ONE target (a workspace: ws_ id, owner/repo,
+   * owner/repo@branch, github.com/owner/repo@branch). The call is allowed when ANY of them matches a
+   * grant. Used by the `workspace` resource; `addresses[0]` is then only the
+   * display address for errors.
+   */
+  anyOf?: string[];
   /**
    * True when the tool COULD touch resources but no specific address was
    * supplied (e.g. `search_all_libraries` with no `libraryIds`, or a list-all
@@ -59,6 +67,13 @@ export interface DataToolRule {
    * no narrowing identifier was given.
    */
   extract: (args: Record<string, unknown>) => ExtractedAddress;
+  /**
+   * Optional async resolution, run by the dispatch chokepoint INSTEAD of
+   * `extract` when present: for tools whose target can only be known from the
+   * run (its checkouts, the PRs it shipped) or a Mongo lookup. Implemented in
+   * permissions/workspace-address.ts and wired by native-registry.ts.
+   */
+  asyncResolve?: 'workspace';
 }
 
 function str(v: unknown): string {
@@ -134,6 +149,37 @@ function nodeId(args: Record<string, unknown>): ExtractedAddress {
   const id = str(args.nodeId);
   if (!id) return { addresses: [], unscoped: true };
   return { addresses: [id] };
+}
+
+/**
+ * `workspace_for_repo`: the workspace the call names — `owner/repo`,
+ * `owner/repo@<branch>` (default main) and `github.com/owner/repo@<branch>`
+ * (its canonical name). At dispatch an EXISTING workspace is judged by its own
+ * configuration and id instead (workspace-address.ts). No repo -> unscoped.
+ */
+function workspaceFromRepoArgs(args: Record<string, unknown>): ExtractedAddress {
+  const slug = repoSlug(args.repo);
+  if (!slug) return { addresses: [], unscoped: true };
+  const branch = str(args.branch) || 'main';
+  const aliases = workspaceAliases({ repo: slug, branch });
+  return { addresses: [aliases[1] ?? slug], anyOf: aliases };
+}
+
+/** `workspace_get` / `workspace_task`: the `workspaceId` argument (its repo identities are added at dispatch). */
+function workspaceIdArg(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.workspaceId);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id], anyOf: [id] };
+}
+
+/**
+ * `workspace_merge`: `owner/repo` from the PR URL. When THIS run shipped the
+ * PR, dispatch adds the shipping workspace's identities and `owner/repo@<base>`.
+ */
+function workspaceFromPullRequest(args: Record<string, unknown>): ExtractedAddress {
+  const slug = repoSlugFromPullRequestUrl(args.prUrl);
+  if (!slug) return { addresses: [], unscoped: true };
+  return { addresses: [`github.com/${slug}`], anyOf: [`github.com/${slug}`, slug] };
 }
 
 function toolNameAddress(args: Record<string, unknown>): ExtractedAddress {
@@ -294,14 +340,26 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   // separate authority, so file ops share the single `execute` verb (split into
   // exec:read/exec:write later only if finer control is wanted).
   run_command: { resource: 'exec', action: 'execute', extract: envId },
-  // Managed-workspace shipping. `workspace_ship` acts on the run's bound
-  // workspace environment (the bridge pins environmentId), so it is scoped
-  // like run_command. `workspace_for_repo` (create/find a workspace) and
-  // `workspace_merge` (merge a PR after checks) address no single environment,
-  // so they are unscoped and need a wildcard exec grant.
-  workspace_ship: { resource: 'exec', action: 'execute', extract: envId },
-  workspace_for_repo: { resource: 'exec', action: 'execute', extract: () => ({ addresses: [], unscoped: true }) },
-  workspace_merge: { resource: 'exec', action: 'execute', extract: () => ({ addresses: [], unscoped: true }) },
+  // ── Managed workspaces (`workspace` resource, FAIL-CLOSED; 0.0.296) ───────
+  // Keyed by the WORKSPACE (ws_ id / its configured owner/repo[@branch]),
+  // any identity matching a grant — see permissions/workspace-grants.ts.
+  // Before 0.0.296 these were exec: workspace_for_repo / workspace_merge
+  // unscoped (only exec:* could call them) and workspace_ship keyed by the
+  // checkout env, which exists only mid-run, so no profile could say "this
+  // workspace only". `exec:execute@*` still passes them all (legacy superset).
+  //   - read     workspace_get, get_workspace_task (look, change nothing)
+  //   - execute  workspace_for_repo (find or create the workspace record),
+  //              workspace_task (start a worker run in it), and the CHECKOUT
+  //              itself (neuron-step producer), which DERIVES
+  //              exec:execute@<checkout env> until the checkout is released
+  //   - write    workspace_ship (push the checkout's branch, open a PR)
+  //   - control  workspace_merge (merge into the base branch)
+  workspace_get: { resource: 'workspace', action: 'read', extract: workspaceIdArg, asyncResolve: 'workspace' },
+  workspace_for_repo: { resource: 'workspace', action: 'execute', extract: workspaceFromRepoArgs, asyncResolve: 'workspace' },
+  workspace_task: { resource: 'workspace', action: 'execute', extract: workspaceIdArg, asyncResolve: 'workspace' },
+  get_workspace_task: { resource: 'workspace', action: 'read', extract: () => ({ addresses: [], unscoped: true }), asyncResolve: 'workspace' },
+  workspace_ship: { resource: 'workspace', action: 'write', extract: () => ({ addresses: [], unscoped: true }), asyncResolve: 'workspace' },
+  workspace_merge: { resource: 'workspace', action: 'control', extract: workspaceFromPullRequest, asyncResolve: 'workspace' },
   ssh_shell: { resource: 'exec', action: 'execute', extract: envId }, // inline (no environmentId) ⇒ unscoped ⇒ needs '*'
   read_file: { resource: 'exec', action: 'execute', extract: envId },
   ssh_copy: { resource: 'exec', action: 'execute', extract: envId },

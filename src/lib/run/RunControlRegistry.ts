@@ -192,6 +192,14 @@ export interface RunControlContext {
    */
   capabilityProfile?: any;
   /**
+   * Run-scoped workspace capability state (permissions/workspace-grants.ts):
+   * grants DERIVED at run time (`exec:execute@<checkout env>` once the run
+   * checks out a workspace its profile allows), the checkouts the engine
+   * acquired or verified for this run, and the pull requests it shipped.
+   * Process-local and cleared with the context, like everything here.
+   */
+  workspaceGrants?: unknown;
+  /**
    * Set when a graceful stop (steering) is requested. Step executors and
    * universalNode check this between steps and halt at the next safe boundary,
    * without killing in-flight tools.
