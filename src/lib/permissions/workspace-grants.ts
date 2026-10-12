@@ -175,6 +175,60 @@ export function decideWorkspace(
   };
 }
 
+/**
+ * The identities of "this repository at that base branch" — what a pull
+ * request into a branch OTHER than the workspace's own base is checked
+ * against (`github.com/<o>/<r>@<base>`, `<o>/<r>@<base>`). Empty when the
+ * repository or the branch is unknown.
+ */
+export function repoBaseAliases(repo: unknown, base: unknown): string[] {
+  const slug = repoSlug(repo);
+  const b = typeof base === 'string' ? base.trim().toLowerCase() : '';
+  if (!slug || !b) return [];
+  return [`github.com/${slug}@${b}`, `${slug}@${b}`];
+}
+
+/**
+ * `workspace:write` for a pull request into `requestedBase` (workspace_ship,
+ * workspace_task {ship:true}). The caller's write grant on the WORKSPACE is
+ * checked separately (dispatch gate / workspace_task); this adds the base:
+ *
+ *   - into the workspace's own base branch (config.gitBranch, default
+ *     `main`): nothing more is needed;
+ *   - into ANY OTHER branch: a write grant must name that base —
+ *     `<o>/<r>@<base>` or `github.com/<o>/<r>@<base>` (or a wildcard /
+ *     prefix selector covering it). A grant on the ws_ id or on the bare
+ *     repository does not reach another base branch.
+ *
+ * `exec:execute@*` (legacy superset) and `workspace:write@*` pass unchanged.
+ */
+export function decideShipBase(
+  profile: CapabilityProfile,
+  workspace: { repo: unknown; configuredBase: unknown },
+  requestedBase: unknown,
+): CapabilityDecision {
+  const configured =
+    typeof workspace.configuredBase === 'string' && workspace.configuredBase.trim() ? workspace.configuredBase.trim() : 'main';
+  const requested = typeof requestedBase === 'string' && requestedBase.trim() ? requestedBase.trim() : configured;
+  const slug = repoSlug(workspace.repo);
+  if (requested === configured) {
+    return { allowed: true, resource: 'workspace', action: 'write', address: slug ? `${slug}@${configured}` : configured };
+  }
+  const aliases = repoBaseAliases(workspace.repo, requested);
+  const decision = decideWorkspace(profile, 'write', aliases);
+  if (decision.allowed) return decision;
+  const target = slug ? `${slug}@${requested}` : `<owner>/<repo>@${requested}`;
+  return {
+    ...decision,
+    address: target,
+    reason:
+      `Permission denied: agent profile '${profile.name}' may open pull requests only into this workspace's base ` +
+      `branch '${configured}'. A pull request into '${requested}' needs workspace:write on '${target}' ` +
+      `(or 'github.com/${target}'); a grant on the workspace id or the bare repository does not cover another ` +
+      `base branch. Omit \`base\` to target '${configured}'.`,
+  };
+}
+
 // ── Run-scoped state ─────────────────────────────────────────────────────────
 
 /** A checkout this run holds (or held), as the engine itself acquired or verified it. */

@@ -17,6 +17,8 @@ import { CapabilityDeniedError, type CapabilityProfile } from '../../src/lib/per
 import {
   workspaceAliases,
   decideWorkspace,
+  decideShipBase,
+  repoBaseAliases,
   repoSlug,
   addDerivedGrant,
   revokeCheckoutGrants,
@@ -139,6 +141,52 @@ describe('decideWorkspace', () => {
     expect(decideWorkspace(star, 'execute', []).allowed).toBe(true);
     const none: CapabilityProfile = { name: 'n', capabilities: [] };
     expect(decideWorkspace(none, 'read', ALIASES).reason).toMatch(/no workspace read grants/);
+  });
+});
+
+describe('decideShipBase — a PR into another base branch needs a grant naming that base', () => {
+  const BECOME = { repo: 'https://github.com/XiroEx/become.git', configuredBase: 'beta' };
+  const p = (selector: string, resource = 'workspace', actions = ['write']): CapabilityProfile => ({
+    name: 'op',
+    capabilities: [{ resource: resource as Any, actions: actions as Any, selector }],
+  });
+
+  it('into the workspace base: nothing beyond the workspace write grant', () => {
+    expect(decideShipBase(p(WS), BECOME, 'beta').allowed).toBe(true);
+    expect(decideShipBase(p(WS), BECOME, undefined).allowed).toBe(true);
+    expect(decideShipBase(p(WS), BECOME, '').allowed).toBe(true);
+  });
+
+  it('into another base: the ws_ id and the bare repo do not reach it', () => {
+    for (const sel of [WS, 'github.com/XiroEx/become', 'XiroEx/become', 'github.com/XiroEx/become@beta', 'xiroex/become@beta']) {
+      const d = decideShipBase(p(sel), BECOME, 'main');
+      expect(d.allowed, sel).toBe(false);
+      expect(d.reason).toMatch(/only into this workspace's base branch 'beta'/);
+      expect(d.reason).toMatch(/workspace:write on 'xiroex\/become@main'/);
+    }
+  });
+
+  it('into another base: a write grant naming that base (either form, any case) does', () => {
+    expect(decideShipBase(p('xiroex/become@main'), BECOME, 'main').allowed).toBe(true);
+    expect(decideShipBase(p('github.com/XiroEx/become@main'), BECOME, 'main').allowed).toBe(true);
+    // it names THAT base only
+    expect(decideShipBase(p('xiroex/become@main'), BECOME, 'release').allowed).toBe(false);
+    // and it must be a write grant
+    expect(decideShipBase(p('xiroex/become@main', 'workspace', ['execute', 'control']), BECOME, 'main').allowed).toBe(false);
+  });
+
+  it('write@* and the legacy exec:execute@* are unchanged', () => {
+    expect(decideShipBase(p('*'), BECOME, 'main').allowed).toBe(true);
+    expect(decideShipBase(p('*', 'exec', ['execute']), BECOME, 'main').allowed).toBe(true);
+    expect(decideShipBase(p('env_1', 'exec', ['execute']), BECOME, 'main').allowed).toBe(false);
+  });
+
+  it('a workspace without a configured base defaults to main; an unknown repo needs a * grant', () => {
+    expect(decideShipBase(p(WS), { repo: 'XiroEx/become', configuredBase: undefined }, 'main').allowed).toBe(true);
+    expect(decideShipBase(p('xiroex/become@x'), { repo: 'not a repo', configuredBase: 'beta' }, 'x').allowed).toBe(false);
+    expect(decideShipBase(p('*'), { repo: 'not a repo', configuredBase: 'beta' }, 'x').allowed).toBe(true);
+    expect(repoBaseAliases('https://github.com/XiroEx/become.git', 'Main')).toEqual(['github.com/xiroex/become@main', 'xiroex/become@main']);
+    expect(repoBaseAliases('nope', 'main')).toEqual([]);
   });
 });
 
