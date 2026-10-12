@@ -15,6 +15,7 @@ import { CapabilityDeniedError } from '../permissions/types';
 import { persistDenial } from '../permissions/persist-denial';
 import { isGuardedExecTool, runExecGuard, ExecBlockedError, auditAttempt } from '../permissions/exec-guard';
 import { getDataToolRule, isDataTool } from '../permissions/tool-map';
+import { resolveWorkspaceToolAddress } from '../permissions/workspace-address';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -480,12 +481,27 @@ export class NativeToolRegistry {
     // genuine DENY (CapabilityDeniedError) must be surfaced to the model.
     try {
       const profile = getCapabilityProfile(context?.state);
+      // Workspace tools name their target only through the run (its checkouts,
+      // the PRs it shipped) or Mongo (an existing workspace's id), so their
+      // address is resolved here, before the synchronous gate. null for every
+      // other tool (the rule's own extract runs). A resolution failure must not
+      // reach the fail-open catch below: it falls back to the rule's own
+      // synchronous address, which is never wider.
+      let resolved: Awaited<ReturnType<typeof resolveWorkspaceToolAddress>> = null;
+      if (profile) {
+        try {
+          resolved = await resolveWorkspaceToolAddress(name, args ?? {}, context);
+        } catch (resolveErr) {
+          console.warn(`[NativeRegistry] workspace address resolution failed for tool=${name}:`, resolveErr);
+          resolved = null;
+        }
+      }
       // ALWAYS call enforce (even when unprofiled): data resources short-circuit
       // to allow on a null profile (back-compat), but exec/computer are
       // FAIL-CLOSED and MUST be denied on an unprofiled run — so the null case
       // has to reach enforce. (Previously this was `if (profile)`, which skipped
       // enforcement entirely for unprofiled runs and defeated fail-closed.)
-      enforceToolCapability(profile ?? null, name, args ?? {});
+      enforceToolCapability(profile ?? null, name, args ?? {}, resolved ?? undefined);
     } catch (err) {
       if (err instanceof CapabilityDeniedError) {
         // SHADOW (Goal 3): during migration, a would-be exec/computer DENY is
@@ -1556,7 +1572,7 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   }
 
   // ─── Managed workspaces (spawned per run; see lib/workspaces) ─────────────
-  for (const toolName of ['workspace_for_repo', 'workspace_ship', 'workspace_merge']) {
+  for (const toolName of ['workspace_for_repo', 'workspace_ship', 'workspace_merge', 'workspace_get', 'workspace_task', 'get_workspace_task']) {
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const mod = require(`./native/${toolName.replace(/_/g, '-')}.js`);

@@ -125,9 +125,13 @@ describe('workspace_merge', () => {
 describe('capability mapping', () => {
   const wild: CapabilityProfile = { name: 'wild', capabilities: [{ resource: 'exec', actions: ['execute'], selector: '*' }] };
   const scoped: CapabilityProfile = { name: 'scoped', capabilities: [{ resource: 'exec', actions: ['execute'], selector: 'env_1' }] };
-  it('workspace_ship is scoped to the pinned environment like run_command', () => {
-    expect(() => enforceToolCapability(scoped, 'workspace_ship', { environmentId: 'env_1', branch: 'b', title: 't' })).not.toThrow();
-    expect(() => enforceToolCapability(scoped, 'workspace_ship', { environmentId: 'env_2', branch: 'b', title: 't' })).toThrow(CapabilityDeniedError);
+  it('workspace_ship is a workspace:write tool (0.0.296): exec:* still passes, a scoped exec grant no longer does', () => {
+    // Addressed by the WORKSPACE whose checkout runs in the pinned env (resolved
+    // at dispatch, see permissions/workspace-address.ts); without that
+    // resolution the call is unscoped. A scoped exec grant on the checkout env
+    // could only ever have been written mid-run, so nothing relied on it.
+    expect(() => enforceToolCapability(wild, 'workspace_ship', { environmentId: 'env_1', branch: 'b', title: 't' })).not.toThrow();
+    expect(() => enforceToolCapability(scoped, 'workspace_ship', { environmentId: 'env_1', branch: 'b', title: 't' })).toThrow(CapabilityDeniedError);
     expect(() => enforceToolCapability(null, 'workspace_ship', { environmentId: 'env_1', branch: 'b', title: 't' })).toThrow(CapabilityDeniedError);
   });
   it('workspace_for_repo and workspace_merge are unscoped: a wildcard exec grant is required', () => {

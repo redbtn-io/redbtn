@@ -116,7 +116,10 @@ export async function runExecGuard(
   const rule = getDataToolRule(name);
   if (!rule || !isFailClosedResource(rule.resource)) return; // not a guarded tool
 
-  const resource = rule.resource;
+  // The workspace tools were exec tools until 0.0.296 and the hub's
+  // exec-attempt ledger only knows exec/computer/environment, so they keep
+  // being recorded (and rate-limited, and kill-switched) as exec.
+  const resource = rule.resource === 'workspace' ? 'exec' : rule.resource;
   const userId = resolveField(context, 'userId') ?? '';
   const envId = typeof args?.environmentId === 'string' ? args.environmentId.trim() : '';
   const address = envId || '*';
@@ -222,7 +225,9 @@ export async function auditAttempt(
       graphId: resolveField(context, 'graphId') ?? null,
       conversationId: resolveField(context, 'conversationId') ?? null,
       agentId: resolveField(context, 'agentId') ?? null,
-      resource, action, address, toolName: name, outcome,
+      // The ledger knows exec/computer/environment; workspace tools are exec there.
+      resource: resource === 'workspace' ? 'exec' : resource,
+      action, address, toolName: name, outcome,
       blockCode: blockCode ?? null,
     };
     const res = await fetch(`${base}/api/v1/permissions/exec-attempts`, {

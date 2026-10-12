@@ -20,7 +20,9 @@ import { ParserExecutor, type ParserToolExecutor } from './parserExecutor';
 import { getParserRegistry } from './parserRegistry';
 import { getNativeRegistry } from '../../../tools/native-registry';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
-import { getRunPublisher, getNeuronRegistry, getMcpClient, getGraphRegistry, getMeteringClient } from '../../../run/contextLookup';
+import { getRunPublisher, getNeuronRegistry, getMcpClient, getGraphRegistry, getMeteringClient, getCapabilityProfile, getCapabilityScopeKey } from '../../../run/contextLookup';
+import { decideWorkspace, workspaceAliases, addDerivedGrant, recordWorkspaceCheckout, revokeCheckoutGrants, repoSlug } from '../../../permissions/workspace-grants';
+import { CapabilityDeniedError } from '../../../permissions/types';
 import { HumanMessage } from '@langchain/core/messages';
 import {
   resolveToolStrategy,
@@ -380,16 +382,52 @@ export async function acquireWorkspaceForStep(state: any): Promise<WorkspaceSess
     throw new WorkspaceEnvironmentUnavailableError(workspaceId, 'the run has no runId to hold a checkout with');
   }
 
-  // An active checkout for this run already exists (a retry, or a sibling step
-  // in the same run) — bind to it rather than spawning a second container.
+  let existing: any = null;
   try {
-    const existing = await new WorkspaceRepository(db).getWorkspace(workspaceId);
-    const mine = existing?.activeCheckouts?.find(
-      (c: any) => c.runId === runId && c.environmentId && new Date(c.leaseExpiresAt).getTime() > Date.now()
-    );
-    if (mine) return null;
+    existing = await new WorkspaceRepository(db).getWorkspace(workspaceId);
   } catch {
     /* fall through to acquire; acquire's own errors are surfaced */
+  }
+
+  // Capability gate (permissions/workspace-grants.ts). A PROFILED run may only
+  // check out a workspace its profile allows `workspace:execute` on (or holds
+  // the legacy `exec:execute@*`), and is refused BEFORE any container spawns.
+  // An unprofiled run is unchanged: the checkout proceeds and exec stays
+  // fail-closed for it, exactly as before.
+  const profile = getCapabilityProfile(state);
+  if (profile) {
+    const aliases = workspaceAliases({
+      workspaceId,
+      repo: existing?.config?.gitRepoUrl,
+      branch: existing?.config?.gitBranch,
+    });
+    const decision = decideWorkspace(profile, 'execute', aliases);
+    if (!decision.allowed) {
+      throw new CapabilityDeniedError({
+        resource: 'workspace',
+        action: 'execute',
+        address: decision.address ?? workspaceId,
+        profileName: profile.name ?? 'unnamed-profile',
+        message: decision.reason ?? `Permission denied: workspace ${workspaceId} may not be checked out by this agent.`,
+      });
+    }
+  }
+
+  // An active checkout for this run already exists (a retry, or a sibling step
+  // in the same run) — bind to it rather than spawning a second container.
+  const mine = existing?.activeCheckouts?.find(
+    (c: any) => c.runId === runId && c.environmentId && new Date(c.leaseExpiresAt).getTime() > Date.now()
+  );
+  if (mine) {
+    // Mongo says THIS run holds it, so it may derive (e.g. a retried step,
+    // possibly on another worker where the earlier derivation never happened).
+    deriveCheckoutGrants(state, profile, runId, {
+      workspaceId,
+      environmentId: mine.environmentId,
+      checkoutId: mine.checkoutId,
+      workspace: existing,
+    });
+    return null;
   }
 
   const delegatedFrom = delegatedFromUserId(state);
@@ -426,8 +464,53 @@ export async function acquireWorkspaceForStep(state: any): Promise<WorkspaceSess
     state.parameters.workingDir = state.data.workingDir;
   }
 
+  deriveCheckoutGrants(state, profile, runId, {
+    workspaceId,
+    environmentId: session.environmentId,
+    checkoutId: session.acquired.checkout.checkoutId,
+    workspace: session.acquired.workspace ?? existing,
+  });
+
   session.startRenewing();
   return session;
+}
+
+/**
+ * DERIVED grants for a checkout the engine itself acquired (or verified in
+ * Mongo as this run's): `exec:execute@<its environmentId>` for the profile
+ * scope in force, so file / command tools — and workspace_ship — work inside
+ * the checkout and nowhere else. Also records the checkout so workspace_ship /
+ * workspace_merge can be addressed by the workspace. Unprofiled runs derive
+ * nothing (their exec stays fail-closed, as before). See workspace-grants.ts.
+ */
+function deriveCheckoutGrants(
+  state: any,
+  profile: any,
+  runId: string,
+  checkout: { workspaceId: string; environmentId: string; checkoutId?: string; workspace?: any },
+): void {
+  if (!profile || !checkout.environmentId) return;
+  const scopeKey = getCapabilityScopeKey(state);
+  const ws = checkout.workspace;
+  const aliases = workspaceAliases({
+    workspaceId: checkout.workspaceId,
+    repo: ws?.config?.gitRepoUrl,
+    branch: ws?.config?.gitBranch,
+  });
+  addDerivedGrant(runId, scopeKey, { resource: 'exec', actions: ['execute'], selector: checkout.environmentId });
+  recordWorkspaceCheckout(runId, {
+    workspaceId: checkout.workspaceId,
+    environmentId: checkout.environmentId,
+    checkoutId: checkout.checkoutId,
+    aliases,
+    repo: repoSlug(ws?.config?.gitRepoUrl),
+    baseBranch: typeof ws?.config?.gitBranch === 'string' ? ws.config.gitBranch : null,
+    scopeKey,
+  });
+  console.log(
+    `[NeuronExecutor] workspace ${checkout.workspaceId}: derived exec:execute@${checkout.environmentId} ` +
+      `for run ${runId} (scope ${scopeKey})`,
+  );
 }
 
 function getWorkspaceDb(state: any): any {
@@ -1777,6 +1860,9 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
         // loud: an unreleased checkout blocks the workspace until the reaper.
         console.error('[NeuronExecutor] Failed to release workspace checkout:', releaseErr);
       }
+      // The derived exec grant lives exactly as long as the checkout this step
+      // held: once released, the run has no exec authority over that environment.
+      revokeCheckoutGrants(state?.runId || state?.data?.runId, workspaceSession.environmentId);
       // Unconditional: a release that threw still leaves the binding pointing at
       // a checkout this step no longer owns. Only ever runs when WE owned it —
       // when an outer owner holds the checkout `acquireWorkspaceForStep` returns

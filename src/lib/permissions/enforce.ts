@@ -23,7 +23,8 @@
  */
 
 import { decide, selectorMatches } from './matcher';
-import { getDataToolRule } from './tool-map';
+import { getDataToolRule, type ExtractedAddress } from './tool-map';
+import { decideWorkspace } from './workspace-grants';
 import {
   CapabilityDeniedError,
   type CapabilityAction,
@@ -35,7 +36,7 @@ import {
  * Resources that are FAIL-CLOSED: denied when the run has no profile granting them
  * (the inverse of state/knowledge's fail-open default). See types.ts.
  */
-const FAIL_CLOSED_RESOURCES = new Set(['exec', 'computer', 'environment']);
+const FAIL_CLOSED_RESOURCES = new Set(['exec', 'computer', 'environment', 'workspace']);
 
 /** True for high-risk resources gated fail-closed (exec/computer/environment). */
 export function isFailClosedResource(resource: string): boolean {
@@ -46,6 +47,13 @@ export function isFailClosedResource(resource: string): boolean {
 function envAddrForError(args: Record<string, unknown>): string {
   const id = typeof args?.environmentId === 'string' ? args.environmentId.trim() : '';
   return id || '*';
+}
+
+/** What a fail-closed resource is scoped by, for the unprofiled denial message. */
+function scopeHint(resource: string): string {
+  return resource === 'workspace'
+    ? 'scoped to the workspace (ws_ id or owner/repo[@branch]), or \'*\''
+    : 'scoped to the environmentId, or \'*\'';
 }
 
 /** Does the profile have ANY grant whose selector is a wildcard for this resource+action? */
@@ -79,6 +87,13 @@ export function enforceToolCapability(
   profile: CapabilityProfile | null | undefined,
   toolName: string,
   args: Record<string, unknown>,
+  /**
+   * The call's address when the dispatcher already resolved it (rules with an
+   * async `resolve`, e.g. the workspace tools, which need the run's checkouts
+   * or a Mongo lookup to know which workspace a call targets). Omitted: the
+   * rule's synchronous `extract` runs.
+   */
+  extracted?: ExtractedAddress,
 ): void {
   // 1. Not a mapped tool → out of scope for this layer (allow).
   const rule = getDataToolRule(toolName);
@@ -102,13 +117,33 @@ export function enforceToolCapability(
         message:
           `Permission denied: ${resource} is fail-closed and the run has no capability ` +
           `profile granting it. An operator must attach a profile granting ` +
-          `${resource}:${action} (scoped to the environmentId, or '*') to this agent.`,
+          `${resource}:${action} (${scopeHint(resource)}) to this agent.`,
       });
     }
     return;
   }
 
-  const { addresses, unscoped } = rule.extract(args ?? {});
+  const target = extracted ?? rule.extract(args ?? {});
+
+  // Workspace tools: one workspace, several identities (ws_ id and its
+  // configured owner/repo forms) — allowed when ANY identity matches a grant, and
+  // `exec:execute@*` remains the legacy superset. See workspace-grants.ts.
+  if (resource === 'workspace') {
+    const aliases = target.anyOf ?? target.addresses;
+    const decision = decideWorkspace(profile, action, target.unscoped && aliases.length === 0 ? [] : aliases);
+    if (!decision.allowed) {
+      throw new CapabilityDeniedError({
+        resource,
+        action,
+        address: decision.address ?? '*',
+        profileName: profile.name,
+        message: decision.reason ?? 'Permission denied.',
+      });
+    }
+    return;
+  }
+
+  const { addresses, unscoped } = target;
 
   // 3. Unscoped/broad call (e.g. list-all, search-all with no filter, or a
   //    required-address tool called without its address). Fail-closed: require
@@ -173,6 +208,7 @@ export function normalizeProfile(raw: unknown): CapabilityProfile | null {
     'state',
     'knowledge',
     'exec',
+    'workspace',
     'computer',
     'environment',
     'graph',
