@@ -665,7 +665,14 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                     if (nativeError) {
                         throw new Error(nativeError);
                     }
-                    // Extract result content using the same logic as the MCP path
+                    // Extract result content using the same logic as the MCP path.
+                    // NOTE (2026-10-13): unlike the neuron tool loop (tool-resolver
+                    // keeps image results raw for vision), a graph tool step writes
+                    // its result into run state, so it is NOT changed to keep image
+                    // blocks deliberately. As before: a text-first result is
+                    // unwrapped to its text block (images dropped); an image-first
+                    // result (desktop_screenshot, redboard_attachment_view) is
+                    // stored raw, base64 included, which existing graphs rely on.
                     let extractedNativeResult: any = nativeResult;
                     if (nativeResult && !nativeResult.isError && nativeResult.content && Array.isArray(nativeResult.content)) {
                         const firstContent = nativeResult.content[0];
@@ -812,6 +819,8 @@ async function executeToolInternal(config: ToolStepConfig, state: any): Promise<
                 if (result && !result.isError && result.content && Array.isArray(result.content)) {
                     // Try to parse JSON content if it's text
                     const firstContent = result.content[0];
+                    // Same unwrap rule as the native path above (see its NOTE): tool
+                    // steps do not special-case image blocks; neurons do (tool-resolver).
                     if (firstContent?.type === 'text' && firstContent.text) {
                         try {
                             extractedResult = JSON.parse(firstContent.text);
