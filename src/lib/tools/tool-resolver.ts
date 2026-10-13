@@ -474,8 +474,17 @@ export function partitionToolRefs(refs: ToolRef[]): {
  */
 /**
  * Recursively sanitize JSON schema for LLM provider function declaration compatibility.
- * Specifically handles union type arrays (e.g. type: ['string', 'null']) which
- * Google Gemini / OpenAPI / Protobuf schema parsers reject.
+ * Gemini's function-declaration `Schema` (OpenAPI subset, protobuf-parsed) rejects
+ * the WHOLE request on a keyword it does not know, so:
+ *   - union type arrays (`type: ['string', 'null']`) collapse to the single type;
+ *   - `exclusiveMinimum` / `exclusiveMaximum` (400 "Unknown name
+ *     exclusiveMinimum", seen with the Elite Entries MCP tools on
+ *     gemini-2.5-flash and gemini-3.8-flash) become an inclusive `minimum` /
+ *     `maximum` when none is set — the tool still validates its own input;
+ *   - `const` becomes a one-value `enum` for strings and is dropped otherwise.
+ * Keywords are only rewritten when their value has the keyword's shape, so a
+ * PROPERTY that happens to be named `const` or `exclusiveMinimum` (an object
+ * value) is left alone. Other providers accept the narrowed schema unchanged.
  */
 export function sanitizeSchemaForProvider(schema: any): any {
   if (!schema || typeof schema !== 'object') return schema;
@@ -489,6 +498,11 @@ export function sanitizeSchemaForProvider(schema: any): any {
       if (nonNullTypes.length === 1 && typeof nonNullTypes[0] === 'string') {
         clean.type = nonNullTypes[0];
       }
+    } else if ((key === 'exclusiveMinimum' || key === 'exclusiveMaximum') && (typeof value === 'number' || typeof value === 'boolean')) {
+      const bound = key === 'exclusiveMinimum' ? 'minimum' : 'maximum';
+      if (typeof value === 'number' && (schema as Record<string, unknown>)[bound] === undefined) clean[bound] = value;
+    } else if (key === 'const' && (value === null || typeof value !== 'object')) {
+      if (typeof value === 'string' && (schema as Record<string, unknown>).enum === undefined) clean.enum = [value];
     } else if (value && typeof value === 'object') {
       clean[key] = sanitizeSchemaForProvider(value);
     } else {
