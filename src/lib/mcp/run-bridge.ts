@@ -111,6 +111,12 @@ import { runControlRegistry } from '../run/RunControlRegistry';
 import { awaitWithCancelGrace } from '../run/tool-cancel';
 import { callerIsTrusted } from '../tools/native/_outbound-url';
 import type { ToolInvocationContext } from '../tools/tool-resolver';
+import {
+  MAX_CALLS_CEILING,
+  bridgeCallBudget,
+  resolveMaxRepeatedToolCalls,
+  RepeatedCallGuard,
+} from '../neurons/run-limits';
 import { getMcpClient } from '../run/contextLookup';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -249,15 +255,15 @@ const PROTOCOL_VERSION_PATTERN = /^[A-Za-z0-9._:-]+$/;
 const PUBLISHER_TIMEOUT_MS = 15_000;
 
 /**
- * Absolute ceiling on `maxCalls`, whatever `maxToolIterations` the node config
- * carries. The node config is not model-chosen, so this is a bound on operator
- * error rather than on an attacker, but every one of those calls is an archive
- * write and the budget should not be able to name a number with no roof.
+ * Ceiling on an explicit numeric `maxCalls` (was 2,000; raised 2026-10-13).
+ * The node config is not model-chosen, so this bounds operator error rather
+ * than an attacker. A step that needs no budget at all opts into unlimited
+ * (`maxToolIterations: 0`, see lib/neurons/run-limits); the runaway guard
+ * (identical call + identical result, `maxRepeatedToolCalls`) then stands in
+ * for the count cap, and the per-connection / in-flight / archive-deadline
+ * bounds below are unchanged.
  */
-export const MAX_CALLS_CEILING = 2_000;
-
-/** Default `--max-turns` assumption when the node does not set one. */
-const DEFAULT_MAX_TOOL_ITERATIONS = 50;
+export { MAX_CALLS_CEILING };
 
 /**
  * Tools that are forbidden wholesale from the bridge.
@@ -450,8 +456,14 @@ export interface StartRunToolBridgeOptions {
   // ── optional ──────────────────────────────────────────────────────────────
   /** Resolved connection credentials, forwarded to `callTool` unchanged. */
   credentials?: unknown;
-  /** Node's `maxToolIterations`; sets the hard call cap (`n*4 + 8`). */
-  maxToolIterations?: number;
+  /**
+   * Node's `maxToolIterations`; sets the call budget (`n*4 + 8`, capped at
+   * MAX_CALLS_CEILING). `0` / `"unlimited"` = no budget. Unset = the CLI
+   * default (DEFAULT_CLI_MAX_TURNS). See lib/neurons/run-limits.
+   */
+  maxToolIterations?: number | string | null;
+  /** Node's `maxRepeatedToolCalls` (runaway guard); `0` turns it off. Default 50. */
+  maxRepeatedToolCalls?: number | string | null;
   /** Called once on a fatal security event (auth revocation). */
   onFatal?: (err: Error) => void;
   /** Called on run cancellation — the executor kills the CLI child here. */
@@ -481,6 +493,8 @@ export interface RunBridgeStats {
   authFailures: number;
   /** Calls refused because the hard cap was reached. */
   capped: number;
+  /** Calls refused by the runaway guard (identical call + identical result streak). */
+  repeatRefused?: number;
 }
 
 export interface RunToolBridge {
@@ -499,7 +513,7 @@ export interface RunToolBridge {
   readonly stats: RunBridgeStats;
   readonly revoked: boolean;
   readonly revokedReason: string | null;
-  /** Hard cap on total `tools/call` dispatches for this session. */
+  /** Hard cap on total `tools/call` dispatches for this session (`Infinity` = unlimited). */
   readonly maxCalls: number;
   /** Refuse further work and drop every peer. Idempotent. */
   revoke(reason: string): void;
@@ -891,6 +905,7 @@ export async function startRunToolBridge(
     dir,
     credentials,
     maxToolIterations,
+    maxRepeatedToolCalls,
     onFatal,
     onCancel,
     authDeadlineMs = AUTH_DEADLINE_MS,
@@ -902,11 +917,9 @@ export async function startRunToolBridge(
   const tools = buildBridgeToolTable(resolvedTools ?? []);
   const toolsByName = new Map<string, Tool>(tools.map((t) => [t.name, t]));
   const nonce = crypto.randomBytes(32).toString('hex');
-  const iterations =
-    typeof maxToolIterations === 'number' && Number.isFinite(maxToolIterations) && maxToolIterations > 0
-      ? maxToolIterations
-      : DEFAULT_MAX_TOOL_ITERATIONS;
-  const maxCalls = Math.min(Math.floor(iterations) * 4 + 8, MAX_CALLS_CEILING);
+  // Budget and runaway guard: lib/neurons/run-limits (unlimited = Infinity).
+  const maxCalls = bridgeCallBudget(maxToolIterations);
+  const repeatGuard = new RepeatedCallGuard(resolveMaxRepeatedToolCalls(maxRepeatedToolCalls));
 
   // The step directory is the access control: 0700 there makes 0600 on the
   // socket. We deliberately do NOT flip the process-global umask around
@@ -933,7 +946,7 @@ export async function startRunToolBridge(
     /* no stale socket */
   }
 
-  const stats: RunBridgeStats = { callsTotal: 0, denied: 0, authFailures: 0, capped: 0 };
+  const stats: RunBridgeStats = { callsTotal: 0, denied: 0, authFailures: 0, capped: 0, repeatRefused: 0 };
   const sockets = new Set<net.Socket>();
   /**
    * Read-flow state per peer.
@@ -1248,10 +1261,22 @@ export async function startRunToolBridge(
     // whether it is served or denied. (A frame the cap itself refused is not
     // charged — otherwise a capped session could never report a stable
     // `callsTotal`.)
+    // Runaway guard (not a length cap): refuse the next repeat of a call that
+    // already returned the identical result `maxRepeatedToolCalls` times in a
+    // row. Not charged against the budget, like a capped frame.
+    const guardName = typeof params?.name === 'string' ? params.name : '';
+    const guardArgs = params?.arguments;
+    if (repeatGuard.shouldRefuse(guardName, guardArgs)) {
+      stats.repeatRefused = (stats.repeatRefused ?? 0) + 1;
+      return { content: [{ type: 'text', text: repeatGuard.message(echoName(guardName)) }], isError: true };
+    }
+
     stats.callsTotal += 1;
     inflight += 1;
     try {
-      return await dispatchToolsCall(params);
+      const result = await dispatchToolsCall(params);
+      repeatGuard.record(guardName, guardArgs, result);
+      return result;
     } finally {
       inflight -= 1;
     }

@@ -165,6 +165,7 @@ import { runControlRegistry } from '../../../run/RunControlRegistry';
 // `claude-code` executor owns, so sharing them cannot destabilise it.
 import { sanitizeSegment, runDirRoot } from './claudeCodeExecutor';
 import { createCliSlotQueue, slotWaitReporter, logSlotAdmission } from './cli-slot';
+import { DEFAULT_CLI_STEP_TIMEOUT_MS, resolveStepTimeoutMs } from '../../../neurons/run-limits';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -174,7 +175,8 @@ type AnyObject = Record<string, any>;
 // =============================================================================
 
 /** Wall-clock ceiling for one CLI child when the step does not set one. */
-export const DEFAULT_TIMEOUT_MS = 1_800_000;
+/** Step wall clock when unset (12 h; was 30 min). `timeoutMs: 0` = none. lib/neurons/run-limits. */
+export const DEFAULT_TIMEOUT_MS = DEFAULT_CLI_STEP_TIMEOUT_MS;
 
 /** Grace between SIGTERM and SIGKILL. */
 export const SIGKILL_GRACE_MS = 10_000;
@@ -1371,10 +1373,7 @@ export async function runAgyCliStep(
   const effortMode = AGY_MODELS.get(model) ?? 'required';
   const effort = resolveAgyEffort(state, neuronCfg, effortMode);
   const mount = resolveWorkspaceMount(state);
-  const timeoutMs =
-    typeof (config as AnyObject).timeoutMs === 'number' && (config as AnyObject).timeoutMs > 0
-      ? (config as AnyObject).timeoutMs
-      : DEFAULT_TIMEOUT_MS;
+  const timeoutMs = resolveStepTimeoutMs((config as AnyObject).timeoutMs, DEFAULT_TIMEOUT_MS);
 
   const dir = path.join(
     runDirRoot(),
@@ -1535,10 +1534,8 @@ export async function runAgyCliStep(
       abortSignal: abortSignal ?? null,
       neuronStepId: stepId,
       dir,
-      maxToolIterations:
-        typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0
-          ? config.maxToolIterations
-          : undefined,
+      maxToolIterations: config.maxToolIterations as number | string | undefined,
+      maxRepeatedToolCalls: (config as AnyObject).maxRepeatedToolCalls,
       onCancel: () => requestKill('run cancelled'),
       instructions: agyBridgeInstructions(servable.map((t) => t.name)),
     });
