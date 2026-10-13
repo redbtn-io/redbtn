@@ -1,0 +1,118 @@
+# do-not-merge: hold a PR on purpose by adding the `do-not-merge` label (and say
+# why in a PR comment). Never remove another agent's hold without asking George.
+#
+# While the label is on the PR:
+#   - the `do-not-merge` check FAILS. Where a repository ruleset requires this
+#     check on main/beta, GitHub refuses the merge for everyone, admins too;
+#   - the PR is converted to a DRAFT. GitHub refuses to merge a draft (web UI,
+#     `gh pr merge` and the REST API), which also holds in private repos where
+#     no ruleset can be applied. Marking it ready while held re-drafts it.
+# Removing the label releases the hold: the check passes, a draft that this
+# workflow created is marked ready again, and this workflow's earlier failed
+# runs on the same commit are deleted so no stale failure lingers on the PR.
+#
+# Without the label the job is skipped, which GitHub reports as a success, so
+# ordinary PRs pass this check without using a runner. Jobs that do run are
+# serialised per PR, so the last event decides the final state.
+name: do-not-merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled, ready_for_review]
+
+permissions: {}
+
+jobs:
+  do-not-merge:
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'do-not-merge') ||
+      (github.event.action == 'unlabeled' && github.event.label.name == 'do-not-merge')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    concurrency:
+      group: do-not-merge-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      actions: write        # delete this workflow's stale failed runs on release
+      contents: write       # convertPullRequestToDraft is refused without it
+      pull-requests: write  # draft / ready-for-review
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      PR_ID: ${{ github.event.pull_request.node_id }}
+      EVENT_HELD: ${{ contains(github.event.pull_request.labels.*.name, 'do-not-merge') }}
+      EVENT_DRAFT: ${{ github.event.pull_request.draft }}
+      EVENT_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Enforce or release the hold
+        run: |
+          set -u
+          # Decide from the PR as it is now, not as it was when the event fired.
+          if state=$(gh api "repos/$GH_REPO/pulls/$PR" \
+              --jq '"\(any(.labels[]; .name == "do-not-merge")) \(.draft) \(.head.sha)"' 2>/dev/null) \
+              && [ -n "$state" ]; then
+            read -r held draft sha <<<"$state"
+          else
+            echo "::warning::Could not read the PR from the API; deciding from the event payload."
+            held="$EVENT_HELD"; draft="$EVENT_DRAFT"; sha="$EVENT_SHA"
+          fi
+
+          if [ "$held" = "true" ]; then
+            if [ "$draft" != "true" ]; then
+              if gh api graphql -f id="$PR_ID" -f query='
+                  mutation($id: ID!) {
+                    convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { isDraft } }
+                  }' >/dev/null; then
+                echo "Converted the PR to a draft: GitHub will not merge it while the hold stands."
+              else
+                echo "::warning::Could not convert the PR to a draft."
+              fi
+            fi
+            echo "::error title=Held on purpose (do-not-merge)::Do not merge this PR. The do-not-merge label is the hold; remove the label to release it, and ask George before removing another agent's hold."
+            exit 1
+          fi
+
+          # Hold released: undo a draft only if this workflow created it.
+          if [ "$draft" = "true" ]; then
+            actor=$(gh api graphql -f owner="${GH_REPO%%/*}" -f name="${GH_REPO#*/}" -F number="$PR" \
+              --jq '.data.repository.pullRequest.timelineItems.nodes[0].actor.login // ""' -f query='
+                query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                      timelineItems(last: 1, itemTypes: [CONVERT_TO_DRAFT_EVENT]) {
+                        nodes { ... on ConvertToDraftEvent { actor { login } } }
+                      }
+                    }
+                  }
+                }' 2>/dev/null || true)
+            case "$actor" in
+              github-actions|github-actions\[bot\])
+                if gh api graphql -f id="$PR_ID" -f query='
+                    mutation($id: ID!) {
+                      markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { isDraft } }
+                    }' >/dev/null; then
+                  echo "Hold released: marked the PR ready for review again."
+                else
+                  echo "::warning::Could not mark the PR ready for review."
+                fi
+                ;;
+              *)
+                echo "Left as a draft: it was not drafted by this workflow (last drafted by '${actor:-unknown}')."
+                ;;
+            esac
+          fi
+
+          # Delete this workflow's earlier failed/cancelled runs on this commit:
+          # some tools (RedRun's promote, statusCheckRollup readers) read every
+          # check run on the commit, not just the newest one per name.
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ -n "$sha" ]; then
+            stale=$(gh api "repos/$GH_REPO/actions/workflows/do-not-merge.yml/runs?head_sha=$sha&per_page=100" \
+              --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID}) | select(.conclusion == \"failure\" or .conclusion == \"cancelled\" or .conclusion == \"timed_out\") | .id" 2>/dev/null || true)
+            for run in $stale; do
+              gh api -X DELETE "repos/$GH_REPO/actions/runs/$run" >/dev/null 2>&1 \
+                && echo "Deleted stale run $run." \
+                || echo "::warning::Could not delete stale run $run."
+            done
+          fi
+          echo "No do-not-merge label: OK to merge."
