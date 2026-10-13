@@ -36,11 +36,13 @@ import { runControlRegistry } from '../../../run/RunControlRegistry';
 import { resolveTools, partitionToolRefs } from '../../../tools/tool-resolver';
 import { runDirRoot, sanitizeSegment, resolveWorkspaceMount } from './claudeCodeExecutor';
 import { acquireCopilotLease, type CopilotLeaseHandle } from './copilotSdkLease';
+import { DEFAULT_CLI_STEP_TIMEOUT_MS, resolveStepTimeoutMs } from '../../../neurons/run-limits';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
-export const DEFAULT_TIMEOUT_MS = 1_800_000;
+/** Step wall clock when unset (12 h; was 30 min). `timeoutMs: 0` = none. lib/neurons/run-limits. */
+export const DEFAULT_TIMEOUT_MS = DEFAULT_CLI_STEP_TIMEOUT_MS;
 export const MAX_PROMPT_BYTES = 4 * 1024 * 1024;
 export const MAX_ASSISTANT_OUTPUT_BYTES = 16 * 1024 * 1024;
 export const MAX_USAGE_EVENTS = 256;
@@ -495,8 +497,7 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
 
   const model = resolveCopilotSdkModel(neuronCfg.model);
   const mount = resolveWorkspaceMount(state);
-  const timeoutMs = typeof (config as AnyObject).timeoutMs === 'number' && (config as AnyObject).timeoutMs > 0
-    ? (config as AnyObject).timeoutMs : DEFAULT_TIMEOUT_MS;
+  const timeoutMs = resolveStepTimeoutMs((config as AnyObject).timeoutMs, DEFAULT_TIMEOUT_MS);
   const dir = path.join(
     runDirRoot(),
     sanitizeSegment(runId, 'norun'),
@@ -713,7 +714,8 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       abortSignal: bridgeAbortController.signal,
       neuronStepId: stepId,
       dir,
-      maxToolIterations: typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0 ? config.maxToolIterations : undefined,
+      maxToolIterations: config.maxToolIterations as number | string | undefined,
+      maxRepeatedToolCalls: (config as AnyObject).maxRepeatedToolCalls,
       onCancel: () => requestStop('run cancelled', abortError('Copilot SDK run cancelled')),
     });
     bridge = await controlled(bridgeStartupPromise);

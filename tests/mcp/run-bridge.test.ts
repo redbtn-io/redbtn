@@ -1295,9 +1295,54 @@ describe('hard call cap', () => {
     expect(received).toHaveLength(16);
   });
 
-  it('defaults to 50 iterations (208 calls) when the node sets none', async () => {
+  it('defaults to 500 turns (2,008 calls) when the node sets none (0.0.301; was 50 / 208)', async () => {
     const { bridge: b } = await start({ maxToolIterations: undefined });
-    expect(b.maxCalls).toBe(208);
+    expect(b.maxCalls).toBe(2008);
+  });
+
+  it('maxToolIterations 0 or "unlimited" means no call budget', async () => {
+    for (const v of [0, 'unlimited'] as const) {
+      const { bridge: b } = await start({ maxToolIterations: v });
+      expect(b.maxCalls).toBe(Infinity);
+      const c = await client(b);
+      for (let i = 0; i < 20; i++) {
+        const res = await c.send('tools/call', { name: 'run_command', arguments: { command: `echo ${i}` } });
+        expect(res.result.isError).toBeFalsy();
+      }
+      expect(b.stats.capped).toBe(0);
+      await b.close();
+      bridge = null;
+    }
+  });
+});
+
+describe('runaway guard (maxRepeatedToolCalls)', () => {
+  it('refuses a call that already returned the identical result N times in a row, and resets on a different call', async () => {
+    const { bridge: b } = await start({ maxToolIterations: 0, maxRepeatedToolCalls: 3 });
+    const c = await client(b);
+    for (let i = 0; i < 3; i++) {
+      const res = await c.send('tools/call', { name: 'run_command', arguments: { command: 'echo same' } });
+      expect(res.result.isError).toBeFalsy();
+    }
+    const refused = await c.send('tools/call', { name: 'run_command', arguments: { command: 'echo same' } });
+    expect(refused.result.isError).toBe(true);
+    expect(refused.result.content[0].text).toMatch(/runaway guard/);
+    expect(b.stats.repeatRefused).toBe(1);
+    // a different call is served and resets the streak
+    const other = await c.send('tools/call', { name: 'run_command', arguments: { command: 'echo other' } });
+    expect(other.result.isError).toBeFalsy();
+    const again = await c.send('tools/call', { name: 'run_command', arguments: { command: 'echo same' } });
+    expect(again.result.isError).toBeFalsy();
+  });
+
+  it('maxRepeatedToolCalls 0 turns the guard off', async () => {
+    const { bridge: b } = await start({ maxToolIterations: 0, maxRepeatedToolCalls: 0 });
+    const c = await client(b);
+    for (let i = 0; i < 60; i++) {
+      const res = await c.send('tools/call', { name: 'run_command', arguments: { command: 'echo same' } });
+      expect(res.result.isError).toBeFalsy();
+    }
+    expect(b.stats.repeatRefused).toBe(0);
   });
 });
 

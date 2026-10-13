@@ -113,6 +113,7 @@ import { getRunPublisher } from '../../../run/contextLookup';
 import { runControlRegistry } from '../../../run/RunControlRegistry';
 import { sanitizeSegment, runDirRoot } from './claudeCodeExecutor';
 import { createCliSlotQueue, slotWaitReporter, logSlotAdmission } from './cli-slot';
+import { DEFAULT_CLI_STEP_TIMEOUT_MS, resolveStepTimeoutMs } from '../../../neurons/run-limits';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -122,7 +123,8 @@ type AnyObject = Record<string, any>;
 // =============================================================================
 
 /** Wall-clock ceiling for one CLI child when the step does not set one. */
-export const DEFAULT_TIMEOUT_MS = 1_800_000;
+/** Step wall clock when unset (12 h; was 30 min). `timeoutMs: 0` = none. lib/neurons/run-limits. */
+export const DEFAULT_TIMEOUT_MS = DEFAULT_CLI_STEP_TIMEOUT_MS;
 
 /** Grace between SIGTERM and SIGKILL. */
 export const SIGKILL_GRACE_MS = 5_000;
@@ -914,10 +916,7 @@ export async function runOpencodeStep(options: RunOpencodeStepOptions): Promise<
   const secret =
     (typeof neuronCfg?.apiKey === 'string' && neuronCfg.apiKey) || process.env.OPENCODE_NEURON_SECRET || '';
   const credential = resolveProviderCredential(model, secret || undefined);
-  const timeoutMs =
-    typeof (config as AnyObject).timeoutMs === 'number' && (config as AnyObject).timeoutMs > 0
-      ? (config as AnyObject).timeoutMs
-      : DEFAULT_TIMEOUT_MS;
+  const timeoutMs = resolveStepTimeoutMs((config as AnyObject).timeoutMs, DEFAULT_TIMEOUT_MS);
 
   const dir = path.join(
     runDirRoot(),
@@ -1028,10 +1027,8 @@ export async function runOpencodeStep(options: RunOpencodeStepOptions): Promise<
       abortSignal: abortSignal ?? null,
       neuronStepId: stepId,
       dir,
-      maxToolIterations:
-        typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0
-          ? config.maxToolIterations
-          : undefined,
+      maxToolIterations: config.maxToolIterations as number | string | undefined,
+      maxRepeatedToolCalls: (config as AnyObject).maxRepeatedToolCalls,
       onCancel: () => requestKill('run cancelled'),
     });
 
