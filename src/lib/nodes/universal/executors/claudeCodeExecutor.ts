@@ -92,12 +92,23 @@ export { SLOT_WAIT_PROGRESS_INTERVAL_MS };
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
 
+import {
+  DEFAULT_CLI_MAX_TURNS,
+  DEFAULT_CLI_STEP_TIMEOUT_MS,
+  resolveStepTimeoutMs,
+  resolveToolIterationLimit,
+} from '../../../neurons/run-limits';
+
 // =============================================================================
 // Constants
 // =============================================================================
 
-/** Wall-clock ceiling for one CLI child when the step does not set one. */
-export const DEFAULT_TIMEOUT_MS = 7_200_000;
+/**
+ * Wall-clock ceiling for one CLI child when the step does not set one (12 h;
+ * was 2 h). `timeoutMs: 0` / `"unlimited"` = no step wall clock; the run-level
+ * timeout still applies. See lib/neurons/run-limits.
+ */
+export const DEFAULT_TIMEOUT_MS = DEFAULT_CLI_STEP_TIMEOUT_MS;
 
 /** Grace between SIGTERM and SIGKILL. */
 export const SIGKILL_GRACE_MS = 10_000;
@@ -113,8 +124,11 @@ export const SIGKILL_GRACE_MS = 10_000;
  */
 export const RUN_POLL_INTERVAL_MS = 60_000;
 
-/** Default `--max-turns` when the node does not set `maxToolIterations`. */
-export const DEFAULT_MAX_TURNS = 50;
+/**
+ * Default `--max-turns` when the node does not set `maxToolIterations` (500;
+ * was 50). `maxToolIterations: 0` / `"unlimited"` passes no `--max-turns`.
+ */
+export const DEFAULT_MAX_TURNS = DEFAULT_CLI_MAX_TURNS;
 
 /**
  * System prompts longer than this are delivered in-band on stdin instead of as
@@ -624,7 +638,8 @@ export interface SpawnArgsInput {
   mcpConfigPath: string;
   sessionId?: string;
   resumeSessionId?: string;
-  maxTurns: number;
+  /** `null` = unlimited: no `--max-turns` argument. */
+  maxTurns: number | null;
   /** Omitted when the prompt was folded into stdin (see MAX_SYSTEM_PROMPT_ARG_BYTES). */
   systemPrompt?: string;
   jsonSchema?: string;
@@ -679,7 +694,7 @@ export function buildSpawnArgs(input: SpawnArgsInput): string[] {
   } else if (input.sessionId) {
     args.push('--session-id', input.sessionId);
   }
-  args.push('--max-turns', String(input.maxTurns));
+  if (input.maxTurns !== null && input.maxTurns !== undefined) args.push('--max-turns', String(input.maxTurns));
   if (input.systemPrompt) args.push('--system-prompt', input.systemPrompt);
   if (input.jsonSchema) args.push('--json-schema', input.jsonSchema);
   return args;
@@ -1218,14 +1233,9 @@ export async function runClaudeCodeStep(
 
   const model = resolveModel(neuronCfg?.model);
   const mount = resolveWorkspaceMount(state);
-  const maxTurns =
-    typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0
-      ? config.maxToolIterations
-      : DEFAULT_MAX_TURNS;
-  const timeoutMs =
-    typeof (config as AnyObject).timeoutMs === 'number' && (config as AnyObject).timeoutMs > 0
-      ? (config as AnyObject).timeoutMs
-      : DEFAULT_TIMEOUT_MS;
+  // null = unlimited (no --max-turns, no bridge call budget). lib/neurons/run-limits.
+  const maxTurns = resolveToolIterationLimit(config.maxToolIterations, DEFAULT_MAX_TURNS);
+  const timeoutMs = resolveStepTimeoutMs((config as AnyObject).timeoutMs, DEFAULT_TIMEOUT_MS);
 
   // The CLI is the whole node's turn: stream whenever the node asked for it.
   //
@@ -1437,7 +1447,8 @@ export async function runClaudeCodeStep(
       abortSignal: abortSignal ?? null,
       neuronStepId: stepId,
       dir,
-      maxToolIterations: maxTurns,
+      maxToolIterations: maxTurns === null ? 'unlimited' : maxTurns,
+      maxRepeatedToolCalls: (config as AnyObject).maxRepeatedToolCalls,
       onCancel: () => requestKill('run cancelled'),
     });
 

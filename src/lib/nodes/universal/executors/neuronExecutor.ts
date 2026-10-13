@@ -32,6 +32,12 @@ import {
   type ToolStrategy,
   type HostedToolSpec,
 } from '../../../neurons/capability-matrix';
+import {
+  DEFAULT_API_MAX_TOOL_ITERATIONS,
+  RepeatedCallGuard,
+  resolveMaxRepeatedToolCalls,
+  resolveToolIterationLimit,
+} from '../../../neurons/run-limits';
 import { resolveTools, toBindToolsPayload, partitionToolRefs, type ResolvedTool } from '../../../tools/tool-resolver';
 import { coerceArgsToSchema } from '../../../tools/coerce-args';
 import { runClaudeCodeStep } from './claudeCodeExecutor';
@@ -2107,9 +2113,15 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
   const promptCache = args.promptCache === true;
 
   const runPublisher: any = getRunPublisher(state);
-  const maxIterations = typeof config.maxToolIterations === 'number' && config.maxToolIterations > 0
-    ? config.maxToolIterations
-    : 5;
+  // lib/neurons/run-limits: default 25 (was 5); `maxToolIterations: 0` /
+  // "unlimited" = no iteration cap. The runaway guard below (identical call +
+  // identical result, `maxRepeatedToolCalls`, default 50) protects unlimited
+  // loops instead of a count cap.
+  const iterationLimit = resolveToolIterationLimit(config.maxToolIterations, DEFAULT_API_MAX_TOOL_ITERATIONS);
+  const maxIterations = iterationLimit === null ? Infinity : iterationLimit;
+  const repeatGuard = new RepeatedCallGuard(resolveMaxRepeatedToolCalls((config as any).maxRepeatedToolCalls));
+  let consecutiveRefusals = 0;
+  let stopLoop = false;
   const neuronStepId = config.outputField;
 
   // Resolve per-run tool credentials once at loop start. These are templated
@@ -2374,6 +2386,19 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
         throw err;
       }
 
+      // Runaway guard: the same call that already returned the same result
+      // `maxRepeatedToolCalls` times in a row is answered with an error instead
+      // of being dispatched; three refusals in a row end the loop (wrap-up).
+      if (resolved && repeatGuard.shouldRefuse(toolName, dispatchArgs)) {
+        const refusal = repeatGuard.message(toolName);
+        console.warn(`[NeuronExecutor] runaway guard refused '${toolName}' (step ${neuronStepId})`);
+        messages.push({ role: 'tool', tool_call_id: toolCallId, name: toolName, content: refusal });
+        consecutiveRefusals += 1;
+        if (consecutiveRefusals >= 3) stopLoop = true;
+        continue;
+      }
+      consecutiveRefusals = 0;
+
       // Register an onCancel callback so an external interrupt can abort the
       // in-flight tool dispatch. The dispatcher itself reads
       // `ctx.abortSignal` (sourced from RunControlRegistry above), so this
@@ -2423,6 +2448,7 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
         });
         lastToolResult = result;
         lastToolName = toolName;
+        repeatGuard.record(toolName, dispatchArgs, result);
       } catch (dispatchErr: any) {
         toolFailed = true;
         const errMsg = dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr);
@@ -2491,10 +2517,16 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
         }),
       );
     }
+    if (stopLoop) {
+      console.warn(`[NeuronExecutor] runaway guard ended the tool loop for step ${neuronStepId}`);
+      break;
+    }
   }
 
   // Loop exhausted — synthesize a wrap-up message from the last tool result.
-  const wrapUp = `I attempted multiple tool calls (max ${maxIterations}) but did not reach a final answer. ` +
+  const wrapUp = (stopLoop
+    ? 'I stopped because I kept repeating the same tool call and getting the same result. '
+    : `I attempted multiple tool calls (max ${maxIterations}) but did not reach a final answer. `) +
     (lastToolName
       ? `Last tool: ${lastToolName}. Last result: ${safeStringify(lastToolResult).slice(0, 500)}`
       : 'No tools were dispatched.');
