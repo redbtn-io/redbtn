@@ -55,6 +55,53 @@ export interface ServerConfig {
   platform?: boolean;
 }
 
+/**
+ * One entry of a static tool roster: a bare tool name, or a tool definition
+ * cached when the connection was discovered (`mcpconnections.discoveredTools`
+ * carries `{ name, description, inputSchema }`). With a definition, neurons
+ * see the tool's real argument names and types; with a bare name they get a
+ * permissive empty schema and have to guess (e.g. `channel_id` for
+ * `channelId`, or a 64-bit Discord id as a JSON number, which is rounded).
+ */
+export type StaticToolSpec =
+  | string
+  | { name: string; description?: string; inputSchema?: Record<string, unknown> };
+
+const PERMISSIVE_SCHEMA = (): Tool['inputSchema'] => ({ type: 'object', properties: {} });
+
+function isObjectSchema(schema: unknown): schema is Tool['inputSchema'] {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return false;
+  const s = schema as Record<string, unknown>;
+  if (s.type !== 'object') return false;
+  return s.properties === undefined || (typeof s.properties === 'object' && s.properties !== null && !Array.isArray(s.properties));
+}
+
+/**
+ * Turn a static roster into registry tools. Names are deduplicated, entries
+ * without a usable name are dropped, and a definition whose `inputSchema` is
+ * not an object schema falls back to the permissive one.
+ */
+export function normalizeStaticRoster(specs: readonly unknown[], serverName: string): Tool[] {
+  const out: Tool[] = [];
+  const seen = new Set<string>();
+  for (const spec of specs) {
+    const def = spec && typeof spec === 'object' && !Array.isArray(spec) ? (spec as Record<string, unknown>) : null;
+    const name = typeof spec === 'string' ? spec : typeof def?.name === 'string' ? def.name : '';
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    const description = typeof def?.description === 'string' && def.description.trim()
+      ? def.description
+      : `MCP tool ${name} on ${serverName}`;
+    const cached = def?.inputSchema;
+    // Cloned: the roster usually comes straight from a database document.
+    const inputSchema: Tool['inputSchema'] = isObjectSchema(cached)
+      ? { ...structuredClone(cached), properties: structuredClone(cached.properties ?? {}) }
+      : PERMISSIVE_SCHEMA();
+    out.push({ name, description, inputSchema });
+  }
+  return out;
+}
+
 /** A tool match. `server` is the connection name. */
 export interface FoundTool {
   server: string;
@@ -165,14 +212,16 @@ export class McpRegistry {
    * accept credentials per-call via `_meta.credentials.headers`. Credentials
    * are supplied at call time (templated per-run from state), NOT here.
    *
-   * Tool schemas are best-effort: `/health` only advertises tool names, so we
-   * register permissive object schemas. The neuron tool-resolver tolerates
-   * this (the runtime tool call validates server-side).
+   * Tool schemas: pass cached definitions (`{ name, description, inputSchema }`,
+   * e.g. the connection's `discoveredTools`) and they are served as-is, so a
+   * neuron sees the real argument names and types. Bare names — and the
+   * `/health` probe, which only advertises names — get permissive object
+   * schemas; the runtime tool call still validates server-side.
    *
-   * @param config.tools Optional explicit tool roster. When omitted we probe
-   *   `{url}/health` for a `tools: string[]` list.
+   * @param config.tools Optional explicit tool roster (names or definitions).
+   *   When omitted or empty we probe `{url}/health` for a `tools: string[]` list.
    */
-  async registerStaticServer(config: ServerConfig & { tools?: string[]; messagePath?: string }): Promise<void> {
+  async registerStaticServer(config: ServerConfig & { tools?: StaticToolSpec[]; messagePath?: string }): Promise<void> {
     const { name, url, headers } = config;
     const { key } = this.keyFor(config);
 
@@ -181,14 +230,14 @@ export class McpRegistry {
       return;
     }
 
-    let toolNames: string[] = config.tools ?? [];
-    if (toolNames.length === 0) {
+    let tools: Tool[] = normalizeStaticRoster(config.tools ?? [], name);
+    if (tools.length === 0) {
       try {
         const res = await fetch(`${url}/health`, { headers: { ...(headers ?? {}) } });
         if (res.ok) {
           const body: any = await res.json();
           if (Array.isArray(body?.tools)) {
-            toolNames = body.tools.filter((t: unknown) => typeof t === 'string');
+            tools = normalizeStaticRoster(body.tools.filter((t: unknown) => typeof t === 'string'), name);
           }
         } else {
           console.warn(`[Registry] Static server ${name} health probe returned ${res.status}`);
@@ -198,15 +247,9 @@ export class McpRegistry {
       }
     }
 
-    if (toolNames.length === 0) {
+    if (tools.length === 0) {
       throw new Error(`[Registry] registerStaticServer: no tools discovered for ${name} at ${url}`);
     }
-
-    const tools: Tool[] = toolNames.map((toolName) => ({
-      name: toolName,
-      description: `MCP tool ${toolName} on ${name}`,
-      inputSchema: { type: 'object', properties: {} },
-    }));
 
     const client = new McpClientSSE(url, name, {
       headers,
@@ -227,7 +270,8 @@ export class McpRegistry {
 
     this.clients.set(key, client);
     this.servers.set(key, registration);
-    console.log(`[Registry] Statically registered ${name} with ${tools.length} tools (no handshake)`);
+    const withSchemas = tools.filter((t) => Object.keys(t.inputSchema.properties ?? {}).length > 0).length;
+    console.log(`[Registry] Statically registered ${name} with ${tools.length} tools (no handshake, ${withSchemas} with input schemas)`);
   }
 
   /**
