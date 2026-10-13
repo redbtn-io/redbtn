@@ -154,6 +154,28 @@ function ensureJsonSchema(schema: unknown): Record<string, unknown> {
   return { type: 'object', properties: {}, additionalProperties: true };
 }
 
+/**
+ * True when an MCP-shaped tool result carries at least one image block with
+ * data. The neuron tool loop must hand such a result to
+ * `formatToolResultForModel` unchanged: unwrapping it to its first text block
+ * (what text-only results get) throws the image away, so the model only ever
+ * saw "mind-light.png (image/png, 233885 bytes)" from redboard_attachment_view.
+ */
+export function hasImageBlock(result: unknown): boolean {
+  const content = (result as { content?: unknown } | null | undefined)?.content;
+  return (
+    Array.isArray(content) &&
+    content.some(
+      (c) =>
+        !!c &&
+        typeof c === 'object' &&
+        (c as { type?: unknown }).type === 'image' &&
+        typeof (c as { data?: unknown }).data === 'string' &&
+        ((c as { data: string }).data.length > 0),
+    )
+  );
+}
+
 // =============================================================================
 // Native resolver
 // =============================================================================
@@ -204,8 +226,12 @@ function resolveNative(
         credentials: ctx.credentials as any,
       });
 
-      // Unwrap MCP-shaped result for the LLM's benefit
+      // Unwrap MCP-shaped result for the LLM's benefit — but never when it
+      // carries an image: neuronExecutor.formatToolResultForModel turns the
+      // raw {content:[{type:'image'}]} shape into a vision message, and the
+      // text-only unwrap would drop the pixels.
       if (result && !result.isError && Array.isArray(result.content)) {
+        if (hasImageBlock(result)) return result;
         const text = result.content.find((c) => c?.type === 'text');
         if (text?.text) {
           try {
@@ -271,6 +297,8 @@ function resolveMcp(
       }, ctx.abortSignal ?? undefined);
       // Unwrap MCP shape (same as native path)
       if (result && !result.isError && Array.isArray(result.content)) {
+        // Image results stay raw so the model actually sees them (see hasImageBlock).
+        if (hasImageBlock(result)) return result;
         const text = result.content.find((c: any) => c?.type === 'text');
         if (text?.text) {
           try {
