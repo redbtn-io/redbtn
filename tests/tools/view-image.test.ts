@@ -48,7 +48,7 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('view_image', () => {
-  test('path: returns an MCP image block the model can see, plus facts', async () => {
+  test('path: returns an MCP image block the model can see, plus facts (and deletes nothing)', async () => {
     const res = await viewImageTool.handler({ environmentId: 'env_test', path: '/workspace/shot.png' }, ctx());
     expect(res.isError).toBeFalsy();
     expect(res.content[0]).toMatchObject({ type: 'image', mimeType: 'image/png' });
@@ -56,6 +56,7 @@ describe('view_image', () => {
     const facts = JSON.parse(res.content[1].text as string);
     expect(facts).toMatchObject({ source: '/workspace/shot.png', width: 40, height: 20 });
     expect(session.sftpRead).toHaveBeenCalledWith('/workspace/shot.png');
+    expect(session.exec).not.toHaveBeenCalled();
   });
 
   test('relative paths resolve against the working directory; environmentId falls back to state', async () => {
@@ -70,9 +71,13 @@ describe('view_image', () => {
     const cmd = session.exec.mock.calls[0][0] as string;
     expect(cmd).toContain('curl -fsSL');
     expect(cmd).toContain(`'${url}'`);
+    // Inside the working directory (a workspace jails SFTP to its exec root,
+    // so /tmp is refused), and deleted again once read.
     const saved = session.sftpRead.mock.calls[0][0] as string;
-    expect(saved).toMatch(/^\/tmp\/view-image\/.+-IMG_9989\.PNG$/);
-    expect(JSON.parse(res.content[1].text as string)).toMatchObject({ source: url, savedTo: saved });
+    expect(saved).toMatch(/\/\.view-image\/.+-IMG_9989\.PNG$/);
+    expect(JSON.parse(res.content[1].text as string)).toMatchObject({ source: url });
+    const cleanup = session.exec.mock.calls[1][0] as string;
+    expect(cleanup).toContain(`rm -f '${saved}'`);
   });
 
   test('a failed download says why (links expire)', async () => {
