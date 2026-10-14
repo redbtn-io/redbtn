@@ -1860,6 +1860,19 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   }
 
   try {
+    // View Image — returns an MCP image block so the model SEES the picture
+    // (read_file returns bytes as text). path in the env, or a url fetched
+    // inside the env. Same exec:execute gate as read_file.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const viewImage = require('./native/view-image.js');
+    registry.register('view_image', viewImage.default || viewImage);
+    console.log('[NativeRegistry] Registered built-in tool: view_image');
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register view_image:', msg);
+  }
+
+  try {
     // Write File — atomic SFTP write with optional file mode
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const writeFile = require('./native/write-file.js');

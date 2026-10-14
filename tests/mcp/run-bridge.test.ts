@@ -2356,3 +2356,46 @@ describe('construction guards', () => {
     expect(b.maxCalls).toBe(12 * 4 + 8);
   });
 });
+
+// =============================================================================
+// Tool-result images (view_image, screenshots)
+// =============================================================================
+
+describe('tool-result images', () => {
+  const imageTool: RunBridgeToolRef = {
+    name: 'probe__show',
+    description: 'Returns an image',
+    inputSchema: { type: 'object', properties: {} },
+    source: 'mcp',
+    invoke: async () => ({
+      content: [
+        { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
+        { type: 'text', text: '{"source":"x"}' },
+      ],
+    }),
+  };
+
+  it("passes the MCP image block through to the CLI by default ('pass')", async () => {
+    const { bridge: b } = await start({ resolvedTools: [imageTool] });
+    const c = await client(b);
+    const res = await c.send('tools/call', { name: 'probe__show', arguments: {} });
+    expect(res.result.content[0]).toEqual({ type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' });
+  });
+
+  it("toolImages:'describe' swaps the pixels for a vision-model description", async () => {
+    const seen: string[] = [];
+    const { bridge: b } = await start({
+      resolvedTools: [imageTool],
+      toolImages: 'describe',
+      describeImage: async (img: { data: string; mimeType: string }) => {
+        seen.push(img.mimeType);
+        return 'a green card reading PELICAN-42';
+      },
+    });
+    const c = await client(b);
+    const res = await c.send('tools/call', { name: 'probe__show', arguments: {} });
+    expect(seen).toEqual(['image/png']);
+    expect(res.result.content.map((x: { type: string }) => x.type)).toEqual(['text', 'text']);
+    expect(res.result.content[0].text).toContain('PELICAN-42');
+  });
+});

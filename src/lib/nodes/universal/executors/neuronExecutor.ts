@@ -12,6 +12,8 @@
  * 5. This executor resolves those templates to actual values before using them
  */
 
+import { describeToolResultImages } from '../../../media/describe-image';
+import { stripImageDataForRecord } from '../../../media/image-prep';
 import type { NeuronStepConfig } from '../types';
 import { renderTemplate, getNestedProperty } from '../templateRenderer';
 import { executeWithErrorHandlingDetailed, recordStepError, clearStepError, buildContinueValue } from './errorHandler';
@@ -2475,7 +2477,10 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
       }
 
       if (!toolFailed && runPublisher) {
-        await runPublisher.toolComplete(toolId, result, {
+        // The record gets the result minus image base64 (the model still gets
+        // the pixels below): run state and archived messages must not carry
+        // megabytes per screenshot.
+        await runPublisher.toolComplete(toolId, stripImageDataForRecord(result), {
           neuronStep: neuronStepId,
           iteration,
         }, { triggeredBy: 'neuron', neuronStepId });
@@ -2487,6 +2492,11 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
       // context window and fail the next call. Instead the `tool` message
       // carries compact base64-free metadata and the image is queued as a
       // vision part (see pendingImages, flushed after the loop).
+      // Step opt-in for a model that cannot take images: swap each image
+      // block for a vision-model description before it reaches the thread.
+      if ((config as any).toolImages === 'describe') {
+        result = await describeToolResultImages(result, 'replace');
+      }
       const formatted = formatToolResultForModel(result);
       messages.push({
         role: 'tool',
