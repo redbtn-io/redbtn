@@ -57,7 +57,7 @@ describe('exec/computer — FAIL-CLOSED when unprofiled', () => {
   // (fail-closed) and a jailed run could both reach them ungated. They must be
   // fail-closed exactly like ssh_shell/read_file.
   it('DENIES fs-pack + async-exec env tools with no profile (fail-closed)', () => {
-    for (const t of ['write_file', 'edit_file', 'glob', 'grep_files', 'list_dir', 'ssh_run_async', 'ssh_tail', 'ssh_kill', 'ssh_jobs']) {
+    for (const t of ['write_file', 'edit_file', 'glob', 'grep_files', 'list_dir', 'view_image', 'ssh_run_async', 'ssh_tail', 'ssh_kill', 'ssh_jobs']) {
       expect(() => enforceToolCapability(null, t, { environmentId: ENV, command: 'x', path: '/x', jobId: 'j', pattern: '*' }))
         .toThrow(CapabilityDeniedError);
     }
@@ -160,7 +160,7 @@ describe('runtime exec-guard also covers the fs-pack + async-exec tools', () => 
   // these tools are dropped from the map they silently lose that layer too, so
   // assert coverage here — this test fails if the fix is reverted.
   it('treats every environment write/exec tool as a guarded exec tool', () => {
-    for (const t of ['write_file', 'edit_file', 'glob', 'grep_files', 'list_dir', 'ssh_run_async', 'ssh_tail', 'ssh_kill', 'ssh_jobs']) {
+    for (const t of ['write_file', 'edit_file', 'glob', 'grep_files', 'list_dir', 'view_image', 'ssh_run_async', 'ssh_tail', 'ssh_kill', 'ssh_jobs']) {
       expect(isGuardedExecTool(t), `${t} must be a guarded exec tool`).toBe(true);
     }
   });

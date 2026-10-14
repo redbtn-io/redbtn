@@ -386,6 +386,9 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   glob: { resource: 'exec', action: 'execute', extract: envId },
   grep_files: { resource: 'exec', action: 'execute', extract: envId },
   list_dir: { resource: 'exec', action: 'execute', extract: envId },
+  // view_image reads an image off the environment (SFTP), or downloads a URL
+  // INSIDE it with curl: the same authority as read_file + run_command.
+  view_image: { resource: 'exec', action: 'execute', extract: envId },
   ssh_run_async: { resource: 'exec', action: 'execute', extract: envId },
   ssh_tail: { resource: 'exec', action: 'execute', extract: envId },
   ssh_kill: { resource: 'exec', action: 'execute', extract: envId },

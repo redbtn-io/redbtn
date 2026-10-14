@@ -716,6 +716,9 @@ export async function runCopilotSdkStep(options: RunCopilotSdkStepOptions): Prom
       dir,
       maxToolIterations: config.maxToolIterations as number | string | undefined,
       maxRepeatedToolCalls: (config as AnyObject).maxRepeatedToolCalls,
+      // Step opt-in for a CLI that drops MCP image blocks (claude-code and agy
+      // were verified to SEE them, 2026-10-14): describe images as text instead.
+      toolImages: (config as AnyObject).toolImages === 'describe' ? 'describe' : 'pass',
       onCancel: () => requestStop('run cancelled', abortError('Copilot SDK run cancelled')),
     });
     bridge = await controlled(bridgeStartupPromise);

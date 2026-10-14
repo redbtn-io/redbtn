@@ -176,6 +176,14 @@ export interface NeuronStepConfig {
      */
     imageFallback?: 'ocr' | 'describe' | 'skip';
     /**
+     * Images RETURNED BY TOOLS (view_image, screenshots). `'pass'` (default):
+     * the model gets the pixels (API neurons as a vision turn; CLI neurons as
+     * the MCP image block, which claude-code and agy were verified to see on
+     * 2026-10-14). `'describe'`: for a model or CLI that cannot see them, each
+     * image is replaced by a vision-model description (lib/media/describe-image).
+     */
+    toolImages?: 'pass' | 'describe';
+    /**
      * Request audio output from the model.
      *
      * NOTE: Audio output requires model-level support (e.g. Gemini Live API)
