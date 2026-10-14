@@ -118,6 +118,8 @@ import {
   RepeatedCallGuard,
 } from '../neurons/run-limits';
 import { getMcpClient } from '../run/contextLookup';
+import { describeToolResultImages, describeImageWithGemini, type DescribeImageFn } from '../media/describe-image';
+import { stripImageDataForRecord } from '../media/image-prep';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyObject = Record<string, any>;
@@ -450,6 +452,15 @@ export interface StartRunToolBridgeOptions {
   abortSignal: AbortSignal | null;
   /** Owning neuron step id, stamped on every published tool event. */
   neuronStepId: string;
+  /**
+   * What to do with image blocks in tool results. `'pass'` (default): forward
+   * the MCP result unchanged — Claude Code and other MCP clients show the image
+   * to the model. `'describe'`: the CLI drops MCP images, so each image block is
+   * REPLACED by a vision-model description (lib/media/describe-image).
+   */
+  toolImages?: 'pass' | 'describe';
+  /** Describer for `toolImages: 'describe'` (tests inject one). Default: Gemini. */
+  describeImage?: DescribeImageFn;
   /** The step's private directory (mode 0700). Holds `bridge.sock`. */
   dir: string;
 
@@ -910,6 +921,8 @@ export async function startRunToolBridge(
     onCancel,
     authDeadlineMs = AUTH_DEADLINE_MS,
     instructions,
+    toolImages = 'pass',
+    describeImage = describeImageWithGemini,
   } = options;
   const serverInstructions =
     typeof instructions === 'string' && instructions.trim() ? instructions.slice(0, 4096) : '';
@@ -1442,11 +1455,17 @@ export async function startRunToolBridge(
             // keys, and caps the size — a result is as caller-chosen as an
             // argument, and it was the one half of the call the module contract
             // claimed to bound but did not.
-            boundPublishedInput(scrubResultForPublish(result), MAX_PUBLISHED_RESULT_BYTES),
+            boundPublishedInput(scrubResultForPublish(stripImageDataForRecord(result)), MAX_PUBLISHED_RESULT_BYTES),
             { neuronStep: neuronStepId, bridge: true, source: toolType },
             { triggeredBy: 'neuron', neuronStepId },
           ),
         );
+      }
+      // A CLI that drops MCP image blocks (toolImages: 'describe') gets a
+      // vision-model description in their place, so a screenshot or a
+      // view_image result is never silently invisible to it.
+      if (toolImages === 'describe') {
+        result = await describeToolResultImages(result, 'replace', describeImage);
       }
       if (customTool) {
         if (result && Array.isArray((result as any).content)) {
