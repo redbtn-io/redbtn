@@ -47,7 +47,13 @@ type AnyObject = Record<string, any>;
 
 const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_S = 60;
-const DOWNLOAD_DIR = '/tmp/view-image';
+/**
+ * Downloads land INSIDE the working directory, not /tmp: a managed workspace
+ * jails file access to its exec root (/workspace) and refuses an SFTP read
+ * of /tmp ("path ... escapes the exec root", 2026-10-14). The file is deleted
+ * again as soon as it has been read, so nothing shows up in `git status`.
+ */
+const DOWNLOAD_DIR_NAME = '.view-image';
 
 function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
@@ -154,14 +160,17 @@ const viewImageTool: NativeToolDefinition = {
     }
 
     // ── Locate the bytes ────────────────────────────────────────────────────
+    const root = (typeof env?.workingDir === 'string' && env.workingDir) || '/workspace';
+    const downloadDir = path.posix.join(root, DOWNLOAD_DIR_NAME);
     let filePath: string;
     let source: string;
+    let downloaded = false;
     if (hasUrl) {
       const url = args.url.trim();
-      filePath = `${DOWNLOAD_DIR}/${downloadNameFor(url)}`;
+      filePath = `${downloadDir}/${downloadNameFor(url)}`;
       source = url;
       const cmd =
-        `mkdir -p ${DOWNLOAD_DIR} && ` +
+        `mkdir -p ${shellQuote(downloadDir)} && ` +
         `curl -fsSL --max-time ${DOWNLOAD_TIMEOUT_S} --max-filesize ${MAX_DOWNLOAD_BYTES} -o ${shellQuote(filePath)} ${shellQuote(url)}`;
       try {
         const r = await session.exec(cmd, {
@@ -172,13 +181,13 @@ const viewImageTool: NativeToolDefinition = {
           const why = String(r.stderr || r.stdout || '').trim().slice(-400);
           return toolError('DOWNLOAD_FAILED', `could not download the image (curl exit ${r.exitCode}): ${why || 'no output'}. Signed attachment links expire after 24 h.`, { url });
         }
+        downloaded = true;
       } catch (err) {
         return toolError('DOWNLOAD_FAILED', `could not download the image: ${err instanceof Error ? err.message : String(err)}`, { url });
       }
     } else {
       const p = args.path.trim();
-      const base = (typeof env?.workingDir === 'string' && env.workingDir) || '/workspace';
-      filePath = path.posix.isAbsolute(p) ? p : path.posix.join(base, p);
+      filePath = path.posix.isAbsolute(p) ? p : path.posix.join(root, p);
       source = filePath;
     }
 
@@ -192,6 +201,13 @@ const viewImageTool: NativeToolDefinition = {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return toolError(/ENOENT|No such file/i.test(msg) ? 'NOT_FOUND' : 'SFTP_READ_FAILED', `Failed to read ${filePath}: ${msg}`);
+    } finally {
+      if (downloaded) {
+        // Best-effort: the scratch copy must not linger in the working tree.
+        await Promise.resolve(
+          session.exec(`rm -f ${shellQuote(filePath)}; rmdir ${shellQuote(downloadDir)} 2>/dev/null; true`, { timeout: 15_000 }),
+        ).catch(() => undefined);
+      }
     }
 
     let img;
@@ -204,7 +220,6 @@ const viewImageTool: NativeToolDefinition = {
 
     const facts: AnyObject = {
       source,
-      ...(hasUrl ? { savedTo: filePath } : {}),
       mimeType: img.mimeType,
       width: img.width,
       height: img.height,
