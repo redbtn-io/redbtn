@@ -197,6 +197,29 @@ function wrapStreamWithCleanup(
   };
 }
 
+export const CANONICAL_NEURON_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  'agy-flash-3-8': 'wgDCU4KX6txQ',
+  'sonnet-5': 'isTFRza5QAZe',
+  'opus-5': 'prwWA4-jOVtZ',
+  'fable-5-1': 'sM3mI4dSLq8R',
+  'muse-spark-1-3-contributor': 'HNNYFsTKM1kM',
+  'muse-spark-1.3-contributor': 'HNNYFsTKM1kM',
+  'muse-spark-zen': 'F2t4uNn_yLgC',
+  'muse-spark-free': 'F2t4uNn_yLgC',
+  'copilot-gpt-5': 'exRjFdCSbkh_',
+  'agy-gemini-4': 'kNjJm-W66Hky',
+  'gemini-2.5-flash': 'zTijXiWPXbtQ',
+  'gemini-2-5-flash-chat': 'zTijXiWPXbtQ',
+  'gemini-2.5-pro': 'Fk5mK4rn-ndE',
+  'gemini-2-5-pro-chat': 'Fk5mK4rn-ndE',
+  'gemini-3.5-flash-lite': '4Pd9uyCsgVHD',
+  'gemini-3.8-flash': '9cBDomqQIsZ7',
+  'gpt-5.6-terra': 'YfeglBX-wJdl',
+  'deepseek-r1': 'jpvkoLWj-Ucp',
+  'nemotron-3-ultra': 'RuXouI5m-EMJ',
+  'nemotron-3.5-lightning': 'oCDFe9CQgjHL',
+});
+
 export class NeuronRegistry {
   private configCache: LRUCache<string, NeuronConfig>;
   private db: ReturnType<typeof getDatabase>;
@@ -373,6 +396,13 @@ export class NeuronRegistry {
       neuronId,
       $or: [{ userId }, { isPublic: true }, ...SYSTEM_OWNER_BRANCHES],
     });
+    if (!doc && CANONICAL_NEURON_ALIASES[neuronId]) {
+      const aliasTarget = CANONICAL_NEURON_ALIASES[neuronId];
+      doc = await Neuron.findOne({
+        neuronId: aliasTarget,
+        $or: [{ userId }, { isPublic: true }, ...SYSTEM_OWNER_BRANCHES],
+      });
+    }
     if (!doc && (neuronId === 'red-neuron' || neuronId === 'red-worker')) {
       doc = await Neuron.findOne({
         isDefault: true,
