@@ -315,6 +315,15 @@ export function classifyFallbackTrigger(err: unknown): FallbackTriggerCode | nul
   // the transport's.
   if (/timed out|timeout|etimedout|stream stalled|did not start/.test(text)) return 'timeout';
 
+  // Upstream model generation / completion failures (empty response, LangChain / SDK model failures)
+  if (
+    /failed to generate a response|no response returned|empty response|model failed|empty completion|did not return a response/.test(
+      text,
+    )
+  ) {
+    return 'http_5xx';
+  }
+
   return null;
 }
 

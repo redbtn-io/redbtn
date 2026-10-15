@@ -320,6 +320,18 @@ describe('classifyFallbackTrigger — API providers', () => {
     ).toBe('http_429');
   });
 
+  it('falls back on "The model failed to generate a response."', () => {
+    expect(
+      classifyFallbackTrigger(new Error('The model failed to generate a response.')),
+    ).toBe('http_5xx');
+  });
+
+  it('falls back on empty completion / response failure', () => {
+    expect(
+      classifyFallbackTrigger(new Error('Provider returned empty response')),
+    ).toBe('http_5xx');
+  });
+
   it('does NOT fall back on a content refusal', () => {
     expect(
       classifyFallbackTrigger(new Error("I can't help with that request.")),
