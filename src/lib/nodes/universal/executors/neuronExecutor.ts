@@ -12,6 +12,7 @@
  * 5. This executor resolves those templates to actual values before using them
  */
 
+import { StepResumeTracker, INTERRUPTED_TOOL_RESULT } from '../../../run/step-resume';
 import { describeToolResultImages } from '../../../media/describe-image';
 import { stripImageDataForRecord } from '../../../media/image-prep';
 import type { NeuronStepConfig } from '../types';
@@ -2100,6 +2101,22 @@ function generateToolId(toolName: string, iteration: number): string {
  *   3. If the loop exhausts iterations, synthesize a wrap-up message.
  */
 export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string> {
+  // Interrupt CONTINUATION (lib/run/step-resume.ts): keep this step's
+  // transcript so a run started with resumeFromRunId continues it, and seed
+  // this loop from the interrupted run's transcript when it is that run.
+  const tracker = await StepResumeTracker.create(args.state, args.config as any, 'api', args.neuronId);
+  try {
+    const out = await runNativeToolUseLoopCore(args, tracker);
+    await tracker.complete();
+    return out;
+  } catch (err) {
+    const aborted = args.abortSignal?.aborted === true || (err as { name?: string })?.name === 'AbortError';
+    await tracker.onError(err, aborted);
+    throw err;
+  }
+}
+
+async function runNativeToolUseLoopCore(args: NativeToolUseLoopArgs, tracker: StepResumeTracker): Promise<string> {
   const {
     config,
     state,
@@ -2188,7 +2205,8 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
   // APPEND-ONLY: every request must be a byte-for-byte prefix extension of the
   // previous one, or the provider's prompt cache misses. Never insert, rewrite
   // or trim earlier entries here.
-  const messages: any[] = [...baseMessages];
+  // Seeded with the interrupted run's own history when this step continues it.
+  const messages: any[] = tracker.seed(baseMessages);
 
   // One affinity key for the whole loop — derived from the opening, which the
   // loop never changes.
@@ -2201,6 +2219,10 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
   let finalContent = '';
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
+    // Persist the transcript at every iteration boundary, so an interrupt at
+    // any point leaves the work done so far for the continuing run.
+    await tracker.checkpoint(messages);
+
     // Cooperative abort check between iterations
     if (abortSignal?.aborted) {
       const err: Error & { name: string } = new Error('Neuron tool-use loop aborted');
@@ -2468,7 +2490,9 @@ export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise
         // 'fallback' or 'skip' — append the error as the tool result so the
         // LLM can react. Both behave the same here because we always need
         // SOMETHING in the message thread for the assistant's tool_call.
-        result = { error: errMsg, _toolError: true };
+        // An interrupt killed this call: say so plainly, so the run that
+        // continues this transcript knows the result is unknown, not an error.
+        result = abortSignal?.aborted ? INTERRUPTED_TOOL_RESULT : { error: errMsg, _toolError: true };
         lastToolResult = result;
       } finally {
         if (onCancelHandler && runCtx?.controller?.signal) {

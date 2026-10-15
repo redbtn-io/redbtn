@@ -647,6 +647,14 @@ export const RunKeys = {
    */
   recovery: (runId: string) => `run:recovery:${runId}`,
   /**
+   * Interrupt-continuation records: `run:step-resume:{runId}` (hash, field =
+   * step key). Each neuron step writes its in-flight transcript here (API
+   * tool-loop messages, or the CLI session + transcript) so that a run started
+   * with `resumeFromRunId` can CONTINUE that step instead of starting over.
+   * See lib/run/step-resume.ts. Redis-only, TTL'd.
+   */
+  stepResume: (runId: string) => `run:step-resume:${runId}`,
+  /**
    * Requeue-on-boot recovery claim: `run:recovery:claim:{runId}`.
    *
    * Atomic `SET NX` ticket a booting engine takes before re-dispatching an
