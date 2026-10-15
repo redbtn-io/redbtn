@@ -23,6 +23,8 @@ import {
   unpackFile,
   claudeProjectSlug,
   shrinkMessages,
+  pickTranscriptFiles,
+  claudeTranscriptHasTurns,
 } from '../../src/lib/run/step-resume';
 import { runNativeToolUseLoop } from '../../src/lib/nodes/universal/executors/neuronExecutor';
 import { collectAgyConversation, restoreAgyConversation } from '../../src/lib/nodes/universal/executors/agyCliExecutor';
@@ -203,5 +205,23 @@ describe('CLI records', () => {
     restoreAgyConversation(b, { ...files, '../escape.txt': packFile(Buffer.from('x')) });
     expect(fs.readFileSync(path.join(b, 'conversations', `${cid}.db`), 'utf8')).toBe('db');
     expect(fs.existsSync(path.join(path.dirname(b), 'escape.txt'))).toBe(false);
+  });
+});
+
+describe('kill snapshot vs the stub a dying CLI rewrites', () => {
+  const real = packFile(Buffer.from('{"type":"user","message":{}}\n{"type":"assistant","message":{}}\n{"type":"last-prompt"}\n'));
+  const stub = packFile(Buffer.from('{"type":"last-prompt","lastPrompt":"x"}\n{"type":"atis-latch","atis":""}\n'));
+  it('prefers the larger snapshot over a later stub', () => {
+    expect(pickTranscriptFiles({ 's.jsonl': stub }, { 's.jsonl': real })).toEqual({ 's.jsonl': real });
+  });
+  it('keeps the later read when it grew past the snapshot', () => {
+    expect(pickTranscriptFiles({ 's.jsonl': real }, { 's.jsonl': stub })).toEqual({ 's.jsonl': real });
+  });
+  it('falls back to the later read with no snapshot', () => {
+    expect(pickTranscriptFiles({ 's.jsonl': stub }, null)).toEqual({ 's.jsonl': stub });
+  });
+  it('a stub has no turns, so it is never resumed', () => {
+    expect(claudeTranscriptHasTurns({ 's.jsonl': stub })).toBe(false);
+    expect(claudeTranscriptHasTurns({ 's.jsonl': real })).toBe(true);
   });
 });

@@ -319,6 +319,45 @@ export function unpackFile(b64: string): Buffer {
   return zlib.gunzipSync(Buffer.from(b64, 'base64'));
 }
 
+/**
+ * Choose between the transcript captured when the kill was requested and the
+ * one read again in `finally`. The bridge removes the step dir on cancel, and
+ * a CLI that is still shutting down then writes a fresh stub file (its exit
+ * bookkeeping only, no conversation) at the same path. That stub is non-empty,
+ * so "prefer whatever is there now" resumed an empty session. The larger set
+ * wins: a transcript only grows while the CLI runs.
+ */
+export function pickTranscriptFiles(
+  later: Record<string, string>,
+  snapshot: Record<string, string> | null,
+): Record<string, string> {
+  const size = (files: Record<string, string> | null): number => {
+    let n = 0;
+    for (const v of Object.values(files ?? {})) {
+      try {
+        n += unpackFile(v).length;
+      } catch {
+        /* unreadable entry counts as nothing */
+      }
+    }
+    return n;
+  };
+  if (!snapshot || !Object.keys(snapshot).length) return later;
+  return size(snapshot) >= size(later) ? snapshot : later;
+}
+
+/** True when a claude-code transcript holds at least one conversation turn. */
+export function claudeTranscriptHasTurns(files: Record<string, string>): boolean {
+  for (const v of Object.values(files)) {
+    try {
+      if (/"type":"(user|assistant)"/.test(unpackFile(v).toString('utf8'))) return true;
+    } catch {
+      /* not a readable entry */
+    }
+  }
+  return false;
+}
+
 /** Claude Code's transcript directory slug for a cwd (`/a/b c` -> `-a-b-c`). */
 export function claudeProjectSlug(cwd: string): string {
   return cwd.replace(/[^a-zA-Z0-9]/g, '-');
