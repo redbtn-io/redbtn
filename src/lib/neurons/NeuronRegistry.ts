@@ -369,10 +369,17 @@ export class NeuronRegistry {
     const cacheKey = `${userId}:${neuronId}`;
     let config = this.configCache.get(cacheKey);
     if (config) return config;
-    const doc = await Neuron.findOne({
+    let doc = await Neuron.findOne({
       neuronId,
       $or: [{ userId }, { isPublic: true }, ...SYSTEM_OWNER_BRANCHES],
     });
+    if (!doc && (neuronId === 'red-neuron' || neuronId === 'red-worker')) {
+      doc = await Neuron.findOne({
+        isDefault: true,
+        role: neuronId === 'red-worker' ? 'worker' : 'chat',
+        $or: SYSTEM_OWNER_BRANCHES,
+      });
+    }
     if (!doc) throw new NeuronNotFoundError(`Neuron '${neuronId}' not found`);
 
     // Resolve apiKey from secretName via the vault. Unset → undefined →

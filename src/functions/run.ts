@@ -291,8 +291,8 @@ function generateRunId(): string {
 async function loadUserSettings(userId: string) {
   const defaults = {
     accountTier: 4,
-    defaultNeuronId: 'red-neuron',
-    defaultWorkerNeuronId: 'red-neuron',
+    defaultNeuronId: 'zTijXiWPXbtQ',
+    defaultWorkerNeuronId: '9cBDomqQIsZ7',
     defaultGraphId: DEFAULT_GRAPH_ID,
   };
   try {

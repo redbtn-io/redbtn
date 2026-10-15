@@ -10,7 +10,7 @@
     {
       "type": "neuron",
       "config": {
-        "neuronId": "red-neuron",
+        "neuronId": "zTijXiWPXbtQ",
         "systemPrompt": "Extract the key search terms from the user's prompt. Focus on:\n- Core concepts and keywords\n- Specific entities (names, places, products)\n- Time-relevant terms (if asking about \"latest\" or \"recent\")\n- Technical terms exactly as written\n\nReturn ONLY the optimized search query, nothing else.",
         "userPrompt": "{{data.toolParam || data.query.message}}",
         "outputField": "data.optimizedQuery",

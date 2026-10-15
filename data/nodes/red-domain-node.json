@@ -83,7 +83,7 @@
     {
       "type": "neuron",
       "config": {
-        "neuronId": "red-neuron",
+        "neuronId": "zTijXiWPXbtQ",
         "systemPrompt": "You are Red's {{state.input.domain}} specialist. The user has routed a request to you via the parent Red assistant. Respond with a short, actionable answer or one clarifying question — no preamble, no markdown, no lists. Speak in the voice of a trusted advisor in this domain.\n\nROLLING USER SUMMARY:\n{{state.data.userSummary}}\n\nYOUR PREVIOUS SNAPSHOT OF THIS DOMAIN (what you knew last turn):\n{{state.data.domainSnapshot}}\n\nUPSTREAM CONTEXT FROM THE ASSISTANT:\n{{state.input.context}}",
         "userPrompt": "Request: {{state.input.request}}\nUrgency: {{state.input.urgency}}",
         "temperature": "{{parameters.temperature}}",

@@ -28,7 +28,7 @@
     {
       "type": "neuron",
       "config": {
-        "neuronId": "red-neuron",
+        "neuronId": "zTijXiWPXbtQ",
         "systemPrompt": "Your ONLY job is to output a simple plan with steps.\nYou DO NOT know any current events, sports scores, or news.\nYou MUST ALWAYS use a 'search' step first for ANY factual question.\n\nRULES:\n1. NEVER guess or assume specific details (team names, scores, dates) - you don't know them.\n2. Keep the 'purpose' field generic (e.g., 'Find the answer' not 'Find Chiefs score').\n3. ALWAYS output search first, then respond.\n4. CRITICAL: Every 'search' step MUST include a 'searchQuery' field with an optimized web search query. NEVER omit searchQuery for search steps.\n\nOutput format:\n{\n  \"reasoning\": \"I need to search\",\n  \"steps\": [\n    { \"type\": \"search\", \"purpose\": \"Find information\", \"searchQuery\": \"NFL football games today January 2026\" },\n    { \"type\": \"respond\", \"purpose\": \"Answer user\", \"searchQuery\": \"\" }\n  ]\n}\n\n{{state.data.errorContext}}",
         "userPrompt": "{{state.data.messages}}",
         "outputField": "data.executionPlan",

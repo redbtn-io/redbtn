@@ -33,7 +33,7 @@
     {
       "type": "neuron",
       "config": {
-        "neuronId": "red-neuron",
+        "neuronId": "zTijXiWPXbtQ",
         "systemPrompt": "Output ONLY valid JSON. No explanations or markdown.",
         "userPrompt": "Analyze this search request and create an optimized search plan with 2-3 parallel query variants.\n\nUser's Question: {{state.data.searchQuery}}\nToday's Date: {{state.data.currentDate}}\n\nRespond with this JSON structure:\n{\n  \"classification\": {\n    \"realtime\": true/false,\n    \"temporal\": \"today|this_week|this_month|this_year|historical|timeless\",\n    \"domain\": \"sports|news|tech|science|finance|health|entertainment|general\",\n    \"intent\": \"score_lookup|news|how_to|fact_check|price_check|weather|comparison|general_info\",\n    \"entities\": [\"entity1\", \"entity2\"]\n  },\n  \"queries\": [\n    {\n      \"query\": \"optimized search string\",\n      \"dateRestrict\": \"d1\",\n      \"siteSearch\": \"espn.com\",\n      \"exactTerms\": \"Chiefs\"\n    }\n  ]\n}\n\nRULES:\n- Generate 2-3 queries approaching from different angles\n- Each query: 3-8 words, optimized for Google (no question marks, no filler)\n- For time-sensitive queries: include the date in at least one query, use dateRestrict (d1=past day, w1=past week, m1=past month, y1=past year)\n- siteSearch: target authoritative domains (sports→espn.com, news→reuters.com, tech→arstechnica.com, finance→bloomberg.com)\n- exactTerms: specific names/entities that MUST appear\n- One query should be broad, one narrow/specific, one from an alternative angle\n- dateRestrict, siteSearch, exactTerms are all optional per query — only include when they add value",
         "outputField": "data.queryPlanRaw",
@@ -81,7 +81,7 @@
           {
             "type": "neuron",
             "config": {
-              "neuronId": "red-neuron",
+              "neuronId": "zTijXiWPXbtQ",
               "systemPrompt": "Analyze search results and respond ONLY with valid JSON.",
               "userPrompt": "You are an AI search evaluator. Analyze the search results to determine if there is enough information to answer the user's query.\n\nUser Query: {{state.data.query.message}}\n\nSearch Results:\n\n\nCurrent Iteration: {{state.data.loopIteration}} of 5\n\nEvaluate:\n1. Do the search results contain relevant information to answer the query?\n2. Is the information complete enough for a satisfactory answer?\n3. If not sufficient, what specific aspect should the next search focus on?\n\nRespond with a JSON object:\n{\n  \"sufficient\": true/false,\n  \"reasoning\": \"Brief explanation of your decision\",\n  \"newSearchQuery\": \"If not sufficient, provide a refined search query focusing on missing information\"\n}\n\nBe practical: If results provide ANY useful information, consider it sufficient. Only request more searches if critical information is completely missing.",
               "outputField": "data.evaluationRaw",

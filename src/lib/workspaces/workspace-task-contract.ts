@@ -13,8 +13,8 @@ type AnyObject = Record<string, any>;
 /** The platform worker graph a workspace_task child runs (ops/workspace-task/). */
 export const WORKSPACE_TASK_GRAPH_ID = 'workspace-task';
 
-/** Default worker neuron (a claude-code CLI neuron). */
-export const WORKSPACE_TASK_DEFAULT_NEURON = 'sonnet-5';
+/** Default worker neuron (a claude-code CLI neuron — Claude Sonnet 5). */
+export const WORKSPACE_TASK_DEFAULT_NEURON = 'isTFRza5QAZe';
 
 /**
  * The child run's capability profile: exactly the workspace grants the parent

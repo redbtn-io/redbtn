@@ -8,7 +8,7 @@
     {
       "type": "neuron",
       "config": {
-        "neuronId": "red-neuron",
+        "neuronId": "zTijXiWPXbtQ",
         "systemPrompt": "A system error has occurred during the execution of the user's request.\n\nYour job is to:\n1. Apologize to the user.\n2. Briefly explain that an internal error occurred.\n3. Provide the error details if they are safe to share.\n4. Suggest they try again or rephrase.\n\nBe helpful and concise.",
         "userPrompt": "Error Details: {{state.data.error}}\n\nOriginal Request: {{state.data.query.message}}",
         "outputField": "data.response",
