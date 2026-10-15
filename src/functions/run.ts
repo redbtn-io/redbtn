@@ -201,6 +201,15 @@ export interface RunOptions {
    */
   lockWaitMs?: number;
   /**
+   * The caller re-queues this run when the conversation lock is busy (the
+   * worker's chat lock-contention retry). A busy lock then throws WITHOUT
+   * publishing a terminal run error: the run is not over, and a stream
+   * subscriber would otherwise see a failed turn seconds before the retry
+   * succeeds. The caller's last attempt omits this, so a run that never gets
+   * the lock still ends with a published error.
+   */
+  lockBusyRetry?: boolean;
+  /**
    * ENGINE-INTERNAL. A capability profile to enforce on this run instead of
    * the one its graph declares; the graph's own profile (when it declares one)
    * stays the CEILING — a grant the declared profile does not cover is
@@ -1817,7 +1826,7 @@ export async function run(
     const err = new Error(
       `[run] Conversation ${lockKey}${agentId ? `:${agentId}` : ''} already has an active run`,
     );
-    await publishFallbackError(err, 'lock-busy');
+    if (!(options as RunOptions).lockBusyRetry) await publishFallbackError(err, 'lock-busy');
     throw err;
   }
   console.log(`[run] Acquired lock for conversation ${lockKey}${agentId ? ` agent=${agentId}` : ''}`);
