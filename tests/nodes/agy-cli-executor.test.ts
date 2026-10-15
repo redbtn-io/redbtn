@@ -649,9 +649,15 @@ describe('resolveAgyModel', () => {
 
   it('knows the models the neuron docs will actually name', () => {
     for (const model of [
+      'gemini-4-argon',
+      'gemini-4-argon-high',
+      'gemini-4-argon-medium',
+      'gemini-4-argon-low',
       'gemini-3.8-flash',
       'gemini-3.7-flash',
       'gemini-3.6-flash',
+      'claude-opus-5-5',
+      'claude-sonnet-5-5',
       'claude-sonnet-4-6',
       'claude-opus-4-6-thinking',
       'gpt-oss-120b-medium',
