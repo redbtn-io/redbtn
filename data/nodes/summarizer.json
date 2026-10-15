@@ -10,7 +10,7 @@
     {
       "type": "neuron",
       "config": {
-        "neuronId": "red-neuron",
+        "neuronId": "zTijXiWPXbtQ",
         "systemPrompt": "Extract key facts and data to answer the user's query accurately and concisely.\n\nIMPORTANT: Do NOT repeat or rephrase the query - only provide the facts and information.",
         "userPrompt": "User Query: {{state.data.originalQuery || data.query.message}}\n\nSearch Results:\n{{state.data.searchResults || data.scrapedContent}}\n\nExtract and summarize the key information that answers this query. Start directly with the facts - do NOT repeat the query:",
         "outputField": "data.summary",

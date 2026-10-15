@@ -10,7 +10,7 @@
     {
       "type": "neuron",
       "config": {
-        "neuronId": "red-neuron",
+        "neuronId": "zTijXiWPXbtQ",
         "systemPrompt": "CRITICAL INSTRUCTION: If you see a <web_search> tag in the conversation, you MUST use ONLY the information inside that tag to answer. DO NOT use your training data. The search result is the ground truth. If the search provides a factual statement relevant to the user's question, treat that information as authoritative and use it to form your response.\n\n{{state.data.systemMessage}}",
         "userPrompt": "{{state.data.messages}}",
         "temperature": "{{parameters.temperature}}",
