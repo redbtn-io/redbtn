@@ -530,6 +530,15 @@ export class RunPublisher {
   }
 
   /**
+   * The Redis client this run publishes on. Used by step-level helpers that
+   * keep run-scoped side records (lib/run/step-resume.ts) and must reach the
+   * same Redis as the run state.
+   */
+  getRedisClient(): Redis {
+    return this.redis;
+  }
+
+  /**
    * Read a single shared-state field. Returns `undefined` when missing.
    */
   async getSharedField(key: string): Promise<unknown> {

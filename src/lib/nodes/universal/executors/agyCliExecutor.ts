@@ -138,6 +138,7 @@
  * @module lib/nodes/universal/executors/agyCliExecutor
  */
 
+import { StepResumeTracker, noticeFor, packFile, unpackFile } from '../../../run/step-resume';
 import { spawn, execFileSync, type ChildProcessByStdio } from 'child_process';
 import type { Readable, Writable } from 'stream';
 import * as fs from 'fs';
@@ -1336,6 +1337,11 @@ export async function runAgyCliStep(
   const stepId = config.outputField;
   const runId = callRunId || state?.runId || state?.data?.runId || 'norun';
   const publisher: AnyObject | undefined = getRunPublisher(state);
+  // Interrupt CONTINUATION (lib/run/step-resume.ts): resume the interrupted
+  // run's agy conversation for this step, and keep ours if we are interrupted.
+  const resumeTracker = await StepResumeTracker.create(state, config as AnyObject, 'cli', neuronId);
+  let stepCompleted = false;
+  let effectiveConversationId = '';
 
   // The credential comes from redsecrets through the ordinary
   // `secretName → getConfig().apiKey` path, exactly like `claude-code`.
@@ -1579,7 +1585,9 @@ export async function runAgyCliStep(
         : mount.tree;
     const preamble = BRIDGE_PREAMBLE.replace('%TREE%', preambleTree);
     const systemPrompt = buildSystemPrompt(config, state, preamble);
-    const userPrompt = buildUserPrompt(config, state);
+    const userPrompt = resumeTracker.resumed
+      ? noticeFor(buildUserPrompt(config, state))
+      : buildUserPrompt(config, state);
     const prompt = `=== SYSTEM INSTRUCTIONS ===\n${systemPrompt}\n=== END SYSTEM INSTRUCTIONS ===\n\n${userPrompt}`;
 
     const promptBytes = Buffer.byteLength(prompt, 'utf8');
@@ -1622,12 +1630,29 @@ export async function runAgyCliStep(
     // is enough for it to serialise that envelope.
     const printTimeoutMs = Math.max(1000, runTimeoutMs - 5000);
 
+    // Continuing an interrupted step: put its conversation back into this
+    // step's private HOME, then --conversation it.
+    let continuedConversationId: string | undefined;
+    const prior = resumeTracker.resumed;
+    if (prior?.cli === 'agy-cli' && prior.sessionId && prior.files) {
+      try {
+        restoreAgyConversation(path.join(home, '.gemini', 'antigravity-cli'), prior.files);
+        continuedConversationId = prior.sessionId;
+        effectiveConversationId = prior.sessionId;
+        await resumeTracker.recordSession('agy-cli', prior.sessionId);
+      } catch (err) {
+        console.warn(`[AgyCli] could not restore the interrupted conversation (starting fresh): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else if (prior) {
+      console.warn(`[AgyCli] step '${stepId}': interrupted run left no conversation to resume; continuing with the notice only`);
+    }
+
     const args = buildAgySpawnArgs({
       model,
       effort,
       printTimeoutMs,
       jsonSchema: jsonSchemaArg,
-      conversationId: resolveResumeConversationId(config, state, stepId),
+      conversationId: continuedConversationId ?? resolveResumeConversationId(config, state, stepId),
     });
 
     const env = buildAgyChildEnv({ home, dir });
@@ -1719,6 +1744,15 @@ export async function runAgyCliStep(
     // diagnosable from the error rather than just "ViewFile".
     const deniedSteps: string[] = [];
     const onStdoutLine = (line: string): void => {
+      // Record the conversation id the moment the CLI names it (every
+      // step_update carries it), so an interrupt can still find the session.
+      if (!effectiveConversationId) {
+        const m = /"conversation_id"\s*:\s*"([0-9a-fA-F-]{36})"/.exec(line);
+        if (m) {
+          effectiveConversationId = m[1];
+          void resumeTracker.recordSession('agy-cli', effectiveConversationId);
+        }
+      }
       const denied = agyDeniedStep(line);
       if (denied && deniedSteps.length < 10) deniedSteps.push(denied);
       if (!streamToUser) return;
@@ -1982,8 +2016,24 @@ export async function runAgyCliStep(
     const cliBag: AnyObject = { ...(state?.data?._cli ?? {}), [stepId]: cli };
     if (state?.data && typeof state.data === 'object') state.data._cli = cliBag;
 
+    stepCompleted = true;
     return { [stepId]: output, 'data._cli': cliBag };
   } finally {
+    // Interrupt continuation: keep an interrupted step's conversation files so
+    // the continuing run can --conversation it on any worker.
+    try {
+      if (!stepCompleted && abortSignal?.aborted && effectiveConversationId) {
+        const files = collectAgyConversation(
+          path.join(realDir(dir), 'home', '.gemini', 'antigravity-cli'),
+          effectiveConversationId,
+        );
+        await resumeTracker.recordInterruptedCli('agy-cli', effectiveConversationId, files);
+      } else {
+        await resumeTracker.complete();
+      }
+    } catch (err) {
+      console.warn('[AgyCli] could not keep the interrupted conversation:', err);
+    }
     if (wallTimer) clearTimeout(wallTimer);
     if (killTimer) clearTimeout(killTimer);
     if (pollTimer) clearInterval(pollTimer);
@@ -2146,6 +2196,36 @@ function flattenContent(content: unknown): string {
  * validated as a UUID before it becomes an argv token, because it comes back
  * out of graph state.
  */
+/** Every file of one agy conversation, relative to `.gemini/antigravity-cli`. */
+export function collectAgyConversation(agyDir: string, conversationId: string): Record<string, string> {
+  const files: Record<string, string> = {};
+  const add = (rel: string) => {
+    const full = path.join(agyDir, rel);
+    try {
+      const st = fs.statSync(full);
+      if (st.isFile()) files[rel] = packFile(fs.readFileSync(full));
+      else if (st.isDirectory()) for (const e of fs.readdirSync(full)) add(path.join(rel, e));
+    } catch {
+      /* absent */
+    }
+  };
+  add(path.join('conversations', `${conversationId}.db`));
+  add(path.join('annotations', `${conversationId}.pbtxt`));
+  add(path.join('brain', conversationId));
+  return files;
+}
+
+/** Write a collected conversation back under `.gemini/antigravity-cli`, refusing any path escape. */
+export function restoreAgyConversation(agyDir: string, files: Record<string, string>): void {
+  const root = path.resolve(agyDir);
+  for (const [rel, packed] of Object.entries(files)) {
+    const target = path.resolve(root, rel);
+    if (!target.startsWith(root + path.sep)) continue;
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(target, unpackFile(packed), { mode: 0o600 });
+  }
+}
+
 function resolveResumeConversationId(
   config: NeuronStepConfig,
   state: AnyObject,

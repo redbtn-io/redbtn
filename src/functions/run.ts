@@ -881,8 +881,11 @@ async function loadPreviousRunSnapshot(
       });
     }
     if (!tuple) {
-      console.warn(`[run] resumeFromRunId=${prevRunId} requested but no checkpoint found`);
-      return null;
+      // Still surface WHICH run this continues: neuron steps continue from
+      // their own per-step records (lib/run/step-resume.ts), which do not
+      // depend on a graph checkpoint (an interrupt mid-first-node has none).
+      console.warn(`[run] resumeFromRunId=${prevRunId} requested but no checkpoint found; continuing with step records only`);
+      return { runId: prevRunId, interruptedAt: Date.now(), reason, newTrigger, state: {} };
     }
     const channelValues = (tuple.checkpoint?.channel_values as Record<string, unknown>) || {};
     const stripped = stripNonSerializable(channelValues);

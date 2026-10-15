@@ -371,6 +371,9 @@ export const universalNode = async (state: any): Promise<Partial<any>> => {
             // Set current step index in state
             // Used by streaming execution path to track which step is executing
             state._currentStepIndex = i;
+            // Graph node instance id, so a step can key run-scoped records by
+            // (node, step index) — lib/run/step-resume.ts.
+            state._currentGraphNodeId = graphNodeId;
 
             // Execute step with current accumulated state
             // Each step can read:
