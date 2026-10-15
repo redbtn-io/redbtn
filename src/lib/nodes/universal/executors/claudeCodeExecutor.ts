@@ -1343,8 +1343,19 @@ export async function runClaudeCodeStep(
   };
 
   /** Idempotent SIGTERM → 10 s → SIGKILL, both to the whole group. */
+  // Interrupt continuation: the bridge removes the step dir the moment the
+  // run is cancelled, before this executor's `finally` runs, so the session
+  // transcript is snapshotted here, as the kill is requested.
+  let killSnapshot: Record<string, string> | null = null;
   const requestKill = (reason: string): void => {
     if (ctl.killReason) return;
+    if (effectiveSessionId && /cancel|abort/i.test(reason)) {
+      try {
+        killSnapshot = collectClaudeTranscript(path.join(dir, 'home', '.claude', 'projects'), effectiveSessionId);
+      } catch {
+        /* best-effort */
+      }
+    }
     ctl.killReason = reason;
     console.warn(`[ClaudeCode] killing CLI child for run ${runId}: ${reason}`);
     signalGroup('SIGTERM');
@@ -1518,12 +1529,15 @@ export async function runClaudeCodeStep(
       try {
         const projDir = path.join(dir, 'home', '.claude', 'projects', claudeProjectSlug(cwd));
         fs.mkdirSync(projDir, { recursive: true, mode: 0o700 });
+        let restored = 0;
         for (const [rel, packed] of Object.entries(prior.files)) {
           const name = path.basename(rel);
           if (!/^[A-Za-z0-9._-]+$/.test(name)) continue;
           fs.writeFileSync(path.join(projDir, name), unpackFile(packed), { mode: 0o600 });
+          restored++;
         }
-        continuedSessionId = prior.sessionId;
+        // --resume of a session the CLI cannot find exits before system/init.
+        if (restored) continuedSessionId = prior.sessionId;
       } catch (err) {
         console.warn(`[ClaudeCode] could not restore the interrupted session (starting fresh): ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -1954,9 +1968,16 @@ export async function runClaudeCodeStep(
     // Interrupt continuation: an interrupted step keeps its transcript so the
     // continuing run can --resume it on any worker; anything else drops it.
     try {
-      if (!stepCompleted && abortSignal?.aborted && effectiveSessionId) {
-        const files = collectClaudeTranscript(path.join(dir, 'home', '.claude', 'projects'), effectiveSessionId);
-        await resumeTracker.recordInterruptedCli('claude-code', effectiveSessionId, files);
+      const interrupted = abortSignal?.aborted === true || /cancel|abort/i.test(ctl.killReason ?? '');
+      if (!stepCompleted && interrupted && effectiveSessionId) {
+        let files = collectClaudeTranscript(path.join(dir, 'home', '.claude', 'projects'), effectiveSessionId);
+        if (!Object.keys(files).length && killSnapshot) files = killSnapshot;
+        if (Object.keys(files).length) {
+          await resumeTracker.recordInterruptedCli('claude-code', effectiveSessionId, files);
+        } else {
+          console.warn(`[ClaudeCode] step '${stepId}' was interrupted but its session transcript was gone; the continuing run will start fresh`);
+          await resumeTracker.complete();
+        }
       } else {
         await resumeTracker.complete();
       }

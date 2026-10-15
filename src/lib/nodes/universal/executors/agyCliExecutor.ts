@@ -1440,8 +1440,22 @@ export async function runAgyCliStep(
   };
 
   /** Idempotent SIGTERM → 10 s → SIGKILL, both to the whole group. */
+  // Interrupt continuation: the bridge removes the step dir (and with it the
+  // private HOME holding the conversation) the moment the run is cancelled,
+  // so the conversation is snapshotted here, as the kill is requested.
+  let killSnapshot: Record<string, string> | null = null;
   const requestKill = (reason: string): void => {
     if (ctl.killReason) return;
+    if (effectiveConversationId && /cancel|abort/i.test(reason)) {
+      try {
+        killSnapshot = collectAgyConversation(
+          path.join(realDir(dir), 'home', '.gemini', 'antigravity-cli'),
+          effectiveConversationId,
+        );
+      } catch {
+        /* best-effort */
+      }
+    }
     ctl.killReason = reason;
     console.warn(`[AgyCli] killing CLI child for run ${runId}: ${reason}`);
     signalGroup('SIGTERM');
@@ -1637,7 +1651,7 @@ export async function runAgyCliStep(
     if (prior?.cli === 'agy-cli' && prior.sessionId && prior.files) {
       try {
         restoreAgyConversation(path.join(home, '.gemini', 'antigravity-cli'), prior.files);
-        continuedConversationId = prior.sessionId;
+        if (Object.keys(prior.files).some((k) => k.startsWith('conversations'))) continuedConversationId = prior.sessionId;
         effectiveConversationId = prior.sessionId;
         await resumeTracker.recordSession('agy-cli', prior.sessionId);
       } catch (err) {
@@ -2022,12 +2036,24 @@ export async function runAgyCliStep(
     // Interrupt continuation: keep an interrupted step's conversation files so
     // the continuing run can --conversation it on any worker.
     try {
-      if (!stepCompleted && abortSignal?.aborted && effectiveConversationId) {
-        const files = collectAgyConversation(
-          path.join(realDir(dir), 'home', '.gemini', 'antigravity-cli'),
-          effectiveConversationId,
-        );
-        await resumeTracker.recordInterruptedCli('agy-cli', effectiveConversationId, files);
+      const interrupted = abortSignal?.aborted === true || /cancel|abort/i.test(ctl.killReason ?? '');
+      if (!stepCompleted && interrupted && effectiveConversationId) {
+        let files: Record<string, string> = {};
+        try {
+          files = collectAgyConversation(
+            path.join(realDir(dir), 'home', '.gemini', 'antigravity-cli'),
+            effectiveConversationId,
+          );
+        } catch {
+          files = {};
+        }
+        if (!Object.keys(files).length && killSnapshot) files = killSnapshot;
+        if (Object.keys(files).length) {
+          await resumeTracker.recordInterruptedCli('agy-cli', effectiveConversationId, files);
+        } else {
+          console.warn(`[AgyCli] step '${stepId}' was interrupted but its conversation was gone; the continuing run will start fresh`);
+          await resumeTracker.complete();
+        }
       } else {
         await resumeTracker.complete();
       }
