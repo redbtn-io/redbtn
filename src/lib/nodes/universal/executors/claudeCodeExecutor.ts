@@ -93,6 +93,14 @@ export { SLOT_WAIT_PROGRESS_INTERVAL_MS };
 type AnyObject = Record<string, any>;
 
 import {
+  StepResumeTracker,
+  noticeFor,
+  packFile,
+  unpackFile,
+  claudeProjectSlug,
+} from '../../../run/step-resume';
+
+import {
   DEFAULT_CLI_MAX_TURNS,
   DEFAULT_CLI_STEP_TIMEOUT_MS,
   resolveStepTimeoutMs,
@@ -1217,6 +1225,11 @@ export async function runClaudeCodeStep(
   const stepId = config.outputField;
   const runId = callRunId || state?.runId || state?.data?.runId || 'norun';
   const publisher: AnyObject | undefined = getRunPublisher(state);
+  // Interrupt CONTINUATION (lib/run/step-resume.ts): resume the interrupted
+  // run's session for this step, and keep ours if we are interrupted.
+  const resumeTracker = await StepResumeTracker.create(state, config as AnyObject, 'cli', neuronId);
+  let stepCompleted = false;
+  let effectiveSessionId = '';
 
   // The OAuth token comes from redsecrets through the ordinary
   // `secretName → getConfig().apiKey` path. Never from `appConfig.env` (which
@@ -1462,7 +1475,11 @@ export async function runClaudeCodeStep(
     // ── prompts ────────────────────────────────────────────────────────────
     const preamble = BRIDGE_PREAMBLE.replace('%TREE%', mount.tree);
     const systemPrompt = buildSystemPrompt(config, state, preamble);
-    const userPrompt = buildUserPrompt(config, state);
+    // A continued step gets the new prompt behind the interrupt notice; its
+    // earlier work is in the resumed session itself.
+    const userPrompt = resumeTracker.resumed
+      ? noticeFor(buildUserPrompt(config, state))
+      : buildUserPrompt(config, state);
 
     const systemFitsInArgv =
       Buffer.byteLength(systemPrompt, 'utf8') <= MAX_SYSTEM_PROMPT_ARG_BYTES;
@@ -1493,12 +1510,35 @@ export async function runClaudeCodeStep(
       }
     }
 
+    // Continuing an interrupted step: put its transcript back where the CLI
+    // looks for it (this run's config dir, this run's cwd slug), then resume.
+    let continuedSessionId: string | undefined;
+    const prior = resumeTracker.resumed;
+    if (prior?.cli === 'claude-code' && prior.sessionId && prior.files) {
+      try {
+        const projDir = path.join(dir, 'home', '.claude', 'projects', claudeProjectSlug(cwd));
+        fs.mkdirSync(projDir, { recursive: true, mode: 0o700 });
+        for (const [rel, packed] of Object.entries(prior.files)) {
+          const name = path.basename(rel);
+          if (!/^[A-Za-z0-9._-]+$/.test(name)) continue;
+          fs.writeFileSync(path.join(projDir, name), unpackFile(packed), { mode: 0o600 });
+        }
+        continuedSessionId = prior.sessionId;
+      } catch (err) {
+        console.warn(`[ClaudeCode] could not restore the interrupted session (starting fresh): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else if (prior) {
+      console.warn(`[ClaudeCode] step '${stepId}': interrupted run left no transcript to resume; continuing with the notice only`);
+    }
+    effectiveSessionId = continuedSessionId ?? uuidv5(`${runId}:${stepId}`);
+    await resumeTracker.recordSession('claude-code', effectiveSessionId);
+
     const args = buildSpawnArgs({
       model,
       effort: resolveEffort(state, neuronCfg),
       mcpConfigPath,
       sessionId: uuidv5(`${runId}:${stepId}`),
-      resumeSessionId: resolveResumeSessionId(config, state, stepId),
+      resumeSessionId: continuedSessionId ?? resolveResumeSessionId(config, state, stepId),
       maxTurns,
       systemPrompt: systemFitsInArgv ? systemPrompt : undefined,
       jsonSchema: jsonSchemaArg,
@@ -1908,8 +1948,21 @@ export async function runClaudeCodeStep(
     const cliBag: AnyObject = { ...(state?.data?._cli ?? {}), [stepId]: cli };
     if (state?.data && typeof state.data === 'object') state.data._cli = cliBag;
 
+    stepCompleted = true;
     return { [stepId]: output, 'data._cli': cliBag };
   } finally {
+    // Interrupt continuation: an interrupted step keeps its transcript so the
+    // continuing run can --resume it on any worker; anything else drops it.
+    try {
+      if (!stepCompleted && abortSignal?.aborted && effectiveSessionId) {
+        const files = collectClaudeTranscript(path.join(dir, 'home', '.claude', 'projects'), effectiveSessionId);
+        await resumeTracker.recordInterruptedCli('claude-code', effectiveSessionId, files);
+      } else {
+        await resumeTracker.complete();
+      }
+    } catch (err) {
+      console.warn('[ClaudeCode] could not keep the interrupted transcript:', err);
+    }
     if (reader) {
       try {
         reader.close();
@@ -2041,6 +2094,26 @@ function flattenContent(content: unknown): string {
       .join('\n');
   }
   return content == null ? '' : String(content);
+}
+
+/** The session's transcript file(s) under a CLAUDE_CONFIG_DIR/projects tree. */
+export function collectClaudeTranscript(projectsDir: string, sessionId: string): Record<string, string> {
+  const files: Record<string, string> = {};
+  let slugs: string[] = [];
+  try {
+    slugs = fs.readdirSync(projectsDir);
+  } catch {
+    return files;
+  }
+  for (const slug of slugs) {
+    const f = path.join(projectsDir, slug, `${sessionId}.jsonl`);
+    try {
+      if (fs.statSync(f).isFile()) files[`${sessionId}.jsonl`] = packFile(fs.readFileSync(f));
+    } catch {
+      /* not in this slug */
+    }
+  }
+  return files;
 }
 
 /**
