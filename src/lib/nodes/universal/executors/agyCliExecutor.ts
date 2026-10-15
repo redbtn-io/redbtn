@@ -138,7 +138,7 @@
  * @module lib/nodes/universal/executors/agyCliExecutor
  */
 
-import { StepResumeTracker, noticeFor, packFile, unpackFile } from '../../../run/step-resume';
+import { StepResumeTracker, noticeFor, packFile, unpackFile, pickTranscriptFiles } from '../../../run/step-resume';
 import { spawn, execFileSync, type ChildProcessByStdio } from 'child_process';
 import type { Readable, Writable } from 'stream';
 import * as fs from 'fs';
@@ -2047,7 +2047,7 @@ export async function runAgyCliStep(
         } catch {
           files = {};
         }
-        if (!Object.keys(files).length && killSnapshot) files = killSnapshot;
+        files = pickTranscriptFiles(files, killSnapshot);
         if (Object.keys(files).length) {
           await resumeTracker.recordInterruptedCli('agy-cli', effectiveConversationId, files);
         } else {

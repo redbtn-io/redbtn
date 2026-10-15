@@ -98,6 +98,8 @@ import {
   packFile,
   unpackFile,
   claudeProjectSlug,
+  pickTranscriptFiles,
+  claudeTranscriptHasTurns,
 } from '../../../run/step-resume';
 
 import {
@@ -1525,7 +1527,7 @@ export async function runClaudeCodeStep(
     // looks for it (this run's config dir, this run's cwd slug), then resume.
     let continuedSessionId: string | undefined;
     const prior = resumeTracker.resumed;
-    if (prior?.cli === 'claude-code' && prior.sessionId && prior.files) {
+    if (prior?.cli === 'claude-code' && prior.sessionId && prior.files && claudeTranscriptHasTurns(prior.files)) {
       try {
         const projDir = path.join(dir, 'home', '.claude', 'projects', claudeProjectSlug(cwd));
         fs.mkdirSync(projDir, { recursive: true, mode: 0o700 });
@@ -1757,7 +1759,8 @@ export async function runClaudeCodeStep(
       throw new ClaudeCodeError(
         failure!.code,
         `claude-code init guard rejected the session: ${failure!.message} ` +
-          `(exit ${exit.code ?? 'null'}${exit.signal ? `, ${exit.signal}` : ''})`,
+          `(exit ${exit.code ?? 'null'}${exit.signal ? `, ${exit.signal}` : ''})` +
+          (stderrTail.trim() ? `. stderr tail: ${stderrTail.trim()}` : ''),
       );
     }
 
@@ -1970,9 +1973,11 @@ export async function runClaudeCodeStep(
     try {
       const interrupted = abortSignal?.aborted === true || /cancel|abort/i.test(ctl.killReason ?? '');
       if (!stepCompleted && interrupted && effectiveSessionId) {
-        let files = collectClaudeTranscript(path.join(dir, 'home', '.claude', 'projects'), effectiveSessionId);
-        if (!Object.keys(files).length && killSnapshot) files = killSnapshot;
-        if (Object.keys(files).length) {
+        const files = pickTranscriptFiles(
+          collectClaudeTranscript(path.join(dir, 'home', '.claude', 'projects'), effectiveSessionId),
+          killSnapshot,
+        );
+        if (Object.keys(files).length && claudeTranscriptHasTurns(files)) {
           await resumeTracker.recordInterruptedCli('claude-code', effectiveSessionId, files);
         } else {
           console.warn(`[ClaudeCode] step '${stepId}' was interrupted but its session transcript was gone; the continuing run will start fresh`);
