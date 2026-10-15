@@ -273,3 +273,40 @@ describe('getUserNeurons', () => {
     expect(configs.find((c) => c.id === 'pub-1')).toMatchObject({ isPublic: true });
   });
 });
+
+// ===========================================================================
+// 6. CANONICAL_NEURON_ALIASES resolution
+// ===========================================================================
+describe('canonical neuron alias fallback', () => {
+  it('resolves agy-flash-3-8 via alias when slug is requested', async () => {
+    findOneMock.mockImplementation((filter: any) => {
+      if (filter.neuronId === 'agy-flash-3-8') return Promise.resolve(null);
+      if (filter.neuronId === 'wgDCU4KX6txQ') {
+        return Promise.resolve(
+          neuronDoc({ neuronId: 'wgDCU4KX6txQ', userId: 'user_a', isPublic: true })
+        );
+      }
+      return Promise.resolve(null);
+    });
+
+    const registry = makeRegistry();
+    const config = await registry.getConfig('agy-flash-3-8', 'user_b');
+    expect(config.id).toBe('wgDCU4KX6txQ');
+  });
+
+  it('resolves muse-spark-1-3-contributor via alias when slug is requested', async () => {
+    findOneMock.mockImplementation((filter: any) => {
+      if (filter.neuronId === 'muse-spark-1-3-contributor') return Promise.resolve(null);
+      if (filter.neuronId === 'HNNYFsTKM1kM') {
+        return Promise.resolve(
+          neuronDoc({ neuronId: 'HNNYFsTKM1kM', userId: 'user_a', isPublic: true })
+        );
+      }
+      return Promise.resolve(null);
+    });
+
+    const registry = makeRegistry();
+    const config = await registry.getConfig('muse-spark-1-3-contributor', 'user_b');
+    expect(config.id).toBe('HNNYFsTKM1kM');
+  });
+});

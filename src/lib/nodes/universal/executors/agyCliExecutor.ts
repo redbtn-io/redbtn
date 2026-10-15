@@ -272,6 +272,10 @@ export type AgyEffortMode = 'required' | 'optional' | 'unsupported';
  * with a readable message instead.
  */
 export const AGY_MODELS: ReadonlyMap<string, AgyEffortMode> = new Map<string, AgyEffortMode>([
+  ['gemini-4-argon', 'required'],
+  ['gemini-4-argon-high', 'optional'],
+  ['gemini-4-argon-medium', 'optional'],
+  ['gemini-4-argon-low', 'optional'],
   ['gemini-3.8-flash', 'required'],
   ['gemini-3.8-flash-high', 'optional'],
   ['gemini-3.8-flash-medium', 'optional'],
@@ -287,6 +291,14 @@ export const AGY_MODELS: ReadonlyMap<string, AgyEffortMode> = new Map<string, Ag
   ['gemini-3.1-pro', 'required'],
   ['gemini-3.1-pro-high', 'optional'],
   ['gemini-3.1-pro-low', 'optional'],
+  ['claude-opus-5-5', 'required'],
+  ['claude-opus-5-5-high', 'optional'],
+  ['claude-opus-5-5-medium', 'optional'],
+  ['claude-opus-5-5-low', 'optional'],
+  ['claude-sonnet-5-5', 'required'],
+  ['claude-sonnet-5-5-high', 'optional'],
+  ['claude-sonnet-5-5-medium', 'optional'],
+  ['claude-sonnet-5-5-low', 'optional'],
   ['claude-sonnet-4-6', 'unsupported'],
   ['claude-opus-4-6-thinking', 'unsupported'],
   ['gpt-oss-120b-medium', 'unsupported'],

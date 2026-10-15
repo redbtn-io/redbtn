@@ -34,7 +34,7 @@
       "type": "neuron",
       "condition": "{{!state.data.isKnownVerb && !state.data.isUnknownWordCommand}}",
       "config": {
-        "neuronId": "red-neuron",
+        "neuronId": "zTijXiWPXbtQ",
         "systemPrompt": "You are the redbtn CLI router. Decide whether the user's line should run as a platform COMMAND or be answered as CHAT.\n\nKnown commands: help, status, graphs, runs, deploy, logs, version, whoami.\n\n- If the line clearly maps to one of the known commands (even phrased in natural language, e.g. \"show me recent runs\" -> runs), choose route \"command\" and set `command` to the matching verb.\n- Otherwise choose route \"chat\".\n\nOUTPUT SCHEMA: { \"route\": \"command\" | \"chat\", \"command\": \"(optional verb)\", \"args\": { } }",
         "userPrompt": "Command line: {{state.data.query.message}}",
         "outputField": "data.cliRouting",
