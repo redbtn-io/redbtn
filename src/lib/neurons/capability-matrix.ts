@@ -33,7 +33,7 @@
  * @module lib/neurons/capability-matrix
  */
 
-import type { NeuronProvider } from '../types/neuron';
+import type { NeuronProvider, NeuronCapabilities } from '../types/neuron';
 
 /**
  * The strategies the runtime knows how to execute.
@@ -49,6 +49,7 @@ export interface ResolveToolStrategyInput {
   provider: NeuronProvider;
   model: string;
   override?: 'auto' | ToolStrategy;
+  capabilities?: NeuronCapabilities;
 }
 
 /**
@@ -80,9 +81,15 @@ const MATRIX: Record<NeuronProvider, MatrixEntry[]> = {
   anthropic: [
     { patterns: ['claude-*'], strategy: 'native' },
   ],
-  // OpenAI — gpt-3.5+, gpt-4*, o1*, o3* all support tools
+  // OpenAI — gpt-3.5+, gpt-4*, o1*, o3* all support tools, plus OpenRouter/open-weight models
   openai: [
-    { patterns: ['gpt-3.5*', 'gpt-4*', 'gpt-5*', 'o1*', 'o3*', 'chatgpt-*'], strategy: 'native' },
+    {
+      patterns: [
+        'gpt-3.5*', 'gpt-4*', 'gpt-5*', 'o1*', 'o3*', 'chatgpt-*',
+        'meta/*', 'mistralai/*', 'qwen/*', 'deepseek/*',
+      ],
+      strategy: 'native',
+    },
   ],
   // Google — Gemini 1.5+ all support function calling
   google: [
@@ -166,10 +173,13 @@ const PROVIDER_DEFAULTS: Record<NeuronProvider, ToolStrategy> = {
 /**
  * Resolve a tool strategy for the given provider/model pair.
  *
- * @param provider - Neuron provider
- * @param model    - Model name (matched case-insensitively against glob patterns)
- * @param override - Optional explicit strategy. `'auto'` (or omit) consults
- *                   the matrix. Any other value is returned as-is.
+ * @param provider     - Neuron provider
+ * @param model        - Model name (matched case-insensitively against glob patterns)
+ * @param override     - Optional explicit strategy. `'auto'` (or omit) consults
+ *                       the matrix. Any other value is returned as-is.
+ * @param capabilities - Optional explicit per-neuron capabilities from the neuron
+ *                       document. When `capabilities.tools` is set (true OR false),
+ *                       it takes precedence over the static matrix for non-CLI providers.
  *
  * @returns The strategy the executor should use.
  */
@@ -177,11 +187,29 @@ export function resolveToolStrategy(
   provider: NeuronProvider,
   model: string,
   override?: 'auto' | ToolStrategy,
+  capabilities?: NeuronCapabilities,
 ): ToolStrategy {
   // Explicit override always wins (except for 'auto' which means "consult
   // the matrix").
   if (override && override !== 'auto') {
     return override;
+  }
+
+  // Explicit capability override on the neuron doc:
+  // When present (true OR false), the explicit value wins over the static matrix.
+  // Note: CLI-driven providers run their own tool loop out-of-band and never use
+  // LangChain tool binding, so their strategy is always 'none'.
+  const isCliProvider =
+    provider === 'claude-code' ||
+    provider === 'agy-cli' ||
+    provider === 'copilot-sdk' ||
+    provider === 'opencode';
+
+  if (capabilities?.tools === false) {
+    return 'none';
+  }
+  if (capabilities?.tools === true) {
+    return isCliProvider ? 'none' : 'native';
   }
 
   const entries = MATRIX[provider];

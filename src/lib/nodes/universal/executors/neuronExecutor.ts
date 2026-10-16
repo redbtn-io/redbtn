@@ -1140,7 +1140,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       }
       if (clientRefs.length > 0) {
         const strategy: ToolStrategy = neuronCfg
-          ? resolveToolStrategy(neuronCfg.provider, neuronCfg.model, config.toolStrategy)
+          ? resolveToolStrategy(neuronCfg.provider, neuronCfg.model, config.toolStrategy, neuronCfg.capabilities)
           : (config.toolStrategy && config.toolStrategy !== 'auto' ? config.toolStrategy as ToolStrategy : 'none');
 
         console.log('[NeuronExecutor] Tool strategy resolved:', {
@@ -1148,6 +1148,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
           provider: neuronCfg?.provider,
           model: neuronCfg?.model,
           override: config.toolStrategy,
+          capabilities: neuronCfg?.capabilities,
           resolved: strategy,
           toolCount: clientRefs.length,
           hostedCount: hostedSpecs.length,
