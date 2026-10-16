@@ -78,8 +78,37 @@ describe('resolveToolStrategy', () => {
       expect(resolveToolStrategy('openai', 'o3-mini')).toBe('native');
     });
 
+    it('open-weight and OpenRouter models resolve to native', () => {
+      expect(resolveToolStrategy('openai', 'meta/muse-spark-1.3-contributor')).toBe('native');
+      expect(resolveToolStrategy('openai', 'meta/muse-spark-open')).toBe('native');
+      expect(resolveToolStrategy('openai', 'deepseek/deepseek-chat')).toBe('native');
+      expect(resolveToolStrategy('openai', 'qwen/qwen-2.5-72b-instruct')).toBe('native');
+      expect(resolveToolStrategy('openai', 'mistralai/mistral-large-2407')).toBe('native');
+    });
+
     it('unknown openai model falls back to none', () => {
       expect(resolveToolStrategy('openai', 'davinci-003')).toBe('none');
+    });
+  });
+
+  describe('capabilities.tools overrides', () => {
+    it('capabilities.tools === true resolves to native for API providers', () => {
+      expect(resolveToolStrategy('openai', 'davinci-003', 'auto', { tools: true })).toBe('native');
+      expect(resolveToolStrategy('google', 'gemini-1.0-pro', 'auto', { tools: true })).toBe('native');
+      expect(resolveToolStrategy('ollama', 'unknown-model', 'auto', { tools: true })).toBe('native');
+    });
+
+    it('capabilities.tools === false resolves to none even for native-capable models', () => {
+      expect(resolveToolStrategy('openai', 'gpt-4', 'auto', { tools: false })).toBe('none');
+      expect(resolveToolStrategy('anthropic', 'claude-3-5-sonnet', 'auto', { tools: false })).toBe('none');
+      expect(resolveToolStrategy('custom', 'any-model', 'auto', { tools: false })).toBe('none');
+    });
+
+    it('capabilities.tools === true still resolves to none for CLI providers that manage their own loop', () => {
+      expect(resolveToolStrategy('claude-code', 'claude-3-7-sonnet', 'auto', { tools: true })).toBe('none');
+      expect(resolveToolStrategy('agy-cli', 'gemini-3.8-flash', 'auto', { tools: true })).toBe('none');
+      expect(resolveToolStrategy('copilot-sdk', 'gpt-5', 'auto', { tools: true })).toBe('none');
+      expect(resolveToolStrategy('opencode', 'any-model', 'auto', { tools: true })).toBe('none');
     });
   });
 
