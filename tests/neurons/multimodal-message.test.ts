@@ -244,3 +244,19 @@ describe('buildMultimodalMessage — integration shape for vision agent', () => 
     ]);
   });
 });
+
+describe('buildMultimodalMessage — resolved attachments override', () => {
+  it('uses the override list (data: urls from attachmentImages) instead of the state refs', () => {
+    const state = { data: { input: { attachments: [imageAttachment({ url: '/api/v1/attachments/att_1' })] } } };
+    const msg = buildMultimodalMessage({} as any, 'look', state, [
+      imageAttachment({ url: 'data:image/png;base64,AAAA' }),
+    ]) as any;
+    expect(msg.content[0]).toEqual({ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } });
+    expect(msg.content[1]).toEqual({ type: 'text', text: 'look' });
+  });
+
+  it('an empty override (every image dropped) yields no multimodal message', () => {
+    const state = { data: { input: { attachments: [imageAttachment()] } } };
+    expect(buildMultimodalMessage({} as any, 'look', state, [])).toBeNull();
+  });
+});
