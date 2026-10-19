@@ -210,7 +210,8 @@ function resolveConfigValue(value: any, state: any): any {
 // The named re-export keeps the existing call-site (line ~635) working,
 // and any future consumer can `import { buildMultimodalMessage } from
 // './multimodalMessage'` directly. See Phase 8 (media-wire-attachments-neuron).
-import { buildMultimodalMessage, type AttachmentRef } from './multimodalMessage';
+import { buildMultimodalMessage, resolveAttachmentSource, isImageAttachment, type AttachmentRef } from './multimodalMessage';
+import { resolveImageAttachments } from './attachmentImages';
 export { buildMultimodalMessage };
 export type { AttachmentRef };
 
@@ -927,6 +928,11 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
     // Support userId at root or in data
     const userId = state.userId || state.data?.userId;
 
+    // Prompt attachments as the model will see them: hub-stored chat images
+    // (relative, auth-gated urls) become data: urls. Resolved once per call.
+    const promptAttachments =
+      config.multimodal === false ? [] : await resolveImageAttachments(resolveAttachmentSource(state), { userId });
+
     // redToken usage metering (shadow mode) — see emitNeuronUsage(). Thin
     // closure binding the common per-execution args; each call path passes its
     // own providerResponse (+ optional stepId override for the tool loop).
@@ -1164,7 +1170,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
             config,
             state,
             model,
-            baseMessages: await buildBaseMessagesForToolLoop(config, state),
+            baseMessages: await buildBaseMessagesForToolLoop(config, state, promptAttachments),
             resolvedTools: resolved,
             hostedSpecs,
             promptCache,
@@ -1310,7 +1316,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
         const resolvedPrompt = messagesArray != null ? String(messagesArray) : renderTemplate(config.userPrompt, state);
         messages = [];
         if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
-        const multimodalMsg = buildMultimodalMessage(config, resolvedPrompt, state);
+        const multimodalMsg = buildMultimodalMessage(config, resolvedPrompt, state, promptAttachments);
         if (multimodalMsg) {
           messages.push(multimodalMsg);
         } else {
@@ -1322,21 +1328,10 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       // exists, upgrade the last user message to a multimodal HumanMessage.
       // We extract the text from the last user message and pass it to
       // buildMultimodalMessage so the content parts are: [audio/images..., text].
-      if (config.audioInput || config.imageInput || config.multimodal) {
-        const lastUserIdx = messages.reduceRight((found, msg, idx) =>
-          found === -1 && (msg.role === 'user' || msg instanceof HumanMessage) ? idx : found, -1
-        );
-        if (lastUserIdx !== -1) {
-          const lastMsg = messages[lastUserIdx];
-          const existingText = typeof lastMsg.content === 'string'
-            ? lastMsg.content
-            : (lastMsg.content?.find?.((p: any) => p.type === 'text')?.text ?? '');
-          const multimodalMsg = buildMultimodalMessage(config, existingText, state);
-          if (multimodalMsg) {
-            messages[lastUserIdx] = multimodalMsg;
-            console.log('[NeuronExecutor] Upgraded last user message to multimodal HumanMessage');
-          }
-        }
+      // Image attachments upgrade it too, flag or not (the same auto-inference
+      // as the string-prompt path): chat graphs feed history here.
+      if (config.audioInput || config.imageInput || config.multimodal || promptAttachments.some(isImageAttachment)) {
+        upgradeLastUserMessage(messages, config, state, promptAttachments);
       }
     } else {
       // Standard template rendering for prompts
@@ -1366,7 +1361,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
       }
 
       // Attempt to build a multimodal HumanMessage (audio + image content parts)
-      const multimodalMessage = buildMultimodalMessage(config, userPrompt, state);
+      const multimodalMessage = buildMultimodalMessage(config, userPrompt, state, promptAttachments);
       if (multimodalMessage) {
         messages.push(multimodalMessage);
         console.log('[NeuronExecutor] Using multimodal HumanMessage for LLM call');
@@ -1897,6 +1892,7 @@ async function executeNeuronInternal(config: NeuronStepConfig, state: any): Prom
 async function buildBaseMessagesForToolLoop(
   config: NeuronStepConfig,
   state: any,
+  promptAttachments?: AttachmentRef[],
 ): Promise<any[]> {
   const messagesFieldMatch = config.userPrompt.match(/^\{\{state\.([\w\.]+)\}\}$/);
   let messages: any[];
@@ -1912,7 +1908,7 @@ async function buildBaseMessagesForToolLoop(
       if (state.systemPrefix) systemPrompt = systemPrompt ? `${state.systemPrefix}\n\n${systemPrompt}` : state.systemPrefix;
       messages = [];
       if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
-      const mm = buildMultimodalMessage(config, resolvedPrompt, state);
+      const mm = buildMultimodalMessage(config, resolvedPrompt, state, promptAttachments);
       messages.push(mm ?? { role: 'user', content: resolvedPrompt });
       return normalizeMessages(messages);
     }
@@ -1933,6 +1929,9 @@ async function buildBaseMessagesForToolLoop(
         messages.unshift({ role: 'system', content: systemPrompt });
       }
     }
+    // Same upgrade as the plain path: the tool loop used to send chat
+    // history text-only, so image attachments never reached the model.
+    upgradeLastUserMessage(messages, config, state, promptAttachments);
   } else {
     let systemPrompt: string | undefined = config.systemPrompt
       ? renderTemplate(config.systemPrompt, state)
@@ -1945,10 +1944,37 @@ async function buildBaseMessagesForToolLoop(
     const userPrompt = renderTemplate(config.userPrompt, state);
     messages = [];
     if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
-    messages.push({ role: 'user', content: userPrompt });
+    const mm = buildMultimodalMessage(config, userPrompt, state, promptAttachments);
+    messages.push(mm ?? { role: 'user', content: userPrompt });
   }
 
   return normalizeMessages(messages);
+}
+
+/**
+ * Messages-array mode: swap the LAST user message for a multimodal one
+ * carrying the step's audio / image parts (+ its text). No-op when there is
+ * nothing multimodal or no user message.
+ */
+function upgradeLastUserMessage(
+  messages: any[],
+  config: NeuronStepConfig,
+  state: any,
+  promptAttachments?: AttachmentRef[],
+): void {
+  const lastUserIdx = messages.reduceRight((found, msg, idx) =>
+    found === -1 && (msg?.role === 'user' || msg instanceof HumanMessage) ? idx : found, -1
+  );
+  if (lastUserIdx === -1) return;
+  const lastMsg = messages[lastUserIdx];
+  const existingText = typeof lastMsg.content === 'string'
+    ? lastMsg.content
+    : (lastMsg.content?.find?.((p: any) => p.type === 'text')?.text ?? '');
+  const multimodalMsg = buildMultimodalMessage(config, existingText, state, promptAttachments);
+  if (multimodalMsg) {
+    messages[lastUserIdx] = multimodalMsg;
+    console.log('[NeuronExecutor] Upgraded last user message to multimodal HumanMessage');
+  }
 }
 
 /**

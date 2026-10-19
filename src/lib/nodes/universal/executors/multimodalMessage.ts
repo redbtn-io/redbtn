@@ -30,6 +30,7 @@ import type { NeuronStepConfig } from '../types';
  * (every field optional) and the Discord trigger payload.
  */
 export interface AttachmentRef {
+  attachmentId?: string;
   kind?: 'image' | 'video' | 'audio' | 'document' | 'file';
   mimeType?: string;
   url?: string;
@@ -37,7 +38,7 @@ export interface AttachmentRef {
   size?: number;
 }
 
-function isImageAttachment(a: AttachmentRef): boolean {
+export function isImageAttachment(a: AttachmentRef): boolean {
   return a.kind === 'image' || (a.mimeType ?? '').startsWith('image/');
 }
 
@@ -69,8 +70,10 @@ export function buildMultimodalMessage(
   config: NeuronStepConfig,
   textContent: string,
   state: any,
+  /** Attachments already resolved for the model (see attachmentImages.ts); defaults to the state's. */
+  attachmentsOverride?: AttachmentRef[],
 ): HumanMessage | null {
-  const attachments = resolveAttachmentSource(state);
+  const attachments = attachmentsOverride ?? resolveAttachmentSource(state);
   const hasImageAttachment = attachments.some(isImageAttachment);
 
   const input = state?.data?.input || {};
