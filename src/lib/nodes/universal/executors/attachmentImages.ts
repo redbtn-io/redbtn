@@ -52,7 +52,7 @@ export async function resolveImageAttachments(
   if (!attachments.some((a) => isImage(a) && hubAttachmentId(a))) return attachments;
 
   const fetchFn = opts.fetchFn ?? fetch;
-  const baseUrl = (opts.baseUrl ?? process.env.BASE_URL ?? process.env.NEXTAUTH_URL ?? 'http://localhost:3000').replace(/\/+$/, '');
+  const baseUrl = (opts.baseUrl || process.env.WEBAPP_URL || process.env.BASE_URL || 'http://localhost:3000').replace(/\/+$/, '');
   const serviceKey = opts.serviceKey ?? process.env.INTERNAL_SERVICE_KEY ?? '';
 
   const out: AttachmentRef[] = [];
