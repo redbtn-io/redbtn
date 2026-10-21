@@ -671,7 +671,8 @@ export class Red {
     args: Record<string, unknown>,
     context?: { conversationId?: string; generationId?: string; messageId?: string; credentials?: any },
     signal?: AbortSignal,
-    scope?: McpToolScope
+    scope?: McpToolScope,
+    serverName?: string
   ): Promise<any> {
     // Tool start/complete/error events flow through RunPublisher.toolStart/toolComplete/toolError
     // which already persist to redlogs. No additional logging needed here.
@@ -682,7 +683,7 @@ export class Red {
       generationId: context?.generationId,
       messageId: context?.messageId,
       credentials: context?.credentials,
-    }, signal, scope);
+    }, signal, scope, serverName);
   }
 
   /**
