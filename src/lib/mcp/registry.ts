@@ -335,9 +335,26 @@ export class McpRegistry {
   /**
    * Find a tool among the servers visible to `scope`: the executing account's
    * own connections, then platform servers. Other accounts' connections are
-   * never searched.
+   * never searched. When `serverName` names a visible connection
+   * (case-insensitive), only that connection's registration is considered;
+   * when it names nothing visible, falls back to the first match so existing
+   * graphs keep working.
    */
-  findTool(toolName: string, scope?: McpToolScope): FoundTool | undefined {
+  findTool(toolName: string, scope?: McpToolScope, serverName?: string): FoundTool | undefined {
+    if (serverName) {
+      const want = serverName.toLowerCase();
+      for (const [, registration] of this.visible(scope)) {
+        if (registration.connectionName.toLowerCase() !== want) continue;
+        const tool = registration.tools.find(t => t.name === toolName);
+        if (tool) {
+          return {
+            server: registration.connectionName,
+            tool,
+            ...(registration.ownerUserId ? { ownerUserId: registration.ownerUserId } : {}),
+          };
+        }
+      }
+    }
     for (const [, registration] of this.visible(scope)) {
       const tool = registration.tools.find(t => t.name === toolName);
       if (tool) {
@@ -387,13 +404,26 @@ export class McpRegistry {
       };
     },
     signal?: AbortSignal,
-    scope?: McpToolScope
+    scope?: McpToolScope,
+    serverName?: string
   ): Promise<any> {
     let foundKey: string | undefined;
-    for (const [key, registration] of this.visible(scope)) {
-      if (registration.tools.some(t => t.name === toolName)) {
-        foundKey = key;
-        break;
+    if (serverName) {
+      const want = serverName.toLowerCase();
+      for (const [key, registration] of this.visible(scope)) {
+        if (registration.connectionName.toLowerCase() !== want) continue;
+        if (registration.tools.some(t => t.name === toolName)) {
+          foundKey = key;
+          break;
+        }
+      }
+    }
+    if (!foundKey) {
+      for (const [key, registration] of this.visible(scope)) {
+        if (registration.tools.some(t => t.name === toolName)) {
+          foundKey = key;
+          break;
+        }
       }
     }
 
