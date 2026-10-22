@@ -1965,10 +1965,10 @@ export async function run(
   // lib/mcp/run-scope) — never another account's, and there are no global
   // user connections.
   const runCtxMcpClient = createRunMcpClient(
-    (toolName, args, meta, signal, scope) => red.callMcpTool(toolName, args, meta, signal, scope),
+    (toolName, args, meta, signal, scope, serverName) => red.callMcpTool(toolName, args, meta, signal, scope, serverName),
     resolveRunMcpScope(options),
     // Same account scope as callTool: lets neurons see each tool's schema.
-    (toolName, scope) => red.mcpRegistry?.findTool?.(toolName, scope),
+    (toolName, scope, serverName) => red.mcpRegistry?.findTool?.(toolName, scope, serverName),
   );
   // Data-permissions: resolve the agent's capability profile from the graph
   // config (if any). `null` when the graph declares no profile → the run is

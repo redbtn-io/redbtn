@@ -22,10 +22,11 @@ export type CallMcpTool = (
   meta: Record<string, unknown> | undefined,
   signal: AbortSignal | undefined,
   scope: McpToolScope,
+  serverName?: string,
 ) => Promise<unknown>;
 
 /** Look a tool up in the registry for one account scope (no network). */
-export type FindMcpTool = (toolName: string, scope: McpToolScope) => FoundTool | undefined;
+export type FindMcpTool = (toolName: string, scope: McpToolScope, serverName?: string) => FoundTool | undefined;
 
 /**
  * Resolve the MCP scope for a run: the account it executes as. Mirrors
@@ -54,14 +55,15 @@ export function createRunMcpClient(callMcpTool: CallMcpTool, scope: McpToolScope
   const frozen: McpToolScope = Object.freeze({ ...scope });
   return {
     scope: frozen,
-    callTool: (toolName: string, args: unknown, meta?: unknown, signal?: AbortSignal) =>
+    callTool: (toolName: string, args: unknown, meta?: unknown, signal?: AbortSignal, serverName?: string) =>
       callMcpTool(
         toolName,
         args as Record<string, unknown>,
         meta as Record<string, unknown> | undefined,
         signal,
         frozen,
+        serverName,
       ),
-    findTool: (toolName: string): FoundTool | undefined => (findMcpTool ? findMcpTool(toolName, frozen) : undefined),
+    findTool: (toolName: string, serverName?: string): FoundTool | undefined => (findMcpTool ? findMcpTool(toolName, frozen, serverName) : undefined),
   };
 }

@@ -261,6 +261,7 @@ function resolveMcp(
   // there's no collision when two servers expose the same tool name.
   const dotIdx = name.indexOf('.');
   const toolName = dotIdx >= 0 ? name.slice(dotIdx + 1) : name;
+  const serverName = dotIdx >= 0 ? name.slice(0, dotIdx) : undefined;
   const llmFacingName = dotIdx >= 0 ? name.replace('.', '__') : name;
 
   // Pull the registry from the run-context registry (with state fallback for
@@ -269,7 +270,7 @@ function resolveMcp(
   // through LangGraph state to avoid checkpoint-serialization corruption.
   const mcpClient: any = getMcpClient(state);
 
-  const found = mcpClient?.findTool ? mcpClient.findTool(toolName) : undefined;
+  const found = mcpClient?.findTool ? mcpClient.findTool(toolName, serverName) : undefined;
   // Best-effort schema discovery — if the tool is registered we have a
   // schema; otherwise we fall back to a permissive object schema and let
   // the runtime tool-call validate.
@@ -294,7 +295,7 @@ function resolveMcp(
         conversationId: (ctx.state as any).options?.conversationId
           ?? (ctx.state as any).data?.options?.conversationId,
         credentials: ctx.credentials,
-      }, ctx.abortSignal ?? undefined);
+      }, ctx.abortSignal ?? undefined, serverName);
       // Unwrap MCP shape (same as native path)
       if (result && !result.isError && Array.isArray(result.content)) {
         // Image results stay raw so the model actually sees them (see hasImageBlock).
