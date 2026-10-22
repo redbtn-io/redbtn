@@ -2127,6 +2127,59 @@ function generateToolId(toolName: string, iteration: number): string {
  *         message per result, then loop.
  *   3. If the loop exhausts iterations, synthesize a wrap-up message.
  */
+/**
+ * Default nudge sent back as a `user` turn when the native tool-use loop's
+ * opt-in completion check (`config.completion`) sees a no-tool-call turn
+ * whose text does not match `requireMatch`.
+ */
+export const DEFAULT_COMPLETION_NUDGE =
+  'You ended your turn without calling a tool and without your final report, so the task is not finished. ' +
+  'Do not narrate what you will do next: do it now with your tools. ' +
+  'When everything is done, finish with the required final report.';
+
+/** Default nudges per run before the loop gives up and returns the last text as-is. */
+export const DEFAULT_COMPLETION_MAX_NUDGES = 3;
+
+export interface CompletionCheck {
+  regex: RegExp;
+  nudge: string;
+  maxNudges: number;
+}
+
+/** Regex sources already warned about (invalid `completion.requireMatch`). */
+const warnedBadCompletionPatterns = new Set<string>();
+
+/**
+ * Resolve the opt-in completion check for the native tool-use loop.
+ * Returns null when the feature is off (`completion` unset, no
+ * `requireMatch`, `maxNudges: 0`, or an invalid regex) — callers then keep
+ * today's behaviour (any no-tool-call turn is final). Never throws.
+ */
+export function resolveCompletionCheck(completion: NeuronStepConfig['completion']): CompletionCheck | null {
+  const source = completion?.requireMatch;
+  if (typeof source !== 'string' || !source) return null;
+  let maxNudges = DEFAULT_COMPLETION_MAX_NUDGES;
+  if (completion.maxNudges !== undefined) {
+    const n = typeof completion.maxNudges === 'number' ? Math.floor(completion.maxNudges) : NaN;
+    if (Number.isNaN(n)) return null;
+    if (n <= 0) return null;
+    maxNudges = n;
+  }
+  try {
+    return {
+      regex: new RegExp(source, completion.flags ?? 'i'),
+      nudge: completion.nudge ?? DEFAULT_COMPLETION_NUDGE,
+      maxNudges,
+    };
+  } catch (err) {
+    if (!warnedBadCompletionPatterns.has(source)) {
+      warnedBadCompletionPatterns.add(source);
+      console.warn('[NeuronExecutor] ignoring invalid completion.requireMatch (feature off):', err instanceof Error ? err.message : String(err));
+    }
+    return null;
+  }
+}
+
 export async function runNativeToolUseLoop(args: NativeToolUseLoopArgs): Promise<string> {
   // Interrupt CONTINUATION (lib/run/step-resume.ts): keep this step's
   // transcript so a run started with resumeFromRunId continues it, and seed
@@ -2166,6 +2219,8 @@ async function runNativeToolUseLoopCore(args: NativeToolUseLoopArgs, tracker: St
   const iterationLimit = resolveToolIterationLimit(config.maxToolIterations, DEFAULT_API_MAX_TOOL_ITERATIONS);
   const maxIterations = iterationLimit === null ? Infinity : iterationLimit;
   const repeatGuard = new RepeatedCallGuard(resolveMaxRepeatedToolCalls((config as any).maxRepeatedToolCalls));
+  const completionCheck = resolveCompletionCheck(config.completion);
+  let completionNudges = 0;
   let consecutiveRefusals = 0;
   let stopLoop = false;
   const neuronStepId = config.outputField;
@@ -2321,8 +2376,29 @@ async function runNativeToolUseLoopCore(args: NativeToolUseLoopArgs, tracker: St
           ? response.content.filter((p: any) => p?.type === 'text').map((p: any) => p.text || '').join('')
           : String(response?.content ?? ''));
 
-    // No tool calls -> this is the final assistant message.
+    // No tool calls -> this is the final assistant message, UNLESS the
+    // opt-in completion check is on and the text doesn't match: then the
+    // model only narrated progress, so nudge it (as a `user` turn) and keep
+    // looping. The nudge is appended to `messages` like any other message,
+    // so the transcript persistence (`tracker.checkpoint` at the top of the
+    // next iteration) and step-resume see it. Nudges still consume an
+    // iteration, so `maxToolIterations` bounds the run.
     if (toolCalls.length === 0) {
+      if (completionCheck && !completionCheck.regex.test(responseContent ?? '')) {
+        if (completionNudges < completionCheck.maxNudges) {
+          completionNudges += 1;
+          messages.push(response);
+          messages.push({ role: 'user', content: completionCheck.nudge });
+          console.log(
+            `[NeuronExecutor] tool-loop turn ${iteration + 1} ended without a final report ` +
+            `(no tool call, no completion match); nudging (${completionNudges}/${completionCheck.maxNudges})`,
+          );
+          continue;
+        }
+        console.warn(
+          `[NeuronExecutor] tool-loop completion nudges exhausted (${completionCheck.maxNudges}); returning last text as-is`,
+        );
+      }
       finalContent = responseContent;
       // Stream the final content to the user if requested. We do this once
       // at the end (rather than incrementally) because the tool-use loop

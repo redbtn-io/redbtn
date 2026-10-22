@@ -311,6 +311,24 @@ export interface NeuronStepConfig {
      */
     maxToolIterations?: number;
     /**
+     * Opt-in completion check for the native tool-use loop. When set, a
+     * no-tool-call turn is only final when its text matches `requireMatch`;
+     * otherwise the engine nudges the model (as a `user` turn) and continues
+     * the loop, up to `maxNudges` times. Unset (or `maxNudges: 0`, or an
+     * invalid regex) disables the check entirely — any no-tool-call turn is
+     * final, exactly as before.
+     */
+    completion?: {
+        /** Regex source (JS RegExp, flags "i" unless `flags` given). */
+        requireMatch: string;
+        /** Regex flags. Default: "i". */
+        flags?: string;
+        /** Nudge message sent back as a `user` turn. See DEFAULT_COMPLETION_NUDGE. */
+        nudge?: string;
+        /** Nudges per run before giving up. Default 3. 0 = feature off. */
+        maxNudges?: number;
+    };
+    /**
      * Per-run credentials injected into every model-driven (native tool-use
      * loop) tool call's `_meta.credentials`. Use this when an attached MCP
      * tool must authenticate as the END USER with a token that lives in run
