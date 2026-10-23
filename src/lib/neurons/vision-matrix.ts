@@ -55,9 +55,13 @@ interface MatrixEntry {
  * rule). Users can override per-neuron via NeuronConfig.capabilities.vision.
  */
 const MATRIX: Record<NeuronProvider, MatrixEntry[]> = {
-  // Anthropic — every Claude 3+ model has vision.
+  // Anthropic — every Claude model since Claude 3 has vision. Matched as
+  // claude-* minus the pre-vision claude-2 / claude-instant, because current
+  // ids lead with the family, not the version (claude-sonnet-5-5,
+  // claude-opus-4-8), and would miss a claude-3*/claude-4* prefix.
   anthropic: [
-    { patterns: ['claude-3*', 'claude-4*'], hasVision: true },
+    { patterns: ['claude-2*', 'claude-instant*'], hasVision: false },
+    { patterns: ['claude-*'], hasVision: true },
   ],
   // OpenAI — gpt-4o family + dedicated -vision variants + o1/o3 reasoning
   // (which all support image inputs as of late 2025). gpt-5 will too.
