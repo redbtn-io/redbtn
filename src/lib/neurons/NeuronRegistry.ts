@@ -68,6 +68,12 @@ export { NeuronConfig, NeuronDocument } from '../types/neuron';
 const log = createLogger('NeuronRegistry');
 
 /**
+ * Largest max_tokens the Anthropic SDK will send without streaming: it refuses
+ * a request whose max_tokens implies more than 10 minutes at 128K tokens/hour.
+ */
+export const ANTHROPIC_NON_STREAMING_MAX_TOKENS = 21_333;
+
+/**
  * Create a fetch wrapper with timeout for Ollama requests
  * Default timeout: 300 seconds (5 minutes)
  */
@@ -519,11 +525,24 @@ export class NeuronRegistry {
           streamUsage: true,
         });
       case 'anthropic':
+        // Current Claude models 400 on any sampling parameter ("`temperature`
+        // is deprecated for this model") and on ChatAnthropic's default
+        // `thinking: {type: 'disabled'}`, so send neither: adaptive thinking,
+        // with depth set by the neuron's `parameters.effort` when it has one.
         return new ChatAnthropic({
           model: config.model,
-          temperature: config.temperature ?? 0.0,
           maxTokens: config.maxTokens,
-          topP: config.topP,
+          // The Anthropic SDK refuses a non-streamed call whose max_tokens
+          // implies more than 10 minutes of output (above ~21,333), and the
+          // tool-use loop invokes without streaming. Stream internally only
+          // past that point: streamed `jsonSchema` structured output fails to
+          // parse, so smaller neurons keep the plain request.
+          ...((config.maxTokens ?? 0) > ANTHROPIC_NON_STREAMING_MAX_TOKENS ? { streaming: true } : {}),
+          thinking: { type: 'adaptive' },
+          // Cast: the installed SDK types predate `xhigh`, which the API accepts.
+          ...(config.parameters?.effort
+            ? { outputConfig: { effort: config.parameters.effort as 'high' } }
+            : {}),
           apiKey: config.apiKey,
           clientOptions: { baseURL: config.endpoint },
         });

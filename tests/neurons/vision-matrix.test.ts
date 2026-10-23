@@ -21,6 +21,10 @@ describe('resolveVisionCapability — acceptance matrix', () => {
     expect(resolveVisionCapability('anthropic', 'claude-3-5-sonnet-20241022')).toBe(true);
     expect(resolveVisionCapability('anthropic', 'claude-3-haiku-20240307')).toBe(true);
     expect(resolveVisionCapability('anthropic', 'claude-4-sonnet-20250514')).toBe(true);
+    expect(resolveVisionCapability('anthropic', 'claude-sonnet-5-5')).toBe(true);
+    expect(resolveVisionCapability('anthropic', 'claude-opus-5-5')).toBe(true);
+    expect(resolveVisionCapability('anthropic', 'claude-opus-4-8')).toBe(true);
+    expect(resolveVisionCapability('anthropic', 'claude-haiku-5-5')).toBe(true);
   });
 
   it('returns true for gemini-2', () => {
