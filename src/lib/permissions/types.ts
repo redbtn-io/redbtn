@@ -64,7 +64,8 @@ export type CapabilityResource =
   | 'stream'       // stream session queries (list_stream_sessions, get_stream_session)
   | 'communication'// outbound notifications (send_email; send_webhook stays UNMAPPED: the run bridge forbids it unconditionally)
   | 'web'          // outbound web queries (fetch_url, scrape_url)
-  | 'task';        // agent task tracking (task_create, task_list, task_get, task_update, task_complete)
+  | 'task'         // agent task tracking (task_create, task_list, task_get, task_update, task_complete)
+  | 'browser';     // browser control via the extension (browser_* tools); FAIL-CLOSED like computer; senses map read=See, control=Control, execute=Exec (browser_evaluate only)
 
 /** Verbs. Every mapped tool declares exactly one. */
 export type CapabilityAction =

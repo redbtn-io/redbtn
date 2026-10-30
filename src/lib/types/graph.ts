@@ -250,7 +250,8 @@ export interface GraphConfig {
         | 'stream'
         | 'communication'
         | 'web'
-        | 'task';
+        | 'task'
+        | 'browser';
       actions: Array<'read' | 'write' | 'create' | 'delete' | 'execute' | 'control'>;
       selector: string;
     }>;

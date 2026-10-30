@@ -20,6 +20,12 @@ export {
 } from './EnvironmentManager';
 
 export {
+  BrowserSession,
+  BrowserUnsupportedError,
+  type BrowserRequest,
+} from './BrowserSession';
+
+export {
   EnvironmentSession,
   type EnvironmentSessionOptions,
   type SshClientFactory,

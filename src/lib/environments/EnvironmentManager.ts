@@ -44,6 +44,7 @@
 
 import { EnvironmentSession, type SshClientFactory, type OnExecCompleteHandler } from './EnvironmentSession';
 import { DesktopAgentSession } from './DesktopAgentSession';
+import { BrowserSession } from './BrowserSession';
 import type { IEnvironmentSession } from './IEnvironmentSession';
 import { getProcessMeteringClient } from '../run/meteringClient';
 
@@ -209,8 +210,21 @@ export class EnvironmentManager {
     //    Push connectors (desktop-agent/cli) speak the /ws/desktop relay via
     //    DesktopAgentSession; self-hosted uses SSH via EnvironmentSession. Both
     //    implement IEnvironmentSession so the tools don't care which.
+    // `browser` gets its OWN session class, not DesktopAgentSession: a
+    // browser env has no exec/sftp surface at all, and BrowserSession makes
+    // those methods fail loudly as unsupported instead of relaying them to an
+    // extension that cannot run them; the browser_* tools dispatch through
+    // BrowserSession.browser() instead.
+    const isBrowser = env.kind === 'browser';
     const isPush = env.kind === 'desktop-agent' || env.kind === 'cli';
-    const session: IEnvironmentSession = isPush
+    const session: IEnvironmentSession = isBrowser
+      ? new BrowserSession(
+          env,
+          userId,
+          env.installId ?? '',
+          resolveDesktopRelayTimeoutMs(env.idleTimeoutMs),
+        )
+      : isPush
       ? new DesktopAgentSession(
           env,
           userId,
