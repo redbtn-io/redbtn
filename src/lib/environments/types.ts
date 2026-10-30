@@ -119,9 +119,13 @@ export interface IEnvironment {
    * and redbtn targets it by Redis pub/sub — there is no SSH host/port/secret
    * for this kind, so those fields are optional below. `'cli'` is the same
    * push-model connector but headless (the `redbtn` CLI's `connect` command);
-   * it is resolved identically to `'desktop-agent'` (no SSH).
+   * it is resolved identically to `'desktop-agent'` (no SSH). `'browser'` is
+   * also a push-model connector (the redbtn Browser extension): one env per
+   * browser profile, the extension holds an outbound connection and is
+   * targeted by installId over the same relay — no SSH host/user/secret, and
+   * it is resolved identically to `'desktop-agent'`/`'cli'`.
    */
-  kind: 'self-hosted' | 'desktop-agent' | 'cli';
+  kind: 'self-hosted' | 'desktop-agent' | 'cli' | 'browser';
   /** Hostname or IP. Required for `self-hosted`; absent for `desktop-agent`. */
   host?: string;
   /** SSH port. Default 22. Not used by `desktop-agent`. */

@@ -36,7 +36,7 @@ import {
  * Resources that are FAIL-CLOSED: denied when the run has no profile granting them
  * (the inverse of state/knowledge's fail-open default). See types.ts.
  */
-const FAIL_CLOSED_RESOURCES = new Set(['exec', 'computer', 'environment', 'workspace']);
+const FAIL_CLOSED_RESOURCES = new Set(['exec', 'computer', 'environment', 'workspace', 'browser']);
 
 /** True for high-risk resources gated fail-closed (exec/computer/environment). */
 export function isFailClosedResource(resource: string): boolean {
@@ -99,7 +99,11 @@ export function enforceToolCapability(
   const rule = getDataToolRule(toolName);
   if (!rule) return;
 
-  const { resource, action } = rule;
+  const resource = rule.resource;
+  // Dynamic-action rules (e.g. browser_tabs: See for op 'list', Control for
+  // open/close/activate) resolve the verb from the call's own args; every
+  // decision/error below uses this resolved action, never the static default.
+  const action = rule.actionFor ? rule.actionFor(args ?? {}) : rule.action;
 
   // 2. No profile.
   //    - DATA resources (state/knowledge): today's behavior — unrestricted (fail-OPEN, back-compat).
@@ -221,6 +225,7 @@ export function normalizeProfile(raw: unknown): CapabilityProfile | null {
     'communication',
     'web',
     'task',
+    'browser',
   ]);
   const VALID_ACTIONS = new Set(['read', 'write', 'create', 'delete', 'execute', 'control']);
   for (const c of caps) {

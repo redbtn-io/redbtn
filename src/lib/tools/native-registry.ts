@@ -737,6 +737,43 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
   }
 
   try {
+    // Browser pack — tabs / snapshot / read / screenshot / navigation / input /
+    // evaluate / console / network / upload / locks on the calling user's
+    // targeted browser (redbtn browser extension), driven over Redis
+    // request→reply (desktop:cmd:{userId}:{installId} → desktop:reply:{id})
+    // through the webapp /ws/desktop gateway, kind:'browser'.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const browser = require('./native/browser-tools.js');
+    registry.register('browser_list', browser.browserList);
+    registry.register('browser_tabs', browser.browserTabs);
+    registry.register('browser_snapshot', browser.browserSnapshot);
+    registry.register('browser_read', browser.browserRead);
+    registry.register('browser_screenshot', browser.browserScreenshot);
+    registry.register('browser_navigate', browser.browserNavigate);
+    registry.register('browser_click', browser.browserClick);
+    registry.register('browser_type', browser.browserType);
+    registry.register('browser_press_key', browser.browserPressKey);
+    registry.register('browser_hover', browser.browserHover);
+    registry.register('browser_scroll', browser.browserScroll);
+    registry.register('browser_select', browser.browserSelect);
+    registry.register('browser_fill_form', browser.browserFillForm);
+    registry.register('browser_wait_for', browser.browserWaitFor);
+    registry.register('browser_dialog', browser.browserDialog);
+    registry.register('browser_evaluate', browser.browserEvaluate);
+    registry.register('browser_console', browser.browserConsole);
+    registry.register('browser_network', browser.browserNetwork);
+    registry.register('browser_upload', browser.browserUpload);
+    registry.register('browser_acquire_lock', browser.browserAcquireLock);
+    registry.register('browser_release_lock', browser.browserReleaseLock);
+    console.log(
+      '[NativeRegistry] Registered built-in tools: browser_list, browser_tabs, browser_snapshot, browser_read, browser_screenshot, browser_navigate, browser_click, browser_type, browser_press_key, browser_hover, browser_scroll, browser_select, browser_fill_form, browser_wait_for, browser_dialog, browser_evaluate, browser_console, browser_network, browser_upload, browser_acquire_lock, browser_release_lock',
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[NativeRegistry] Failed to register browser tools:', msg);
+  }
+
+  try {
     // Push Stream Event — ephemeral status events to a Stream session's UI
     // (no conversation-history pollution, separate from terminal run results)
     // eslint-disable-next-line @typescript-eslint/no-require-imports

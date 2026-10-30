@@ -74,6 +74,14 @@ export interface DataToolRule {
    * permissions/workspace-address.ts and wired by native-registry.ts.
    */
   asyncResolve?: 'workspace';
+  /**
+   * Optional dynamic action: when present, the enforcement layer calls this
+   * with the call's args to resolve the verb for THIS call instead of the
+   * static `action` (which remains the audit/default verb). Exists for tools
+   * whose sense depends on an op argument — e.g. `browser_tabs` is See
+   * (read) for op 'list' but Control for open/close/activate.
+   */
+  actionFor?: (args: Record<string, unknown>) => CapabilityAction;
 }
 
 function str(v: unknown): string {
@@ -129,6 +137,19 @@ function searchDocumentsAddress(args: Record<string, unknown>): ExtractedAddress
  */
 function envId(args: Record<string, unknown>): ExtractedAddress {
   const id = str(args.environmentId) || str(args.machine);
+  if (!id) return { addresses: [], unscoped: true };
+  return { addresses: [id] };
+}
+
+/**
+ * Address extractor for browser tools — keys on the targeted browser
+ * environment: the `browser` arg (the browser_* tools' own target field),
+ * falling back to `environmentId` / `machine` like the exec/computer tools.
+ * Selectors are authored as environmentIds so an agent is jailed to specific
+ * browser profiles. No target at all ⇒ UNSCOPED ⇒ requires a `'*'` grant.
+ */
+function browserTarget(args: Record<string, unknown>): ExtractedAddress {
+  const id = str(args.browser) || str(args.environmentId) || str(args.machine);
   if (!id) return { addresses: [], unscoped: true };
   return { addresses: [id] };
 }
@@ -474,6 +495,47 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   task_get: { resource: 'task', action: 'read', extract: taskAddress },
   task_update: { resource: 'task', action: 'write', extract: taskAddress },
   task_complete: { resource: 'task', action: 'write', extract: taskAddress },
+
+  // ── Browser: the redbtn Browser extension (browser_* tools) ───────────────
+  // FAIL-CLOSED (enforce.ts): `browser` is in FAIL_CLOSED_RESOURCES, so these
+  // tools also inherit the exec-guard runtime gates (kill switch / rate limit /
+  // durable audit). Senses map to verbs: read=See, control=Control,
+  // execute=Exec (browser_evaluate only — it runs arbitrary JS in the page).
+  // EVERY browser_* native must be mapped here or it is ungated: an unmapped
+  // tool short-circuits to "allow" in enforce.ts and skips the exec guard.
+  browser_list: { resource: 'browser', action: 'read', extract: () => ({ addresses: [], unscoped: true }) },
+  // browser_tabs' sense depends on its `action` arg: 'list' (and a missing
+  // arg, which the tool treats as list) is See; open/close/activate are
+  // Control. The static `action` is the audit default; `actionFor` resolves
+  // the verb per call in enforce.ts.
+  browser_tabs: {
+    resource: 'browser',
+    action: 'control',
+    actionFor: (args) => (str(args.action) === 'list' || str(args.action) === '' ? 'read' : 'control'),
+    extract: browserTarget,
+  },
+  // See (read)
+  browser_snapshot: { resource: 'browser', action: 'read', extract: browserTarget },
+  browser_read: { resource: 'browser', action: 'read', extract: browserTarget },
+  browser_screenshot: { resource: 'browser', action: 'read', extract: browserTarget },
+  browser_console: { resource: 'browser', action: 'read', extract: browserTarget },
+  browser_network: { resource: 'browser', action: 'read', extract: browserTarget },
+  // Control
+  browser_navigate: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_click: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_type: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_press_key: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_hover: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_scroll: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_select: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_fill_form: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_wait_for: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_dialog: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_upload: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_acquire_lock: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_release_lock: { resource: 'browser', action: 'control', extract: browserTarget },
+  // Exec (arbitrary JS evaluation in the page — the browser sense of exec)
+  browser_evaluate: { resource: 'browser', action: 'execute', extract: browserTarget },
 };
 
 /** Is this tool name a gated data tool? */
