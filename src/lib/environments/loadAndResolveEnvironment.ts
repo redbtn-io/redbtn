@@ -147,7 +147,13 @@ function applyDefaults(raw: Record<string, unknown>): IEnvironment {
   // Preserve the discriminator. `desktop-agent` envs have no SSH host/user/
   // secret — keep those fields optional rather than coercing to `String(undefined)`.
   const kind: IEnvironment['kind'] =
-    raw.kind === 'desktop-agent' ? 'desktop-agent' : raw.kind === 'cli' ? 'cli' : 'self-hosted';
+    raw.kind === 'desktop-agent'
+      ? 'desktop-agent'
+      : raw.kind === 'cli'
+        ? 'cli'
+        : raw.kind === 'browser'
+          ? 'browser'
+          : 'self-hosted';
   return {
     environmentId: String(raw.environmentId),
     userId: String(raw.userId),
@@ -275,8 +281,10 @@ export async function loadAndResolveEnvironment(
   // helper only validates ownership/visibility for desktop-agent envs.
   // -------------------------------------------------------------------------
   // `cli` is the headless variant of the desktop push connector — same
-  // no-SSH, Redis-relayed model, resolved identically.
-  if (env.kind === 'desktop-agent' || env.kind === 'cli') {
+  // no-SSH, Redis-relayed model, resolved identically. `browser` (the
+  // redbtn Browser extension) is the same push model again — one env per
+  // browser profile, no SSH host/user/secret — so it short-circuits here too.
+  if (env.kind === 'desktop-agent' || env.kind === 'cli' || env.kind === 'browser') {
     return { env, sshKey: '' };
   }
 
