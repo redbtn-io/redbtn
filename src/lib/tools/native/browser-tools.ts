@@ -3,8 +3,8 @@
  *
  * Thin tools that let a graph drive a user's browser: list / tabs / snapshot /
  * read / screenshot / navigate / click / type / key / hover / scroll / select /
- * fill_form / wait_for / dialog / evaluate / console / network / upload and
- * tab locks. Each reads `userId` from the run state, builds a `BrowserAction`,
+ * fill_form / wait_for / dialog / evaluate / console / network / upload /
+ * record_start / record_status / record_stop and tab locks. Each reads `userId` from the run state, builds a `BrowserAction`,
  * round-trips it through `requestDesktopRaw` (Redis request→reply over the
  * /ws/desktop gateway, kind:'browser'), and returns the result.
  *
@@ -22,7 +22,8 @@
  *   browser_press_key, browser_hover, browser_scroll, browser_select,
  *   browser_fill_form, browser_wait_for, browser_dialog, browser_evaluate,
  *   browser_console, browser_network, browser_upload, browser_acquire_lock,
- *   browser_release_lock.
+ *   browser_release_lock, browser_record_start, browser_record_status,
+ *   browser_record_stop.
  *
  * # Fail-safe
  *
@@ -352,7 +353,7 @@ function makeTool(
   extraProps: AnyObject,
   required: string[],
   build: BuildFn,
-  opts: { includeTabId?: boolean; includeRef?: boolean } = {},
+  opts: { includeTabId?: boolean; includeRef?: boolean; defaultTimeoutMs?: number } = {},
 ): NativeToolDefinition {
   const properties: AnyObject = {
     browser: BROWSER_PROP,
@@ -368,7 +369,10 @@ function makeTool(
     inputSchema: { type: 'object', properties, required },
     async handler(rawArgs: AnyObject, context: NativeToolContext): Promise<NativeMcpResult> {
       const args = rawArgs || {};
-      return dispatch(context, cleanAction(build(args)), args);
+      const withTimeout = opts.defaultTimeoutMs && args.timeoutMs === undefined
+        ? { ...args, timeoutMs: opts.defaultTimeoutMs }
+        : args;
+      return dispatch(context, cleanAction(build(args)), withTimeout);
     },
   };
 }
@@ -678,6 +682,58 @@ const browserReleaseLockTool = makeTool(
   { includeTabId: false },
 );
 
+const browserRecordStartTool = makeTool(
+  'browser_record_start',
+  'Start recording a tab as video, for demos, walkthroughs and bug reports. Keep driving the page with the other browser_* tools, then call browser_record_stop to get the file. Video only, no audio. One recording at a time. The tab must be active and visible, because Chrome only paints what is on screen; activate it with browser_tabs first if needed. Agent clicks and hovers are drawn as a cursor. Frames from any site this browser does not permit are replaced with a blank screen. Fails safe with a browser_failed error if no browser is connected.',
+  {
+    fps: { type: 'number', description: 'Output frames per second, 1-60. Default 30.' },
+    maxSeconds: { type: 'number', description: 'Stop capturing after this long, 1-1800. Default 300. browser_record_stop must still be called to save the file.' },
+    format: { type: 'string', enum: ['mp4', 'webm'], description: 'Container. Default mp4 (H.264). Falls back to the other one if this browser cannot encode it. WebM files have no duration header, so some players cannot seek them.' },
+    bitrate: { type: 'number', description: 'Target video bits per second. Default 4000000. Lower it for long recordings: uploads are capped at 50 MB.' },
+    quality: { type: 'number', description: 'JPEG quality of the captured frames, 10-100. Default 80.' },
+    maxWidth: { type: 'number', description: 'Maximum capture width in pixels. Default 1920.' },
+    maxHeight: { type: 'number', description: 'Maximum capture height in pixels. Default 1080.' },
+    cursor: { type: 'boolean', description: 'Draw the agent cursor and click ripples into the video. Default true.' },
+  },
+  [],
+  (args) => ({
+    action: 'record_start',
+    tabId: args.tabId,
+    fps: args.fps,
+    maxSeconds: args.maxSeconds,
+    format: args.format,
+    bitrate: args.bitrate,
+    quality: args.quality,
+    maxWidth: args.maxWidth,
+    maxHeight: args.maxHeight,
+    cursor: args.cursor,
+  }),
+);
+
+const browserRecordStatusTool = makeTool(
+  'browser_record_status',
+  'Check the current recording: state (idle, recording, finished), duration, frames captured, hiddenFrames (frames blanked because the site was not permitted) and bytes so far. A state of finished with an endReason means a limit or a closed tab ended it, and browser_record_stop must still be called to save it. Fails safe with a browser_failed error if no browser is connected.',
+  {},
+  [],
+  (_args) => ({ action: 'record_status' }),
+  { includeTabId: false },
+);
+
+const browserRecordStopTool = makeTool(
+  'browser_record_stop',
+  'Stop the recording and save it. The video is not returned inline. By default it is saved to the Downloads folder of the machine running the browser (download.path) and uploaded as a redbtn attachment of up to 50 MB (upload.url, upload.attachmentId). If one destination fails, downloadError or uploadError says why. If every destination fails the extension keeps the recording, so this can be called again. Fails safe with a browser_failed error if no browser is connected.',
+  {
+    save: { type: 'string', enum: ['both', 'download', 'upload'], description: 'Where to save the video. Default both.' },
+    filename: { type: 'string', description: 'File name. The extension always matches the real container.' },
+    caption: { type: 'string', description: 'Caption for the uploaded attachment.' },
+    discard: { type: 'boolean', description: 'Throw the recording away instead of saving it.' },
+  },
+  [],
+  (args) => ({ action: 'record_stop', save: args.save, filename: args.filename, caption: args.caption, discard: args.discard }),
+  // Encoding, a disk write and an upload don't fit the 12s default; the hub caps at 120s.
+  { includeTabId: false, defaultTimeoutMs: 120_000 },
+);
+
 // ─── Exports ─────────────────────────────────────────────────────────────────
 
 export const BROWSER_TOOLS: Record<string, NativeToolDefinition> = {
@@ -702,6 +758,9 @@ export const BROWSER_TOOLS: Record<string, NativeToolDefinition> = {
   browser_upload: browserUploadTool,
   browser_acquire_lock: browserAcquireLockTool,
   browser_release_lock: browserReleaseLockTool,
+  browser_record_start: browserRecordStartTool,
+  browser_record_status: browserRecordStatusTool,
+  browser_record_stop: browserRecordStopTool,
 };
 
 export const browserList = browserListTool;
@@ -725,6 +784,9 @@ export const browserNetwork = browserNetworkTool;
 export const browserUpload = browserUploadTool;
 export const browserAcquireLock = browserAcquireLockTool;
 export const browserReleaseLock = browserReleaseLockTool;
+export const browserRecordStart = browserRecordStartTool;
+export const browserRecordStatus = browserRecordStatusTool;
+export const browserRecordStop = browserRecordStopTool;
 
 (module as any).exports = {
   browserList: browserListTool,
@@ -748,5 +810,8 @@ export const browserReleaseLock = browserReleaseLockTool;
   browserUpload: browserUploadTool,
   browserAcquireLock: browserAcquireLockTool,
   browserReleaseLock: browserReleaseLockTool,
+  browserRecordStart: browserRecordStartTool,
+  browserRecordStatus: browserRecordStatusTool,
+  browserRecordStop: browserRecordStopTool,
   BROWSER_TOOLS,
 };
