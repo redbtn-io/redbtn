@@ -765,8 +765,11 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     registry.register('browser_upload', browser.browserUpload);
     registry.register('browser_acquire_lock', browser.browserAcquireLock);
     registry.register('browser_release_lock', browser.browserReleaseLock);
+    registry.register('browser_record_start', browser.browserRecordStart);
+    registry.register('browser_record_status', browser.browserRecordStatus);
+    registry.register('browser_record_stop', browser.browserRecordStop);
     console.log(
-      '[NativeRegistry] Registered built-in tools: browser_list, browser_tabs, browser_snapshot, browser_read, browser_screenshot, browser_navigate, browser_click, browser_type, browser_press_key, browser_hover, browser_scroll, browser_select, browser_fill_form, browser_wait_for, browser_dialog, browser_evaluate, browser_console, browser_network, browser_upload, browser_acquire_lock, browser_release_lock',
+      '[NativeRegistry] Registered built-in tools: browser_list, browser_tabs, browser_snapshot, browser_read, browser_screenshot, browser_navigate, browser_click, browser_type, browser_press_key, browser_hover, browser_scroll, browser_select, browser_fill_form, browser_wait_for, browser_dialog, browser_evaluate, browser_console, browser_network, browser_upload, browser_acquire_lock, browser_release_lock, browser_record_start, browser_record_status, browser_record_stop',
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

@@ -43,9 +43,12 @@ const BROWSER_TOOLS = [
   'browser_upload',
   'browser_acquire_lock',
   'browser_release_lock',
+  'browser_record_start',
+  'browser_record_status',
+  'browser_record_stop',
 ] as const;
 
-const SEE_TOOLS = ['browser_snapshot', 'browser_read', 'browser_screenshot', 'browser_console', 'browser_network'];
+const SEE_TOOLS = ['browser_snapshot', 'browser_read', 'browser_screenshot', 'browser_console', 'browser_network', 'browser_record_start', 'browser_record_status', 'browser_record_stop'];
 const CONTROL_TOOLS = [
   'browser_navigate',
   'browser_click',

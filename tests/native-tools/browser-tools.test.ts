@@ -1,7 +1,7 @@
 /**
  * Browser native tools — unit tests.
  *
- * Asserts the tool catalog shape (all 21 browser_* tools, server:'browser',
+ * Asserts the tool catalog shape (all 24 browser_* tools, server:'browser',
  * object schemas, handlers), that every targeted tool accepts `browser` and
  * `environmentId`, and that handlers fail safe (browser_failed, isError)
  * without a userId — without touching Mongo/Redis.

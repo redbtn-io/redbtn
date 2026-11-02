@@ -520,6 +520,9 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   browser_screenshot: { resource: 'browser', action: 'read', extract: browserTarget },
   browser_console: { resource: 'browser', action: 'read', extract: browserTarget },
   browser_network: { resource: 'browser', action: 'read', extract: browserTarget },
+  browser_record_start: { resource: 'browser', action: 'read', extract: browserTarget },
+  browser_record_status: { resource: 'browser', action: 'read', extract: browserTarget },
+  browser_record_stop: { resource: 'browser', action: 'read', extract: browserTarget },
   // Control
   browser_navigate: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_click: { resource: 'browser', action: 'control', extract: browserTarget },

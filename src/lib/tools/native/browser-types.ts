@@ -91,7 +91,21 @@ export type BrowserAction =
       files?: Record<string, unknown>[] | AnyObject[];
     })
   | (BrowserActionBase & { action: 'acquire_lock'; minutes?: number; note?: string })
-  | (BrowserActionBase & { action: 'release_lock' });
+  | (BrowserActionBase & { action: 'release_lock' })
+  | (BrowserActionBase & {
+      action: 'record_start';
+      tabId?: number;
+      fps?: number;
+      maxSeconds?: number;
+      format?: string;
+      bitrate?: number;
+      quality?: number;
+      maxWidth?: number;
+      maxHeight?: number;
+      cursor?: boolean;
+    })
+  | (BrowserActionBase & { action: 'record_status' })
+  | (BrowserActionBase & { action: 'record_stop'; save?: string; filename?: string; caption?: string; discard?: boolean });
 
 export const BROWSER_TOOL_NAMES = [
   'browser_list',
@@ -115,6 +129,9 @@ export const BROWSER_TOOL_NAMES = [
   'browser_upload',
   'browser_acquire_lock',
   'browser_release_lock',
+  'browser_record_start',
+  'browser_record_status',
+  'browser_record_stop',
 ] as const;
 
 export type BrowserToolName = (typeof BROWSER_TOOL_NAMES)[number];
