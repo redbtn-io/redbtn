@@ -16,6 +16,7 @@ import { getToolResultErrorMessage } from './toolResultError';
 // resolvable from an ESM caller — which silently turned every parser tool step
 // into a swallowed "Cannot find module" instead of a tool call.
 import { renderTemplate, resolveValue, renderParameters } from '../templateRenderer';
+import { getByPath } from '../safeExpression';
 
 /**
  * `{{secret:NAME}}` — the reference form output configs use to name a secret
@@ -554,12 +555,11 @@ export class ParserExecutor {
                 } else {
                     // JSON response with base64 audio at a path (Gemini, etc.)
                     const data = await resp.json() as any;
-                    // Navigate the response path dynamically
-                    try {
-                        const pathFn = new Function("data", `return data?.${responsePath}`);
-                        audioData = pathFn(data) || null;
-                    } catch {
-                        // Fallback: try common paths
+                    // Navigate the response path with a safe nested getter — no
+                    // `new Function`/eval, so a hostile `responsePath` cannot run
+                    // code in the worker. Falls back to common provider paths.
+                    audioData = (getByPath(data, responsePath) as string | undefined) || null;
+                    if (!audioData) {
                         audioData = data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data
                                  || data?.audio?.data
                                  || data?.audio_content

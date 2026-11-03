@@ -14,6 +14,7 @@ import { executeStep } from '../stepExecutor';
 import { checkAbort } from '../universalNode';
 import { getRunPublisher } from '../../../run/contextLookup';
 import { PARALLEL_BRANCH_FAILURE_KEY } from '../../../run/run-shared-state';
+import { evaluateBoolean } from '../safeExpression';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -333,21 +334,10 @@ export async function executeLoop(
  * @param state - Current state with loop metadata
  * @returns True if loop should exit, false if should continue
  */
-function evaluateExitCondition(condition: string, state: any): boolean {
+export function evaluateExitCondition(condition: string, state: any): boolean {
     try {
-        // Create safe evaluation context with only state access
-        const context = {
-            state: state
-        };
-        // Build evaluation function with restricted scope
-        const evalFunc = new Function('context', `
-      with (context) {
-        return ${condition};
-      }
-    `);
-        const result = evalFunc(context);
-        // Ensure boolean result
-        return Boolean(result);
+        // Evaluate in a sandboxed vm with only `state` in scope (no host globals).
+        return evaluateBoolean(condition, { state });
     }
     catch (error: any) {
         console.error(`[LoopExecutor] Failed to evaluate exit condition: ${condition}`, error.message);
