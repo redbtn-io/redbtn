@@ -8,10 +8,9 @@
  * secrets. `evaluateExpression` runs inside a `node:vm` context that cannot
  * reach `process`, `require`, or any host global.
  *
- * The escape matrix runs TWICE — once with the defense-in-depth static
- * pre-check enabled, once with it disabled — to prove the vm boundary blocks
- * every escape on its own. A sentinel env var is set in the test process; no
- * escape may ever return it.
+ * The escape matrix runs directly against the vm boundary (the module has no
+ * static pre-check), proving the vm blocks every escape on its own. A sentinel
+ * env var is set in the test process; no escape may ever return it.
  *
  * Lives under tests/ (not next to the source) because vitest.config.ts only
  * discovers test files beneath the tests/ directory.
@@ -22,7 +21,6 @@ import {
     evaluateBoolean,
     getByPath,
     SafeExpressionError,
-    __setStaticPrecheckForTests,
 } from '../../src/lib/nodes/universal/safeExpression';
 import { resolveValue } from '../../src/lib/nodes/universal/templateRenderer';
 import { executeConditional } from '../../src/lib/nodes/universal/executors/conditionalExecutor';
@@ -36,7 +34,6 @@ beforeAll(() => {
 });
 afterAll(() => {
     delete process.env.SAFEEXPR_SENTINEL;
-    __setStaticPrecheckForTests(true);
 });
 
 // Every entry MUST throw or fail closed — it may never return a host value.
@@ -100,13 +97,30 @@ function runEscapeMatrix(): void {
     }
 }
 
-describe('safeExpression: escapes blocked (static pre-check ENABLED)', () => {
-    beforeAll(() => __setStaticPrecheckForTests(true));
+describe('safeExpression: escapes blocked by the vm boundary', () => {
     it('every escape fails closed and never returns a host value', () => {
         runEscapeMatrix();
     });
-    it('a direct secret read throws', () => {
+    it('a direct secret read throws (process is not defined in the sandbox)', () => {
         expect(() => evaluateExpression('process.env.SAFEEXPR_SENTINEL', {})).toThrow(SafeExpressionError);
+    });
+    it('a constructor-chain secret read is blocked, never the sentinel', () => {
+        let leaked: unknown = '__threw__';
+        try {
+            leaked = evaluateExpression("({}).constructor.constructor('return process.env.SAFEEXPR_SENTINEL')()", {});
+        } catch {
+            /* expected */
+        }
+        expect(leaked).not.toBe(SENTINEL);
+    });
+    it('a scope-value prototype walk is blocked', () => {
+        let leaked: unknown = '__threw__';
+        try {
+            leaked = evaluateExpression("state.items.map.constructor('return process')()", ESCAPE_SCOPE);
+        } catch {
+            /* expected */
+        }
+        assertNoHostLeak(leaked);
     });
 });
 
@@ -259,32 +273,30 @@ describe('call site: loopExecutor.evaluateExitCondition', () => {
     });
 });
 
-describe('safeExpression: escapes blocked (static pre-check DISABLED — vm layer alone)', () => {
-    beforeAll(() => __setStaticPrecheckForTests(false));
-    afterAll(() => __setStaticPrecheckForTests(true));
-
-    it('every escape still fails closed with only the vm boundary', () => {
-        runEscapeMatrix();
+describe('safeExpression: benign free identifiers as ordinary names (no false positives)', () => {
+    // Regression for the removed static pre-check, which wrongly rejected admin
+    // transforms that used words like `module` / `global` / `import` as ordinary
+    // variable or property names. These MUST evaluate, not throw.
+    it('a local variable named `module`', () => {
+        expect(
+            evaluateExpression('(() => { const module = state.a; return module + 1 })()', { state: { a: 41 } }),
+        ).toBe(42);
     });
-    it('a constructor-chain secret read is blocked by the vm, not the pre-check', () => {
-        let leaked: unknown = '__threw__';
-        try {
-            leaked = evaluateExpression(
-                "({}).constructor.constructor('return process.env.SAFEEXPR_SENTINEL')()",
-                {},
-            );
-        } catch {
-            /* expected */
-        }
-        expect(leaked).not.toBe(SENTINEL);
+    it('a local variable named `global`', () => {
+        expect(
+            evaluateExpression('(function(){ var global = state.n; return global * 2 })()', { state: { n: 21 } }),
+        ).toBe(42);
     });
-    it('a scope-value prototype walk is blocked by the vm', () => {
-        let leaked: unknown = '__threw__';
-        try {
-            leaked = evaluateExpression("state.items.map.constructor('return process')()", ESCAPE_SCOPE);
-        } catch {
-            /* expected */
-        }
-        assertNoHostLeak(leaked);
+    it('a shell-quote (shq) helper reading state.data', () => {
+        const expr = `(() => { const shq = (s) => "'" + String(s) + "'"; return shq(state.data); })()`;
+        expect(evaluateExpression(expr, { state: { data: 'a b' } })).toBe("'a b'");
+    });
+    it('`process` and `import` as plain property names', () => {
+        expect(evaluateExpression('state.data.process', { state: { data: { process: 'P' } } })).toBe('P');
+        expect(evaluateExpression('state.data.import', { state: { data: { import: 'I' } } })).toBe('I');
+    });
+    it('the same forms through resolveValue (the real `{{ ... }}` path)', () => {
+        expect(resolveValue('{{ (() => { const module = state.a; return module + 1 })() }}', { a: 41 })).toBe(42);
+        expect(resolveValue('{{ state.data.process }}', { data: { process: 'ok' } })).toBe('ok');
     });
 });
