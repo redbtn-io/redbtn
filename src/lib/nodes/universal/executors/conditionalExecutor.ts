@@ -6,6 +6,7 @@
  */
 import type { ConditionalStepConfig } from '../types';
 import { renderTemplate } from '../templateRenderer';
+import { evaluateBoolean, evaluateExpression } from '../safeExpression';
 
 // Debug logging - set to true to enable verbose logs
 const DEBUG = false;
@@ -96,17 +97,14 @@ export function executeConditional(config: ConditionalStepConfig, state: any): P
                         console.log('[ConditionalExecutor] Fast existence check:', { path: matchedPath, result });
                 }
                 else {
-                    // Create a minimal state object for evaluation to avoid stack overflow
-                    // when state contains large objects or circular references
-                    const evalFunc = new Function('state', `
-            try {
-              return ${expression};
-            } catch (innerError) {
-              // Handle evaluation errors gracefully
-              return false;
-            }
-          `);
-                    result = Boolean(evalFunc(state));
+                    // Evaluate in a sandboxed vm (no host globals) instead of
+                    // `new Function`; fails closed to `false`, and tolerates
+                    // large / circular state.
+                    try {
+                        result = evaluateBoolean(expression, { state });
+                    } catch {
+                        result = false;
+                    }
                     conditionStr = trimmedCondition; // Keep original for logging
                 }
                 if (DEBUG)
@@ -164,9 +162,8 @@ function evaluateValue(valueStr: string, state: any): any {
     if (trimmed.startsWith('{{') && trimmed.endsWith('}}')) {
         const expression = trimmed.slice(2, -2).trim();
         try {
-            // Create a function that evaluates the expression with state in scope
-            const evalFunc = new Function('state', `return ${expression}`);
-            const result = evalFunc(state);
+            // Evaluate the expression with only `state` in scope (sandboxed vm).
+            const result = evaluateExpression(expression, { state });
             if (DEBUG)
                 console.log('[ConditionalExecutor] Evaluated JS expression:', {
                     expression,
