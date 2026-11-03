@@ -12,9 +12,8 @@
  * a `node:vm` context that cannot reach `process`, `require`, `Buffer`,
  * `module`, `global`, or any other host global.
  *
- * How the boundary holds (every claim is exercised in the test suite, which also
- * runs the escape matrix with the static pre-check disabled to prove the vm
- * layer blocks each escape on its own):
+ * How the boundary holds (every claim is exercised in the test suite, whose
+ * escape matrix runs directly against this vm-only boundary):
  *  - `contextCodeGeneration.strings = false` makes any reconstructed
  *    `Function("…")()` / `eval("…")` throw `EvalError`, which kills the
  *    `constructor.constructor("return process")()` family even though those
@@ -55,40 +54,6 @@ export interface EvaluateOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 250;
-
-/**
- * Defense-in-depth static pre-check. The vm boundary blocks every escape on its
- * own (the suite proves this with the pre-check disabled); this only rejects
- * obviously-hostile text early, with a clearer error. It flags a dangerous
- * *free* identifier — not a member access like `state.process`, and not text
- * inside a string literal — so it never bans `=>` or `constructor`.
- */
-const DANGEROUS_FREE_IDENTIFIER =
-    /(?<![.\w$])(?:require|process|module|globalThis|Buffer|eval|import|__proto__)\b/;
-
-let staticPrecheckEnabled = true;
-
-/**
- * TEST-ONLY: toggle the defense-in-depth static pre-check so the suite can prove
- * the vm layer alone blocks every escape. Not part of the supported API.
- */
-export function __setStaticPrecheckForTests(enabled: boolean): void {
-    staticPrecheckEnabled = enabled;
-}
-
-function stripStringLiterals(src: string): string {
-    // Blank the CONTENTS of '…' and "…" string literals so an identifier that
-    // only appears inside a string (e.g. `state.kind === 'process'`) does not
-    // trip the pre-check. Real escapes are blocked by the vm regardless.
-    return src.replace(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"/g, "''");
-}
-
-function runStaticPrecheck(expression: string): void {
-    if (!staticPrecheckEnabled) return;
-    if (DANGEROUS_FREE_IDENTIFIER.test(stripStringLiterals(expression))) {
-        throw new SafeExpressionError('Expression references a disallowed global identifier');
-    }
-}
 
 /**
  * Convert a scope value to a JSON-safe structure. True cycles are dropped (a
@@ -145,8 +110,6 @@ export function evaluateExpression(
     if (typeof expression !== 'string') {
         throw new SafeExpressionError('Expression must be a string');
     }
-
-    runStaticPrecheck(expression);
 
     const keys = Object.keys(scope ?? {});
     for (const key of keys) {
