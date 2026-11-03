@@ -35,6 +35,7 @@
  */
 
 import { getGlobalStateClient } from '../../globalState';
+import { evaluateExpression } from './safeExpression';
 
 /**
  * Build a GlobalStateClient scoped to the current run's user.
@@ -305,7 +306,7 @@ export function getNestedProperty(obj: any, path: string): any {
  * 2. Pure template expressions (exactly `{{...}}` with nothing outside):
  *    a. Try simple path resolution first (state.xxx, parameters.xxx).
  *    b. If that returns undefined OR the expression is complex (operators, ternary,
- *       function calls, array indexing, etc.), evaluate via `new Function` with
+ *       function calls, array indexing, etc.), evaluate via the sandboxed evaluator with
  *       `state` in scope — this preserves the actual JS type of the result.
  * 3. Mixed template strings (contain `{{...}}` but also surrounding text) fall back
  *    to `renderTemplate`, which always returns a string.
@@ -364,7 +365,7 @@ export function resolveValue(value: any, state: any, options: ResolveValueOption
                 if (resolved !== undefined) {
                     return resolved;
                 }
-                // Fall through to new Function evaluation if not found
+                // Fall through to expression evaluation if not found
             } else {
                 // state.xxx
                 const path = expression.slice('state.'.length);
@@ -379,20 +380,18 @@ export function resolveValue(value: any, state: any, options: ResolveValueOption
                         return dataValue;
                     }
                 }
-                // Fall through to new Function evaluation if not found
+                // Fall through to expression evaluation if not found
             }
         }
 
-        // Complex expression (or simple path that returned undefined) — evaluate via new Function.
+        // Complex expression (or simple path that returned undefined) — evaluate in the sandbox.
         //
         // `parameters` is bound alongside `state` so `{{parameters.x || 'y'}}`
         // evaluates instead of throwing a ReferenceError and falling back to
         // the raw source. Strictly additive: every expression that already
         // worked still does.
         try {
-            // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-            const evalFunc = new Function('state', 'parameters', `return (${expression})`);
-            return evalFunc(state, state?.parameters ?? {});
+            return evaluateExpression(expression, { state, parameters: state?.parameters ?? {} });
         } catch (error) {
             console.error('[TemplateRenderer] resolveValue: failed to evaluate expression:', expression, error);
             if (options.throwOnError) {
