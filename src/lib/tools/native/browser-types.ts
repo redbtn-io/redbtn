@@ -25,6 +25,7 @@ export type BrowserAction =
       op?: 'list' | 'open' | 'close' | 'activate' | string;
       tabId?: number;
       url?: string;
+      waitMs?: number;
     })
   | (BrowserActionBase & { action: 'snapshot'; tabId?: number })
   | (BrowserActionBase & { action: 'read'; tabId?: number; format?: 'text' | 'markdown' | string })
@@ -32,30 +33,37 @@ export type BrowserAction =
       action: 'screenshot';
       tabId?: number;
       format?: 'png' | 'jpeg' | string;
+      quality?: number;
+      fullRes?: boolean;
     })
   | (BrowserActionBase & {
       action: 'navigate';
       op?: 'url' | 'back' | 'forward' | 'reload' | string;
       url?: string;
+      wait?: boolean;
+      waitMs?: number;
       tabId?: number;
     })
   | (BrowserActionBase & {
       action: 'click';
       tabId?: number;
       ref?: string;
+      selector?: string;
+      text?: string;
       x?: number;
       y?: number;
       button?: 'left' | 'right' | 'middle' | string;
       double?: boolean;
     })
-  | (BrowserActionBase & { action: 'type'; tabId?: number; ref?: string; text?: string })
-  | (BrowserActionBase & { action: 'press_key'; tabId?: number; keys?: string[]; key?: string })
-  | (BrowserActionBase & { action: 'hover'; tabId?: number; ref?: string; x?: number; y?: number })
-  | (BrowserActionBase & { action: 'scroll'; tabId?: number; ref?: string; dx?: number; dy?: number })
+  | (BrowserActionBase & { action: 'type'; tabId?: number; ref?: string; selector?: string; text?: string })
+  | (BrowserActionBase & { action: 'press_key'; tabId?: number; ref?: string; selector?: string; keys?: string[]; key?: string })
+  | (BrowserActionBase & { action: 'hover'; tabId?: number; ref?: string; selector?: string; text?: string; x?: number; y?: number })
+  | (BrowserActionBase & { action: 'scroll'; tabId?: number; ref?: string; selector?: string; dx?: number; dy?: number })
   | (BrowserActionBase & {
       action: 'select';
       tabId?: number;
       ref?: string;
+      selector?: string;
       value?: string;
       text?: string;
     })
@@ -70,6 +78,7 @@ export type BrowserAction =
       ref?: string;
       text?: string;
       selector?: string;
+      url?: string;
       timeoutMs?: number;
     })
   | (BrowserActionBase & {
@@ -78,20 +87,43 @@ export type BrowserAction =
       promptText?: string;
       tabId?: number;
     })
-  | (BrowserActionBase & { action: 'evaluate'; tabId?: number; expression?: string })
+  | (BrowserActionBase & { action: 'evaluate'; tabId?: number; expression?: string; frame?: string })
   | (BrowserActionBase & { action: 'console'; tabId?: number; level?: string; limit?: number })
-  | (BrowserActionBase & { action: 'network'; tabId?: number; limit?: number })
+  | (BrowserActionBase & {
+      action: 'network';
+      tabId?: number;
+      limit?: number;
+      filter?: string;
+      type?: string;
+      frame?: string;
+      status?: string;
+      media?: boolean;
+      headers?: boolean;
+      clear?: boolean;
+      reload?: boolean;
+      waitMs?: number;
+      watch?: boolean;
+    })
+  | (BrowserActionBase & {
+      action: 'network_body';
+      tabId?: number;
+      requestId: string;
+      maxBytes?: number;
+    })
+  | (BrowserActionBase & { action: 'frames'; tabId?: number })
   | (BrowserActionBase & {
       action: 'upload';
       tabId?: number;
       ref?: string;
+      selector?: string;
       fileName?: string;
       contentBase64?: string;
       mimeType?: string;
       files?: Record<string, unknown>[] | AnyObject[];
     })
-  | (BrowserActionBase & { action: 'acquire_lock'; minutes?: number; note?: string })
-  | (BrowserActionBase & { action: 'release_lock' })
+  | (BrowserActionBase & { action: 'acquire_lock'; name?: string; minutes?: number; note?: string })
+  | (BrowserActionBase & { action: 'release_lock'; name?: string; force?: boolean })
+  | (BrowserActionBase & { action: 'reload'; checkOnly?: boolean; onlyIfChanged?: boolean })
   | (BrowserActionBase & {
       action: 'record_start';
       tabId?: number;
@@ -126,9 +158,12 @@ export const BROWSER_TOOL_NAMES = [
   'browser_evaluate',
   'browser_console',
   'browser_network',
+  'browser_network_body',
+  'browser_frames',
   'browser_upload',
   'browser_acquire_lock',
   'browser_release_lock',
+  'browser_reload',
   'browser_record_start',
   'browser_record_status',
   'browser_record_stop',
