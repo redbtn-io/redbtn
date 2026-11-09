@@ -40,15 +40,18 @@ const BROWSER_TOOLS = [
   'browser_evaluate',
   'browser_console',
   'browser_network',
+  'browser_network_body',
+  'browser_frames',
   'browser_upload',
   'browser_acquire_lock',
   'browser_release_lock',
+  'browser_reload',
   'browser_record_start',
   'browser_record_status',
   'browser_record_stop',
 ] as const;
 
-const SEE_TOOLS = ['browser_snapshot', 'browser_read', 'browser_screenshot', 'browser_console', 'browser_network', 'browser_record_start', 'browser_record_status', 'browser_record_stop'];
+const SEE_TOOLS = ['browser_snapshot', 'browser_read', 'browser_screenshot', 'browser_console', 'browser_network', 'browser_network_body', 'browser_frames', 'browser_record_start', 'browser_record_status', 'browser_record_stop'];
 const CONTROL_TOOLS = [
   'browser_navigate',
   'browser_click',
@@ -63,6 +66,7 @@ const CONTROL_TOOLS = [
   'browser_upload',
   'browser_acquire_lock',
   'browser_release_lock',
+  'browser_reload',
 ];
 
 describe('browser — every browser_* tool is mapped to the browser resource', () => {

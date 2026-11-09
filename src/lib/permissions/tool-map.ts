@@ -520,6 +520,8 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   browser_screenshot: { resource: 'browser', action: 'read', extract: browserTarget },
   browser_console: { resource: 'browser', action: 'read', extract: browserTarget },
   browser_network: { resource: 'browser', action: 'read', extract: browserTarget },
+  browser_network_body: { resource: 'browser', action: 'read', extract: browserTarget },
+  browser_frames: { resource: 'browser', action: 'read', extract: browserTarget },
   browser_record_start: { resource: 'browser', action: 'read', extract: browserTarget },
   browser_record_status: { resource: 'browser', action: 'read', extract: browserTarget },
   browser_record_stop: { resource: 'browser', action: 'read', extract: browserTarget },
@@ -537,6 +539,12 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   browser_upload: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_acquire_lock: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_release_lock: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_reload: {
+    resource: 'browser',
+    action: 'control',
+    actionFor: (args) => (args.checkOnly === true ? 'read' : 'control'),
+    extract: browserTarget,
+  },
   // Exec (arbitrary JS evaluation in the page — the browser sense of exec)
   browser_evaluate: { resource: 'browser', action: 'execute', extract: browserTarget },
 };
