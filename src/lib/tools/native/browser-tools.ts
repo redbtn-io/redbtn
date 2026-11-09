@@ -132,11 +132,30 @@ async function resolveTargetInstallId(
         ? args.machine
         : '';
   const browserArg = browserArgRaw.trim();
-  if (!envArg && !browserArg) {
-    throw new Error('environmentId is required to target a browser instance.');
-  }
   const userId = resolveUserId(context);
   if (!userId) return undefined;
+
+  if (!envArg && !browserArg) {
+    if (fuzzyBrowserLookupAllowed(context)) {
+      try {
+        const mongoose = await import('mongoose');
+        const conn = mongoose.connection;
+        if (conn?.db) {
+          const docs = await conn.db.collection('environments').find({ userId, kind: 'browser' }).toArray();
+          if (docs.length === 1 && docs[0].installId) {
+            return docs[0].installId;
+          }
+          if (docs.length > 1) {
+            const matches = docs.map((d: any) => `${d.name || '(unnamed)'} [${d.environmentId || d.installId?.slice(0, 8)}]`).join(', ');
+            throw new Error(`Multiple browser environments exist (${matches}); pass environmentId or browser to select one.`);
+          }
+        }
+      } catch (err: any) {
+        if (err?.message && err.message.includes('Multiple browser environments')) throw err;
+      }
+    }
+    throw new Error('environmentId is required to target a browser instance.');
+  }
 
   // 1. Explicit environmentId: the checked address. Resolve it or fail.
   if (envArg) {
@@ -245,13 +264,6 @@ async function dispatch(
 ): Promise<NativeMcpResult> {
   const userId = resolveUserId(context);
   if (!userId) return noUserResult();
-
-  if (!args?.environmentId && !args?.browser && !args?.machine) {
-    return textResult({
-      ok: false,
-      error: { code: 'browser_failed', message: 'environmentId is required to target a browser instance.' },
-    }, true);
-  }
 
   let installId: string | undefined = undefined;
   try {
@@ -467,9 +479,10 @@ const browserTabsTool = makeTool(
   {
     action: { type: 'string', enum: ['list', 'open', 'close', 'activate'], default: 'list', description: "Tab operation: 'list', 'open', 'close' or 'activate'." },
     url: { type: 'string', description: "URL to open (action:'open')." },
+    waitMs: { type: 'number', description: "Wait up to this many ms for the opened tab to finish loading (action:'open')." },
   },
   [],
-  (args) => ({ action: 'tabs', op: args.action || 'list', tabId: args.tabId, url: args.url }),
+  (args) => ({ action: 'tabs', op: args.action || 'list', tabId: args.tabId, url: args.url, waitMs: args.waitMs }),
 );
 
 const browserSnapshotTool = makeTool(
@@ -492,12 +505,14 @@ const browserReadTool = makeTool(
 
 const browserScreenshotTool = makeTool(
   'browser_screenshot',
-  'Capture a screenshot of a tab in the target browser and return it as an image the model can see, plus geometry. Fails safe with a browser_failed error if no browser is connected.',
+  'Capture a screenshot of a tab in the target browser at 1:1 CSS viewport scale and return it as an image the model can see, plus geometry. Fails safe with a browser_failed error if no browser is connected.',
   {
     format: { type: 'string', enum: ['png', 'jpeg'], description: 'Image encoding. Default png.' },
+    quality: { type: 'number', description: 'JPEG quality 1-100 (default 80, used when format is jpeg).' },
+    fullRes: { type: 'boolean', description: 'Capture at native devicePixelRatio instead of 1:1 CSS viewport scale (default false).' },
   },
   [],
-  (args) => ({ action: 'screenshot', tabId: args.tabId, format: args.format }),
+  (args) => ({ action: 'screenshot', tabId: args.tabId, format: args.format, quality: args.quality, fullRes: args.fullRes }),
 );
 
 const browserNavigateTool = makeTool(
@@ -506,33 +521,38 @@ const browserNavigateTool = makeTool(
   {
     url: { type: 'string', description: 'URL to load.' },
     op: { type: 'string', enum: ['url', 'back', 'forward', 'reload'], description: "Navigation operation: 'url', 'back', 'forward' or 'reload'." },
+    wait: { type: 'boolean', description: 'Wait briefly for navigation to complete before returning (default true).' },
+    waitMs: { type: 'number', description: 'Maximum time in ms to wait for page load (default 2500, max 15000).' },
   },
   [],
-  (args) => ({ action: 'navigate', op: args.op || (args.url ? 'url' : undefined), url: args.url, tabId: args.tabId }),
+  (args) => ({ action: 'navigate', op: args.op || (args.url ? 'url' : undefined), url: args.url, wait: args.wait, waitMs: args.waitMs, tabId: args.tabId }),
 );
 
 const browserClickTool = makeTool(
   'browser_click',
-  'Click an element in a tab of the target browser — by `ref` from browser_snapshot, or by `x`/`y` coordinates. Supports button (left/right/middle) and double-click. Fails safe with a browser_failed error if no browser is connected.',
+  'Click an element in a tab of the target browser — by `ref` from browser_snapshot, by CSS `selector`, by visible `text`, or by `x`/`y` coordinates. Supports button (left/right/middle) and double-click. Fails safe with a browser_failed error if no browser is connected.',
   {
-    x: { type: 'number', description: 'X coordinate to click (alternative to ref).' },
-    y: { type: 'number', description: 'Y coordinate to click (alternative to ref).' },
+    selector: { type: 'string', description: 'CSS selector to click directly without a snapshot.' },
+    text: { type: 'string', description: 'Visible button/link text or aria-label to click directly without a snapshot.' },
+    x: { type: 'number', description: 'X coordinate to click (alternative to ref/selector/text).' },
+    y: { type: 'number', description: 'Y coordinate to click (alternative to ref/selector/text).' },
     button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button. Default left.' },
     double: { type: 'boolean', description: 'Double-click instead of a single click.' },
   },
   [],
-  (args) => ({ action: 'click', ref: args.ref, x: args.x, y: args.y, tabId: args.tabId, button: args.button, double: args.double }),
+  (args) => ({ action: 'click', ref: args.ref, selector: args.selector, text: args.text, x: args.x, y: args.y, tabId: args.tabId, button: args.button, double: args.double }),
   { includeRef: true },
 );
 
 const browserTypeTool = makeTool(
   'browser_type',
-  'Type text into an element (by `ref` from browser_snapshot) or the focused element of a tab in the target browser. Fails safe with a browser_failed error if no browser is connected.',
+  'Type text into an element (by `ref` or CSS `selector`) or the focused element of a tab in the target browser. Fails safe with a browser_failed error if no browser is connected.',
   {
     text: { type: 'string', description: 'Text to type. Required.' },
+    selector: { type: 'string', description: 'CSS selector to focus before typing.' },
   },
   ['text'],
-  (args) => ({ action: 'type', text: args.text, ref: args.ref, tabId: args.tabId }),
+  (args) => ({ action: 'type', text: args.text, ref: args.ref, selector: args.selector, tabId: args.tabId }),
   { includeRef: true },
 );
 
@@ -542,44 +562,50 @@ const browserPressKeyTool = makeTool(
   {
     keys: { type: 'array', items: { type: 'string' }, description: 'Key names to press together / in sequence. Required (or pass `key`).' },
     key: { type: 'string', description: 'Single key alias for `keys`.' },
+    selector: { type: 'string', description: 'CSS selector to focus before pressing keys.' },
   },
   ['keys'],
-  (args) => ({ action: 'press_key', keys: args.keys || (args.key ? [args.key] : undefined), tabId: args.tabId }),
+  (args) => ({ action: 'press_key', keys: args.keys || (args.key ? [args.key] : undefined), ref: args.ref, selector: args.selector, tabId: args.tabId }),
+  { includeRef: true },
 );
 
 const browserHoverTool = makeTool(
   'browser_hover',
-  'Hover over an element in a tab of the target browser — by `ref` from browser_snapshot, or by `x`/`y` coordinates. Fails safe with a browser_failed error if no browser is connected.',
+  'Hover over an element in a tab of the target browser — by `ref` from browser_snapshot, CSS `selector`, visible `text`, or by `x`/`y` coordinates. Fails safe with a browser_failed error if no browser is connected.',
   {
+    selector: { type: 'string', description: 'CSS selector to hover.' },
+    text: { type: 'string', description: 'Visible text or aria-label to hover.' },
     x: { type: 'number', description: 'X coordinate to hover (alternative to ref).' },
     y: { type: 'number', description: 'Y coordinate to hover (alternative to ref).' },
   },
   [],
-  (args) => ({ action: 'hover', ref: args.ref, x: args.x, y: args.y, tabId: args.tabId }),
+  (args) => ({ action: 'hover', ref: args.ref, selector: args.selector, text: args.text, x: args.x, y: args.y, tabId: args.tabId }),
   { includeRef: true },
 );
 
 const browserScrollTool = makeTool(
   'browser_scroll',
-  'Scroll a tab of the target browser by `dx`/`dy` pixels, optionally within an element given by `ref`. Fails safe with a browser_failed error if no browser is connected.',
+  'Scroll a tab of the target browser by `dx`/`dy` pixels, or scroll an element into view by `ref` or CSS `selector`. Fails safe with a browser_failed error if no browser is connected.',
   {
     dx: { type: 'number', description: 'Horizontal scroll delta in pixels.' },
     dy: { type: 'number', description: 'Vertical scroll delta in pixels.' },
+    selector: { type: 'string', description: 'CSS selector of an element to scroll into view.' },
   },
   [],
-  (args) => ({ action: 'scroll', dx: args.dx, dy: args.dy, ref: args.ref, tabId: args.tabId }),
+  (args) => ({ action: 'scroll', dx: args.dx, dy: args.dy, ref: args.ref, selector: args.selector, tabId: args.tabId }),
   { includeRef: true },
 );
 
 const browserSelectTool = makeTool(
   'browser_select',
-  'Select an option in a <select> element (by `ref` from browser_snapshot) in a tab of the target browser, by option `value` or visible `text`. Fails safe with a browser_failed error if no browser is connected.',
+  'Select an option in a <select> element (by `ref` or CSS `selector`) in a tab of the target browser, by option `value` or visible `text`. Fails safe with a browser_failed error if no browser is connected.',
   {
+    selector: { type: 'string', description: 'CSS selector of the <select> element.' },
     value: { type: 'string', description: 'Option value to select.' },
     text: { type: 'string', description: 'Visible option text to select (alternative to value).' },
   },
   [],
-  (args) => ({ action: 'select', ref: args.ref, value: args.value, text: args.text, tabId: args.tabId }),
+  (args) => ({ action: 'select', ref: args.ref, selector: args.selector, value: args.value, text: args.text, tabId: args.tabId }),
   { includeRef: true },
 );
 
@@ -595,13 +621,14 @@ const browserFillFormTool = makeTool(
 
 const browserWaitForTool = makeTool(
   'browser_wait_for',
-  'Wait for a condition in a tab of the target browser: an element `ref`, visible `text`, or a CSS `selector` to appear, up to `timeoutMs`. Fails safe with a browser_failed error if no browser is connected.',
+  'Wait for a condition in a tab of the target browser: an element `ref`, visible `text`, CSS `selector`, or `url` pattern to match, up to `timeoutMs`. Fails safe with a browser_failed error if no browser is connected.',
   {
     text: { type: 'string', description: 'Visible text to wait for.' },
     selector: { type: 'string', description: 'CSS selector to wait for.' },
+    url: { type: 'string', description: 'URL substring or /regex/ to wait for.' },
   },
   [],
-  (args) => ({ action: 'wait_for', ref: args.ref, text: args.text, selector: args.selector, tabId: args.tabId, timeoutMs: args.timeoutMs }),
+  (args) => ({ action: 'wait_for', ref: args.ref, text: args.text, selector: args.selector, url: args.url, tabId: args.tabId, timeoutMs: args.timeoutMs }),
   { includeRef: true },
 );
 
@@ -618,12 +645,13 @@ const browserDialogTool = makeTool(
 
 const browserEvaluateTool = makeTool(
   'browser_evaluate',
-  'Evaluate a JavaScript `expression` in a tab of the target browser and return its result. Powerful — use only when snapshot/read cannot answer. Fails safe with a browser_failed error if no browser is connected.',
+  'Evaluate a JavaScript `expression` in a tab (or iframe via `frame`) of the target browser and return its result. Powerful — use only when snapshot/read cannot answer. Fails safe with a browser_failed error if no browser is connected.',
   {
     expression: { type: 'string', description: 'JavaScript expression to evaluate. Required.' },
+    frame: { type: 'string', description: 'Run inside an iframe instead of the top page: URL substring, frame name or frameId (see browser_frames). Works for cross-origin iframes.' },
   },
   ['expression'],
-  (args) => ({ action: 'evaluate', expression: args.expression, tabId: args.tabId }),
+  (args) => ({ action: 'evaluate', expression: args.expression, frame: args.frame, tabId: args.tabId }),
 );
 
 const browserConsoleTool = makeTool(
@@ -639,25 +667,69 @@ const browserConsoleTool = makeTool(
 
 const browserNetworkTool = makeTool(
   'browser_network',
-  'Read recent network requests captured from a tab of the target browser, capped by `limit`. Fails safe with a browser_failed error if no browser is connected.',
+  'Read network requests captured from a tab of the target browser, including cross-origin iframes and workers. Supports filter (substring or /regex/), type, frame, status, media (pinned HLS/DASH playlists), headers, clear, reload, waitMs, and watch.',
   {
-    limit: { type: 'number', description: 'Maximum number of requests to return.' },
+    limit: { type: 'number', description: 'Maximum number of requests to return (default 50, max 1500).' },
+    filter: { type: 'string', description: 'Only URLs containing this text, or matching /regex/flags.' },
+    type: { type: 'string', description: 'Comma-separated resource types, e.g. "XHR,Fetch,Media,Document,Script".' },
+    frame: { type: 'string', description: 'Only requests made by a frame/target whose URL contains this text.' },
+    status: { type: 'string', description: 'Status filter: "200", "4xx", "5xx" or "failed".' },
+    media: { type: 'boolean', description: 'Only HLS/DASH playlists, manifests and media requests (pinned buffer).' },
+    headers: { type: 'boolean', description: 'Include request/response headers.' },
+    clear: { type: 'boolean', description: 'Empty the buffer before reading.' },
+    reload: { type: 'boolean', description: 'Clear, hard-reload the tab and capture from its first request.' },
+    waitMs: { type: 'number', description: 'Wait this long before reading (default 4000 with reload, max 30000).' },
+    watch: { type: 'boolean', description: 'Keep the tab attached past the 60s idle sweep so capture continues.' },
   },
   [],
-  (args) => ({ action: 'network', limit: args.limit, tabId: args.tabId }),
+  (args) => ({
+    action: 'network',
+    limit: args.limit,
+    filter: args.filter,
+    type: args.type,
+    frame: args.frame,
+    status: args.status,
+    media: args.media,
+    headers: args.headers,
+    clear: args.clear,
+    reload: args.reload,
+    waitMs: args.waitMs,
+    watch: args.watch,
+    tabId: args.tabId,
+  }),
+);
+
+const browserNetworkBodyTool = makeTool(
+  'browser_network_body',
+  'Read the response body of a request listed by browser_network (by `requestId`), e.g. the text of an .m3u8 playlist. Text is returned decoded; binary stays base64.',
+  {
+    requestId: { type: 'string', description: 'requestId from a browser_network entry. Required.' },
+    maxBytes: { type: 'number', description: 'Cap on returned characters (default 65536, max 262144).' },
+  },
+  ['requestId'],
+  (args) => ({ action: 'network_body', requestId: args.requestId, maxBytes: args.maxBytes, tabId: args.tabId }),
+);
+
+const browserFramesTool = makeTool(
+  'browser_frames',
+  "List the page's frames and cross-origin iframe/worker targets. These are the values browser_evaluate's `frame` can address.",
+  {},
+  [],
+  (args) => ({ action: 'frames', tabId: args.tabId }),
 );
 
 const browserUploadTool = makeTool(
   'browser_upload',
-  'Upload file content to a file input (by `ref` from browser_snapshot) in a tab of the target browser: a single file via `fileName` + `contentBase64` (+ `mimeType`), or multiple via `files` (array of file objects). Fails safe with a browser_failed error if no browser is connected.',
+  'Upload file content to a file input (by `ref` or CSS `selector`) in a tab of the target browser: a single file via `fileName` + `contentBase64` (+ `mimeType`), or multiple via `files` (array of file objects). Fails safe with a browser_failed error if no browser is connected.',
   {
+    selector: { type: 'string', description: 'CSS selector of the file input element.' },
     fileName: { type: 'string', description: 'File name for the single-file upload.' },
     contentBase64: { type: 'string', description: 'Base64-encoded file content for the single-file upload.' },
     mimeType: { type: 'string', description: 'MIME type of the uploaded file.' },
     files: { type: 'array', items: { type: 'object' }, description: 'Multiple file objects (e.g. { fileName, contentBase64, mimeType }).' },
   },
   [],
-  (args) => ({ action: 'upload', ref: args.ref, fileName: args.fileName, contentBase64: args.contentBase64, mimeType: args.mimeType, files: args.files, tabId: args.tabId }),
+  (args) => ({ action: 'upload', ref: args.ref, selector: args.selector, fileName: args.fileName, contentBase64: args.contentBase64, mimeType: args.mimeType, files: args.files, tabId: args.tabId }),
   { includeRef: true },
 );
 
@@ -665,20 +737,36 @@ const browserAcquireLockTool = makeTool(
   'browser_acquire_lock',
   'Acquire the exclusive tab/browser lock on the target browser so other agents do not drive it concurrently. `minutes` sets the lock duration; `note` records why. Fails safe with a browser_failed error if no browser is connected.',
   {
-    minutes: { type: 'number', description: 'Lock duration in minutes.' },
+    name: { type: 'string', description: 'Lock name (default "default").' },
+    minutes: { type: 'number', description: 'Lock duration in minutes (default 10, max 240).' },
     note: { type: 'string', description: 'Note describing why the lock is held.' },
   },
   [],
-  (args) => ({ action: 'acquire_lock', minutes: args.minutes, note: args.note }),
+  (args) => ({ action: 'acquire_lock', name: args.name, minutes: args.minutes, note: args.note }),
   { includeTabId: false },
 );
 
 const browserReleaseLockTool = makeTool(
   'browser_release_lock',
   'Release the tab/browser lock previously acquired with browser_acquire_lock on the target browser. Fails safe with a browser_failed error if no browser is connected.',
-  {},
+  {
+    name: { type: 'string', description: 'Lock name (default "default").' },
+    force: { type: 'boolean', description: 'Force-release even if held by another agent.' },
+  },
   [],
-  (_args) => ({ action: 'release_lock' }),
+  (args) => ({ action: 'release_lock', name: args.name, force: args.force }),
+  { includeTabId: false },
+);
+
+const browserReloadTool = makeTool(
+  'browser_reload',
+  'Reload the redbtn Browser extension itself (to pick up an updated build on disk or a downloaded CRX update), or check its running version/buildId against disk (`checkOnly: true`).',
+  {
+    checkOnly: { type: 'boolean', description: 'When true, return running vs on-disk version/buildId without reloading.' },
+    onlyIfChanged: { type: 'boolean', description: 'When true, reload only if disk buildId/version or a CRX update differs from the running extension.' },
+  },
+  [],
+  (args) => ({ action: 'reload', checkOnly: args.checkOnly, onlyIfChanged: args.onlyIfChanged }),
   { includeTabId: false },
 );
 
@@ -755,9 +843,12 @@ export const BROWSER_TOOLS: Record<string, NativeToolDefinition> = {
   browser_evaluate: browserEvaluateTool,
   browser_console: browserConsoleTool,
   browser_network: browserNetworkTool,
+  browser_network_body: browserNetworkBodyTool,
+  browser_frames: browserFramesTool,
   browser_upload: browserUploadTool,
   browser_acquire_lock: browserAcquireLockTool,
   browser_release_lock: browserReleaseLockTool,
+  browser_reload: browserReloadTool,
   browser_record_start: browserRecordStartTool,
   browser_record_status: browserRecordStatusTool,
   browser_record_stop: browserRecordStopTool,
@@ -781,9 +872,12 @@ export const browserDialog = browserDialogTool;
 export const browserEvaluate = browserEvaluateTool;
 export const browserConsole = browserConsoleTool;
 export const browserNetwork = browserNetworkTool;
+export const browserNetworkBody = browserNetworkBodyTool;
+export const browserFrames = browserFramesTool;
 export const browserUpload = browserUploadTool;
 export const browserAcquireLock = browserAcquireLockTool;
 export const browserReleaseLock = browserReleaseLockTool;
+export const browserReload = browserReloadTool;
 export const browserRecordStart = browserRecordStartTool;
 export const browserRecordStatus = browserRecordStatusTool;
 export const browserRecordStop = browserRecordStopTool;
@@ -807,9 +901,12 @@ export const browserRecordStop = browserRecordStopTool;
   browserEvaluate: browserEvaluateTool,
   browserConsole: browserConsoleTool,
   browserNetwork: browserNetworkTool,
+  browserNetworkBody: browserNetworkBodyTool,
+  browserFrames: browserFramesTool,
   browserUpload: browserUploadTool,
   browserAcquireLock: browserAcquireLockTool,
   browserReleaseLock: browserReleaseLockTool,
+  browserReload: browserReloadTool,
   browserRecordStart: browserRecordStartTool,
   browserRecordStatus: browserRecordStatusTool,
   browserRecordStop: browserRecordStopTool,
