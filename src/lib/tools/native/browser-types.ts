@@ -127,6 +127,8 @@ export type BrowserAction =
   | (BrowserActionBase & {
       action: 'record_start';
       tabId?: number;
+      mode?: 'video' | 'audio' | 'both' | string;
+      audio?: boolean;
       fps?: number;
       maxSeconds?: number;
       format?: string;

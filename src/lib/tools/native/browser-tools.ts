@@ -772,11 +772,13 @@ const browserReloadTool = makeTool(
 
 const browserRecordStartTool = makeTool(
   'browser_record_start',
-  'Start recording a tab as video, for demos, walkthroughs and bug reports. Keep driving the page with the other browser_* tools, then call browser_record_stop to get the file. Video only, no audio. One recording at a time. The tab must be active and visible, because Chrome only paints what is on screen; activate it with browser_tabs first if needed. Agent clicks and hovers are drawn as a cursor. Frames from any site this browser does not permit are replaced with a blank screen. Fails safe with a browser_failed error if no browser is connected.',
+  'Start recording a tab as video, audio, or combined video+audio, for demos, walkthroughs and bug reports. Keep driving the page with the other browser_* tools, then call browser_record_stop to get the file. Pass `mode: "both"` (or `audio: true`) for combined video + audio, `mode: "audio"` for audio-only, or `mode: "video"` (default) for video-only. One recording at a time. For video modes, the tab must be active and visible, because Chrome only paints what is on screen; activate it with browser_tabs first if needed. Agent clicks and hovers are drawn as a cursor. Frames and audio from any site this browser does not permit are blanked/muted automatically. Fails safe with a browser_failed error if no browser is connected.',
   {
+    mode: { type: 'string', enum: ['video', 'audio', 'both'], description: 'Recording mode: "video" (default), "audio" (audio-only), or "both" (combined video + audio).' },
+    audio: { type: 'boolean', description: 'Include tab audio in the recording (shorthand for mode="both" when true).' },
     fps: { type: 'number', description: 'Output frames per second, 1-60. Default 30.' },
     maxSeconds: { type: 'number', description: 'Stop capturing after this long, 1-1800. Default 300. browser_record_stop must still be called to save the file.' },
-    format: { type: 'string', enum: ['mp4', 'webm'], description: 'Container. Default mp4 (H.264). Falls back to the other one if this browser cannot encode it. WebM files have no duration header, so some players cannot seek them.' },
+    format: { type: 'string', enum: ['mp4', 'webm'], description: 'Container. Default mp4 (H.264/AAC). Falls back to the other one if this browser cannot encode it. WebM files have no duration header, so some players cannot seek them.' },
     bitrate: { type: 'number', description: 'Target video bits per second. Default 4000000. Lower it for long recordings: uploads are capped at 50 MB.' },
     quality: { type: 'number', description: 'JPEG quality of the captured frames, 10-100. Default 80.' },
     maxWidth: { type: 'number', description: 'Maximum capture width in pixels. Default 1920.' },
@@ -787,6 +789,8 @@ const browserRecordStartTool = makeTool(
   (args) => ({
     action: 'record_start',
     tabId: args.tabId,
+    mode: args.mode,
+    audio: args.audio,
     fps: args.fps,
     maxSeconds: args.maxSeconds,
     format: args.format,
