@@ -528,6 +528,8 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   // Control
   browser_navigate: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_click: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_drag: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_resize: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_type: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_press_key: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_hover: { resource: 'browser', action: 'control', extract: browserTarget },
