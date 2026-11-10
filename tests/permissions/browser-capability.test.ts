@@ -29,6 +29,8 @@ const BROWSER_TOOLS = [
   'browser_screenshot',
   'browser_navigate',
   'browser_click',
+  'browser_drag',
+  'browser_resize',
   'browser_type',
   'browser_press_key',
   'browser_hover',
@@ -55,6 +57,8 @@ const SEE_TOOLS = ['browser_snapshot', 'browser_read', 'browser_screenshot', 'br
 const CONTROL_TOOLS = [
   'browser_navigate',
   'browser_click',
+  'browser_drag',
+  'browser_resize',
   'browser_type',
   'browser_press_key',
   'browser_hover',
