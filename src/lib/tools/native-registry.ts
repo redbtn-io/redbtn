@@ -751,6 +751,8 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     registry.register('browser_screenshot', browser.browserScreenshot);
     registry.register('browser_navigate', browser.browserNavigate);
     registry.register('browser_click', browser.browserClick);
+    registry.register('browser_drag', browser.browserDrag);
+    registry.register('browser_resize', browser.browserResize);
     registry.register('browser_type', browser.browserType);
     registry.register('browser_press_key', browser.browserPressKey);
     registry.register('browser_hover', browser.browserHover);

@@ -52,13 +52,57 @@ export type BrowserAction =
       text?: string;
       x?: number;
       y?: number;
+      offsetX?: number;
+      offsetY?: number;
+      nx?: number;
+      ny?: number;
       button?: 'left' | 'right' | 'middle' | string;
       double?: boolean;
+      modifiers?: string[];
+    })
+  | (BrowserActionBase & {
+      action: 'drag';
+      tabId?: number;
+      op?: 'drag' | 'down' | 'up' | 'move' | string;
+      ref?: string;
+      selector?: string;
+      from?: Record<string, unknown> | AnyObject;
+      to?: Record<string, unknown> | AnyObject;
+      path?: Record<string, unknown>[] | AnyObject[];
+      fromX?: number;
+      fromY?: number;
+      toX?: number;
+      toY?: number;
+      dx?: number;
+      dy?: number;
+      x?: number;
+      y?: number;
+      offsetX?: number;
+      offsetY?: number;
+      nx?: number;
+      ny?: number;
+      steps?: number;
+      durationMs?: number;
+      button?: 'left' | 'right' | 'middle' | string;
+      buttons?: number;
+      modifiers?: string[];
+    })
+  | (BrowserActionBase & {
+      action: 'resize';
+      tabId?: number;
+      preset?: 'mobile' | 'iphone' | 'tablet' | 'ipad' | 'desktop' | 'reset' | string;
+      width?: number;
+      height?: number;
+      deviceScaleFactor?: number;
+      mobile?: boolean;
+      orientation?: 'portrait' | 'landscape' | string;
+      window?: boolean;
+      reset?: boolean;
     })
   | (BrowserActionBase & { action: 'type'; tabId?: number; ref?: string; selector?: string; text?: string })
   | (BrowserActionBase & { action: 'press_key'; tabId?: number; ref?: string; selector?: string; keys?: string[]; key?: string })
-  | (BrowserActionBase & { action: 'hover'; tabId?: number; ref?: string; selector?: string; text?: string; x?: number; y?: number })
-  | (BrowserActionBase & { action: 'scroll'; tabId?: number; ref?: string; selector?: string; dx?: number; dy?: number })
+  | (BrowserActionBase & { action: 'hover'; tabId?: number; ref?: string; selector?: string; text?: string; x?: number; y?: number; offsetX?: number; offsetY?: number; nx?: number; ny?: number })
+  | (BrowserActionBase & { action: 'scroll'; tabId?: number; ref?: string; selector?: string; dx?: number; dy?: number; x?: number; y?: number; offsetX?: number; offsetY?: number; nx?: number; ny?: number })
   | (BrowserActionBase & {
       action: 'select';
       tabId?: number;
@@ -149,6 +193,8 @@ export const BROWSER_TOOL_NAMES = [
   'browser_screenshot',
   'browser_navigate',
   'browser_click',
+  'browser_drag',
+  'browser_resize',
   'browser_type',
   'browser_press_key',
   'browser_hover',
