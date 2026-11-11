@@ -19,7 +19,8 @@
  * Graphs reference these `toolName`s in a `tool` step (no compiler changes):
  *   browser_list, browser_tabs, browser_snapshot, browser_read,
  *   browser_screenshot, browser_navigate, browser_click, browser_type,
- *   browser_press_key, browser_hover, browser_scroll, browser_select,
+ *   browser_press_key, browser_mouse, browser_gamepad, browser_input_script,
+ *   browser_hover, browser_scroll, browser_select,
  *   browser_fill_form, browser_wait_for, browser_dialog, browser_evaluate,
  *   browser_console, browser_network, browser_upload, browser_acquire_lock,
  *   browser_release_lock, browser_record_start, browser_record_status,
@@ -664,15 +665,122 @@ const browserTypeTool = makeTool(
 
 const browserPressKeyTool = makeTool(
   'browser_press_key',
-  'Press a key or key chord in a tab of the target browser. Pass `keys` as an array of key names (e.g. ["Control", "l"] or ["Enter"]), or a single `key`. Fails safe with a browser_failed error if no browser is connected.',
+  'Press a key or key chord in a tab of the target browser, or HOLD keys for games. Pass `keys` as an array of key names (e.g. ["Control", "l"] or ["Enter"]), or a single `key`. `op: "down"` keeps keys held (e.g. ["w", "shift"]) across later calls until `op: "up"` or `op: "release_all"`, auto-repeating like a keyboard; `holdMs` presses, holds and releases in one call. Events carry real DOM codes (KeyW, ShiftLeft, Space). Held keys are always released on lock release, STOP, tab close, or after maxHoldMs without input calls. Fails safe with a browser_failed error if no browser is connected.',
   {
-    keys: { type: 'array', items: { type: 'string' }, description: 'Key names to press together / in sequence. Required (or pass `key`).' },
+    keys: { type: 'array', items: { type: 'string' }, description: 'Key names to press together / in sequence; with op down/up, the keys to hold or release. Required unless `key` is given or op is release_all/held.' },
     key: { type: 'string', description: 'Single key alias for `keys`.' },
     selector: { type: 'string', description: 'CSS selector to focus before pressing keys.' },
+    op: { type: 'string', enum: ['press', 'down', 'up', 'release_all', 'held'], description: 'press (default), down (hold), up (release), release_all (let go of all held keys, buttons and sticks), held (list what is held).' },
+    holdMs: { type: 'number', description: 'With op press: hold this long before releasing (max 60000).' },
+    repeat: { type: 'boolean', description: 'Auto-repeat the held key like a keyboard. Default true.' },
+    maxHoldMs: { type: 'number', description: 'Safety: release held input after this long without any input call (default 120000, max 600000).' },
   },
-  ['keys'],
-  (args) => ({ action: 'press_key', keys: args.keys || (args.key ? [args.key] : undefined), ref: args.ref, selector: args.selector, tabId: args.tabId }),
+  [],
+  (args) => ({
+    action: 'press_key',
+    keys: args.keys || (args.key ? [args.key] : undefined),
+    ref: args.ref,
+    selector: args.selector,
+    op: args.op,
+    holdMs: args.holdMs,
+    repeat: args.repeat,
+    maxHoldMs: args.maxHoldMs,
+    tabId: args.tabId,
+  }),
   { includeRef: true },
+);
+
+const browserMouseTool = makeTool(
+  'browser_mouse',
+  'Game-style mouse control in a tab of the target browser. `op: "move_relative"` sends `dx`/`dy` motion (spread over `durationMs`/`steps`) whose movementX/movementY sum exactly to dx/dy, which is what first-person cameras read; it works under pointer lock. `op: "lock"` clicks the target (default viewport centre) so the game can take the pointer lock, `op: "lock_status"` reports document.pointerLockElement, `op: "unlock"` exits it. `down`/`up`/`click`/`wheel`/`move` handle buttons; a held button stays down across later calls (aim while holding fire). Results report `path`: "cdp" (trusted events) or "synthetic" (in-page events, used when the browser cannot produce correct deltas under pointer lock, e.g. headless). Fails safe with a browser_failed error if no browser is connected.',
+  {
+    op: { type: 'string', enum: ['move_relative', 'move', 'down', 'up', 'click', 'wheel', 'lock', 'unlock', 'lock_status', 'release_all'], description: 'Operation. Default move_relative when dx/dy is given, else lock_status.' },
+    dx: { type: 'number', description: 'move_relative: horizontal motion in pixels (positive = right).' },
+    dy: { type: 'number', description: 'move_relative: vertical motion in pixels (positive = down).' },
+    durationMs: { type: 'number', description: 'move_relative: spread the motion over this many ms. Default 0.' },
+    steps: { type: 'number', description: 'move_relative: number of mouse events (default one per ~16 ms).' },
+    via: { type: 'string', enum: ['auto', 'cdp', 'synthetic'], description: 'move_relative: force the delivery path. Default auto.' },
+    button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Button for down/up/click, or held during move_relative. Default left.' },
+    holdMs: { type: 'number', description: 'click: hold the button this long.' },
+    deltaX: { type: 'number', description: 'wheel: horizontal delta.' },
+    deltaY: { type: 'number', description: 'wheel: vertical delta (default 100).' },
+    x: { type: 'number', description: 'Viewport X for move/down/up/click/lock (ignored while locked).' },
+    y: { type: 'number', description: 'Viewport Y for move/down/up/click/lock.' },
+    nx: { type: 'number', description: 'Normalized X 0..1 in the selector/ref element or the viewport.' },
+    ny: { type: 'number', description: 'Normalized Y 0..1.' },
+    selector: { type: 'string', description: 'CSS selector of the target (e.g. "canvas").' },
+    waitMs: { type: 'number', description: 'lock: how long to wait for the page to take the lock (default 1500).' },
+  },
+  [],
+  (args) => ({
+    action: 'mouse',
+    op: args.op,
+    dx: args.dx,
+    dy: args.dy,
+    durationMs: args.durationMs,
+    steps: args.steps,
+    via: args.via,
+    button: args.button,
+    holdMs: args.holdMs,
+    deltaX: args.deltaX,
+    deltaY: args.deltaY,
+    x: args.x,
+    y: args.y,
+    nx: args.nx,
+    ny: args.ny,
+    ref: args.ref,
+    selector: args.selector,
+    waitMs: args.waitMs,
+    tabId: args.tabId,
+  }),
+  { includeRef: true, defaultTimeoutMs: 70_000 },
+);
+
+const browserGamepadTool = makeTool(
+  'browser_gamepad',
+  'Emulate a standard-mapping gamepad in a tab: overrides navigator.getGamepads() and fires gamepadconnected. `op: "connect"`, then `op: "set"` with `axes` { lx, ly, rx, ry } (-1..1) and `buttons` { a, b, x, y, lb, rb, lt, rt, select, start, ls, rs, dpadUp, dpadDown, dpadLeft, dpadRight, home } or indices 0-16 (0..1). Values persist until changed (`reset` neutralises first, `holdMs` neutralises after that long). `op: "disconnect"` removes it, `op: "status"` reads what the page sees. Fails safe with a browser_failed error if no browser is connected.',
+  {
+    op: { type: 'string', enum: ['connect', 'set', 'disconnect', 'status'], description: 'Operation. Default set (connects first if needed).' },
+    axes: { type: 'object', description: 'Axes by name or index, e.g. { "lx": 0, "ly": -1 } (stick up = negative y).' },
+    buttons: { type: 'object', description: 'Buttons by name or index, e.g. { "a": 1, "rt": 0.8 }.' },
+    reset: { type: 'boolean', description: 'Neutralise all axes and buttons before applying this set.' },
+    holdMs: { type: 'number', description: 'set: apply, wait this long, then neutralise.' },
+  },
+  [],
+  (args) => ({ action: 'gamepad', op: args.op, axes: args.axes, buttons: args.buttons, reset: args.reset, holdMs: args.holdMs, tabId: args.tabId }),
+  { defaultTimeoutMs: 70_000 },
+);
+
+const browserInputScriptTool = makeTool(
+  'browser_input_script',
+  'Run a timed input timeline inside the browser with millisecond precision (no round trips while it plays), for games: hold W, turn 360 degrees, fire at exact times. Each event has `t` (ms from start) or `after` (ms after the previous event) and one of: { key | keys, op: "down" | "up" | "press", holdMs }; { mouse: "move_relative", dx, dy, durationMs, steps }; { mouse: "move", x, y | nx, ny, durationMs }; { mouse: "down" | "up" | "click", button }; { mouse: "wheel", deltaY }; { wait: ms }; { gamepad: "connect" | "set" | "disconnect", axes, buttons, holdMs }; { screenshot: true, label } (frames returned for that moment); { evaluate: "expression", label } (value read at that moment, e.g. the camera pitch). Returns jitter (actual vs planned dispatch, p50/p95/max ms), the mouse delta path, frames and evaluations. Everything held is released at the end, on error, on abort, on tab close and on lock release. Max 120 s. `record: { fps, maxHeight, bitrate }` records the run (with `overlay: { fps, inputs }` drawing the page frame rate and held keys / mouse deltas into the video) and returns the clip like browser_record_stop. `op: "start"` returns at once; poll `op: "status"`, stop with `op: "abort"`. Fails safe with a browser_failed error if no browser is connected.',
+  {
+    op: { type: 'string', enum: ['run', 'start', 'status', 'abort'], description: 'run (default: play and wait), start (play in the background), status, abort (stop now, release everything).' },
+    events: { type: 'array', items: { type: 'object' }, description: 'The timeline (see the description).' },
+    record: { type: 'object', description: 'Record the run: { fps, maxHeight, maxWidth, bitrate, format, save, filename, caption }.' },
+    overlay: { type: 'object', description: 'With record: { fps: true, inputs: true } (default both) draws the frame rate and inputs into the video.' },
+    repeat: { type: 'boolean', description: 'Auto-repeat held keys like a keyboard. Default true.' },
+    screenshotFormat: { type: 'string', enum: ['jpeg', 'png'], description: 'Format of screenshot markers. Default jpeg.' },
+    screenshotQuality: { type: 'number', description: 'JPEG quality of screenshot markers. Default 60.' },
+    screenshotMaxWidth: { type: 'number', description: 'Downscale screenshot markers to this width. Default 960.' },
+    timeline: { type: 'boolean', description: 'Include the per-event planned vs actual timeline.' },
+  },
+  [],
+  (args) => ({
+    action: 'input_script',
+    op: args.op,
+    events: args.events,
+    record: args.record,
+    overlay: args.overlay,
+    repeat: args.repeat,
+    screenshotFormat: args.screenshotFormat,
+    screenshotQuality: args.screenshotQuality,
+    screenshotMaxWidth: args.screenshotMaxWidth,
+    timeline: args.timeline,
+    tabId: args.tabId,
+  }),
+  // A script plays for up to 120 s (the hub's ceiling); the 12 s default would cut it off.
+  { defaultTimeoutMs: 120_000 },
 );
 
 const browserHoverTool = makeTool(
@@ -900,6 +1008,7 @@ const browserRecordStartTool = makeTool(
     maxWidth: { type: 'number', description: 'Maximum capture width in pixels. Default 1920.' },
     maxHeight: { type: 'number', description: 'Maximum capture height in pixels. Default 1080.' },
     cursor: { type: 'boolean', description: 'Draw the agent cursor and click ripples into the video. Default true.' },
+    overlay: { type: 'object', description: 'Draw a HUD into the video: { fps: true } (page frame rate) and/or { inputs: true } (held keys, mouse buttons and deltas, gamepad).' },
   },
   [],
   (args) => ({
@@ -915,6 +1024,7 @@ const browserRecordStartTool = makeTool(
     maxWidth: args.maxWidth,
     maxHeight: args.maxHeight,
     cursor: args.cursor,
+    overlay: args.overlay,
   }),
 );
 
@@ -956,6 +1066,9 @@ export const BROWSER_TOOLS: Record<string, NativeToolDefinition> = {
   browser_resize: browserResizeTool,
   browser_type: browserTypeTool,
   browser_press_key: browserPressKeyTool,
+  browser_mouse: browserMouseTool,
+  browser_gamepad: browserGamepadTool,
+  browser_input_script: browserInputScriptTool,
   browser_hover: browserHoverTool,
   browser_scroll: browserScrollTool,
   browser_select: browserSelectTool,
@@ -987,6 +1100,9 @@ export const browserDrag = browserDragTool;
 export const browserResize = browserResizeTool;
 export const browserType = browserTypeTool;
 export const browserPressKey = browserPressKeyTool;
+export const browserMouse = browserMouseTool;
+export const browserGamepad = browserGamepadTool;
+export const browserInputScript = browserInputScriptTool;
 export const browserHover = browserHoverTool;
 export const browserScroll = browserScrollTool;
 export const browserSelect = browserSelectTool;
@@ -1018,6 +1134,9 @@ export const browserRecordStop = browserRecordStopTool;
   browserResize: browserResizeTool,
   browserType: browserTypeTool,
   browserPressKey: browserPressKeyTool,
+  browserMouse: browserMouseTool,
+  browserGamepad: browserGamepadTool,
+  browserInputScript: browserInputScriptTool,
   browserHover: browserHoverTool,
   browserScroll: browserScrollTool,
   browserSelect: browserSelectTool,

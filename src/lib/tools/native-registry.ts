@@ -752,6 +752,9 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     registry.register('browser_navigate', browser.browserNavigate);
     registry.register('browser_click', browser.browserClick);
     registry.register('browser_drag', browser.browserDrag);
+    registry.register('browser_mouse', browser.browserMouse);
+    registry.register('browser_gamepad', browser.browserGamepad);
+    registry.register('browser_input_script', browser.browserInputScript);
     registry.register('browser_resize', browser.browserResize);
     registry.register('browser_type', browser.browserType);
     registry.register('browser_press_key', browser.browserPressKey);
@@ -774,7 +777,7 @@ function registerBuiltinTools(registry: NativeToolRegistry): void {
     registry.register('browser_record_status', browser.browserRecordStatus);
     registry.register('browser_record_stop', browser.browserRecordStop);
     console.log(
-      '[NativeRegistry] Registered built-in tools: browser_list, browser_tabs, browser_snapshot, browser_read, browser_screenshot, browser_navigate, browser_click, browser_type, browser_press_key, browser_hover, browser_scroll, browser_select, browser_fill_form, browser_wait_for, browser_dialog, browser_evaluate, browser_console, browser_network, browser_network_body, browser_frames, browser_upload, browser_acquire_lock, browser_release_lock, browser_reload, browser_record_start, browser_record_status, browser_record_stop',
+      '[NativeRegistry] Registered built-in tools: browser_list, browser_tabs, browser_snapshot, browser_read, browser_screenshot, browser_navigate, browser_click, browser_type, browser_press_key, browser_mouse, browser_gamepad, browser_input_script, browser_hover, browser_scroll, browser_select, browser_fill_form, browser_wait_for, browser_dialog, browser_evaluate, browser_console, browser_network, browser_network_body, browser_frames, browser_upload, browser_acquire_lock, browser_release_lock, browser_reload, browser_record_start, browser_record_status, browser_record_stop',
     );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
