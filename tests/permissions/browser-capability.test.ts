@@ -33,6 +33,9 @@ const BROWSER_TOOLS = [
   'browser_resize',
   'browser_type',
   'browser_press_key',
+  'browser_mouse',
+  'browser_gamepad',
+  'browser_input_script',
   'browser_hover',
   'browser_scroll',
   'browser_select',
@@ -61,6 +64,9 @@ const CONTROL_TOOLS = [
   'browser_resize',
   'browser_type',
   'browser_press_key',
+  'browser_mouse',
+  'browser_gamepad',
+  'browser_input_script',
   'browser_hover',
   'browser_scroll',
   'browser_select',
@@ -111,6 +117,16 @@ describe('browser — senses map to verbs (See=read, Control=control, Exec=execu
     expect(rule?.actionFor?.({ action: 'open' })).toBe('control');
     expect(rule?.actionFor?.({ action: 'close' })).toBe('control');
     expect(rule?.actionFor?.({ action: 'activate' })).toBe('control');
+  });
+});
+
+describe('browser — input scripts with evaluate markers need Exec', () => {
+  it('browser_input_script is control, or execute when its timeline evaluates page JS', () => {
+    const rule = getDataToolRule('browser_input_script');
+    expect(rule?.actionFor).toBeDefined();
+    expect(rule?.actionFor?.({ events: [{ t: 0, key: 'w', op: 'down' }] })).toBe('control');
+    expect(rule?.actionFor?.({ op: 'abort' })).toBe('control');
+    expect(rule?.actionFor?.({ events: [{ t: 0, key: 'w' }, { t: 500, evaluate: 'game.camera.pitch' }] })).toBe('execute');
   });
 });
 
