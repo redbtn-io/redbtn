@@ -532,6 +532,16 @@ export const DATA_TOOL_RULES: Record<string, DataToolRule> = {
   browser_resize: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_type: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_press_key: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_mouse: { resource: 'browser', action: 'control', extract: browserTarget },
+  browser_gamepad: { resource: 'browser', action: 'control', extract: browserTarget },
+  // A timed input script is Control, unless its timeline carries `evaluate` markers:
+  // those run page JS exactly like browser_evaluate, so the call needs Exec.
+  browser_input_script: {
+    resource: 'browser',
+    action: 'control',
+    actionFor: (args) => (Array.isArray(args.events) && args.events.some((e) => e && typeof e === 'object' && 'evaluate' in (e as Record<string, unknown>)) ? 'execute' : 'control'),
+    extract: browserTarget,
+  },
   browser_hover: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_scroll: { resource: 'browser', action: 'control', extract: browserTarget },
   browser_select: { resource: 'browser', action: 'control', extract: browserTarget },

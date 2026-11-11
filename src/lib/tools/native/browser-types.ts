@@ -100,7 +100,20 @@ export type BrowserAction =
       reset?: boolean;
     })
   | (BrowserActionBase & { action: 'type'; tabId?: number; ref?: string; selector?: string; text?: string })
-  | (BrowserActionBase & { action: 'press_key'; tabId?: number; ref?: string; selector?: string; keys?: string[]; key?: string })
+  | (BrowserActionBase & { action: 'press_key'; tabId?: number; ref?: string; selector?: string; keys?: string[]; key?: string; op?: 'press' | 'down' | 'up' | 'release_all' | 'held' | string; holdMs?: number; repeat?: boolean; maxHoldMs?: number })
+  | (BrowserActionBase & {
+      action: 'mouse';
+      tabId?: number;
+      op?: 'move_relative' | 'move' | 'down' | 'up' | 'click' | 'wheel' | 'lock' | 'unlock' | 'lock_status' | 'release_all' | string;
+      dx?: number;
+      dy?: number;
+      durationMs?: number;
+      steps?: number;
+      via?: 'auto' | 'cdp' | 'synthetic' | string;
+      button?: 'left' | 'right' | 'middle' | string;
+    })
+  | (BrowserActionBase & { action: 'gamepad'; tabId?: number; op?: 'connect' | 'set' | 'disconnect' | 'status' | string; axes?: AnyObject; buttons?: AnyObject; reset?: boolean; holdMs?: number })
+  | (BrowserActionBase & { action: 'input_script'; tabId?: number; op?: 'run' | 'start' | 'status' | 'abort' | string; events?: AnyObject[]; record?: AnyObject; overlay?: AnyObject })
   | (BrowserActionBase & { action: 'hover'; tabId?: number; ref?: string; selector?: string; text?: string; x?: number; y?: number; offsetX?: number; offsetY?: number; nx?: number; ny?: number })
   | (BrowserActionBase & { action: 'scroll'; tabId?: number; ref?: string; selector?: string; dx?: number; dy?: number; x?: number; y?: number; offsetX?: number; offsetY?: number; nx?: number; ny?: number })
   | (BrowserActionBase & {
@@ -197,6 +210,9 @@ export const BROWSER_TOOL_NAMES = [
   'browser_resize',
   'browser_type',
   'browser_press_key',
+  'browser_mouse',
+  'browser_gamepad',
+  'browser_input_script',
   'browser_hover',
   'browser_scroll',
   'browser_select',

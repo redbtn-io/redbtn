@@ -68,4 +68,19 @@ describe('browser native tools', () => {
     const text = result.content?.map((c: any) => c.text ?? '').join('') ?? '';
     expect(text).toContain('browser_failed');
   });
+
+  test('game input tools build the wire actions the extension expects', () => {
+    const props = (n: string) => Object.keys((BROWSER_TOOLS as any)[n].inputSchema.properties);
+    expect(props('browser_press_key')).toEqual(expect.arrayContaining(['op', 'holdMs', 'repeat', 'maxHoldMs']));
+    expect((BROWSER_TOOLS as any).browser_press_key.inputSchema.required).toEqual([]);
+    expect(props('browser_mouse')).toEqual(expect.arrayContaining(['op', 'dx', 'dy', 'durationMs', 'steps', 'via', 'button']));
+    expect(props('browser_gamepad')).toEqual(expect.arrayContaining(['op', 'axes', 'buttons', 'reset', 'holdMs']));
+    expect(props('browser_input_script')).toEqual(expect.arrayContaining(['op', 'events', 'record', 'overlay']));
+    expect(props('browser_record_start')).toContain('overlay');
+  });
+
+  test('browser_input_script handler fails safe without userId', async () => {
+    const result: any = await (BROWSER_TOOLS as any).browser_input_script.handler({ events: [{ t: 0, key: 'w' }] }, makeContext());
+    expect(result.isError).toBe(true);
+  });
 });
