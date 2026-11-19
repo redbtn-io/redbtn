@@ -39,6 +39,7 @@
  * what keeps legitimate expressions working.
  */
 import * as vm from 'node:vm';
+import { isPlainObject, planScope, scopePruningEnabled, type Keep } from './scopePruning';
 
 /** Thrown when an expression is rejected, fails to evaluate, or times out. */
 export class SafeExpressionError extends Error {
@@ -49,11 +50,25 @@ export class SafeExpressionError extends Error {
 }
 
 export interface EvaluateOptions {
-    /** Wall-clock budget for the evaluation, in milliseconds. Defaults to 250ms. */
+    /**
+     * Wall-clock budget for running the expression itself, in milliseconds.
+     * Defaults to 250ms. Rebuilding the scope inside the sandbox has its own,
+     * size-scaled budget (see scopeLoadBudgetMs) so large state cannot eat it.
+     */
     timeoutMs?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 250;
+
+/**
+ * Budget for rebuilding the scope inside the sandbox: 250ms plus 100ms per MB
+ * of serialised scope. This step only runs the sandbox's own JSON.parse on data
+ * the engine produced, so it cannot loop; the budget just keeps a pathological
+ * multi-hundred-MB scope from stalling the worker forever.
+ */
+function scopeLoadBudgetMs(scopeJsonLength: number): number {
+    return DEFAULT_TIMEOUT_MS + Math.ceil(scopeJsonLength / 1_000_000) * 100;
+}
 
 /**
  * Convert a scope value to a JSON-safe structure. True cycles are dropped (a
@@ -94,6 +109,26 @@ function toJsonSafe(value: unknown, ancestors: Set<object>): unknown {
     return result;
 }
 
+/**
+ * `toJsonSafe` restricted to the parts of `value` a Keep tree names. It walks
+ * the original objects with the same ancestor set, so cycles and shared
+ * references serialise exactly as the full scope would, minus the keys the
+ * expression cannot reach.
+ */
+function toJsonSafePruned(value: unknown, keep: Keep, ancestors: Set<object>): unknown {
+    if (keep.whole || !isPlainObject(value)) return toJsonSafe(value, ancestors);
+    if (ancestors.has(value)) return undefined;
+    ancestors.add(value);
+    const record: Record<string, unknown> = {};
+    for (const [key, child] of keep.children) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+        const mapped = toJsonSafePruned(value[key], child, ancestors);
+        if (mapped !== undefined) record[key] = mapped;
+    }
+    ancestors.delete(value);
+    return record;
+}
+
 const VALID_SCOPE_KEY = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 /**
@@ -118,9 +153,22 @@ export function evaluateExpression(
         }
     }
 
+    // Copy only what the expression can reach (see scopePruning.ts). Variables
+    // it never names are left out and bound as undefined below.
+    const plan = scopePruningEnabled() ? planScope(expression, keys) : null;
+    const bound = keys.filter((key) => !plan || plan.get(key) !== undefined);
+
     let scopeJson: string | undefined;
     try {
-        scopeJson = JSON.stringify(toJsonSafe(scope ?? {}, new Set<object>()));
+        const ancestors = new Set<object>();
+        const safe: Record<string, unknown> = {};
+        for (const key of bound) {
+            const value = (scope as Record<string, unknown>)[key];
+            const keep = plan?.get(key);
+            const mapped = keep ? toJsonSafePruned(value, keep, ancestors) : toJsonSafe(value, ancestors);
+            if (mapped !== undefined) safe[key] = mapped;
+        }
+        scopeJson = JSON.stringify(safe);
     } catch (err) {
         throw new SafeExpressionError(
             `Scope is not serializable: ${err instanceof Error ? err.message : String(err)}`,
@@ -132,35 +180,61 @@ export function evaluateExpression(
     // the fresh context does not install is reachable.
     const sandbox: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     sandbox.__scope_json__ = scopeJson;
+    const context = vm.createContext(sandbox, {
+        codeGeneration: { strings: false, wasm: false },
+        microtaskMode: 'afterEvaluate',
+    });
+    const scriptOptions = {
+        // No module loader is wired, so `import()` has nothing to load.
+        // Make it reject (fail closed) rather than throw the uncaught
+        // ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING that would crash the worker.
+        importModuleDynamically: () => {
+            throw new SafeExpressionError('Dynamic import is not allowed in expressions');
+        },
+    };
 
-    const bindings = keys.map((key) => `const ${key}=__s[${JSON.stringify(key)}];`).join('');
+    // Phase 1: rebuild the scope with the sandbox's own JSON.parse (so every
+    // object has sandbox-realm prototypes) under a size-scaled budget. This
+    // runs engine-produced JSON only, never author code.
+    try {
+        vm.runInContext(
+            '"use strict";globalThis.__s=JSON.parse(globalThis.__scope_json__);globalThis.__scope_json__=undefined;',
+            context,
+            { timeout: scopeLoadBudgetMs(scopeJson.length), ...scriptOptions } as unknown as vm.RunningScriptOptions,
+        );
+    } catch (err) {
+        throw new SafeExpressionError(
+            `Expression scope could not be loaded: ${err instanceof Error ? err.message : String(err)}`,
+        );
+    }
 
+    const bindings = bound
+        .map((key) => `const ${key}=__s[${JSON.stringify(key)}];`)
+        .join('');
+    // Scope variables the expression never names are not copied; bind them as
+    // undefined so a `typeof x` style check still sees the name.
+    const unbound = keys
+        .filter((key) => !bound.includes(key))
+        .map((key) => `const ${key}=undefined;`)
+        .join('');
     // "use strict" + an IIFE so `this` is `undefined` inside; the parenthesised
     // expression keeps the author grammar (an expression yielding a typed value).
+    // `__s` is captured into a local and removed from the global first.
     const code =
-        '"use strict";(function(){const __s=JSON.parse(__scope_json__);' +
+        '"use strict";(function(__s){' +
         bindings +
+        unbound +
         'return (' +
         expression +
-        ');})()';
+        ');})((function(){const s=globalThis.__s;globalThis.__s=undefined;return s;})())';
 
+    // Phase 2: the author expression, under the normal (DoS) budget.
     let result: unknown;
     try {
-        result = vm.runInNewContext(
-            code,
-            sandbox,
-            {
-                timeout: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-                contextCodeGeneration: { strings: false, wasm: false },
-                microtaskMode: 'afterEvaluate',
-                // No module loader is wired, so `import()` has nothing to load.
-                // Make it reject (fail closed) rather than throw the uncaught
-                // ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING that would crash the worker.
-                importModuleDynamically: () => {
-                    throw new SafeExpressionError('Dynamic import is not allowed in expressions');
-                },
-            } as unknown as Parameters<typeof vm.runInNewContext>[2],
-        );
+        result = vm.runInContext(code, context, {
+            timeout: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+            ...scriptOptions,
+        } as unknown as vm.RunningScriptOptions);
     } catch (err) {
         if (err instanceof SafeExpressionError) throw err;
         throw new SafeExpressionError(
