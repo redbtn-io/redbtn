@@ -23,6 +23,14 @@ const { BaseCheckpointSaver, WRITES_IDX_MAP, copyCheckpoint, getCheckpointId } =
 // which crashes LangGraph in `_first()` because `string.versions_seen` is undefined
 // and `undefined['__input__']` throws. Detect it at write time so the next failure
 // surfaces what was unserializable instead of silently corrupting checkpoints.
+import {
+  type BlobStore,
+  checkpointBlobsEnabled,
+  defaultBlobStore,
+  externalizeBlobs,
+  rehydrateBlobs,
+} from './checkpointBlobs';
+
 const FAST_SAFE_STRINGIFY_PLACEHOLDER = '[unable to serialize, circular reference is too complex to analyze]';
 
 /**
@@ -168,8 +176,35 @@ function getWritesModel(): any {
 // ============================================================================
 
 export class MongoCheckpointer extends BaseCheckpointSaver {
-  constructor(serde?: any) {
+  private readonly blobStore: BlobStore;
+
+  constructor(serde?: any, blobStore?: BlobStore) {
     super(serde);
+    this.blobStore = blobStore ?? defaultBlobStore();
+  }
+
+  /**
+   * Swap large strings for stored-blob markers in the copy about to be
+   * written. Never touches live graph state. On any store failure the value
+   * is written inline exactly as before, so offload can only ever help.
+   */
+  private async _offload(label: string, threadId: string, value: any): Promise<any> {
+    if (!checkpointBlobsEnabled()) return value;
+    try {
+      const { value: out, blobs, bytes } = await externalizeBlobs(value, this.blobStore);
+      if (blobs > 0) {
+        console.log(`[MongoCheckpointer] ${label} for thread ${threadId}: ${blobs} large value(s), ${bytes} bytes, stored as blobs`);
+      }
+      return out;
+    } catch (error) {
+      console.error(`[MongoCheckpointer] ${label} blob offload failed for thread ${threadId}; writing inline:`, error);
+      return value;
+    }
+  }
+
+  /** Put stored blobs back so a loaded checkpoint is byte-identical to what ran. */
+  private async _restore(value: any): Promise<any> {
+    return rehydrateBlobs(value, this.blobStore);
   }
 
   private _getIds(config: any): { conversationId: string; threadId: string } {
@@ -196,7 +231,7 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
       if (!doc) return undefined;
       const checkpointBytes = Buffer.from(doc.checkpoint, 'base64');
       const metadataBytes = Buffer.from(doc.metadata, 'base64');
-      const deserializedCheckpoint = await this.serde.loadsTyped('json', checkpointBytes);
+      const deserializedCheckpoint = await this._restore(await this.serde.loadsTyped('json', checkpointBytes));
       const deserializedMetadata = await this.serde.loadsTyped('json', metadataBytes);
       // Refuse corrupted checkpoints written by an old engine before the put-time
       // guard existed. A proper checkpoint is an object with versions_seen; the
@@ -211,7 +246,7 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
       const pendingWrites = await Promise.all(
         writeDocs.map(async (w: any) => {
           const valueBytes = Buffer.from(w.value, 'base64');
-          const deserializedValue = await this.serde.loadsTyped('json', valueBytes);
+          const deserializedValue = await this._restore(await this.serde.loadsTyped('json', valueBytes));
           return [w.taskId, w.channel, deserializedValue];
         })
       );
@@ -252,7 +287,13 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
       for (const doc of docs) {
         const checkpointBytes = Buffer.from(doc.checkpoint, 'base64');
         const metadataBytes = Buffer.from(doc.metadata, 'base64');
-        const deserializedCheckpoint = await this.serde.loadsTyped('json', checkpointBytes);
+        let deserializedCheckpoint: any;
+        try {
+          deserializedCheckpoint = await this._restore(await this.serde.loadsTyped('json', checkpointBytes));
+        } catch (error) {
+          console.error(`[MongoCheckpointer] Skipping checkpoint in list() for thread ${threadId} (checkpointId=${doc.checkpointId}): blob restore failed:`, error);
+          continue;
+        }
         const deserializedMetadata = await this.serde.loadsTyped('json', metadataBytes);
         if (typeof deserializedCheckpoint !== 'object' || deserializedCheckpoint === null || !('versions_seen' in deserializedCheckpoint)) {
           console.error(`[MongoCheckpointer] Skipping corrupted checkpoint in list() for thread ${threadId} (checkpointId=${doc.checkpointId})`);
@@ -263,7 +304,7 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
         const pendingWrites = await Promise.all(
           writeDocs.map(async (w: any) => {
             const valueBytes = Buffer.from(w.value, 'base64');
-            const deserializedValue = await this.serde.loadsTyped('json', valueBytes);
+            const deserializedValue = await this._restore(await this.serde.loadsTyped('json', valueBytes));
             return [w.taskId, w.channel, deserializedValue];
           })
         );
@@ -289,7 +330,7 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
     if (!threadId || !conversationId) throw new Error('[MongoCheckpointer] put() called without thread_id/conversation_id in config.configurable');
     try {
       const CheckpointModel = getCheckpointModel();
-      const preparedCheckpoint = copyCheckpoint(checkpoint);
+      const preparedCheckpoint = await this._offload('put(checkpoint)', threadId, copyCheckpoint(checkpoint));
       const [[, checkpointBytes], [, metadataBytes]] = await Promise.all([
         this.serde.dumpsTyped(preparedCheckpoint),
         this.serde.dumpsTyped(metadata),
@@ -329,7 +370,8 @@ export class MongoCheckpointer extends BaseCheckpointSaver {
       await Promise.all(
         writes.map(async ([channel, value]: [string, any], idx: number) => {
           try {
-            const [, valueBytes] = await this.serde.dumpsTyped(value);
+            const stored = await this._offload(`putWrites(${channel})`, threadId, value);
+            const [, valueBytes] = await this.serde.dumpsTyped(stored);
             assertSerializationOk(`putWrites(${channel})`, value, valueBytes);
             const valueStr = Buffer.from(valueBytes).toString('base64');
             if (oversized(`putWrites(${channel})`, threadId, valueStr.length)) return;
