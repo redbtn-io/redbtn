@@ -83,7 +83,7 @@ const ttsSynthesizeTool: NativeToolDefinition = {
               voice: body.voice,
               textLength: body.textLength,
               durationMs: body.durationMs,
-              model: 'gemini-2.5-flash-preview-tts',
+              model: 'gemini-3.8-flash-tts',
             }),
           },
         ],

@@ -41,7 +41,7 @@ interface SynthesizeArgs {
 
 const DEFAULT_KOKORO_BASE = 'http://192.168.1.6:8880';
 const DEFAULT_GEMINI_VOICE = 'Kore';
-const DEFAULT_GEMINI_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
+const DEFAULT_GEMINI_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-3.8-flash-tts';
 
 /**
  * Gemini's TTS models started (2026-09) answering a bare transcript as if it
